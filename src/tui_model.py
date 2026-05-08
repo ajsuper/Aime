@@ -31,12 +31,12 @@ MonthSelected = "04"
 client = Anthropic(
     max_retries=3
 )
+
 API_URL = "http://localhost:8080/api"
-CONFIG_PATH = ".agent_config.json"
-PREFS_PATH = ".tui_prefs.json"
+CONFIG_PATH = os.environ['HOME'] + "/.config/aime-assistant/agents_config.json"
+PREFS_PATH = os.environ['HOME'] + "/.config/aime-assistant/tui_prefs.json"
 SYSTEM_PROMPT_PATH = "system_prompt.md"
 DEFAULT_THEME = "gruvbox"
-
 
 def load_prefs() -> dict:
     try:
