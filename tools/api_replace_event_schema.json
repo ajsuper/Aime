@@ -1,0 +1,43 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "EditEvent",
+  "description": "Submit event body for POST /api. Replaces the contents of an existing event. All fields must be filled out. Keep the fields the same that you do not want to change.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "date", "title", "summary", "category", "archived"],
+  "properties": {
+    "date": {
+      "type": "string",
+      "pattern": "^\\d{2}/\\d{2}/\\d{4}$",
+      "description": "Date on which the event occurs. Also marks the start of a multi day event."
+    },
+    "time": {
+      "type": "string",
+      "pattern": "^\\d{2}:\\d{2}$",
+      "description": "Format: HH:MM. The time the event starts. Optional."
+    },
+    "category": {
+      "type": "string",
+      "description": "A one word category to help summarise and identify words. Please attempt to use categories that are already being used by other events and only use a new category if you think it is needed."
+    },
+    "archived": {
+      "type": "boolean",
+      "default": false,
+      "description": "When true, an event is considered to be completed or past or not to be worried about for some reason. Use this instead of deleting events or whenever they are completed."
+    },
+    "summary": {
+      "type": "string",
+      "description": "A detailed description of the event containing information such as where an event occurs, what the event is in more detail, and whatever other important information is applicable."
+    },
+    "title": {
+      "type": "string",
+      "description": "A title saying what the event is."
+    },
+    "id": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 0,
+      "description": "The ID of the event to replace."
+    }
+  }
+}

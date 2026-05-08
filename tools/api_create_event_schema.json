@@ -1,0 +1,37 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "CreateEvent",
+  "description": "Submit event body for POST /api. Creates a new event. The ID is assigned automatically by the server. Use this when adding a new event; use EditEvent only to modify an existing event.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["date", "title", "summary", "category", "archived"],
+  "properties": {
+    "date": {
+      "type": "string",
+      "pattern": "^\\d{2}/\\d{2}/\\d{4}$",
+      "description": "Date on which the event occurs. Also marks the start of a multi day event."
+    },
+    "time": {
+      "type": "string",
+      "pattern": "^\\d{2}:\\d{2}$",
+      "description": "Format: HH:MM. The time the event starts. Optional."
+    },
+    "category": {
+      "type": "string",
+      "description": "A one word category to help summarise and identify words. Please attempt to use categories that are already being used by other events and only use a new category if you think it is needed."
+    },
+    "archived": {
+      "type": "boolean",
+      "default": false,
+      "description": "When true, an event is considered to be completed or past or not to be worried about for some reason. Use this instead of deleting events or whenever they are completed."
+    },
+    "summary": {
+      "type": "string",
+      "description": "A detailed description of the event containing information such as where an event occurs, what the event is in more detail, and whatever other important information is applicable."
+    },
+    "title": {
+      "type": "string",
+      "description": "A title saying what the event is. Should be short (20 characters or less)"
+    }
+  }
+}

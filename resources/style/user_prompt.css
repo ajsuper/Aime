@@ -1,0 +1,102 @@
+Screen {
+    background: $surface;
+}
+
+#modes {
+    height: 1fr;
+}
+
+/* --- Assistant --- */
+
+AssistantView {
+    layout: vertical;
+    height: 1fr;
+    padding: 1 1;
+}
+
+#transcript {
+    height: 1fr;
+    border: solid $primary;
+    padding: 0 0;
+    background: $panel;
+    scrollbar-size-vertical: 1;
+}
+
+#prompt {
+    dock: bottom;
+    margin-top: 1;
+    border: solid $accent;
+    background: $panel;
+}
+
+#prompt:focus {
+    border: solid $success;
+}
+
+/* --- Calendar --- */
+
+CalendarView, TopicView {
+    layout: vertical;
+    height: 1fr;
+    padding: 1 2;
+}
+
+Tabs {
+    dock: top;
+}
+
+DataTable {
+    content-align: left top;
+    height: 1fr;
+    width: 3fr;
+    padding: 1 2;
+}
+
+#calendar-body {
+    height: 1fr;
+    width: 1fr;
+}
+
+#calendar-toolbar, #topic-toolbar {
+    height: 3;
+    align: left middle;
+    padding: 0 1;
+}
+
+#calendar-title, #topic-title {
+    width: 1fr;
+    content-align: left middle;
+    padding: 1 0;
+}
+
+#calendar-refresh, #topic-refresh {
+    width: auto;
+    min-width: 12;
+}
+
+#calendar-scroll, #topic-scroll {
+    height: 1fr;
+    width: 1fr;
+    border: solid $primary;
+    padding: 1 2;
+    background: $panel;
+}
+
+#calendar-scroll {
+    width: 1fr;
+    padding: 1 2;
+}
+
+#calendar-scroll, #topic-scroll {
+    scrollbar-size-vertical: 1;
+}
+
+#calendar-list {
+    width: 1fr;
+    height: auto;
+}
+
+#topic-list {
+    width: 1fr;
+    height: auto;
+}

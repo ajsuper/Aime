@@ -1,0 +1,14 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "GetTopicContents",
+  "description": "Submit to POST /api. Retrieves the markdown content of a topic by its ID.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id"],
+  "properties": {
+    "id": {
+      "type": "integer",
+      "description": "The ID of the topic whose content you want to retrieve."
+    }
+  }
+}

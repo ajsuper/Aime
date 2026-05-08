@@ -1,0 +1,18 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ReplaceTopicContents",
+  "description": "Submit to POST /api. Replaces the ENTIRE markdown content of a topic with new content. PREFER EditTopicContents for any small or targeted edit — it is far cheaper and safer. Only use ReplaceTopicContents when: (1) reorganizing or rewriting whole sections of a topic, (2) more than ~50% of the file is changing, or (3) writing initial structured content into a freshly-created topic. Never use this tool to change a single fact, add one line, or insert a small section — that's what EditTopicContents is for.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "contents"],
+  "properties": {
+    "id": {
+      "type": "integer",
+      "description": "The ID of the topic whose content you want to update."
+    },
+    "contents": {
+      "type": "string",
+      "description": "The new markdown content for the topic. This will completely replace the existing content."
+    }
+  }
+}
