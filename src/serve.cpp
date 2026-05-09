@@ -7,11 +7,12 @@
 #include <ctime>
 #include <fstream>
 #include <filesystem>
+#include <cstdlib>
 #include <cctype>
 
-#include "crow_all.h"
+#include "../include/crow_all.h"
 
-std::string database_dir = "database";
+std::string database_dir = "/.local/share/aime-assistant/database/";
 
 // ─── Data structures ─────────────────────────────────────────────────────────
 
@@ -889,6 +890,7 @@ static TopicFilterOptions parseTopicFilterOptions(const crow::json::rvalue& j) {
 // ─── main ─────────────────────────────────────────────────────────────────────
 
 int main(int argc, char* argv[]) {
+    database_dir = std::string(std::getenv("HOME")) + database_dir;
     if (argc > 1) {
         database_dir = argv[1];
     }

@@ -35,7 +35,7 @@ client = Anthropic(
 API_URL = "http://localhost:8080/api"
 CONFIG_PATH = os.environ['HOME'] + "/.config/aime-assistant/agents_config.json"
 PREFS_PATH = os.environ['HOME'] + "/.config/aime-assistant/tui_prefs.json"
-SYSTEM_PROMPT_PATH = "system_prompt.md"
+SYSTEM_PROMPT_PATH = "../resources/prompts/system_prompt.md"
 DEFAULT_THEME = "gruvbox"
 
 def load_prefs() -> dict:
@@ -89,15 +89,15 @@ MONTH_NUMBER_TO_STR_MAP = [
 ]
 
 SCHEMA_FILES = [
-    "api_request_schema.json",
-    "api_replace_event_schema.json",
-    "api_create_event_schema.json",
-    "api_request_topics_schema.json",
-    "api_create_topic_schema.json",
-    "api_replace_topic_schema.json",
-    "api_get_topic_contents_schema.json",
-    "api_replace_topic_contents_schema.json",
-    "api_edit_topic_contents_schema.json",
+    "../resources/tools/api_request_schema.json",
+    "../resources/tools/api_replace_event_schema.json",
+    "../resources/tools/api_create_event_schema.json",
+    "../resources/tools/api_request_topics_schema.json",
+    "../resources/tools/api_create_topic_schema.json",
+    "../resources/tools/api_replace_topic_schema.json",
+    "../resources/tools/api_get_topic_contents_schema.json",
+    "../resources/tools/api_replace_topic_contents_schema.json",
+    "../resources/tools/api_edit_topic_contents_schema.json",
 ]
 
 AGENT_MODEL = "claude-sonnet-4-6"
@@ -792,7 +792,7 @@ class TopicView(Container):
 
 
 class Aime(App):
-    CSS_PATH = "user_prompt.css"
+    CSS_PATH = "../resources/style/user_prompt.css"
     TITLE = "Aime"
     SUB_TITLE = "an extension of your mind"
 

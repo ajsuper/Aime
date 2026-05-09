@@ -1,0 +1,6 @@
+anthropic
+requests
+rich
+textual
+textual-dev
+textual-serve
