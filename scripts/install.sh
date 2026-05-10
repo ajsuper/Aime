@@ -4,7 +4,7 @@
 # To run the backend as a service, see backend_serve.sh.
 set -e
 
-REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CONFIG_DIR="$HOME/.config/aime-assistant"
 DATABASE_DIR="$HOME/.local/share/aime-assistant/database"
 LOG_DIR="$HOME/.local/share/aime-assistant"

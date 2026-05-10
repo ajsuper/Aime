@@ -5,7 +5,7 @@
 
 set -e
 
-REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LOG_DIR="$HOME/.local/share/aime-assistant"
 SERVE_BIN="$REPO_ROOT/build/serve.o"
 

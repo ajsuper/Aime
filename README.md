@@ -39,7 +39,7 @@ Aime officially supports MacOS and Linux, but the dependency list is small and c
 
 * python3
 
-* Anthropic API key - If you run textual_serve.sh, it will prompt you for it, otherwise it needs to be set as an environment variable using: ***Do not share the key with anyone!!***
+* Anthropic API key - If you run scripts/textual_serve.sh, it will prompt you for it, otherwise it needs to be set as an environment variable using: ***Do not share the key with anyone!!***
   
   ```bash
   export ANTHROPIC_API_KEY=(your key) # Temporary variable. Search up how to set permanent variables.
@@ -49,7 +49,7 @@ Aime officially supports MacOS and Linux, but the dependency list is small and c
 
 ```bash
 cd /path/to/aime/
-./install.sh
+./scripts/install.sh
 ```
 
 Which creates the following folders:
@@ -65,8 +65,8 @@ Aime has 2 parts, a **backend c++ server**, and the **frontend python TUI**. Bot
 
 ```bash
 cd /path/to/aime/
-./backend_serve.sh #C++ backend. Required to run tui_model.py either way.
-./textual_serve.sh #Allows you to access Aime through http://localhost:8000
+./scripts/backend_serve.sh #C++ backend. Required to run tui_model.py either way.
+./scripts/textual_serve.sh #Allows you to access Aime through http://localhost:8000
                    #through web browser. Otherwise you would run tui_model.py directly
 ```
 

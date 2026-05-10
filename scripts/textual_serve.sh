@@ -6,7 +6,7 @@
 
 set -e
 
-REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SRC_DIR="$REPO_ROOT/src"
 LOG_DIR="$HOME/.local/share/aime-assistant"
 VENV_DIR="$REPO_ROOT/.venv"
