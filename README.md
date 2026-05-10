@@ -1,5 +1,11 @@
 # Aime
 
+<p align="center">
+  <img src="docs/images/CalenderView.png" alt="Calendar view" width="32%" />
+  <img src="docs/images/CookingAndFoodTopic.png" alt="Cooking and food topic" width="32%" />
+  <img src="docs/images/VolettesPoolPartyWeather.png" alt="Volette's pool party weather" width="32%" />
+</p>
+
 # Goal
 
 Aime aims to be a personal **assistant**. **Not a replacement** for **creativity** or **thinking**, but something that actively and thoughtfully **organizes your ideas and life**. It:
