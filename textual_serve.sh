@@ -84,7 +84,7 @@ EnvironmentFile=$ENV_FILE
 # 'textual serve'. systemd's ExecStart= quote handling differs from a shell
 # and will otherwise split "$PYTHON_BIN tui_model.py" on the space, leaving
 # textual to try to read the python binary as a script.
-ExecStart=/bin/sh -c '$TEXTUAL_BIN serve -c "$PYTHON_BIN tui_model.py"'
+ExecStart=/bin/sh -c '$TEXTUAL_BIN serve -c tui_model.py'
 Restart=always
 RestartSec=3
 
@@ -120,7 +120,7 @@ EOF
     <array>
         <string>$TEXTUAL_BIN</string>
         <string>serve</string>
-        <string>$PYTHON_BIN tui_model.py</string>
+        <string>tui_model.py</string>
     </array>
     <key>WorkingDirectory</key>
     <string>$SRC_DIR</string>
