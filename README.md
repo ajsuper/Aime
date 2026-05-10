@@ -1,10 +1,17 @@
 # Aime
 
-<p align="center">
-  <img src="docs/images/CalenderView.png" alt="Calendar view" width="32%" />
-  <img src="docs/images/CookingAndFoodTopic.png" alt="Cooking and food topic" width="32%" />
-  <img src="docs/images/VolettesPoolPartyWeather.png" alt="Volette's pool party weather" width="32%" />
-</p>
+<table align="center">
+  <tr>
+    <td valign="top" width="66%">
+      <img src="docs/images/CalenderView.png" alt="Calendar view" width="100%" />
+      <br />
+      <img src="docs/images/VolettesPoolPartyWeather.png" alt="Volette's pool party weather" width="100%" />
+    </td>
+    <td valign="top" width="34%">
+      <img src="docs/images/CookingAndFoodTopic.png" alt="Cooking and food topic" width="100%" />
+    </td>
+  </tr>
+</table>
 
 # Goal
 
