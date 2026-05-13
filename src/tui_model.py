@@ -1,6 +1,7 @@
 import json
 import os
 import hashlib
+import threading
 import requests
 from anthropic import Anthropic
 import datetime
@@ -58,6 +59,8 @@ EventKind = Literal[
     "tool_send_response",
     # backend → UI (yielded from stream)
     "assistant_send_text",
+    "assistant_text_delta",
+    "assistant_text_end",
     "assistant_thinking",
     "assistant_use_tool",
     "turn_end",
@@ -112,32 +115,238 @@ class AgentBackend(Protocol):
         ...
 
 class AnthropicMessagesBackend:
-    """Provider-agnostic interface for an agentic conversation backend."""
+    """Anthropic Messages API implementation of AgentBackend.
+
+    Maintains the conversation history client-side as a list of message dicts
+    and drives the agent loop by calling messages.stream() once per assistant
+    turn. Tool uses are surfaced to the UI, which executes them locally and
+    submits results back via tool_send_response; once every tool_use in the
+    last assistant turn has a matching result, the loop continues.
+    """
+
+    def __init__(
+        self,
+        system_prompt: str,
+        model: str,
+        schema_files: list[str],
+        max_tokens: int = 8192,
+    ):
+        self._client = Anthropic(max_retries=3)
+        self._system_prompt = system_prompt
+        self._model = model
+        self._schema_files = schema_files
+        self._max_tokens = max_tokens
+        self._tools = [
+            {"type": "web_search_20250305", "name": "web_search"},
+            *[self._load_schema(p) for p in schema_files],
+        ]
+
+        self._session_id: str | None = None
+        self._messages: list[dict] = []
+        self._pending_tool_results: list[dict] = []
+        self._expected_tool_use_ids: set[str] = set()
+        self._turn_trigger = threading.Event()
+        self._terminated = threading.Event()
+        self._lock = threading.Lock()
+
+    # --- AgentBackend interface ---
 
     def new_session(self) -> str:
-        """Start a fresh session. Returns the session id."""
-        ...
+        with self._lock:
+            self._messages = []
+            self._pending_tool_results = []
+            self._expected_tool_use_ids = set()
+        self._terminated.clear()
+        self._turn_trigger.clear()
+        self._session_id = "msgs-" + hashlib.sha1(os.urandom(8)).hexdigest()[:12]
+        return self._session_id
 
     def load_session(self, session_id: str) -> None:
-        """Resume a previously-started session by id."""
-        ...
+        # No server-side state to resume — caller is expected to have any
+        # prior history already, or to start a fresh new_session().
+        self._session_id = session_id
 
     def reset(self) -> None:
-        """Terminate the current session and start a new one."""
-        ...
-
-    def submit(self, event: BackendEvent) -> None:
-        """Push a user/system/tool-result event into the conversation."""
-        ...
-
-    def stream(self) -> Iterator[BackendEvent]:
-        """Yield normalized events from the model. Blocks until the session
-        terminates; meant to run on a worker thread."""
-        ...
+        # Wake the stream loop so it observes termination and exits cleanly,
+        # then start a fresh session.
+        self._terminated.set()
+        self._turn_trigger.set()
+        self.new_session()
 
     def shutdown(self) -> None:
-        """Clean up any provider resources."""
-        ...
+        self._terminated.set()
+        self._turn_trigger.set()
+
+    def submit(self, event: BackendEvent) -> None:
+        if event.kind in ("user_send_message", "system_send_message"):
+            with self._lock:
+                self._messages.append({
+                    "role": "user",
+                    "content": [{"type": "text", "text": event.text or ""}],
+                })
+            self._turn_trigger.set()
+        elif event.kind == "tool_send_response":
+            result = event.tool_result
+            if isinstance(result, (dict, list)):
+                content_text = json.dumps(result)
+            else:
+                content_text = str(result if result is not None else "")
+            with self._lock:
+                self._pending_tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": event.tool_use_id,
+                    "content": content_text,
+                })
+                self._expected_tool_use_ids.discard(event.tool_use_id)
+                ready = not self._expected_tool_use_ids
+                if ready:
+                    self._messages.append({
+                        "role": "user",
+                        "content": self._pending_tool_results,
+                    })
+                    self._pending_tool_results = []
+            if ready:
+                self._turn_trigger.set()
+        else:
+            raise ValueError(f"submit() does not accept event kind: {event.kind}")
+
+    def stream(self) -> Iterator[BackendEvent]:
+        while True:
+            self._turn_trigger.wait()
+            self._turn_trigger.clear()
+            if self._terminated.is_set():
+                yield BackendEvent(kind="session_terminated")
+                return
+            try:
+                yield from self._run_turn()
+            except Exception as exc:
+                yield BackendEvent(kind="error", error=str(exc))
+                yield BackendEvent(kind="turn_end", stop_reason="error")
+
+    # --- internal ---
+
+    def _run_turn(self) -> Iterator[BackendEvent]:
+        assistant_blocks: list[dict] = []
+
+        with self._lock:
+            messages_snapshot = list(self._messages)
+            # Reserve the assistant message slot up-front and share the same
+            # content list with assistant_blocks. This way, any tool_result
+            # submitted by the UI mid-stream (in response to assistant_use_tool)
+            # sees a _messages tail that already contains the tool_use block —
+            # avoiding the "tool_result without matching tool_use" 400.
+            self._messages.append({"role": "assistant", "content": assistant_blocks})
+
+        with self._client.messages.stream(
+            model=self._model,
+            system=self._system_prompt,
+            tools=self._tools,
+            messages=messages_snapshot,
+            max_tokens=self._max_tokens,
+        ) as stream:
+            current_text: list[str] = []
+            current_tool: dict | None = None
+            partial_json = ""
+
+            for event in stream:
+                etype = getattr(event, "type", None)
+                if etype == "content_block_start":
+                    block = event.content_block
+                    if block.type in ("tool_use", "server_tool_use"):
+                        current_tool = {
+                            "type": block.type,
+                            "id": block.id,
+                            "name": block.name,
+                            "input": {},
+                        }
+                        partial_json = ""
+                    elif block.type == "web_search_tool_result":
+                        # Server-executed result — preserve in history and
+                        # display a one-liner; no response expected from us.
+                        result_block = {
+                            "type": "web_search_tool_result",
+                            "tool_use_id": block.tool_use_id,
+                            "content": getattr(block, "content", []),
+                        }
+                        with self._lock:
+                            assistant_blocks.append(result_block)
+                        count = len(result_block["content"]) if isinstance(result_block["content"], list) else 0
+                        yield BackendEvent(
+                            kind="assistant_use_tool",
+                            tool_name="web_search_result",
+                            tool_input={"results": count},
+                            tool_use_id=block.tool_use_id,
+                            expects_response=False,
+                        )
+                    elif block.type == "text":
+                        current_text = []
+                elif etype == "content_block_delta":
+                    delta = event.delta
+                    dtype = getattr(delta, "type", None)
+                    if dtype == "text_delta":
+                        current_text.append(delta.text)
+                        yield BackendEvent(kind="assistant_text_delta", text=delta.text)
+                    elif dtype == "input_json_delta":
+                        partial_json += delta.partial_json
+                elif etype == "content_block_stop":
+                    if current_tool is not None:
+                        try:
+                            current_tool["input"] = (
+                                json.loads(partial_json) if partial_json else {}
+                            )
+                        except json.JSONDecodeError:
+                            current_tool["input"] = {}
+                        is_server = current_tool["type"] == "server_tool_use"
+                        with self._lock:
+                            assistant_blocks.append(current_tool)
+                            if not is_server:
+                                # Register expectation before yielding so a fast
+                                # tool_send_response can't see an empty set and
+                                # prematurely flush pending results.
+                                self._expected_tool_use_ids.add(current_tool["id"])
+                        yield BackendEvent(
+                            kind="assistant_use_tool",
+                            tool_name=current_tool["name"],
+                            tool_input=dict(current_tool["input"]),
+                            tool_use_id=current_tool["id"],
+                            expects_response=not is_server,
+                        )
+                        current_tool = None
+                        partial_json = ""
+                    elif current_text:
+                        text = "".join(current_text)
+                        with self._lock:
+                            assistant_blocks.append({"type": "text", "text": text})
+                        yield BackendEvent(kind="assistant_text_end", text=text)
+                        current_text = []
+
+            final = stream.get_final_message()
+            stop_reason = final.stop_reason
+
+        with self._lock:
+            if not assistant_blocks:
+                # Drop the empty placeholder so we don't send a bogus
+                # assistant message back next turn.
+                if self._messages and self._messages[-1].get("content") is assistant_blocks:
+                    self._messages.pop()
+
+        if stop_reason != "tool_use":
+            yield BackendEvent(kind="turn_end", stop_reason=stop_reason or "end_turn")
+        # If stop_reason == "tool_use", the outer loop blocks on
+        # _turn_trigger until submit() has gathered every tool_result and
+        # appended them as a user message.
+
+    def _load_schema(self, schema_path: str) -> dict:
+        with open(schema_path, "r") as f:
+            schema = json.load(f)
+        input_schema = {"type": schema["type"], "properties": schema["properties"]}
+        if "required" in schema:
+            input_schema["required"] = schema["required"]
+        return {
+            "name": schema["title"],
+            "description": schema["description"],
+            "input_schema": input_schema,
+        }
 
 
 
@@ -637,11 +846,10 @@ def sortCalenderByDate(events):
 
 # Instantiate the active backend. Swapping to a different provider only
 # requires constructing a different AgentBackend implementation here.
-backend: AgentBackend = SessionsBackend(
+backend: AgentBackend = AnthropicMessagesBackend(
     system_prompt=SYSTEM_PROMPT,
     model=AGENT_MODEL,
     schema_files=SCHEMA_FILES,
-    config_path=CONFIG_PATH,
 )
 backend.new_session()
 
@@ -678,6 +886,7 @@ class AssistantView(Container):
             self.app._thinking_visible = False
             self.app._is_idle = True
             self.app._pending_user_messages = []
+            self.app._stream_buffer = ""
             log.clear()
             log.write("[yellow] The current conversation has ended because you typed '/reset'. Begin a new conversation. [/yellow]")
             self.app.run_worker(
@@ -1130,6 +1339,7 @@ class Aime(App):
     _message_count = 0
     _is_idle = True
     _pending_user_messages: list[str] = []
+    _stream_buffer: str = ""
 
     def _clear_thinking(self) -> None:
         if self._thinking_visible:
@@ -1148,15 +1358,45 @@ class Aime(App):
             log.write(escape_markup(text))
             log.write("[bold red] Pretty output is disabled. Model made small mistake in formatting response.[/bold red]")
 
+    def _ensure_assistant_prefix(self, log: RichLog) -> None:
+        if not self._assistant_prefixed:
+            log.write("[bold red]aime[/bold red]")
+            self._assistant_prefixed = True
+
+    def _stream_flush_lines(self, log: RichLog) -> None:
+        """Flush any complete lines in _stream_buffer to the log. Partial trailing
+        text stays buffered until the next delta or assistant_text_end."""
+        if "\n" not in self._stream_buffer:
+            return
+        head, _, tail = self._stream_buffer.rpartition("\n")
+        for line in head.split("\n"):
+            self._safe_write(log, line)
+        self._stream_buffer = tail
+
+    def _stream_flush_all(self, log: RichLog) -> None:
+        if self._stream_buffer:
+            for line in self._stream_buffer.split("\n"):
+                if line:
+                    self._safe_write(log, line)
+            self._stream_buffer = ""
+
     def _handle_event(self, event: BackendEvent) -> None:
         log = self.query_one("#transcript", RichLog)
 
         if event.kind == "assistant_send_text":
             self._clear_thinking()
-            if not self._assistant_prefixed:
-                log.write("[bold red]aime[/bold red]")
-                self._assistant_prefixed = True
+            self._stream_flush_all(log)
+            self._ensure_assistant_prefix(log)
             self._safe_write(log, event.text or "")
+
+        elif event.kind == "assistant_text_delta":
+            self._clear_thinking()
+            self._ensure_assistant_prefix(log)
+            self._stream_buffer += event.text or ""
+            self._stream_flush_lines(log)
+
+        elif event.kind == "assistant_text_end":
+            self._stream_flush_all(log)
 
         elif event.kind == "assistant_thinking":
             if self.app._log_model_thinking:
@@ -1200,6 +1440,7 @@ class Aime(App):
                 log.write(f"[red]tool result send failed:[/red] {exc}")
 
         elif event.kind == "turn_end":
+            self._stream_flush_all(log)
             if event.stop_reason == "end_turn":
                 self._assistant_prefixed = False
                 self._is_idle = True
