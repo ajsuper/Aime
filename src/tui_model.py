@@ -7,6 +7,8 @@ import datetime
 import calendar
 from datetime import date
 import re
+from dataclasses import dataclass
+from typing import Iterator, Literal, Protocol, runtime_checkable
 
 from rich.markup import render as render_markup, escape as escape_markup
 from rich.errors import MarkupError
@@ -28,15 +30,323 @@ from textual.widgets import (
 )
 
 MonthSelected = "04"
-client = Anthropic(
-    max_retries=3
-)
 
 API_URL = "http://localhost:8080/api"
 CONFIG_PATH = os.environ['HOME'] + "/.config/aime-assistant/agents_config.json"
 PREFS_PATH = os.environ['HOME'] + "/.config/aime-assistant/tui_prefs.json"
 SYSTEM_PROMPT_PATH = "../resources/prompts/system_prompt.md"
 DEFAULT_THEME = "gruvbox"
+
+
+# ============================================================================
+# Provider-agnostic agent backend
+# ============================================================================
+#
+# The UI only ever talks to a `AgentBackend`. Anthropic-specific types,
+# session lifecycle, and event-stream parsing live behind this interface so
+# swapping to a different provider (Anthropic Messages API, OpenAI,
+# self-hosted, etc.) only requires writing a new concrete backend class.
+#
+#   UI ──submit(BackendEvent)──> Backend ──provider API──> model
+#   UI <──stream() yields ──── Backend <──provider events
+#
+
+EventKind = Literal[
+    # UI → backend (passed to submit)
+    "user_send_message",
+    "system_send_message",
+    "tool_send_response",
+    # backend → UI (yielded from stream)
+    "assistant_send_text",
+    "assistant_thinking",
+    "assistant_use_tool",
+    "turn_end",
+    "error",
+    "session_terminated",
+]
+
+
+@dataclass
+class BackendEvent:
+    kind: EventKind
+    text: str | None = None
+    tool_name: str | None = None
+    tool_input: dict | None = None
+    tool_use_id: str | None = None
+    tool_result: dict | None = None
+    # If True (default), the UI is expected to execute the tool locally and
+    # submit a `tool_send_response` event back. Server-side tools handled
+    # entirely by the provider set this to False (display only).
+    expects_response: bool = True
+    stop_reason: str | None = None
+    error: str | None = None
+
+
+@runtime_checkable
+class AgentBackend(Protocol):
+    """Provider-agnostic interface for an agentic conversation backend."""
+
+    def new_session(self) -> str:
+        """Start a fresh session. Returns the session id."""
+        ...
+
+    def load_session(self, session_id: str) -> None:
+        """Resume a previously-started session by id."""
+        ...
+
+    def reset(self) -> None:
+        """Terminate the current session and start a new one."""
+        ...
+
+    def submit(self, event: BackendEvent) -> None:
+        """Push a user/system/tool-result event into the conversation."""
+        ...
+
+    def stream(self) -> Iterator[BackendEvent]:
+        """Yield normalized events from the model. Blocks until the session
+        terminates; meant to run on a worker thread."""
+        ...
+
+    def shutdown(self) -> None:
+        """Clean up any provider resources."""
+        ...
+
+class AnthropicMessagesBackend:
+    """Provider-agnostic interface for an agentic conversation backend."""
+
+    def new_session(self) -> str:
+        """Start a fresh session. Returns the session id."""
+        ...
+
+    def load_session(self, session_id: str) -> None:
+        """Resume a previously-started session by id."""
+        ...
+
+    def reset(self) -> None:
+        """Terminate the current session and start a new one."""
+        ...
+
+    def submit(self, event: BackendEvent) -> None:
+        """Push a user/system/tool-result event into the conversation."""
+        ...
+
+    def stream(self) -> Iterator[BackendEvent]:
+        """Yield normalized events from the model. Blocks until the session
+        terminates; meant to run on a worker thread."""
+        ...
+
+    def shutdown(self) -> None:
+        """Clean up any provider resources."""
+        ...
+
+
+
+class SessionsBackend:
+    """Anthropic Agents/Sessions beta implementation of AgentBackend.
+
+    Owns a single live session at a time. Caches the (environment, agent)
+    pair on disk keyed by a hash of the system prompt + model + tool schemas
+    so identical configurations reuse the same agent across restarts.
+    """
+
+    def __init__(
+        self,
+        system_prompt: str,
+        model: str,
+        schema_files: list[str],
+        config_path: str,
+    ):
+        self._client = Anthropic(max_retries=3)
+        self._system_prompt = system_prompt
+        self._model = model
+        self._schema_files = schema_files
+        self._config_path = config_path
+        self._env_id: str | None = None
+        self._agent_id: str | None = None
+        self._agent_version: str | None = None
+        self._session = None
+
+    # --- AgentBackend interface ---
+
+    def new_session(self) -> str:
+        self._env_id, self._agent_id, self._agent_version = self._get_or_create_setup()
+        try:
+            self._session = self._client.beta.sessions.create(
+                agent={"type": "agent", "id": self._agent_id, "version": self._agent_version},
+                environment_id=self._env_id,
+            )
+        except Exception:
+            # Stale cached agent/env — recreate from scratch.
+            if os.path.exists(self._config_path):
+                os.remove(self._config_path)
+            self._env_id, self._agent_id, self._agent_version = self._get_or_create_setup()
+            self._session = self._client.beta.sessions.create(
+                agent={"type": "agent", "id": self._agent_id, "version": self._agent_version},
+                environment_id=self._env_id,
+            )
+        return self._session.id
+
+    def load_session(self, session_id: str) -> None:
+        # Sessions are server-side; "loading" just means attaching to the id.
+        # The streaming endpoint will pick up wherever the session left off.
+        self._session = type("Session", (), {"id": session_id})()
+
+    def reset(self) -> None:
+        if self._session is not None:
+            try:
+                self._client.beta.sessions.terminate(session_id=self._session.id)
+            except Exception:
+                pass
+        self.new_session()
+
+    def shutdown(self) -> None:
+        if self._session is not None:
+            try:
+                self._client.beta.sessions.terminate(session_id=self._session.id)
+            except Exception:
+                pass
+
+    def submit(self, event: BackendEvent) -> None:
+        if self._session is None:
+            raise RuntimeError("no active session; call new_session() first")
+
+        if event.kind in ("user_send_message", "system_send_message"):
+            self._client.beta.sessions.events.send(
+                session_id=self._session.id,
+                events=[{
+                    "type": "user.message",
+                    "content": [{"type": "text", "text": event.text or ""}],
+                }],
+            )
+        elif event.kind == "tool_send_response":
+            self._client.beta.sessions.events.send(
+                session_id=self._session.id,
+                events=[{
+                    "type": "user.custom_tool_result",
+                    "custom_tool_use_id": event.tool_use_id,
+                    "content": [{"type": "text",
+                                 "text": json.dumps(event.tool_result)}],
+                }],
+            )
+        else:
+            raise ValueError(f"submit() does not accept event kind: {event.kind}")
+
+    def stream(self) -> Iterator[BackendEvent]:
+        if self._session is None:
+            raise RuntimeError("no active session; call new_session() first")
+        with self._client.beta.sessions.events.stream(
+            session_id=self._session.id
+        ) as stream:
+            for raw in stream:
+                for normalized in self._normalize(raw):
+                    yield normalized
+                if raw.type == "session.status_terminated":
+                    return
+
+    # --- internal: provider-specific normalization ---
+
+    def _normalize(self, event) -> Iterator[BackendEvent]:
+        if event.type == "agent.message":
+            for block in event.content:
+                if block.type == "text":
+                    yield BackendEvent(kind="assistant_send_text", text=block.text)
+        # Thinking currently dissabled.
+        #elif event.type == "agent.thinking":
+        #    for block in event.content:
+        #        if block.type == "text":
+        #            yield BackendEvent(kind="assistant_thinking", text=block.text)
+        elif event.type == "agent.custom_tool_use":
+            inp = dict(event.input) if event.input else {}
+            yield BackendEvent(
+                kind="assistant_use_tool",
+                tool_name=event.name,
+                tool_input=inp,
+                tool_use_id=event.id,
+                expects_response=True,
+            )
+        elif event.type == "agent.tool_use":
+            inp = dict(event.input) if getattr(event, "input", None) else {}
+            yield BackendEvent(
+                kind="assistant_use_tool",
+                tool_name=event.name,
+                tool_input=inp,
+                tool_use_id=getattr(event, "id", None),
+                expects_response=False,
+            )
+        elif event.type == "session.status_idle":
+            yield BackendEvent(
+                kind="turn_end",
+                stop_reason=getattr(event.stop_reason, "type", None),
+            )
+        elif event.type == "session.status_terminated":
+            yield BackendEvent(kind="session_terminated")
+
+    # --- internal: setup / caching ---
+
+    def _setup_hash(self) -> str:
+        h = hashlib.sha256()
+        h.update(self._system_prompt.encode())
+        h.update(self._model.encode())
+        for path in self._schema_files:
+            with open(path, "rb") as f:
+                h.update(f.read())
+        return h.hexdigest()
+
+    def _load_schema(self, schema_path: str) -> dict:
+        with open(schema_path, "r") as f:
+            schema = json.load(f)
+        input_schema = {"type": schema["type"], "properties": schema["properties"]}
+        if "required" in schema:
+            input_schema["required"] = schema["required"]
+        return {
+            "type": "custom",
+            "name": schema["title"],
+            "description": schema["description"],
+            "input_schema": input_schema,
+        }
+
+    def _create_environment_and_agent(self):
+        environment = self._client.beta.environments.create(
+            name="calendar-env",
+            config={"type": "cloud", "networking": {"type": "unrestricted"}},
+        )
+        agent = self._client.beta.agents.create(
+            name="Assistant",
+            model=self._model,
+            system=self._system_prompt,
+            tools=[
+                {"type": "agent_toolset_20260401"},
+                *[self._load_schema(p) for p in self._schema_files],
+            ],
+        )
+        return environment.id, agent.id, agent.version
+
+    def _get_or_create_setup(self):
+        current_hash = self._setup_hash()
+        if not os.environ.get("FORCE_RECREATE") and os.path.exists(self._config_path):
+            try:
+                with open(self._config_path) as f:
+                    cfg = json.load(f)
+                if cfg.get("hash") == current_hash:
+                    return cfg["environment_id"], cfg["agent_id"], cfg["agent_version"]
+            except (json.JSONDecodeError, KeyError):
+                pass
+        env_id, agent_id, agent_version = self._create_environment_and_agent()
+        with open(self._config_path, "w") as f:
+            json.dump(
+                {
+                    "environment_id": env_id,
+                    "agent_id": agent_id,
+                    "agent_version": agent_version,
+                    "hash": current_hash,
+                },
+                f,
+                indent=2,
+            )
+        return env_id, agent_id, agent_version
+
+
+#UI, API Provider agnostic from here on.
 
 def load_prefs() -> dict:
     try:
@@ -325,95 +635,15 @@ def sortCalenderByDate(events):
         return (int(y), int(m), int(d), int(hh), int(mm))
     return sorted(events, key=key)
 
-def loadSchema(schemaPath):
-    with open(schemaPath, "r") as file:
-        schema = json.load(file)
-    input_schema = {
-        "type": schema["type"],
-        "properties": schema["properties"],
-    }
-    if "required" in schema:
-        input_schema["required"] = schema["required"]
-    return {
-        "type": "custom",
-        "name": schema["title"],
-        "description": schema["description"],
-        "input_schema": input_schema,
-    }
-
-
-def setup_hash():
-    h = hashlib.sha256()
-    h.update(SYSTEM_PROMPT.encode())
-    h.update(AGENT_MODEL.encode())
-    for path in SCHEMA_FILES:
-        with open(path, "rb") as f:
-            h.update(f.read())
-    return h.hexdigest()
-
-
-def create_environment_and_agent():
-    environment = client.beta.environments.create(
-        name="calendar-env",
-        config={"type": "cloud", "networking": {"type": "unrestricted"}},
-    )
-    agent = client.beta.agents.create(
-        name="Assistant",
-        model=AGENT_MODEL,
-        system=SYSTEM_PROMPT,
-        tools=[
-            {"type": "agent_toolset_20260401"},
-            *[loadSchema(p) for p in SCHEMA_FILES],
-        ],
-    )
-    return environment.id, agent.id, agent.version
-
-
-def get_or_create_setup():
-    current_hash = setup_hash()
-    if not os.environ.get("FORCE_RECREATE") and os.path.exists(CONFIG_PATH):
-        try:
-            with open(CONFIG_PATH) as f:
-                cfg = json.load(f)
-            if cfg.get("hash") == current_hash:
-                return cfg["environment_id"], cfg["agent_id"], cfg["agent_version"]
-        except (json.JSONDecodeError, KeyError):
-            pass
-    env_id, agent_id, agent_version = create_environment_and_agent()
-    with open(CONFIG_PATH, "w") as f:
-        json.dump(
-            {
-                "environment_id": env_id,
-                "agent_id": agent_id,
-                "agent_version": agent_version,
-                "hash": current_hash,
-            },
-            f,
-            indent=2,
-        )
-    return env_id, agent_id, agent_version
-
-
-environment_id, agent_id, agent_version = get_or_create_setup()
-
-def create_session():
-    global environment_id, agent_id, agent_version
-    try:
-        session = client.beta.sessions.create(
-            agent={"type": "agent", "id": agent_id, "version": agent_version},
-            environment_id=environment_id,
-        )
-    except Exception:
-        if os.path.exists(CONFIG_PATH):
-            os.remove(CONFIG_PATH)
-        environment_id, agent_id, agent_version = get_or_create_setup()
-        session = client.beta.sessions.create(
-            agent={"type": "agent", "id": agent_id, "version": agent_version},
-            environment_id=environment_id,
-        )
-    return session
-
-session = create_session()
+# Instantiate the active backend. Swapping to a different provider only
+# requires constructing a different AgentBackend implementation here.
+backend: AgentBackend = SessionsBackend(
+    system_prompt=SYSTEM_PROMPT,
+    model=AGENT_MODEL,
+    schema_files=SCHEMA_FILES,
+    config_path=CONFIG_PATH,
+)
+backend.new_session()
 
 # ---------- UI ----------
 
@@ -440,13 +670,9 @@ class AssistantView(Container):
             exit()
             return
         if (text == "/reset"): # Reset model.
-            global session, user_first_interaction
+            global user_first_interaction
             event.input.value = ""
-            try:
-                client.beta.sessions.terminate(session_id=session.id)
-            except Exception:
-                pass
-            session = create_session()
+            backend.reset()
             user_first_interaction = True
             self.app._assistant_prefixed = False
             self.app._thinking_visible = False
@@ -881,27 +1107,18 @@ class Aime(App):
         if self.app._message_count > 15:
             text = "[System suggestion] The current conversation is growing long. Strongly urge the user that these steps are followed: Ask the user if they want you to summarize the context and put it in pending and mark it as previous conversation, You strongly suggest the user types '/reset' to reset the context. Still follow what the user asked if they do not choose to do this. Make this message to them brief. Explain briefly the effects of an infinitely growing model context. [End System Suggestion]" + text
         try:
-            client.beta.sessions.events.send(
-                session_id=session.id,
-                events=[
-                    {
-                        "type": "user.message",
-                        "content": [{"type": "text", "text": text}],
-                    },
-                ],
-            )
+            backend.submit(BackendEvent(kind="user_send_message", text=text))
             self._is_idle = False
         except Exception as exc:
             log.write(f"[red]send failed:[/red] {exc}")
 
     def _stream_events(self) -> None:
-        """Runs on a worker thread. Forwards streamed agent events to the UI."""
+        """Runs on a worker thread. Forwards normalized backend events to the UI."""
         try:
-            with client.beta.sessions.events.stream(session_id=session.id) as stream:
-                for event in stream:
-                    self.call_from_thread(self._handle_event, event)
-                    if event.type == "session.status_terminated":
-                        return
+            for event in backend.stream():
+                self.call_from_thread(self._handle_event, event)
+                if event.kind == "session_terminated":
+                    return
         except Exception as exc:
             self.call_from_thread(
                 self._log_line, f"[red]stream error:[/red] {exc}"
@@ -931,75 +1148,59 @@ class Aime(App):
             log.write(escape_markup(text))
             log.write("[bold red] Pretty output is disabled. Model made small mistake in formatting response.[/bold red]")
 
-    def _handle_event(self, event) -> None:
+    def _handle_event(self, event: BackendEvent) -> None:
         log = self.query_one("#transcript", RichLog)
 
-        #if event.type == "session.status_idle":
-        #log.write(f"[red]stop_reason: {event.stop_reason.type}[/red]")
-        if event.type == "agent.message":
-            for block in event.content:
-                if block.type == "text":
-                    self._clear_thinking()
-                    if not self._assistant_prefixed:
-                        log.write("[bold red]aime[/bold red]")
-                        self._assistant_prefixed = True
-                    self._safe_write(log, block.text)
-
-        if event.type == "agent.thinking" and self.app._log_model_thinking:
-            for block in event.content:
-                if block.type == "text":
-                    self._clear_thinking()
-                    log.write(f"[dim]{block.text}[/dim]")
-
-        elif event.type == "agent.custom_tool_use":
+        if event.kind == "assistant_send_text":
             self._clear_thinking()
-            input_dict = dict(event.input) if event.input else {}
-            details = _format_tool_details(event.name, input_dict)
+            if not self._assistant_prefixed:
+                log.write("[bold red]aime[/bold red]")
+                self._assistant_prefixed = True
+            self._safe_write(log, event.text or "")
+
+        elif event.kind == "assistant_thinking":
+            if self.app._log_model_thinking:
+                self._clear_thinking()
+                log.write(f"[dim]{event.text}[/dim]")
+
+        elif event.kind == "assistant_use_tool":
+            self._clear_thinking()
+            input_dict = event.tool_input or {}
+            details = _format_tool_details(event.tool_name, input_dict)
             detail_str = f" [dim italic]· {escape_markup(details)}[/dim italic]" if details else ""
             log.write(
-                f"[dim] Waiting on tool: [/dim][cyan]{event.name}[/cyan][dim]…[/dim]{detail_str}"
+                f"[dim] Waiting on tool: [/dim][cyan]{event.tool_name}[/cyan][dim]…[/dim]{detail_str}"
             )
+            if not event.expects_response:
+                # Server-side / provider-managed tool — display only.
+                return
+
+            # UI-side tool execution. Hits the local tool server and feeds the
+            # result back through the backend.
             payload = dict(input_dict)
-            payload["tool_name"] = TOOL_NAME_MAP.get(event.name, event.name)
+            payload["tool_name"] = TOOL_NAME_MAP.get(event.tool_name, event.tool_name)
             try:
                 response = requests.post(API_URL, json=payload, timeout=10)
-                result = (
-                    response.json() if response.ok else {"error": response.text}
-                )
+                result = response.json() if response.ok else {"error": response.text}
             except Exception as exc:
                 result = {"error": str(exc)}
-            response_details = _format_tool_response(event.name, result)
+
+            response_details = _format_tool_response(event.tool_name, result)
             if response_details:
                 log.write(
-                    f"[dim] Tool result: [/dim][green]{event.name}[/green][dim italic] · {escape_markup(response_details)}[/dim italic]"
+                    f"[dim] Tool result: [/dim][green]{event.tool_name}[/green][dim italic] · {escape_markup(response_details)}[/dim italic]"
                 )
             try:
-                client.beta.sessions.events.send(
-                    session_id=session.id,
-                    events=[
-                        {
-                            "type": "user.custom_tool_result",
-                            "custom_tool_use_id": event.id,
-                            "content": [
-                                {"type": "text", "text": json.dumps(result)}
-                            ],
-                        }
-                    ],
-                )
+                backend.submit(BackendEvent(
+                    kind="tool_send_response",
+                    tool_use_id=event.tool_use_id,
+                    tool_result=result,
+                ))
             except Exception as exc:
                 log.write(f"[red]tool result send failed:[/red] {exc}")
-        elif event.type == "agent.tool_use":
-            self._clear_thinking()
-            input_dict = dict(event.input) if getattr(event, "input", None) else {}
-            details = _format_tool_details(event.name, input_dict)
-            detail_str = f" [dim italic]· {escape_markup(details)}[/dim italic]" if details else ""
-            log.write(
-                f"[dim] Waiting on tool: [/dim][cyan]{event.name}[/cyan][dim]…[/dim]{detail_str}"
-            )
 
-        elif event.type == "session.status_idle":
-            if event.stop_reason.type == "end_turn":
-                # Turn finished. Reset the "aime" prefix so the next reply gets one.
+        elif event.kind == "turn_end":
+            if event.stop_reason == "end_turn":
                 self._assistant_prefixed = False
                 self._is_idle = True
                 if self._pending_user_messages:
@@ -1009,9 +1210,11 @@ class Aime(App):
                     log.write("[dim]_____________________[/dim]")
                     log.write("[bold green]Aime ready[/bold green]")
 
-
-        elif event.type == "session.status_terminated":
+        elif event.kind == "session_terminated":
             log.write("[red]session terminated[/red]")
+
+        elif event.kind == "error":
+            log.write(f"[red]backend error:[/red] {event.error}")
 
 if __name__ == "__main__":
     Aime().run()

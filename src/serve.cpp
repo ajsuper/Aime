@@ -12,7 +12,7 @@
 
 #include "../include/crow_all.h"
 
-std::string database_dir = "/.local/share/aime-assistant/database/";
+std::string database_dir = "/.local/share/aime-assistant/database";
 
 // ─── Data structures ─────────────────────────────────────────────────────────
 
