@@ -1,5 +1,5 @@
 Screen {
-    background: $surface;
+    background: $panel;
 }
 
 #modes {
@@ -16,7 +16,7 @@ AssistantView {
 
 #transcript {
     height: 1fr;
-    border: solid $primary;
+    border: solid $primary round;
     padding: 0 0;
     background: $panel;
     scrollbar-size-vertical: 1;
@@ -25,12 +25,12 @@ AssistantView {
 #prompt {
     dock: bottom;
     margin-top: 1;
-    border: solid $accent;
+    border: solid $accent round;
     background: $panel;
 }
 
 #prompt:focus {
-    border: solid $success;
+    border: solid $success round;
 }
 
 /* --- Calendar --- */
@@ -77,7 +77,7 @@ DataTable {
 #calendar-scroll, #topic-scroll {
     height: 1fr;
     width: 1fr;
-    border: solid $primary;
+    border: solid $primary round;
     padding: 1 2;
     background: $panel;
 }

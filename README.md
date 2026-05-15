@@ -13,8 +13,10 @@
   </tr>
 </table>
 
-# Goal
+# The Vision
+Most AI assistants have amnesia — every conversation starts from zero, forcing you to re-explain your life, your context, and your goals over and over. Aime fixes that by acting as a persistent extension of your mind, remembering not just your schedule but your ideas, values, and evolving thoughts, so you can pick up exactly where you left off and keep building on what you know.
 
+# The Goal
 Aime aims to be a personal **assistant**. **Not a replacement** for **creativity** or **thinking**, but something that actively and thoughtfully **organizes your ideas and life**. It:
 
 * Manages a simple **calender** interface based on what you prefer and say.
