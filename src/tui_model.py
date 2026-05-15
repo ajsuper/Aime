@@ -1,15 +1,10 @@
 import json
 import os
-import hashlib
-import threading
 import requests
-from anthropic import Anthropic
 import datetime
 import calendar
 from datetime import date
 import re
-from dataclasses import dataclass
-from typing import Iterator, Literal, Protocol, runtime_checkable
 
 from rich.markup import render as render_markup, escape as escape_markup
 from rich.errors import MarkupError
@@ -29,6 +24,16 @@ from textual.widgets import (
     Tab,
     DataTable,
 )
+from textual.geometry import Offset, Region, Spacing
+from textual_autocomplete import AutoComplete, DropdownItem
+
+from provider_backend import (
+    AgentBackend,
+    AnthropicMessagesBackend,
+    BackendEvent,
+    SessionInfo,
+    SessionsBackend,
+)
 
 MonthSelected = "04"
 
@@ -37,522 +42,6 @@ CONFIG_PATH = os.environ['HOME'] + "/.config/aime-assistant/agents_config.json"
 PREFS_PATH = os.environ['HOME'] + "/.config/aime-assistant/tui_prefs.json"
 SYSTEM_PROMPT_PATH = "../resources/prompts/system_prompt.md"
 DEFAULT_THEME = "gruvbox"
-
-
-# ============================================================================
-# Provider-agnostic agent backend
-# ============================================================================
-#
-# The UI only ever talks to a `AgentBackend`. Anthropic-specific types,
-# session lifecycle, and event-stream parsing live behind this interface so
-# swapping to a different provider (Anthropic Messages API, OpenAI,
-# self-hosted, etc.) only requires writing a new concrete backend class.
-#
-#   UI ──submit(BackendEvent)──> Backend ──provider API──> model
-#   UI <──stream() yields ──── Backend <──provider events
-#
-
-EventKind = Literal[
-    # UI → backend (passed to submit)
-    "user_send_message",
-    "system_send_message",
-    "tool_send_response",
-    # backend → UI (yielded from stream)
-    "assistant_send_text",
-    "assistant_text_delta",
-    "assistant_text_end",
-    "assistant_thinking",
-    "assistant_use_tool",
-    "turn_end",
-    "error",
-    "session_terminated",
-]
-
-
-@dataclass
-class BackendEvent:
-    kind: EventKind
-    text: str | None = None
-    tool_name: str | None = None
-    tool_input: dict | None = None
-    tool_use_id: str | None = None
-    tool_result: dict | None = None
-    # If True (default), the UI is expected to execute the tool locally and
-    # submit a `tool_send_response` event back. Server-side tools handled
-    # entirely by the provider set this to False (display only).
-    expects_response: bool = True
-    stop_reason: str | None = None
-    error: str | None = None
-
-
-@runtime_checkable
-class AgentBackend(Protocol):
-    """Provider-agnostic interface for an agentic conversation backend."""
-
-    def new_session(self) -> str:
-        """Start a fresh session. Returns the session id."""
-        ...
-
-    def load_session(self, session_id: str) -> None:
-        """Resume a previously-started session by id."""
-        ...
-
-    def reset(self) -> None:
-        """Terminate the current session and start a new one."""
-        ...
-
-    def submit(self, event: BackendEvent) -> None:
-        """Push a user/system/tool-result event into the conversation."""
-        ...
-
-    def stream(self) -> Iterator[BackendEvent]:
-        """Yield normalized events from the model. Blocks until the session
-        terminates; meant to run on a worker thread."""
-        ...
-
-    def shutdown(self) -> None:
-        """Clean up any provider resources."""
-        ...
-
-class AnthropicMessagesBackend:
-    """Anthropic Messages API implementation of AgentBackend.
-
-    Maintains the conversation history client-side as a list of message dicts
-    and drives the agent loop by calling messages.stream() once per assistant
-    turn. Tool uses are surfaced to the UI, which executes them locally and
-    submits results back via tool_send_response; once every tool_use in the
-    last assistant turn has a matching result, the loop continues.
-    """
-
-    def __init__(
-        self,
-        system_prompt: str,
-        model: str,
-        schema_files: list[str],
-        max_tokens: int = 8192,
-    ):
-        self._client = Anthropic(max_retries=3)
-        self._system_prompt = system_prompt
-        self._model = model
-        self._schema_files = schema_files
-        self._max_tokens = max_tokens
-        self._tools = [
-            {"type": "web_search_20250305", "name": "web_search"},
-            *[self._load_schema(p) for p in schema_files],
-        ]
-
-        self._session_id: str | None = None
-        self._messages: list[dict] = []
-        self._pending_tool_results: list[dict] = []
-        self._expected_tool_use_ids: set[str] = set()
-        self._turn_trigger = threading.Event()
-        self._terminated = threading.Event()
-        self._lock = threading.Lock()
-
-    # --- AgentBackend interface ---
-
-    def new_session(self) -> str:
-        with self._lock:
-            self._messages = []
-            self._pending_tool_results = []
-            self._expected_tool_use_ids = set()
-        self._terminated.clear()
-        self._turn_trigger.clear()
-        self._session_id = "msgs-" + hashlib.sha1(os.urandom(8)).hexdigest()[:12]
-        return self._session_id
-
-    def load_session(self, session_id: str) -> None:
-        # No server-side state to resume — caller is expected to have any
-        # prior history already, or to start a fresh new_session().
-        self._session_id = session_id
-
-    def reset(self) -> None:
-        # Wake the stream loop so it observes termination and exits cleanly,
-        # then start a fresh session.
-        self._terminated.set()
-        self._turn_trigger.set()
-        self.new_session()
-
-    def shutdown(self) -> None:
-        self._terminated.set()
-        self._turn_trigger.set()
-
-    def submit(self, event: BackendEvent) -> None:
-        if event.kind in ("user_send_message", "system_send_message"):
-            with self._lock:
-                self._messages.append({
-                    "role": "user",
-                    "content": [{"type": "text", "text": event.text or ""}],
-                })
-            self._turn_trigger.set()
-        elif event.kind == "tool_send_response":
-            result = event.tool_result
-            if isinstance(result, (dict, list)):
-                content_text = json.dumps(result)
-            else:
-                content_text = str(result if result is not None else "")
-            with self._lock:
-                self._pending_tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": event.tool_use_id,
-                    "content": content_text,
-                })
-                self._expected_tool_use_ids.discard(event.tool_use_id)
-                ready = not self._expected_tool_use_ids
-                if ready:
-                    self._messages.append({
-                        "role": "user",
-                        "content": self._pending_tool_results,
-                    })
-                    self._pending_tool_results = []
-            if ready:
-                self._turn_trigger.set()
-        else:
-            raise ValueError(f"submit() does not accept event kind: {event.kind}")
-
-    def stream(self) -> Iterator[BackendEvent]:
-        while True:
-            self._turn_trigger.wait()
-            self._turn_trigger.clear()
-            if self._terminated.is_set():
-                yield BackendEvent(kind="session_terminated")
-                return
-            try:
-                yield from self._run_turn()
-            except Exception as exc:
-                yield BackendEvent(kind="error", error=str(exc))
-                yield BackendEvent(kind="turn_end", stop_reason="error")
-
-    # --- internal ---
-
-    def _run_turn(self) -> Iterator[BackendEvent]:
-        assistant_blocks: list[dict] = []
-
-        with self._lock:
-            messages_snapshot = list(self._messages)
-            # Reserve the assistant message slot up-front and share the same
-            # content list with assistant_blocks. This way, any tool_result
-            # submitted by the UI mid-stream (in response to assistant_use_tool)
-            # sees a _messages tail that already contains the tool_use block —
-            # avoiding the "tool_result without matching tool_use" 400.
-            self._messages.append({"role": "assistant", "content": assistant_blocks})
-
-        with self._client.messages.stream(
-            model=self._model,
-            system=self._system_prompt,
-            tools=self._tools,
-            messages=messages_snapshot,
-            max_tokens=self._max_tokens,
-        ) as stream:
-            current_text: list[str] = []
-            current_tool: dict | None = None
-            partial_json = ""
-
-            for event in stream:
-                etype = getattr(event, "type", None)
-                if etype == "content_block_start":
-                    block = event.content_block
-                    if block.type in ("tool_use", "server_tool_use"):
-                        current_tool = {
-                            "type": block.type,
-                            "id": block.id,
-                            "name": block.name,
-                            "input": {},
-                        }
-                        partial_json = ""
-                    elif block.type == "web_search_tool_result":
-                        # Server-executed result — preserve in history and
-                        # display a one-liner; no response expected from us.
-                        result_block = {
-                            "type": "web_search_tool_result",
-                            "tool_use_id": block.tool_use_id,
-                            "content": getattr(block, "content", []),
-                        }
-                        with self._lock:
-                            assistant_blocks.append(result_block)
-                        count = len(result_block["content"]) if isinstance(result_block["content"], list) else 0
-                        yield BackendEvent(
-                            kind="assistant_use_tool",
-                            tool_name="web_search_result",
-                            tool_input={"results": count},
-                            tool_use_id=block.tool_use_id,
-                            expects_response=False,
-                        )
-                    elif block.type == "text":
-                        current_text = []
-                elif etype == "content_block_delta":
-                    delta = event.delta
-                    dtype = getattr(delta, "type", None)
-                    if dtype == "text_delta":
-                        current_text.append(delta.text)
-                        yield BackendEvent(kind="assistant_text_delta", text=delta.text)
-                    elif dtype == "input_json_delta":
-                        partial_json += delta.partial_json
-                elif etype == "content_block_stop":
-                    if current_tool is not None:
-                        try:
-                            current_tool["input"] = (
-                                json.loads(partial_json) if partial_json else {}
-                            )
-                        except json.JSONDecodeError:
-                            current_tool["input"] = {}
-                        is_server = current_tool["type"] == "server_tool_use"
-                        with self._lock:
-                            assistant_blocks.append(current_tool)
-                            if not is_server:
-                                # Register expectation before yielding so a fast
-                                # tool_send_response can't see an empty set and
-                                # prematurely flush pending results.
-                                self._expected_tool_use_ids.add(current_tool["id"])
-                        yield BackendEvent(
-                            kind="assistant_use_tool",
-                            tool_name=current_tool["name"],
-                            tool_input=dict(current_tool["input"]),
-                            tool_use_id=current_tool["id"],
-                            expects_response=not is_server,
-                        )
-                        current_tool = None
-                        partial_json = ""
-                    elif current_text:
-                        text = "".join(current_text)
-                        with self._lock:
-                            assistant_blocks.append({"type": "text", "text": text})
-                        yield BackendEvent(kind="assistant_text_end", text=text)
-                        current_text = []
-
-            final = stream.get_final_message()
-            stop_reason = final.stop_reason
-
-        with self._lock:
-            if not assistant_blocks:
-                # Drop the empty placeholder so we don't send a bogus
-                # assistant message back next turn.
-                if self._messages and self._messages[-1].get("content") is assistant_blocks:
-                    self._messages.pop()
-
-        if stop_reason != "tool_use":
-            yield BackendEvent(kind="turn_end", stop_reason=stop_reason or "end_turn")
-        # If stop_reason == "tool_use", the outer loop blocks on
-        # _turn_trigger until submit() has gathered every tool_result and
-        # appended them as a user message.
-
-    def _load_schema(self, schema_path: str) -> dict:
-        with open(schema_path, "r") as f:
-            schema = json.load(f)
-        input_schema = {"type": schema["type"], "properties": schema["properties"]}
-        if "required" in schema:
-            input_schema["required"] = schema["required"]
-        return {
-            "name": schema["title"],
-            "description": schema["description"],
-            "input_schema": input_schema,
-        }
-
-
-
-class SessionsBackend:
-    """Anthropic Agents/Sessions beta implementation of AgentBackend.
-
-    Owns a single live session at a time. Caches the (environment, agent)
-    pair on disk keyed by a hash of the system prompt + model + tool schemas
-    so identical configurations reuse the same agent across restarts.
-    """
-
-    def __init__(
-        self,
-        system_prompt: str,
-        model: str,
-        schema_files: list[str],
-        config_path: str,
-    ):
-        self._client = Anthropic(max_retries=3)
-        self._system_prompt = system_prompt
-        self._model = model
-        self._schema_files = schema_files
-        self._config_path = config_path
-        self._env_id: str | None = None
-        self._agent_id: str | None = None
-        self._agent_version: str | None = None
-        self._session = None
-
-    # --- AgentBackend interface ---
-
-    def new_session(self) -> str:
-        self._env_id, self._agent_id, self._agent_version = self._get_or_create_setup()
-        try:
-            self._session = self._client.beta.sessions.create(
-                agent={"type": "agent", "id": self._agent_id, "version": self._agent_version},
-                environment_id=self._env_id,
-            )
-        except Exception:
-            # Stale cached agent/env — recreate from scratch.
-            if os.path.exists(self._config_path):
-                os.remove(self._config_path)
-            self._env_id, self._agent_id, self._agent_version = self._get_or_create_setup()
-            self._session = self._client.beta.sessions.create(
-                agent={"type": "agent", "id": self._agent_id, "version": self._agent_version},
-                environment_id=self._env_id,
-            )
-        return self._session.id
-
-    def load_session(self, session_id: str) -> None:
-        # Sessions are server-side; "loading" just means attaching to the id.
-        # The streaming endpoint will pick up wherever the session left off.
-        self._session = type("Session", (), {"id": session_id})()
-
-    def reset(self) -> None:
-        if self._session is not None:
-            try:
-                self._client.beta.sessions.terminate(session_id=self._session.id)
-            except Exception:
-                pass
-        self.new_session()
-
-    def shutdown(self) -> None:
-        if self._session is not None:
-            try:
-                self._client.beta.sessions.terminate(session_id=self._session.id)
-            except Exception:
-                pass
-
-    def submit(self, event: BackendEvent) -> None:
-        if self._session is None:
-            raise RuntimeError("no active session; call new_session() first")
-
-        if event.kind in ("user_send_message", "system_send_message"):
-            self._client.beta.sessions.events.send(
-                session_id=self._session.id,
-                events=[{
-                    "type": "user.message",
-                    "content": [{"type": "text", "text": event.text or ""}],
-                }],
-            )
-        elif event.kind == "tool_send_response":
-            self._client.beta.sessions.events.send(
-                session_id=self._session.id,
-                events=[{
-                    "type": "user.custom_tool_result",
-                    "custom_tool_use_id": event.tool_use_id,
-                    "content": [{"type": "text",
-                                 "text": json.dumps(event.tool_result)}],
-                }],
-            )
-        else:
-            raise ValueError(f"submit() does not accept event kind: {event.kind}")
-
-    def stream(self) -> Iterator[BackendEvent]:
-        if self._session is None:
-            raise RuntimeError("no active session; call new_session() first")
-        with self._client.beta.sessions.events.stream(
-            session_id=self._session.id
-        ) as stream:
-            for raw in stream:
-                for normalized in self._normalize(raw):
-                    yield normalized
-                if raw.type == "session.status_terminated":
-                    return
-
-    # --- internal: provider-specific normalization ---
-
-    def _normalize(self, event) -> Iterator[BackendEvent]:
-        if event.type == "agent.message":
-            for block in event.content:
-                if block.type == "text":
-                    yield BackendEvent(kind="assistant_send_text", text=block.text)
-        # Thinking currently dissabled.
-        #elif event.type == "agent.thinking":
-        #    for block in event.content:
-        #        if block.type == "text":
-        #            yield BackendEvent(kind="assistant_thinking", text=block.text)
-        elif event.type == "agent.custom_tool_use":
-            inp = dict(event.input) if event.input else {}
-            yield BackendEvent(
-                kind="assistant_use_tool",
-                tool_name=event.name,
-                tool_input=inp,
-                tool_use_id=event.id,
-                expects_response=True,
-            )
-        elif event.type == "agent.tool_use":
-            inp = dict(event.input) if getattr(event, "input", None) else {}
-            yield BackendEvent(
-                kind="assistant_use_tool",
-                tool_name=event.name,
-                tool_input=inp,
-                tool_use_id=getattr(event, "id", None),
-                expects_response=False,
-            )
-        elif event.type == "session.status_idle":
-            yield BackendEvent(
-                kind="turn_end",
-                stop_reason=getattr(event.stop_reason, "type", None),
-            )
-        elif event.type == "session.status_terminated":
-            yield BackendEvent(kind="session_terminated")
-
-    # --- internal: setup / caching ---
-
-    def _setup_hash(self) -> str:
-        h = hashlib.sha256()
-        h.update(self._system_prompt.encode())
-        h.update(self._model.encode())
-        for path in self._schema_files:
-            with open(path, "rb") as f:
-                h.update(f.read())
-        return h.hexdigest()
-
-    def _load_schema(self, schema_path: str) -> dict:
-        with open(schema_path, "r") as f:
-            schema = json.load(f)
-        input_schema = {"type": schema["type"], "properties": schema["properties"]}
-        if "required" in schema:
-            input_schema["required"] = schema["required"]
-        return {
-            "type": "custom",
-            "name": schema["title"],
-            "description": schema["description"],
-            "input_schema": input_schema,
-        }
-
-    def _create_environment_and_agent(self):
-        environment = self._client.beta.environments.create(
-            name="calendar-env",
-            config={"type": "cloud", "networking": {"type": "unrestricted"}},
-        )
-        agent = self._client.beta.agents.create(
-            name="Assistant",
-            model=self._model,
-            system=self._system_prompt,
-            tools=[
-                {"type": "agent_toolset_20260401"},
-                *[self._load_schema(p) for p in self._schema_files],
-            ],
-        )
-        return environment.id, agent.id, agent.version
-
-    def _get_or_create_setup(self):
-        current_hash = self._setup_hash()
-        if not os.environ.get("FORCE_RECREATE") and os.path.exists(self._config_path):
-            try:
-                with open(self._config_path) as f:
-                    cfg = json.load(f)
-                if cfg.get("hash") == current_hash:
-                    return cfg["environment_id"], cfg["agent_id"], cfg["agent_version"]
-            except (json.JSONDecodeError, KeyError):
-                pass
-        env_id, agent_id, agent_version = self._create_environment_and_agent()
-        with open(self._config_path, "w") as f:
-            json.dump(
-                {
-                    "environment_id": env_id,
-                    "agent_id": agent_id,
-                    "agent_version": agent_version,
-                    "hash": current_hash,
-                },
-                f,
-                indent=2,
-            )
-        return env_id, agent_id, agent_version
 
 
 #UI, API Provider agnostic from here on.
@@ -855,13 +344,77 @@ backend.new_session()
 
 # ---------- UI ----------
 
+def _slash_command_candidates(state) -> list[DropdownItem]:
+    """AutoComplete candidate factory for the message input.
+
+    Called on every keystroke with the current `TargetState`. Offers the
+    static slash commands plus one `/load <id>` entry per saved conversation.
+    Each saved-conversation item *displays and matches* on the conversation's
+    summary (the human-readable title, just stored under an odd name), while
+    the actual command to insert is carried separately in the item `id` — see
+    `CommandAutoComplete._complete`. The conversation list is pulled through
+    the provider-agnostic `backend.list_sessions()` so the UI stays decoupled
+    from how/where history is stored.
+    """
+    items = [
+        DropdownItem("/reset", prefix="⟳  ", id="/reset"),
+        DropdownItem("/load", prefix="↺  ", id="/load"),
+    ]
+    for session in backend.list_sessions():
+        label = session.summary or "(untitled conversation)"
+        # `main` carries the title so it shows in the dropdown and is
+        # fuzzy-matchable; `id` holds the command that actually gets inserted.
+        items.append(
+            DropdownItem(f"/load  —  {label}", prefix="↺  ", id=f"/load {session.id}")
+        )
+    return items
+
+
+class CommandAutoComplete(AutoComplete):
+    """AutoComplete variant for the slash-command input.
+
+    Two tweaks over the stock widget:
+      * completion inserts the item's `id` (the real command) rather than its
+        displayed `main` text, so dropdown items can show a friendly title
+        while still inserting `/load <session-id>`.
+      * the dropdown is positioned *above* the cursor instead of below.
+    """
+
+    def _complete(self, option_index: int) -> None:
+        if not self.display or self.option_list.option_count == 0:
+            return
+        option = self.option_list.get_option_at_index(option_index)
+        value = option.id or option.value
+        with self.prevent(Input.Changed):
+            self.apply_completion(value, self._get_target_state())
+        self.post_completion()
+
+    def _align_to_target(self) -> None:
+        x, y = self.target.cursor_screen_offset
+        width, height = self.option_list.outer_size
+        # `y - height` places the dropdown above the cursor line; constrain()
+        # still keeps it on-screen if there isn't room above.
+        x, y, _width, _height = Region(x - 1, y - height, width, height).constrain(
+            "inside",
+            "none",
+            Spacing.all(0),
+            self.screen.scrollable_content_region,
+        )
+        self.absolute_offset = Offset(x, y)
+
+
 class AssistantView(Container):
     """Chat transcript + input. Pipes user messages into the agent session and
     renders streamed agent replies."""
 
     def compose(self) -> ComposeResult:
         yield RichLog(id="transcript", wrap=True, markup=True, auto_scroll=True)
-        yield Input(placeholder="Message Aime…  (enter to send)", id="prompt")
+        user_input = Input(placeholder="Message Aime…  (enter to send)", id="prompt")
+        yield user_input
+        # Slash-command autocomplete. `candidates` is a callable so the saved
+        # conversation list is re-evaluated on each keystroke.
+        yield CommandAutoComplete(user_input, candidates=_slash_command_candidates)
+
 
     def on_mount(self) -> None:
         log = self.query_one("#transcript", RichLog)
@@ -869,6 +422,83 @@ class AssistantView(Container):
             "[bold green]Aime ready.[/bold green] "
             "[dim]Ctrl+A assistant · Ctrl+S calendar · Ctrl+T topics · Ctrl+Q quit[/dim]\n"
         )
+
+    def _restart_session_view(
+        self,
+        log: RichLog,
+        banner: str,
+        replay: list[dict] | None = None,
+    ) -> None:
+        """Reset the transcript + per-conversation UI state and (re)start the
+        stream worker. Shared by `/reset` and `/load` — both swap the backend's
+        active session out from under the UI, so the view has to be re-armed
+        the same way regardless of which conversation we land on. When `replay`
+        is provided (used by /load), prior messages are rendered into the
+        transcript before the banner so the user can see the conversation
+        they're resuming."""
+        global user_first_interaction
+        user_first_interaction = True
+        self.app._assistant_prefixed = False
+        self.app._thinking_visible = False
+        self.app._is_idle = True
+        self.app._pending_user_messages = []
+        self.app._stream_buffer = ""
+        log.clear()
+        if replay:
+            self._replay_history(log, replay)
+        log.write(banner)
+        self.app.run_worker(
+            self.app._stream_events,
+            thread=True,
+            exclusive=True,
+            name="agent-stream",
+        )
+
+    def _replay_history(self, log: RichLog, messages: list[dict]) -> None:
+        """Render a saved message list back into the transcript. Best-effort
+        reconstruction: real turns weren't captured event-by-event, so tool
+        calls/results show as one-liners instead of the full streaming view."""
+        for msg in messages:
+            role = msg.get("role")
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            if role == "user":
+                user_texts = []
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") == "text":
+                        text = block.get("text", "")
+                        # Strip the auto-injected "[System info] ... [End System Info]"
+                        # date prefix that _dispatch_user_message prepends — it's
+                        # noise to the user re-reading their own message.
+                        marker = "[End System Info]"
+                        if marker in text:
+                            text = text.split(marker, 1)[1].strip()
+                        if text:
+                            user_texts.append(text)
+                for text in user_texts:
+                    log.write(f"\n[bold cyan]you[/bold cyan]  {text}")
+            elif role == "assistant":
+                wrote_prefix = False
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    btype = block.get("type")
+                    if btype == "text":
+                        if not wrote_prefix:
+                            log.write("[bold red]aime[/bold red]")
+                            wrote_prefix = True
+                        text = block.get("text", "")
+                        if text:
+                            self.app._safe_write(log, text)
+                    elif btype in ("tool_use", "server_tool_use"):
+                        name = block.get("name", "tool")
+                        log.write(
+                            f"[dim] Used tool: [/dim][cyan]{name}[/cyan]"
+                        )
+        log.write("[dim]_____________________[/dim]")
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         log = self.query_one("#transcript", RichLog)
@@ -878,22 +508,32 @@ class AssistantView(Container):
             exit()
             return
         if (text == "/reset"): # Reset model.
-            global user_first_interaction
             event.input.value = ""
             backend.reset()
-            user_first_interaction = True
-            self.app._assistant_prefixed = False
-            self.app._thinking_visible = False
-            self.app._is_idle = True
-            self.app._pending_user_messages = []
-            self.app._stream_buffer = ""
-            log.clear()
-            log.write("[yellow] The current conversation has ended because you typed '/reset'. Begin a new conversation. [/yellow]")
-            self.app.run_worker(
-                self.app._stream_events,
-                thread=True,
-                exclusive=True,
-                name="agent-stream",
+            self._restart_session_view(
+                log,
+                "[yellow] The current conversation has ended because you "
+                "typed '/reset'. Begin a new conversation. [/yellow]",
+            )
+            return
+        if text.startswith("/load"):
+            event.input.value = ""
+            parts = text.split(maxsplit=1)
+            if len(parts) != 2 or not parts[1].strip():
+                log.write("[yellow] Usage: /load <session-id> "
+                          "(tab-complete to pick a saved conversation) [/yellow]")
+                return
+            session_id = parts[1].strip()
+            try:
+                backend.load_session(session_id)
+            except (OSError, ValueError) as exc:
+                log.write(f"[red] Could not load conversation '{session_id}': {exc} [/red]")
+                return
+            self._restart_session_view(
+                log,
+                f"[green] Loaded conversation '{session_id}'. "
+                "Continue where you left off. [/green]",
+                replay=backend.messages_snapshot(),
             )
             return
         if (text == "/toggle_log_model_thinking"):
@@ -1286,7 +926,6 @@ class Aime(App):
     # --- agent bridge ---
 
     def send_user_message(self, text: str) -> None:
-        self.app._message_count += 1
         log = self.query_one("#transcript", RichLog)
         if not self._is_idle:
             self._pending_user_messages.append(text)
@@ -1313,8 +952,6 @@ class Aime(App):
             if bootstrap:
                 text = bootstrap + text
             user_first_interaction = False
-        if self.app._message_count > 15:
-            text = "[System suggestion] The current conversation is growing long. Strongly urge the user that these steps are followed: Ask the user if they want you to summarize the context and put it in pending and mark it as previous conversation, You strongly suggest the user types '/reset' to reset the context. Still follow what the user asked if they do not choose to do this. Make this message to them brief. Explain briefly the effects of an infinitely growing model context. [End System Suggestion]" + text
         try:
             backend.submit(BackendEvent(kind="user_send_message", text=text))
             self._is_idle = False
