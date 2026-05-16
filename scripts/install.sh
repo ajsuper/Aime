@@ -18,8 +18,16 @@ mkdir -p "$LOG_DIR"
 # Copies all default configuration files to the specified config dir.
 cp "$REPO_ROOT"/resources/default-config/.* "$CONFIG_DIR"/ 2>/dev/null || true
 
-# Compile the c++ binary
-g++ "$REPO_ROOT/src/serve.cpp" -lsqlite3 -o "$REPO_ROOT/build/serve.o"
+# Compile the c++ binary. On macOS, asio is typically installed via Homebrew
+# and lives outside the default include path, so point the compiler at it.
+EXTRA_CXXFLAGS=()
+if [ "$(uname)" = "Darwin" ]; then
+    BREW_PREFIX="$(brew --prefix asio 2>/dev/null || true)"
+    if [ -n "$BREW_PREFIX" ]; then
+        EXTRA_CXXFLAGS+=("-I${BREW_PREFIX}/include")
+    fi
+fi
+g++ -std=c++17 "${EXTRA_CXXFLAGS[@]}" "$REPO_ROOT/src/serve.cpp" -lsqlite3 -o "$REPO_ROOT/build/serve.o"
 
 # Set up the python venv used by tui_model.py / textual_serve.sh on the host
 # via uv. We pin to a uv-managed standalone interpreter (--managed-python)
