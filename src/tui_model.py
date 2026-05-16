@@ -389,6 +389,13 @@ class CommandAutoComplete(AutoComplete):
             self.apply_completion(value, self._get_target_state())
         self.post_completion()
 
+    def should_show_dropdown(self, search_string: str) -> bool:
+        # Only autocomplete slash commands; otherwise plain prose like "yes"
+        # would fuzzy-match into "/reset" and trigger an unwanted completion.
+        if not search_string.startswith("/"):
+            return False
+        return super().should_show_dropdown(search_string)
+
     def _align_to_target(self) -> None:
         x, y = self.target.cursor_screen_offset
         width, height = self.option_list.outer_size
