@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "FilterUsersEvents",
-  "description": "Request body for POST /api. All fields are optional; omitted fields use their defaults. The tool gets a list of the users scheduled events based on the filters.",
+  "description": "Request body for POST /api. All fields are optional; omitted fields use their defaults. The tool gets a list of the users scheduled events based on the filters. Try to use at least 1 filter option to maximize effeciency - fetching all events unconditionally wastes valuable API tokens.",
   "type": "object",
   "additionalProperties": false,
   "properties": {
