@@ -131,6 +131,11 @@ class AgentBackend(Protocol):
         """Terminate the current session and start a new one."""
         ...
 
+    def set_session_context(self, text: str) -> None:
+        """Attach session-scoped context that should accompany every turn
+        without entering the message history. Cleared on new_session/load."""
+        ...
+
     def submit(self, event: BackendEvent) -> None:
         """Push a user/system/tool-result event into the conversation."""
         ...
@@ -184,21 +189,24 @@ class AnthropicMessagesBackend:
             {"type": "web_search_20250305", "name": "web_search"},
             *[self._load_schema(p) for p in schema_files],
         ]
-        # The system prompt and tool schemas are byte-identical on every turn,
-        # so mark them as prompt-cache breakpoints. After the first call they're
-        # served from cache (~0.1x input cost) instead of re-billed in full.
-        self._system = [
-            {
-                "type": "text",
-                "text": system_prompt,
-                "cache_control": {"type": "ephemeral"},
-            }
-        ]
+        # System prompt and tool schemas are byte-identical on every turn, so
+        # mark them as prompt-cache breakpoints with a 1-hour TTL — across the
+        # gaps typical of personal-assistant chat the 5-min default TTL would
+        # expire repeatedly and force re-billing the whole prefix.
+        self._system_prompt_block = {
+            "type": "text",
+            "text": system_prompt,
+            "cache_control": {"type": "ephemeral", "ttl": "1h"},
+        }
         if self._tools:
             self._tools[-1] = {
                 **self._tools[-1],
-                "cache_control": {"type": "ephemeral"},
+                "cache_control": {"type": "ephemeral", "ttl": "1h"},
             }
+        # Per-session dynamic context (e.g. bootstrapped topic contents). Lives
+        # in the system array rather than the message history so it stays out
+        # of compaction and doesn't get replayed inside user turns.
+        self._session_context: str = ""
 
         self._session_id: str | None = None
         # One-sentence human-readable description of the session, shown in
@@ -228,6 +236,45 @@ class AnthropicMessagesBackend:
 
     # --- AgentBackend interface ---
 
+    def set_session_context(self, text: str) -> None:
+        """Attach session-scoped context (e.g. bootstrapped topic contents) as
+        an extra cached system block instead of embedding it in the first user
+        message. Keeps it out of message history (no replay, no compaction)
+        while still benefiting from prompt caching."""
+        with self._lock:
+            self._session_context = text or ""
+
+    def _build_system(self) -> list[dict]:
+        """Assemble the system array for this turn.
+
+        Order matters for the prompt cache: identical prefix → cache hit. The
+        date block goes *last* and is uncached, so it can change daily without
+        busting the cached prefix in front of it.
+        """
+        blocks: list[dict] = [self._system_prompt_block]
+        with self._lock:
+            ctx = self._session_context
+        if ctx:
+            blocks.append({
+                "type": "text",
+                "text": ctx,
+                "cache_control": {"type": "ephemeral", "ttl": "1h"},
+            })
+        now = datetime.datetime.now()
+        day_names = ["Monday", "Tuesday", "Wednesday", "Thursday",
+                     "Friday", "Saturday", "Sunday"]
+        date_str = now.strftime("%d/%m/%Y, %H:%M")
+        blocks.append({
+            "type": "text",
+            "text": (
+                f"[System info] Accurate date: {day_names[now.weekday()]}, "
+                f"{date_str}. Base decisions on THIS date, not any previous "
+                "ones. Do not tell this to the user unless relevant. "
+                "[End System Info]"
+            ),
+        })
+        return blocks
+
     def new_session(self) -> str:
         with self._lock:
             self._messages = []
@@ -235,6 +282,7 @@ class AnthropicMessagesBackend:
             self._title_generating = False
             self._pending_tool_results = []
             self._expected_tool_use_ids = set()
+            self._session_context = ""
         self._terminated.clear()
         self._turn_trigger.clear()
         stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -269,6 +317,7 @@ class AnthropicMessagesBackend:
             self._title_generating = False
             self._pending_tool_results = []
             self._expected_tool_use_ids = set()
+            self._session_context = ""
         self._terminated.clear()
         self._turn_trigger.clear()
 
@@ -468,7 +517,7 @@ class AnthropicMessagesBackend:
 
         with self._client.messages.stream(
             model=self._model,
-            system=self._system,
+            system=self._build_system(),
             tools=self._tools,
             messages=self._cacheable_messages(messages_snapshot),
             max_tokens=self._max_tokens,
@@ -583,7 +632,7 @@ class AnthropicMessagesBackend:
             new_content = list(content)
             new_content[-1] = {
                 **new_content[-1],
-                "cache_control": {"type": "ephemeral"},
+                "cache_control": {"type": "ephemeral", "ttl": "1h"},
             }
             out[-1] = {**last, "content": new_content}
         return out
@@ -810,6 +859,11 @@ class SessionsBackend:
     def list_sessions(self) -> list[SessionInfo]:
         # Sessions are server-side and not enumerated locally; nothing to list.
         return []
+
+    def set_session_context(self, text: str) -> None:
+        # Beta Sessions backend manages its own server-side state; nothing to
+        # attach client-side. Kept to satisfy the AgentBackend protocol.
+        return
 
     def messages_snapshot(self) -> list[dict]:
         # Server-side history isn't mirrored client-side here.
