@@ -1,6 +1,8 @@
 """View-facing data services. Wrap ToolGateway with convenience methods so
 calendar/topic views (and any future frontend) don't need to know which
-tool_name strings to send or how to parse the envelopes."""
+tool_name strings to send or how to parse the envelopes. This is where API 
+calls that get stuff for the front end are handled. (Showing events in a calendar
+format etc)"""
 
 import datetime
 
