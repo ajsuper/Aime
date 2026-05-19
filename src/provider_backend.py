@@ -13,9 +13,16 @@ from dataclasses import dataclass
 from typing import Iterator, Literal, Protocol, runtime_checkable
 
 from anthropic import Anthropic
+from cryptography.exceptions import InvalidTag
 
-DATABSE_DIR = os.environ['HOME'] + "/.local/share/aime-assistant/"
-CONVERSATIONS_DIR = os.path.join(DATABSE_DIR, "conversations")
+# `aime.encryption` is imported lazily at the bottom of this file. Importing
+# the `aime` package eagerly here would deadlock: aime/__init__.py imports
+# `controller`, which imports `AgentBackend`/`BackendEvent`/`SessionInfo`
+# from this module — defined below.
+
+# Suffix used for on-disk conversation files. Each is AES-GCM encrypted
+# under the owning user's DEK; the bytes are not JSON anymore.
+_CONV_SUFFIX = ".json.enc"
 
 
 def _jsonable(obj):
@@ -163,6 +170,12 @@ class AgentBackend(Protocol):
         """Clean up any provider resources."""
         ...
 
+
+# Safe to import now: AgentBackend / BackendEvent / SessionInfo are defined,
+# so the aime package's eager import of controller can resolve them.
+import aime.encryption as _enc
+
+
 class AnthropicMessagesBackend:
     """Anthropic Messages API implementation of AgentBackend.
 
@@ -180,7 +193,7 @@ class AnthropicMessagesBackend:
     # How many of the oldest messages to fold into the summary per compaction
     # pass. The cut point is nudged forward from here to land on a safe
     # boundary (see _maybe_compact).
-    COMPACT_BATCH_MSGS = 3
+    COMPACT_BATCH_MSGS = 8
     # Cheap model used for the summarization call.
     COMPACT_MODEL = "claude-haiku-4-5-20251001"
     # Prefix that marks a message as a compaction summary (so later passes can
@@ -192,6 +205,8 @@ class AnthropicMessagesBackend:
         system_prompt: str,
         model: str,
         schema_files: list[str],
+        conversations_dir: str,
+        dek: bytes,
         max_tokens: int = 8192,
     ):
         self._client = Anthropic(max_retries=3)
@@ -199,6 +214,10 @@ class AnthropicMessagesBackend:
         self._model = model
         self._schema_files = schema_files
         self._max_tokens = max_tokens
+        # Per-user state: where this user's encrypted conversation files live
+        # and the data key that decrypts them. Both are required for any IO.
+        self._conversations_dir = conversations_dir
+        self._dek = dek
         self._tools = [
             {"type": "web_search_20250305", "name": "web_search"},
             *[self._load_schema(p) for p in schema_files],
@@ -230,6 +249,11 @@ class AnthropicMessagesBackend:
         # True while a background _generate_title thread is in flight, so
         # submit() doesn't spawn a duplicate one on the next message.
         self._title_generating = False
+        # True while a background compaction thread is in flight. Compaction
+        # makes two sequential Haiku calls (summary + title refresh) so it's
+        # run off the turn thread; this flag prevents stacking up duplicates
+        # when several turns finish before the first compaction completes.
+        self._compacting = False
         self._messages: list[dict] = []
         self._pending_tool_results: list[dict] = []
         self._expected_tool_use_ids: set[str] = set()
@@ -315,8 +339,10 @@ class AnthropicMessagesBackend:
 
     def load_session(self, session_id: str) -> None:
         path = self._session_path(session_id)
-        with open(path) as f:
-            data = json.load(f)
+        with open(path, "rb") as f:
+            blob = f.read()
+        plaintext = _enc.decrypt_blob(self._dek, blob, aad=session_id.encode("utf-8"))
+        data = json.loads(plaintext)
         # Same epoch-bump dance as reset(): the previous stream worker thread
         # (Textual can't actually kill thread workers — exclusive=True only
         # flags them) must observe its captured epoch is stale and exit, or
@@ -335,33 +361,38 @@ class AnthropicMessagesBackend:
         self._terminated.clear()
         self._turn_trigger.clear()
 
-    @staticmethod
-    def _session_path(session_id: str) -> str:
-        os.makedirs(CONVERSATIONS_DIR, exist_ok=True)
-        return os.path.join(CONVERSATIONS_DIR, f"{session_id}.json")
+    def _session_path(self, session_id: str) -> str:
+        os.makedirs(self._conversations_dir, exist_ok=True)
+        return os.path.join(self._conversations_dir, f"{session_id}{_CONV_SUFFIX}")
 
     def list_sessions(self) -> list[SessionInfo]:
-        # History lives as one JSON file per session on disk; enumerate them
-        # and surface just the id + summary the UI needs. A file we can't read
-        # or parse is skipped rather than failing the whole listing.
+        # History lives as one encrypted file per session on disk; enumerate
+        # them and surface just the id + summary the UI needs. A file we
+        # can't read, decrypt, or parse is skipped rather than failing the
+        # whole listing (e.g. truncated, wrong key, or stray junk).
         sessions: list[SessionInfo] = []
         try:
-            names = os.listdir(CONVERSATIONS_DIR)
+            names = os.listdir(self._conversations_dir)
         except OSError:
             return []
         for name in names:
-            if not name.endswith(".json"):
+            if not name.endswith(_CONV_SUFFIX):
                 continue
+            session_id = name[: -len(_CONV_SUFFIX)]
             try:
-                with open(os.path.join(CONVERSATIONS_DIR, name)) as f:
-                    data = json.load(f)
-            except (OSError, ValueError):
+                with open(os.path.join(self._conversations_dir, name), "rb") as f:
+                    blob = f.read()
+                plaintext = _enc.decrypt_blob(
+                    self._dek, blob, aad=session_id.encode("utf-8")
+                )
+                data = json.loads(plaintext)
+            except (OSError, ValueError, InvalidTag):
                 continue
             summary = data.get("summary", "")
             if summary == "none":
                 summary = ""
             sessions.append(SessionInfo(
-                id=data.get("id") or name[:-len(".json")],
+                id=data.get("id") or session_id,
                 summary=summary,
                 saved_at=data.get("saved_at", ""),
             ))
@@ -386,8 +417,12 @@ class AnthropicMessagesBackend:
                         "messages": list(self._messages),
                     }
                 tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
-                with open(tmp, "w") as f:
-                    json.dump(snapshot, f, default=_jsonable)
+                plaintext = json.dumps(snapshot, default=_jsonable).encode("utf-8")
+                blob = _enc.encrypt_blob(
+                    self._dek, plaintext, aad=self._session_id.encode("utf-8")
+                )
+                with open(tmp, "wb") as f:
+                    f.write(blob)
                 os.replace(tmp, path)
             except (OSError, TypeError, ValueError):
                 # OSError: disk/path issues. TypeError/ValueError: a content
@@ -419,14 +454,14 @@ class AnthropicMessagesBackend:
 
     def delete_all_sessions(self) -> None:
         try:
-            names = os.listdir(CONVERSATIONS_DIR)
+            names = os.listdir(self._conversations_dir)
         except OSError:
             return
         for name in names:
-            if not name.endswith(".json"):
+            if not name.endswith(_CONV_SUFFIX):
                 continue
             try:
-                os.remove(os.path.join(CONVERSATIONS_DIR, name))
+                os.remove(os.path.join(self._conversations_dir, name))
             except OSError:
                 pass
 
@@ -538,20 +573,6 @@ class AnthropicMessagesBackend:
     def _run_turn(self) -> Iterator[BackendEvent]:
         assistant_blocks: list[dict] = []
 
-        # Compaction may make a network call (Haiku summary), so run it without
-        # holding the lock. Only _run_turn rewrites the history prefix and turns
-        # are serialized, so the first `cut` messages are stable for the whole
-        # call; any submit() that lands concurrently only appends to the tail,
-        # which we splice back on by position below.
-        with self._lock:
-            pre_compact = list(self._messages)
-        compacted = self._maybe_compact(pre_compact)
-        if compacted is not pre_compact:
-            with self._lock:
-                tail = self._messages[len(pre_compact):]
-                self._messages = compacted + tail
-            self._persist()
-
         with self._lock:
             messages_snapshot = list(self._messages)
             # Reserve the assistant message slot up-front and share the same
@@ -657,6 +678,11 @@ class AnthropicMessagesBackend:
         self._persist()
 
         if stop_reason != "tool_use":
+            # Kick off compaction *after* the turn has finished streaming so the
+            # Haiku summary + title-refresh calls never delay the user-visible
+            # response. The next turn pays full prefix cost only if compaction
+            # hasn't landed yet; once it does, subsequent turns benefit.
+            self._spawn_compaction()
             yield BackendEvent(kind="turn_end", stop_reason=stop_reason or "end_turn")
         # If stop_reason == "tool_use", the outer loop blocks on
         # _turn_trigger until submit() has gathered every tool_result and
@@ -728,25 +754,37 @@ class AnthropicMessagesBackend:
             with self._lock:
                 self._title_generating = False
 
-    def _refresh_title(self, compaction_summary: str) -> None:
+    def _refresh_title(self, recent_user_texts: list[str]) -> None:
         """During compaction, let Haiku tighten or correct the session
-        description given the freshly-merged history summary. Updates
-        self._summary in place; the caller persists. Best-effort."""
+        description based on the most recent user messages. The compaction
+        summary is deliberately *not* used here — it leans on bootstrapped
+        data and older history, so titles derived from it drift away from
+        what the conversation is currently about. Updates self._summary in
+        place; the caller persists. Best-effort."""
+        if not recent_user_texts:
+            return
+        recent_block = "\n\n".join(
+            f"- {t}" for t in recent_user_texts if t and t.strip()
+        )
+        if not recent_block:
+            return
         try:
             resp = self._client.messages.create(
                 model=self.COMPACT_MODEL,
                 system=(
                     "You maintain a one-sentence description of a conversation. "
-                    "Given the current description and an updated summary of the "
-                    "conversation, return an updated one-sentence description, or "
-                    "the original unchanged if it is still accurate. Return only "
-                    "the sentence, no quotes."
+                    "Given the current description and the user's most recent "
+                    "messages, return an updated one-sentence description that "
+                    "reflects what the conversation is *currently* about, or "
+                    "the original unchanged if it is still accurate. Ignore any "
+                    "bracketed [System info] or auto-injected context. Return "
+                    "only the sentence, no quotes."
                 ),
                 messages=[{
                     "role": "user",
                     "content": (
                         f"Current description:\n{self._summary or '(none yet)'}\n\n"
-                        f"Updated conversation summary:\n{compaction_summary}"
+                        f"Most recent user messages:\n{recent_block}"
                     ),
                 }],
                 max_tokens=64,
@@ -791,6 +829,35 @@ class AnthropicMessagesBackend:
             b.text for b in resp.content if getattr(b, "type", None) == "text"
         ).strip()
 
+    def _spawn_compaction(self) -> None:
+        """Run history compaction on a daemon thread. Bails immediately if a
+        compaction is already in flight or if the history isn't long enough to
+        compact yet — both checks are cheap and keep the turn loop fast."""
+        with self._lock:
+            if self._compacting:
+                return
+            if len(self._messages) <= self.COMPACT_TRIGGER_MSGS:
+                return
+            self._compacting = True
+        threading.Thread(target=self._run_compaction_bg, daemon=True).start()
+
+    def _run_compaction_bg(self) -> None:
+        try:
+            with self._lock:
+                pre_compact = list(self._messages)
+            compacted = self._maybe_compact(pre_compact)
+            if compacted is not pre_compact:
+                with self._lock:
+                    # Any messages appended while compaction was running (tool
+                    # results, a follow-up user turn) sit past pre_compact's
+                    # length and are spliced back on verbatim.
+                    tail = self._messages[len(pre_compact):]
+                    self._messages = compacted + tail
+                self._persist()
+        finally:
+            with self._lock:
+                self._compacting = False
+
     def _maybe_compact(self, messages: list[dict]) -> list[dict]:
         """If `messages` has grown past COMPACT_TRIGGER_MSGS, fold the oldest
         ~COMPACT_BATCH_MSGS messages (merging any prior summary) into a single
@@ -826,8 +893,29 @@ class AnthropicMessagesBackend:
             return messages
 
         # Compaction is infrequent and already runs off-lock, so spend one more
-        # cheap Haiku call here to keep the session description current.
-        self._refresh_title(summary_text)
+        # cheap Haiku call here to keep the session description current. Derive
+        # the title from the last few user messages in the verbatim tail, not
+        # from the compaction summary — the summary skews toward bootstrapped
+        # context and older history, which produces stale-feeling titles.
+        recent_user_texts: list[str] = []
+        for msg in reversed(tail):
+            if msg.get("role") != "user":
+                continue
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            texts = [
+                b.get("text", "")
+                for b in content
+                if isinstance(b, dict) and b.get("type") == "text"
+            ]
+            joined = "\n".join(t for t in texts if t)
+            if joined:
+                recent_user_texts.append(joined)
+            if len(recent_user_texts) >= 3:
+                break
+        recent_user_texts.reverse()
+        self._refresh_title(recent_user_texts)
 
         summary_msg = {
             "role": "user",

@@ -37,6 +37,9 @@ from typing import Protocol, runtime_checkable
 
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError, InvalidHashError
+from cryptography.exceptions import InvalidTag
+
+from . import encryption as _enc
 
 
 # ---------------------------------------------------------------------------
@@ -86,8 +89,8 @@ class AuthBackend(Protocol):
     """Drop-in interface so we can swap LocalAuthBackend for OAuth/etc later
     without touching the Flask routes. Frontends should only depend on this."""
 
-    def create(self, username: str, password: str) -> UserRecord: ...
-    def verify(self, username: str, password: str) -> UserRecord: ...
+    def create(self, username: str, password: str) -> tuple[UserRecord, bytes]: ...
+    def verify(self, username: str, password: str) -> tuple[UserRecord, bytes]: ...
     def lookup(self, user_id: int) -> UserRecord | None: ...
 
 
@@ -138,6 +141,9 @@ class LocalAuthBackend:
                     id            INTEGER PRIMARY KEY AUTOINCREMENT,
                     username      TEXT    NOT NULL UNIQUE COLLATE NOCASE,
                     password_hash TEXT    NOT NULL,
+                    salt_kek      BLOB,
+                    wrapped_dek   BLOB,
+                    enc_version   INTEGER NOT NULL DEFAULT 0,
                     created_at    TEXT    NOT NULL DEFAULT (datetime('now'))
                 );
                 CREATE TABLE IF NOT EXISTS auth_attempts (
@@ -148,33 +154,62 @@ class LocalAuthBackend:
                 );
                 """
             )
+            # LEGACY MIGRATION — pre-encryption databases predate the
+            # salt_kek/wrapped_dek/enc_version columns. ADD COLUMN them in
+            # place so existing installs keep working. Safe to remove once
+            # all live installs have been upgraded past this version.
+            existing_cols = {
+                row[1]
+                for row in self._conn.execute("PRAGMA table_info(users)")
+            }
+            for col, decl in (
+                ("salt_kek",    "BLOB"),
+                ("wrapped_dek", "BLOB"),
+                ("enc_version", "INTEGER NOT NULL DEFAULT 0"),
+            ):
+                if col not in existing_cols:
+                    self._conn.execute(f"ALTER TABLE users ADD COLUMN {col} {decl}")
+            # END LEGACY MIGRATION
             self._conn.commit()
 
     # ---- AuthBackend interface --------------------------------------------
 
-    def create(self, username: str, password: str) -> UserRecord:
+    def create(self, username: str, password: str) -> tuple[UserRecord, bytes]:
         self._validate_username(username)
         self._validate_password(password)
         pw_hash = self._hasher.hash(password)
+
+        # Generate this user's per-account data key and wrap it under a KEK
+        # derived from the password. We hand the raw DEK back to the caller
+        # so it can encrypt the new user's first conversation immediately;
+        # only the wrapped form ever touches disk.
+        salt_kek = _enc.generate_salt()
+        dek = _enc.generate_dek()
+        kek = _enc.derive_kek(password, salt_kek)
+        wrapped = _enc.wrap_dek(kek, dek)
+
         with self._lock:
             try:
                 cur = self._conn.execute(
-                    "INSERT INTO users (username, password_hash) VALUES (?, ?)",
-                    (username, pw_hash),
+                    "INSERT INTO users "
+                    "(username, password_hash, salt_kek, wrapped_dek, enc_version) "
+                    "VALUES (?, ?, ?, ?, 1)",
+                    (username, pw_hash, salt_kek, wrapped),
                 )
                 self._conn.commit()
             except sqlite3.IntegrityError as e:
                 raise UsernameTaken(f"username already taken: {username!r}") from e
-            return UserRecord(id=cur.lastrowid, username=username)
+            return UserRecord(id=cur.lastrowid, username=username), dek
 
-    def verify(self, username: str, password: str) -> UserRecord:
+    def verify(self, username: str, password: str) -> tuple[UserRecord, bytes]:
         # Check lockout up front so a locked account never advances to a
         # hash verify (saves CPU and ensures the error is consistent).
         self._raise_if_locked(username)
 
         with self._lock:
             row = self._conn.execute(
-                "SELECT id, username, password_hash FROM users WHERE username = ?",
+                "SELECT id, username, password_hash, salt_kek, wrapped_dek, enc_version "
+                "FROM users WHERE username = ?",
                 (username,),
             ).fetchone()
 
@@ -188,7 +223,7 @@ class LocalAuthBackend:
             self._register_failure(username)
             raise InvalidCredentials("invalid username or password")
 
-        user_id, stored_username, pw_hash = row
+        user_id, stored_username, pw_hash, salt_kek, wrapped_dek, enc_version = row
         try:
             self._hasher.verify(pw_hash, password)
         except (VerifyMismatchError, InvalidHashError):
@@ -206,8 +241,37 @@ class LocalAuthBackend:
                 )
                 self._conn.commit()
 
+        # Unwrap (or, for legacy users, mint) this account's DEK.
+        if enc_version == 0 or salt_kek is None or wrapped_dek is None:
+            # LEGACY MIGRATION — account predates encryption. The password
+            # we just verified is the only opportunity to derive a KEK for
+            # this user, so do it now. Safe to remove once no rows have
+            # enc_version = 0.
+            salt_kek = _enc.generate_salt()
+            dek = _enc.generate_dek()
+            kek = _enc.derive_kek(password, salt_kek)
+            wrapped_dek = _enc.wrap_dek(kek, dek)
+            with self._lock:
+                self._conn.execute(
+                    "UPDATE users SET salt_kek = ?, wrapped_dek = ?, enc_version = 1 "
+                    "WHERE id = ?",
+                    (salt_kek, wrapped_dek, user_id),
+                )
+                self._conn.commit()
+            # END LEGACY MIGRATION
+        else:
+            kek = _enc.derive_kek(password, bytes(salt_kek))
+            try:
+                dek = _enc.unwrap_dek(kek, bytes(wrapped_dek))
+            except InvalidTag:
+                # Should never happen on a successful password verify — the
+                # KEK was derived from the same password the wrap used. If
+                # we see it, the row is corrupt; treat as auth failure.
+                self._register_failure(username)
+                raise InvalidCredentials("invalid username or password")
+
         self._clear_failures(username)
-        return UserRecord(id=user_id, username=stored_username)
+        return UserRecord(id=user_id, username=stored_username), dek
 
     def lookup(self, user_id: int) -> UserRecord | None:
         with self._lock:

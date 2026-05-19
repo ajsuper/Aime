@@ -41,6 +41,7 @@ from aime import (
 )
 from aime.services import sort_events_by_date
 from aime import auth as _auth
+from aime import encryption as _enc
 
 from . import stt as _stt
 
@@ -59,6 +60,111 @@ _SECRET_KEY = _auth.load_or_create_secret_key(
 # the auth backend); signup needs an IP-keyed throttle since attackers don't
 # pick the account name being limited.
 _signup_limiter = _auth.IPRateLimiter(limit=5, window_seconds=60 * 60)
+
+
+# In-process cache of unwrapped DEKs, keyed by user_id. Populated by
+# login/signup, dropped on logout. Lives only in process memory by design:
+# a server restart forces re-login, which is the correct property — without
+# the password we can't re-derive the KEK that unwraps the DEK.
+_dek_cache: dict[int, bytes] = {}
+_dek_cache_lock = threading.Lock()
+
+
+def _user_dir(user_id: int) -> str:
+    return os.path.join(aime_config.DATABASE_DIR, "users", str(user_id))
+
+
+def _conversations_dir(user_id: int) -> str:
+    return os.path.join(_user_dir(user_id), "conversations")
+
+
+# LEGACY MIGRATION — pre-multi-user installs kept all conversations in a
+# single shared directory (~/.local/share/aime-assistant/conversations).
+# On startup, move any *.json files from there into user 1's per-user
+# conversations directory so the first account sees its prior history.
+# Idempotent: if the legacy dir is missing or already empty, this is a no-op.
+# Safe to remove once all live installs have been upgraded past this version.
+def _migrate_legacy_shared_conversations() -> None:
+    legacy_dir = os.path.join(
+        os.environ.get("HOME", ""), ".local/share/aime-assistant/conversations"
+    )
+    if not os.path.isdir(legacy_dir):
+        return
+    try:
+        names = [n for n in os.listdir(legacy_dir) if n.endswith(".json")]
+    except OSError:
+        return
+    if not names:
+        return
+    dest = _conversations_dir(1)
+    os.makedirs(dest, exist_ok=True)
+    moved = 0
+    for name in names:
+        src = os.path.join(legacy_dir, name)
+        dst = os.path.join(dest, name)
+        if os.path.exists(dst):
+            continue
+        try:
+            os.replace(src, dst)
+            moved += 1
+        except OSError:
+            pass
+    if moved:
+        print(
+            f"[migration] moved {moved} legacy conversation(s) from "
+            f"{legacy_dir} to {dest}",
+            file=sys.stderr,
+        )
+
+
+_migrate_legacy_shared_conversations()
+# END LEGACY MIGRATION
+
+
+# LEGACY MIGRATION — encrypt any plaintext *.json conversation files in a
+# user's directory, rewriting them as *.json.enc under the user's DEK and
+# removing the originals. Runs once per UserContext construction (i.e. once
+# per login per process). Idempotent: pure-encrypted directories are a no-op.
+# Safe to remove once all live installs have been upgraded past this version.
+def _encrypt_plaintext_conversations(conv_dir: str, dek: bytes) -> None:
+    if not os.path.isdir(conv_dir):
+        return
+    try:
+        names = os.listdir(conv_dir)
+    except OSError:
+        return
+    converted = 0
+    for name in names:
+        if not name.endswith(".json") or name.endswith(".json.enc"):
+            continue
+        session_id = name[: -len(".json")]
+        src = os.path.join(conv_dir, name)
+        dst = os.path.join(conv_dir, session_id + ".json.enc")
+        if os.path.exists(dst):
+            # Encrypted version already present — drop the plaintext.
+            try:
+                os.remove(src)
+            except OSError:
+                pass
+            continue
+        try:
+            with open(src, "rb") as f:
+                plaintext = f.read()
+            blob = _enc.encrypt_blob(dek, plaintext, aad=session_id.encode("utf-8"))
+            tmp = dst + ".tmp"
+            with open(tmp, "wb") as f:
+                f.write(blob)
+            os.replace(tmp, dst)
+            os.remove(src)
+            converted += 1
+        except OSError:
+            continue
+    if converted:
+        print(
+            f"[migration] encrypted {converted} plaintext conversation(s) in {conv_dir}",
+            file=sys.stderr,
+        )
+# END LEGACY MIGRATION
 
 
 # ---------------------------------------------------------------------------
@@ -111,13 +217,22 @@ class UserContext:
     state (conversation history) is expensive to rebuild and personal use
     won't run into pressure."""
 
-    def __init__(self, user_id: int):
+    def __init__(self, user_id: int, dek: bytes):
         self.user_id = user_id
+
+        conv_dir = _conversations_dir(user_id)
+        os.makedirs(conv_dir, exist_ok=True)
+        # LEGACY MIGRATION — rewrite any leftover plaintext *.json files in
+        # this user's directory as encrypted *.json.enc under their DEK.
+        _encrypt_plaintext_conversations(conv_dir, dek)
+        # END LEGACY MIGRATION
 
         backend = AnthropicMessagesBackend(
             system_prompt=aime_config.load_system_prompt(),
             model=aime_config.AGENT_MODEL,
             schema_files=aime_config.SCHEMA_FILES,
+            conversations_dir=conv_dir,
+            dek=dek,
         )
         backend.new_session()
 
@@ -249,7 +364,15 @@ def _context_for(user_id: int) -> UserContext:
     with _user_contexts_lock:
         ctx = _user_contexts.get(user_id)
         if ctx is None:
-            ctx = UserContext(user_id)
+            with _dek_cache_lock:
+                dek = _dek_cache.get(user_id)
+            if dek is None:
+                # Should be unreachable: login_required gates the only paths
+                # that reach _context_for, and it forces re-login when the
+                # DEK is missing. Raise loudly if it ever happens so the
+                # symptom is clear instead of a confusing decrypt failure.
+                raise RuntimeError(f"no cached DEK for user {user_id}")
+            ctx = UserContext(user_id, dek)
             _user_contexts[user_id] = ctx
         return ctx
 
@@ -367,6 +490,16 @@ def login_required(view):
             if _wants_json():
                 return jsonify({"ok": False, "error": "auth required"}), 401
             return redirect(url_for("login_page"))
+        # DEK only lives in process memory; a server restart drops it and
+        # forces re-login. The signed cookie alone never grants access to
+        # encrypted data.
+        with _dek_cache_lock:
+            has_dek = uid in _dek_cache
+        if not has_dek:
+            session.clear()
+            if _wants_json():
+                return jsonify({"ok": False, "error": "auth required"}), 401
+            return redirect(url_for("login_page"))
         g.user_id = user.id
         g.username = user.username
         return view(*args, **kwargs)
@@ -385,7 +518,7 @@ def login_submit():
     username = (request.form.get("username") or "").strip()
     password = request.form.get("password") or ""
     try:
-        user = _auth_backend.verify(username, password)
+        user, dek = _auth_backend.verify(username, password)
     except _auth.AccountLocked as e:
         return Response(
             _load_login_page(login_error=str(e)),
@@ -400,6 +533,8 @@ def login_submit():
     session.clear()
     session["user_id"] = user.id
     session.permanent = True
+    with _dek_cache_lock:
+        _dek_cache[user.id] = dek
     return redirect("/")
 
 
@@ -422,7 +557,7 @@ def signup_submit():
             mimetype="text/html", status=400,
         )
     try:
-        user = _auth_backend.create(username, password)
+        user, dek = _auth_backend.create(username, password)
     except _auth.UsernameTaken:
         return Response(
             _load_login_page(signup_error="That username is already taken."),
@@ -441,6 +576,8 @@ def signup_submit():
     session.clear()
     session["user_id"] = user.id
     session.permanent = True
+    with _dek_cache_lock:
+        _dek_cache[user.id] = dek
     return redirect("/")
 
 
@@ -448,7 +585,11 @@ def signup_submit():
 def logout():
     # POST-only so a stray <img src="/logout"> or prefetched link can't
     # silently log the user out. The frontend already POSTs via fetch().
+    uid = session.get("user_id")
     session.clear()
+    if uid is not None:
+        with _dek_cache_lock:
+            _dek_cache.pop(uid, None)
     return redirect(url_for("login_page"))
 
 

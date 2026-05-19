@@ -7,4 +7,5 @@ textual-serve
 textual-autocomplete
 flask
 argon2-cffi
+cryptography
 faster-whisper
