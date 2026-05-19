@@ -20,22 +20,37 @@ def replay_messages(messages: list[dict]) -> Iterator[CoreEvent]:
         if not isinstance(content, list):
             continue
         if role == "user":
+            # A user message can mix one or more text blocks with image blocks.
+            # Collapse them into a single user_message_shown event so the
+            # frontend can render attachments in the same bubble as the text.
+            text_parts: list[str] = []
+            attachments: list[dict] = []
             for block in content:
                 if not isinstance(block, dict):
                     continue
-                if block.get("type") != "text":
-                    continue
-                text = block.get("text", "")
-                # Strip the auto-injected "[System info] ... [End System Info]"
-                # date prefix that the backend prepends — it's noise to the
-                # user re-reading their own message.
-                marker = "[End System Info]"
-                if marker in text:
-                    text = text.split(marker, 1)[1].strip()
-                if text:
-                    yield CoreEvent(
-                        kind="user_message_shown", text=text, from_replay=True
-                    )
+                btype = block.get("type")
+                if btype == "text":
+                    text = block.get("text", "")
+                    marker = "[End System Info]"
+                    if marker in text:
+                        text = text.split(marker, 1)[1].strip()
+                    if text:
+                        text_parts.append(text)
+                elif btype == "image":
+                    src = block.get("source") or {}
+                    if src.get("type") == "base64":
+                        attachments.append({
+                            "kind": "image",
+                            "media_type": src.get("media_type") or "image/png",
+                            "data": src.get("data") or "",
+                        })
+            if text_parts or attachments:
+                yield CoreEvent(
+                    kind="user_message_shown",
+                    text="\n\n".join(text_parts),
+                    attachments=attachments,
+                    from_replay=True,
+                )
         elif role == "assistant":
             for block in content:
                 if not isinstance(block, dict):

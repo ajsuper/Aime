@@ -90,6 +90,9 @@ class BackendEvent:
     expects_response: bool = True
     stop_reason: str | None = None
     error: str | None = None
+    # Optional image attachments for user_send_message events. Each entry:
+    #   {"media_type": "image/png" | "image/jpeg" | ..., "data": "<base64>"}
+    images: list[dict] | None = None
 
 
 @dataclass
@@ -138,6 +141,17 @@ class AgentBackend(Protocol):
 
     def submit(self, event: BackendEvent) -> None:
         """Push a user/system/tool-result event into the conversation."""
+        ...
+
+    def delete_session(self, session_id: str) -> None:
+        """Delete a saved session by id. No-op for backends without enumerable
+        history. If the deleted session is currently active, also resets to a
+        fresh session."""
+        ...
+
+    def delete_all_sessions(self) -> None:
+        """Delete every saved session and reset the active conversation. No-op
+        for backends without enumerable history."""
         ...
 
     def stream(self) -> Iterator[BackendEvent]:
@@ -395,16 +409,48 @@ class AnthropicMessagesBackend:
         self._terminate_active_stream()
         self.new_session()
 
+    def delete_session(self, session_id: str) -> None:
+        if not session_id:
+            return
+        try:
+            os.remove(self._session_path(session_id))
+        except OSError:
+            pass
+
+    def delete_all_sessions(self) -> None:
+        try:
+            names = os.listdir(CONVERSATIONS_DIR)
+        except OSError:
+            return
+        for name in names:
+            if not name.endswith(".json"):
+                continue
+            try:
+                os.remove(os.path.join(CONVERSATIONS_DIR, name))
+            except OSError:
+                pass
+
     def shutdown(self) -> None:
         self._terminated.set()
         self._turn_trigger.set()
 
     def submit(self, event: BackendEvent) -> None:
         if event.kind in ("user_send_message", "system_send_message"):
+            content: list[dict] = []
+            for img in (event.images or []):
+                content.append({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": img.get("media_type") or "image/png",
+                        "data": img.get("data") or "",
+                    },
+                })
+            content.append({"type": "text", "text": event.text or ""})
             with self._lock:
                 self._messages.append({
                     "role": "user",
-                    "content": [{"type": "text", "text": event.text or ""}],
+                    "content": content,
                 })
                 # Generate the session description as soon as there is at
                 # least one user message and the session has no title yet
@@ -876,6 +922,13 @@ class SessionsBackend:
             except Exception:
                 pass
         self.new_session()
+
+    def delete_session(self, session_id: str) -> None:
+        # Server-side sessions; nothing to delete locally.
+        return
+
+    def delete_all_sessions(self) -> None:
+        return
 
     def shutdown(self) -> None:
         if self._session is not None:

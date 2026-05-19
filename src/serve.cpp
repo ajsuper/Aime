@@ -9,10 +9,34 @@
 #include <filesystem>
 #include <cstdlib>
 #include <cctype>
+#include <mutex>
+#include <unordered_map>
 
 #include "../include/crow_all.h"
 
-std::string database_dir = "/.local/share/aime-assistant/database";
+// Root directory under which every user's database lives. Set from
+// $HOME/.local/share/aime-assistant/database (or argv[1]) in main().
+// Each user gets:
+//     <g_root>/users/<user_id>/database.sql
+//     <g_root>/users/<user_id>/topics/<topic_id>_<title>.md
+// Auth state and the Flask session secret live one level up at <g_root>/.
+static std::string g_root;
+
+// Per-user sqlite handle cache. Crow is multithreaded and sqlite (built in
+// the default SERIALIZED mode) is safe to share a connection across threads,
+// so we hand out the same handle to whichever worker thread is currently
+// servicing that user's request. Never evicted: open handles are cheap and
+// the user population for a personal-scale deploy is small.
+static std::unordered_map<int, sqlite3*> g_user_dbs;
+static std::mutex g_user_dbs_mu;
+
+static std::string userDir(int user_id) {
+    return g_root + "/users/" + std::to_string(user_id);
+}
+
+static std::string userTopicsDir(int user_id) {
+    return userDir(user_id) + "/topics";
+}
 
 // ─── Data structures ─────────────────────────────────────────────────────────
 
@@ -463,7 +487,7 @@ Topic rowToTopic(sqlite3_stmt* stmt) {
 }
 
 
-void addTopic(sqlite3* database, Topic& topic) {
+void addTopic(sqlite3* database, int user_id, Topic& topic) {
     sqlite3_stmt* stmt;
     const std::string sql =
         "INSERT INTO TOPIC(TOPIC_TITLE, TOPIC_SUMMARY, TOPIC_CATEGORY)"
@@ -485,8 +509,8 @@ void addTopic(sqlite3* database, Topic& topic) {
     sqlite3_finalize(stmt);
     topic.id = static_cast<int>(sqlite3_last_insert_rowid(database));
 
-    std::filesystem::create_directories(database_dir + "/topics");
-    std::string fileName = database_dir + "/topics/" + std::to_string(topic.id) + "_" + sanitizeFileName(topic.topicTitle) + ".md";
+    std::filesystem::create_directories(userTopicsDir(user_id));
+    std::string fileName = userTopicsDir(user_id) + "/" + std::to_string(topic.id) + "_" + sanitizeFileName(topic.topicTitle) + ".md";
     std::ofstream topicFile(fileName);
     if (!topicFile.is_open()) {
         std::cout << "Failed to create topic file: " << fileName << std::endl;
@@ -545,7 +569,7 @@ Topic getTopic(sqlite3* database, int topicID) {
     return topic;
 }
 
-std::string getTopicContents(sqlite3* database, int topicID) {
+std::string getTopicContents(sqlite3* database, int user_id, int topicID) {
     Topic topic;
     sqlite3_stmt* stmt;
     const std::string sql = "SELECT * FROM TOPIC WHERE ID=?";
@@ -567,7 +591,7 @@ std::string getTopicContents(sqlite3* database, int topicID) {
 
     sqlite3_finalize(stmt);
 
-    std::string fileName = database_dir + "/topics/" + std::to_string(topic.id) + "_" + sanitizeFileName(topic.topicTitle) + ".md";
+    std::string fileName = userTopicsDir(user_id) + "/" + std::to_string(topic.id) + "_" + sanitizeFileName(topic.topicTitle) + ".md";
     std::ifstream topicFile(fileName);
     if (!topicFile.is_open()) {
         std::cout << "Failed to open topic file: " << fileName << std::endl;
@@ -580,7 +604,7 @@ std::string getTopicContents(sqlite3* database, int topicID) {
     return content;
 }
 
-void replaceTopicContents(sqlite3* database, int topicID, const std::string& newContent) {
+void replaceTopicContents(sqlite3* database, int user_id, int topicID, const std::string& newContent) {
     Topic topic;
     sqlite3_stmt* stmt;
     const std::string sql = "SELECT * FROM TOPIC WHERE ID=?";
@@ -602,7 +626,7 @@ void replaceTopicContents(sqlite3* database, int topicID, const std::string& new
 
     sqlite3_finalize(stmt);
 
-    std::string fileName = database_dir + "/topics/" + std::to_string(topic.id) + "_" + sanitizeFileName(topic.topicTitle) + ".md";
+    std::string fileName = userTopicsDir(user_id) + "/" + std::to_string(topic.id) + "_" + sanitizeFileName(topic.topicTitle) + ".md";
     std::ofstream topicFile(fileName);
     if (!topicFile.is_open()) {
         std::cout << "Failed to open topic file for writing: " << fileName << std::endl;
@@ -613,7 +637,7 @@ void replaceTopicContents(sqlite3* database, int topicID, const std::string& new
     topicFile.close();
 }
 
-EditResult editTopicContents(sqlite3* database, int topicID, const std::vector<EditPatch>& patches) {
+EditResult editTopicContents(sqlite3* database, int user_id, int topicID, const std::vector<EditPatch>& patches) {
     EditResult result;
     Topic topic;
     sqlite3_stmt* stmt;
@@ -636,7 +660,7 @@ EditResult editTopicContents(sqlite3* database, int topicID, const std::vector<E
     }
     sqlite3_finalize(stmt);
 
-    std::string fileName = database_dir + "/topics/" + std::to_string(topic.id) + "_" + sanitizeFileName(topic.topicTitle) + ".md";
+    std::string fileName = userTopicsDir(user_id) + "/" + std::to_string(topic.id) + "_" + sanitizeFileName(topic.topicTitle) + ".md";
     std::ifstream in(fileName);
     if (!in.is_open()) {
         result.ok = false;
@@ -887,21 +911,100 @@ static TopicFilterOptions parseTopicFilterOptions(const crow::json::rvalue& j) {
     return opts;
 }
 
+// ─── Per-user DB resolution ──────────────────────────────────────────────────
+
+// Returns the sqlite handle for `user_id`, opening and initializing it on
+// first use. Always returns a non-null handle (sqlite3_open creates the file
+// if it's missing). Thread-safe: the mutex serializes lookup/insertion only;
+// the returned handle is then used lock-free by the caller, which is fine
+// because sqlite is built in SERIALIZED mode.
+static sqlite3* getUserDb(int user_id) {
+    std::lock_guard<std::mutex> lock(g_user_dbs_mu);
+    auto it = g_user_dbs.find(user_id);
+    if (it != g_user_dbs.end()) {
+        return it->second;
+    }
+    std::filesystem::create_directories(userDir(user_id));
+    std::string dbPath = userDir(user_id) + "/database.sql";
+    sqlite3* db = nullptr;
+    openDatabase(const_cast<char*>(dbPath.c_str()), &db);
+    createCalender(db);
+    createTopics(db);
+    g_user_dbs.emplace(user_id, db);
+    return db;
+}
+
+// Move a legacy single-user layout under <root>/database.sql + <root>/topics/
+// to user 1 so existing data keeps working after the multi-user switch.
+// Idempotent: if user 1 already has data, the legacy files are left alone
+// rather than overwritten (we never want to clobber an existing user 1).
+static void migrateLegacyIfPresent() {
+    std::string legacyDb = g_root + "/database.sql";
+    std::string legacyTopics = g_root + "/topics";
+    std::string user1Db = userDir(1) + "/database.sql";
+    if (!std::filesystem::exists(legacyDb)) return;
+    if (std::filesystem::exists(user1Db)) {
+        std::cout << "Legacy DB present at " << legacyDb
+                  << " but user 1 already initialized — leaving legacy in place."
+                  << std::endl;
+        return;
+    }
+    std::filesystem::create_directories(userDir(1));
+    std::error_code ec;
+    std::filesystem::rename(legacyDb, user1Db, ec);
+    if (ec) {
+        std::cout << "Legacy migration: failed to move " << legacyDb << " → "
+                  << user1Db << ": " << ec.message() << std::endl;
+        return;
+    }
+    if (std::filesystem::exists(legacyTopics)) {
+        std::filesystem::rename(legacyTopics, userTopicsDir(1), ec);
+        if (ec) {
+            std::cout << "Legacy migration: failed to move topics dir: "
+                      << ec.message() << std::endl;
+        }
+    }
+    std::cout << "Migrated legacy database to user 1." << std::endl;
+}
+
+// Extract and validate user_id from the request body. Returns true and sets
+// `out` on success; on failure populates `err` with an HTTP response.
+static bool requireUserId(const crow::json::rvalue& j, int& out, crow::response& err) {
+    if (!j.has("user_id")) {
+        err = crow::response(400, "missing required field: user_id");
+        return false;
+    }
+    int64_t v = 0;
+    try {
+        v = j["user_id"].i();
+    } catch (...) {
+        err = crow::response(400, "user_id must be an integer");
+        return false;
+    }
+    // Positive only: 0 / negative would map to no real account and could
+    // collide with the sentinel returned by getEvent/getTopic for "not found".
+    if (v <= 0 || v > 2147483647) {
+        err = crow::response(400, "user_id out of range");
+        return false;
+    }
+    out = static_cast<int>(v);
+    return true;
+}
+
 // ─── main ─────────────────────────────────────────────────────────────────────
 
 int main(int argc, char* argv[]) {
-    database_dir = std::string(std::getenv("HOME")) + database_dir;
+    const char* home = std::getenv("HOME");
+    g_root = (home ? std::string(home) : std::string("")) +
+             "/.local/share/aime-assistant/database";
     if (argc > 1) {
-        database_dir = argv[1];
+        g_root = argv[1];
     }
-    std::string dbPath = database_dir + "/database.sql";
-    sqlite3* database;
-    openDatabase(const_cast<char*>(dbPath.c_str()), &database);
-    createCalender(database);
-    createTopics(database);
+    std::filesystem::create_directories(g_root + "/users");
+    migrateLegacyIfPresent();
 
     crow::SimpleApp DatabaseAPI;
-    CROW_ROUTE(DatabaseAPI, "/api").methods("POST"_method)([database](const crow::request& req){
+    CROW_ROUTE(DatabaseAPI, "/api").methods("POST"_method)([](const crow::request& req){
         auto jsonData = crow::json::load(req.body);
         if (!jsonData) {
             return crow::response(400, "Invalid JSON");
@@ -910,6 +1013,13 @@ int main(int argc, char* argv[]) {
         if (!jsonData.has("tool_name")) {
             return crow::response(400, "Invalid JSON");
         }
+
+        int user_id = 0;
+        crow::response authErr;
+        if (!requireUserId(jsonData, user_id, authErr)) {
+            return authErr;
+        }
+        sqlite3* database = getUserDb(user_id);
 
         if (jsonData["tool_name"] == "get_events") {
             FilterOptions opts = parseFilterOptions(jsonData);
@@ -989,7 +1099,7 @@ int main(int argc, char* argv[]) {
             Topic topic = parseEditTopic(jsonData);
             topic.id = -1;
 
-            addTopic(database, topic);
+            addTopic(database, user_id, topic);
 
             crow::json::wvalue response;
             response["ok"] = true;
@@ -1025,7 +1135,7 @@ int main(int argc, char* argv[]) {
             }
 
             int topicID = static_cast<int>(jsonData["id"].i());
-            std::string contents = getTopicContents(database, topicID);
+            std::string contents = getTopicContents(database, user_id, topicID);
 
             crow::json::wvalue response;
             response["id"] = topicID;
@@ -1039,7 +1149,7 @@ int main(int argc, char* argv[]) {
             int topicID = static_cast<int>(jsonData["id"].i());
             std::string newContents = std::string(jsonData["contents"].s());
 
-            replaceTopicContents(database, topicID, newContents);
+            replaceTopicContents(database, user_id, topicID, newContents);
 
             crow::json::wvalue response;
             response["ok"] = true;
@@ -1071,7 +1181,7 @@ int main(int argc, char* argv[]) {
                 patches.push_back(p);
             }
 
-            EditResult er = editTopicContents(database, topicID, patches);
+            EditResult er = editTopicContents(database, user_id, topicID, patches);
 
             crow::json::wvalue response;
             response["ok"] = er.ok;
@@ -1089,8 +1199,12 @@ int main(int argc, char* argv[]) {
 
     DatabaseAPI.bindaddr("127.0.0.1").port(8080).multithreaded().run();
 
-    // curl -X POST http://localhost:8080/add   -H "Content-Type: application/json"   -d '{"a": 5, "b": 3}'
-
-    sqlite3_close(database);
+    // Close every per-user handle on shutdown. Hold the mutex even though
+    // workers should already be stopped at this point — defensive.
+    {
+        std::lock_guard<std::mutex> lock(g_user_dbs_mu);
+        for (auto& kv : g_user_dbs) sqlite3_close(kv.second);
+        g_user_dbs.clear();
+    }
     return 0;
 }

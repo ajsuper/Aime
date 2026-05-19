@@ -82,6 +82,9 @@ class TopicService:
             return resp.get("contents", "") or ""
         return ""
 
+    def replace_topic_contents(self, topic_id, contents: str):
+        return self._gw.call("replace_topic_contents", id=topic_id, contents=contents)
+
     def create_topic(self, title: str, summary: str, category: str) -> dict:
         return self._gw.call(
             "create_topic", title=title, summary=summary, category=category

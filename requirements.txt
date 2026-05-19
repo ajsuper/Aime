@@ -6,3 +6,5 @@ textual-dev
 textual-serve
 textual-autocomplete
 flask
+argon2-cffi
+faster-whisper

@@ -17,7 +17,7 @@ event (worker thread for agent output; calling thread for input handlers);
 frontends are responsible for thread-marshaling if their UI toolkit needs it.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Literal
 
 from provider_backend import AgentBackend, BackendEvent, SessionInfo
@@ -66,6 +66,11 @@ class CoreEvent:
     # Set on events emitted during /load history replay. Lets the frontend
     # skip live-only affordances like the "thinking…" placeholder.
     from_replay: bool = False
+    # User-message attachments (images, embedded text files). Each entry is
+    # {"kind": "image", "media_type": str, "data": str (base64)} for images.
+    # Text files are still embedded in `text` via <aime:file> sentinels; the
+    # frontend extracts and renders them alongside these.
+    attachments: list[dict] = field(default_factory=list)
 
 
 Subscriber = Callable[[CoreEvent], None]
@@ -134,11 +139,13 @@ class ConversationController:
 
     # --- input ---
 
-    def dispatch_input(self, raw: str) -> bool:
+    def dispatch_input(self, raw: str, images: list[dict] | None = None) -> bool:
         """Process a line of user input (slash commands or plain text).
-        Returns True if the frontend should quit the app."""
+        Optional `images` are forwarded to the backend with the next user
+        message; ignored for slash commands. Returns True if the frontend
+        should quit the app."""
         text = (raw or "").strip()
-        if not text:
+        if not text and not images:
             return False
         if text == ":q":
             return True
@@ -165,26 +172,38 @@ class ConversationController:
                 text=f"Log model thinking set to: {self._log_model_thinking}",
             ))
             return False
-        self.send_user_message(text)
+        self.send_user_message(text, images=images)
         return False
 
-    def send_user_message(self, text: str) -> None:
+    def send_user_message(self, text: str, images: list[dict] | None = None) -> None:
         """Send (or queue) a plain user message without slash parsing."""
         if not self._is_idle:
-            self._pending_user_messages.append(text)
+            self._pending_user_messages.append((text, images))
             self._emit(CoreEvent(kind="user_message_queued", text=text))
             return
-        self._dispatch_user_message(text)
+        self._dispatch_user_message(text, images=images)
 
-    def _dispatch_user_message(self, text: str) -> None:
-        self._emit(CoreEvent(kind="user_message_shown", text=text))
+    def _dispatch_user_message(self, text: str, images: list[dict] | None = None) -> None:
+        attachments: list[dict] = []
+        for img in (images or []):
+            mt = img.get("media_type")
+            data = img.get("data")
+            if mt and data:
+                attachments.append({
+                    "kind": "image", "media_type": mt, "data": data,
+                })
+        self._emit(CoreEvent(
+            kind="user_message_shown", text=text, attachments=attachments,
+        ))
         if self._user_first_interaction:
             bootstrap = bootstrap_special_topics(self._tools)
             if bootstrap:
                 self._backend.set_session_context(bootstrap)
             self._user_first_interaction = False
         try:
-            self._backend.submit(BackendEvent(kind="user_send_message", text=text))
+            self._backend.submit(BackendEvent(
+                kind="user_send_message", text=text, images=images,
+            ))
             self._is_idle = False
         except Exception as exc:
             self._emit(CoreEvent(kind="error", text=f"send failed: {exc}"))
@@ -240,6 +259,18 @@ class ConversationController:
     def list_sessions(self) -> list[SessionInfo]:
         return self._backend.list_sessions()
 
+    def delete_session(self, session_id: str) -> None:
+        was_active = (
+            getattr(self._backend, "_session_id", None) == session_id
+        )
+        self._backend.delete_session(session_id)
+        if was_active:
+            self.reset()
+
+    def delete_all_sessions(self) -> None:
+        self._backend.delete_all_sessions()
+        self.reset()
+
     # --- stream worker ---
 
     def run_stream_loop(self) -> None:
@@ -275,8 +306,8 @@ class ConversationController:
             if event.stop_reason == "end_turn":
                 self._is_idle = True
                 if self._pending_user_messages:
-                    next_text = self._pending_user_messages.pop(0)
-                    self._dispatch_user_message(next_text)
+                    next_text, next_images = self._pending_user_messages.pop(0)
+                    self._dispatch_user_message(next_text, images=next_images)
                 else:
                     self._emit(CoreEvent(kind="ready"))
         elif kind == "session_terminated":

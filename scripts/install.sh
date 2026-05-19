@@ -62,6 +62,44 @@ uv python install "$PYTHON_VERSION"
 uv venv --managed-python --python "$PYTHON_VERSION" "$VENV_DIR"
 uv pip install --python "$VENV_DIR/bin/python" -r "$REPO_ROOT/requirements.txt"
 
+# Pre-download a Whisper speech-to-text model. faster-whisper fetches models
+# on first use, but doing it here avoids a long wait the first time someone
+# uses voice input. Models live under models/whisper/.
+WHISPER_DIR="$REPO_ROOT/models/whisper"
+echo ""
+echo "Whisper speech-to-text model — pick one for the web app's voice input:"
+echo "  1) tiny.en      (~75MB, fastest, lower accuracy)"
+echo "  2) base.en      (~145MB, fast)"
+echo "  3) small.en     (~480MB, balanced — recommended)"
+echo "  4) medium.en    (~1.5GB, high accuracy)"
+echo "  5) large-v3-turbo (~1.6GB, best accuracy/speed multilingual)"
+echo "  s) Skip (download on first use)"
+read -r -p "Choice [1/2/3/4/5/s] (default 3): " WHISPER_CHOICE
+WHISPER_CHOICE="${WHISPER_CHOICE:-3}"
+case "$WHISPER_CHOICE" in
+    1) WHISPER_MODEL_NAME="tiny.en" ;;
+    2) WHISPER_MODEL_NAME="base.en" ;;
+    3) WHISPER_MODEL_NAME="small.en" ;;
+    4) WHISPER_MODEL_NAME="medium.en" ;;
+    5) WHISPER_MODEL_NAME="large-v3-turbo" ;;
+    s|S|skip|SKIP) WHISPER_MODEL_NAME="" ;;
+    *) echo "Unrecognised choice '$WHISPER_CHOICE'; skipping pre-download." >&2
+       WHISPER_MODEL_NAME="" ;;
+esac
+
+if [ -n "$WHISPER_MODEL_NAME" ]; then
+    mkdir -p "$WHISPER_DIR"
+    echo "Pre-downloading Whisper model: $WHISPER_MODEL_NAME ..."
+    "$VENV_DIR/bin/python" - "$WHISPER_MODEL_NAME" "$WHISPER_DIR" <<'PY'
+import sys
+from faster_whisper import WhisperModel
+name, cache = sys.argv[1], sys.argv[2]
+WhisperModel(name, device="cpu", compute_type="int8", download_root=cache)
+print(f"Whisper model {name!r} cached under {cache}")
+PY
+    echo "$WHISPER_MODEL_NAME" > "$WHISPER_DIR/.selected"
+fi
+
 echo "aime build complete."
 echo "  binary:  $REPO_ROOT/build/serve.o"
 echo "  venv:    $VENV_DIR"

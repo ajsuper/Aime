@@ -14,6 +14,7 @@ from .controller import ConversationController, CoreEvent, CoreEventKind
 from .tool_gateway import ToolGateway
 from .services import CalendarService, TopicService
 from . import config
+from . import auth
 
 __all__ = [
     "ConversationController",
@@ -23,4 +24,5 @@ __all__ = [
     "CalendarService",
     "TopicService",
     "config",
+    "auth",
 ]

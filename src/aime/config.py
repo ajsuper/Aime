@@ -10,6 +10,14 @@ import os
 
 API_URL = "http://localhost:8080/api"
 
+# Where Aime keeps per-user data. Mirrors the C++ backend's database_dir.
+# Auth state (auth.sql, secret_key) lives at the root; per-user databases
+# will live under users/<id>/ once the C++ side learns to route by user_id.
+DATABASE_DIR = os.environ.get(
+    "AIME_DATABASE_DIR",
+    os.path.join(os.environ["HOME"], ".local/share/aime-assistant/database"),
+)
+
 # Agent configuration file used by the Sessions backend to cache its
 # server-side environment/agent setup. The Messages backend ignores it.
 CONFIG_PATH = os.environ['HOME'] + "/.config/aime-assistant/agents_config.json"

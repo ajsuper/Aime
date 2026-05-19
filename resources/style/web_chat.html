@@ -3,21 +3,109 @@
 <head>
   <meta charset="utf-8">
   <title>Aime</title>
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
   <style>
-    :root {
-      color-scheme: dark;
-      --bg: #0f1115;
+    :root { color-scheme: dark; }
+    /* Default theme — Warm Cocoa. */
+    :root, :root[data-theme="cocoa"] {
+      --bg: #1F1B1A;
+      --bg-elev: #2B2522;
+      --bg-input: #34302D;
+      --border: #3D3733;
+      --text: #EDE6DE;
+      --muted: #9C9088;
+      --accent: #E8A87C;
+      --accent-hover: #F2BD96;
+      --user-bubble: linear-gradient(135deg, #E8A87C 0%, #C97B63 100%);
+      --warning: #F2C078;
+      --error: #E07A5F;
+      --success: #A3C9A8;
+    }
+    :root[data-theme="midnight"] {
+      --bg: #0F1115;
       --bg-elev: #161922;
-      --bg-input: #1c2030;
+      --bg-input: #1C2030;
       --border: #232838;
-      --text: #e6e8ef;
-      --muted: #8a90a3;
-      --accent: #7c8cff;
-      --accent-hover: #94a1ff;
-      --user-bubble: linear-gradient(135deg, #6f7dff 0%, #8a64ff 100%);
-      --warning: #f5b454;
-      --error: #ff6b6b;
-      --success: #5dd39e;
+      --text: #E6E8EF;
+      --muted: #8A90A3;
+      --accent: #7C8CFF;
+      --accent-hover: #94A1FF;
+      --user-bubble: linear-gradient(135deg, #6F7DFF 0%, #8A64FF 100%);
+      --warning: #F5B454;
+      --error: #FF6B6B;
+      --success: #5DD39E;
+    }
+    :root[data-theme="forest"] {
+      --bg: #131A17;
+      --bg-elev: #1C2622;
+      --bg-input: #232F2A;
+      --border: #2C3934;
+      --text: #E2E8E3;
+      --muted: #8A998F;
+      --accent: #8FBF9F;
+      --accent-hover: #A7D2B5;
+      --user-bubble: linear-gradient(135deg, #8FBF9F 0%, #5E9B7A 100%);
+      --warning: #D7B26D;
+      --error: #D87F6E;
+      --success: #8FBF9F;
+    }
+    :root[data-theme="slate"] {
+      --bg: #14171C;
+      --bg-elev: #1D2127;
+      --bg-input: #262B33;
+      --border: #2E343D;
+      --text: #E4E7EC;
+      --muted: #8B929C;
+      --accent: #5FB3FF;
+      --accent-hover: #7DC2FF;
+      --user-bubble: linear-gradient(135deg, #5FB3FF 0%, #4178D9 100%);
+      --warning: #F0B454;
+      --error: #F26B6B;
+      --success: #6BD3A0;
+    }
+    :root[data-theme="sunset"] {
+      --bg: #1B1320;
+      --bg-elev: #261A2D;
+      --bg-input: #2F2237;
+      --border: #382A41;
+      --text: #EDE3EA;
+      --muted: #9D8DA0;
+      --accent: #FF8C6B;
+      --accent-hover: #FFA787;
+      --user-bubble: linear-gradient(135deg, #FF8C6B 0%, #E64C7F 100%);
+      --warning: #FFC36B;
+      --error: #FF6B7E;
+      --success: #B5D49E;
+    }
+    :root[data-theme="mint"] {
+      --bg: #101817;
+      --bg-elev: #182322;
+      --bg-input: #1F2D2B;
+      --border: #283936;
+      --text: #E0EAE7;
+      --muted: #819690;
+      --accent: #5BD0B3;
+      --accent-hover: #7BDCC5;
+      --user-bubble: linear-gradient(135deg, #5BD0B3 0%, #3A9DCC 100%);
+      --warning: #E8C26C;
+      --error: #E07A6E;
+      --success: #5BD0B3;
+    }
+    :root[data-theme="parchment"] {
+      color-scheme: light;
+      --bg: #F4EFE6;
+      --bg-elev: #EAE2D2;
+      --bg-input: #FFFCF4;
+      --border: #D7CCB6;
+      --text: #2E2A23;
+      --muted: #7A6F5D;
+      --accent: #B8612A;
+      --accent-hover: #CF7438;
+      --user-bubble: linear-gradient(135deg, #B8612A 0%, #8A3F18 100%);
+      --warning: #C58B1D;
+      --error: #B14333;
+      --success: #4F8253;
     }
     * { box-sizing: border-box; }
     html, body { height: 100%; }
@@ -26,38 +114,88 @@
            display: flex; flex-direction: column;
            font-size: 15px; line-height: 1.55;
            -webkit-font-smoothing: antialiased; }
-    header { padding: 0.9rem 1.25rem; border-bottom: 1px solid var(--border);
-             font-weight: 600; font-size: 0.95rem; letter-spacing: 0.01em;
-             background: rgba(15, 17, 21, 0.85); backdrop-filter: blur(10px);
-             display: flex; align-items: center; gap: 0.6rem;
-             position: sticky; top: 0; z-index: 10; }
-    header::before { content: ""; width: 8px; height: 8px; border-radius: 50%;
-                     background: var(--success);
-                     box-shadow: 0 0 8px rgba(93, 211, 158, 0.6); }
+    /* Left rail: thin vertical bar with the app menu trigger. */
+    #left-rail { width: 44px; flex-shrink: 0; background: var(--bg-elev);
+                 border-right: 1px solid var(--border);
+                 display: flex; flex-direction: column; align-items: center;
+                 padding: 0.5rem 0; gap: 0.5rem; }
+    .rail-btn { width: 32px; height: 32px; border-radius: 8px; border: 0;
+                background: transparent; color: var(--muted); cursor: pointer;
+                display: flex; align-items: center; justify-content: center;
+                transition: color 0.15s, background 0.15s; padding: 0; }
+    .rail-btn:hover { color: var(--text); background: rgba(255,255,255,0.05); }
+    .rail-btn.active { color: var(--accent); background: rgba(124,140,255,0.12); }
+    .rail-btn svg { width: 20px; height: 20px; }
+
+    /* Menu popover anchored to the rail button. */
+    #app-menu { position: fixed; left: 52px; top: 0.5rem;
+                background: var(--bg-elev); border: 1px solid var(--border);
+                border-radius: 10px; padding: 0.35rem; min-width: 160px;
+                box-shadow: 0 8px 24px rgba(0,0,0,0.4); z-index: 50;
+                display: none; }
+    #app-menu.open { display: block; }
+    #app-menu button { display: block; width: 100%; text-align: left;
+                       background: transparent; border: 0; color: var(--text);
+                       font: inherit; font-size: 0.9rem; padding: 0.45rem 0.7rem;
+                       border-radius: 6px; cursor: pointer; }
+    #app-menu button:hover { background: rgba(124,140,255,0.12); color: var(--accent); }
+
+    /* Main row: rail, optional side panel, then chat. */
+    #main { flex: 1; display: flex; min-height: 0; }
+    #chat-col { flex: 1; display: flex; flex-direction: column; min-width: 240px; }
+    #divider { width: 6px; cursor: col-resize; background: var(--border);
+               flex-shrink: 0; transition: background 0.15s; position: relative; }
+    #divider:hover, #divider.dragging { background: var(--accent); }
+    #divider::after { content: ""; position: absolute; left: -3px; right: -3px;
+                      top: 0; bottom: 0; }
+    body.col-resizing { cursor: col-resize; user-select: none; }
+    body.col-resizing iframe { pointer-events: none; }
+    #side-col { width: 420px; min-width: 240px;
+                display: none; flex-direction: column; min-height: 0;
+                background: var(--bg-elev); flex-shrink: 0;
+                border-right: 1px solid var(--border); }
+    #side-col.open { display: flex; }
+    body:not(.side-open) #divider { display: none; }
+    .side-header { display: flex; align-items: center;
+                   padding: 0.6rem 0.5rem 0.6rem 1rem; gap: 0.5rem;
+                   border-bottom: 1px solid var(--border); flex-shrink: 0; }
+    .side-header .title { flex: 1; font-weight: 600; font-size: 0.95rem; }
+    .side-close { background: transparent; border: 0; color: var(--muted);
+                  width: 28px; height: 28px; border-radius: 6px; cursor: pointer;
+                  display: flex; align-items: center; justify-content: center;
+                  padding: 0; transition: color 0.15s, background 0.15s; }
+    .side-close:hover { color: var(--text); background: rgba(255,255,255,0.05); }
+    .side-close svg { width: 16px; height: 16px; }
+
     #log { flex: 1; overflow-y: auto; padding: 1.5rem 1rem 1rem;
            scroll-behavior: smooth; }
     #log-inner { max-width: 760px; margin: 0 auto; display: flex;
                  flex-direction: column; gap: 0.75rem; }
-    .msg { white-space: pre-wrap; word-wrap: break-word;
+    .msg { word-wrap: break-word;
            animation: fade-in 0.2s ease-out; }
+    .msg.user, .msg.notice, .msg.aime { white-space: pre-wrap; }
     @keyframes fade-in {
       from { opacity: 0; transform: translateY(4px); }
       to   { opacity: 1; transform: translateY(0); }
     }
     .msg .who { display: none; }
-    .msg.aime, .msg.notice { padding-left: 2.5rem; position: relative; }
+    .msg.aime, .msg.notice { padding-left: 1.25rem; position: relative; }
     .msg.aime::before {
-      content: "A"; position: absolute; left: 0; top: 0.1rem;
-      width: 1.75rem; height: 1.75rem; border-radius: 50%;
-      background: linear-gradient(135deg, #ff7a59 0%, #ff5577 100%);
-      color: white; font-size: 0.8rem; font-weight: 600;
-      display: flex; align-items: center; justify-content: center;
-      letter-spacing: 0; line-height: 1;
+      content: ""; position: absolute; left: 0; top: 0.3rem; bottom: 0.3rem;
+      width: 3px; border-radius: 2px;
+      background: linear-gradient(180deg, var(--accent) 0%, var(--accent-hover) 100%);
     }
+    /* Avatar only on the first assistant block of a run — when two aime
+       bubbles are adjacent siblings (no tool call / user msg between them),
+       suppress the avatar on the follow-up. */
+    .msg.aime + .msg.aime::before { display: none; }
     .msg.user { align-self: flex-end; max-width: 80%;
                 background: var(--user-bubble); color: white;
                 padding: 0.65rem 1rem; border-radius: 18px 18px 4px 18px;
                 box-shadow: 0 2px 10px rgba(124, 140, 255, 0.15); }
+    .msg.user.no-text { background: transparent; padding: 0;
+                        box-shadow: none; color: var(--text); }
+    .msg.user.no-text .content { display: none; }
     .msg.notice { color: var(--muted); font-size: 0.85rem;
                   font-style: normal; opacity: 0.85; }
     .msg.notice::before {
@@ -80,58 +218,976 @@
     .msg .content code { background: var(--bg-elev); padding: 0.1em 0.35em;
                          border-radius: 4px; }
     .msg .content pre code { background: transparent; padding: 0; }
+    .msg .content hr.md-hr { border: 0; height: 1px; margin: 0.45rem 0;
+                             background: var(--border); }
+    .msg .content > p { margin: 0.25rem 0; }
+    .msg .content > p:first-child { margin-top: 0; }
+    .msg .content > p:last-child  { margin-bottom: 0; }
+    .msg .content > :first-child { margin-top: 0; }
+    .msg .content > :last-child  { margin-bottom: 0; }
+    .msg .content ul, .msg .content ol { margin: 0.3rem 0; padding-left: 1.4rem; }
+    .msg .content li { margin: 0.1rem 0; }
+    .msg .content h1, .msg .content h2, .msg .content h3,
+    .msg .content h4, .msg .content h5, .msg .content h6 {
+      margin: 0.6rem 0 0.3rem; line-height: 1.25;
+    }
     form { display: flex; padding: 1rem; gap: 0.5rem;
-           background: var(--bg); border-top: 1px solid var(--border); }
+           background: var(--bg); border-top: 1px solid var(--border);
+           flex-shrink: 0; }
     .input-wrap { max-width: 760px; margin: 0 auto; width: 100%;
                   display: flex; gap: 0.5rem; align-items: center;
                   background: var(--bg-input); border: 1px solid var(--border);
-                  border-radius: 24px; padding: 0.35rem 0.35rem 0.35rem 1rem;
+                  border-radius: 24px; padding: 0.35rem;
                   transition: border-color 0.15s, box-shadow 0.15s; }
+    .attach-btn { background: transparent; color: var(--muted); border: 0;
+                  border-radius: 50%; width: 36px; height: 36px; cursor: pointer;
+                  display: flex; align-items: center; justify-content: center;
+                  transition: color 0.15s, background 0.15s; flex-shrink: 0;
+                  padding: 0; }
+    .attach-btn:hover { color: var(--text); background: rgba(255,255,255,0.05); }
+    .attach-btn svg { width: 20px; height: 20px; }
     .input-wrap:focus-within { border-color: var(--accent);
                                box-shadow: 0 0 0 3px rgba(124, 140, 255, 0.15); }
     input[type=text] { flex: 1; background: transparent; color: var(--text);
                        border: 0; outline: none; padding: 0.5rem 0;
                        font: inherit; }
     input[type=text]::placeholder { color: var(--muted); }
-    button { background: var(--accent); color: white; border: 0;
+    .send-btn { background: var(--accent); color: white; border: 0;
              border-radius: 50%; width: 36px; height: 36px;
              font: inherit; cursor: pointer; display: flex;
              align-items: center; justify-content: center;
              transition: background 0.15s, transform 0.05s; flex-shrink: 0; }
-    button:hover:not(:disabled) { background: var(--accent-hover); }
-    button:active:not(:disabled) { transform: scale(0.96); }
-    button:disabled { opacity: 0.4; cursor: default; }
-    button svg { width: 18px; height: 18px; }
-    #log::-webkit-scrollbar { width: 10px; }
-    #log::-webkit-scrollbar-track { background: transparent; }
-    #log::-webkit-scrollbar-thumb { background: var(--border);
+    .send-btn:hover:not(:disabled) { background: var(--accent-hover); }
+    .send-btn:active:not(:disabled) { transform: scale(0.96); }
+    .send-btn:disabled { opacity: 0.4; cursor: default; }
+    .send-btn svg { width: 18px; height: 18px; }
+    .new-btn { background: transparent; color: var(--muted); border: 0;
+               border-radius: 50%; width: 36px; height: 36px; cursor: pointer;
+               display: flex; align-items: center; justify-content: center;
+               transition: color 0.15s, background 0.15s; flex-shrink: 0; }
+    .new-btn:hover { color: var(--text); background: var(--bg-elev); }
+    .new-btn svg { width: 18px; height: 18px; }
+    .mic-btn { background: transparent; color: var(--muted); border: 0;
+               border-radius: 50%; width: 36px; height: 36px; cursor: pointer;
+               display: flex; align-items: center; justify-content: center;
+               transition: color 0.15s, background 0.15s; flex-shrink: 0; }
+    .mic-btn:hover { color: var(--text); background: var(--bg-elev); }
+    .mic-btn svg { width: 18px; height: 18px; }
+    .mic-btn.active { color: white; background: var(--accent); }
+    .mic-btn.active:hover { background: var(--accent-hover); }
+    .mic-btn.recording { background: #e5484d; color: white;
+                         animation: mic-pulse 1s ease-in-out infinite; }
+    .mic-btn.recording:hover { background: #d93d42; }
+    @keyframes mic-pulse {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(229, 72, 77, 0.55); }
+      50%      { box-shadow: 0 0 0 8px rgba(229, 72, 77, 0); }
+    }
+    .input-wrap.voice-mode input[type=text] { color: var(--muted);
+                                              font-style: italic; cursor: default; }
+    .input-wrap.recording { border-color: #e5484d;
+                            animation: input-rec-glow 1.4s ease-in-out infinite; }
+    @keyframes input-rec-glow {
+      0%, 100% { box-shadow: 0 0 0 2px rgba(229, 72, 77, 0.18); }
+      50%      { box-shadow: 0 0 0 5px rgba(229, 72, 77, 0.32); }
+    }
+    .input-wrap.recording input[type=text] { color: #e5484d; font-style: normal;
+                                             font-weight: 500; }
+    .input-wrap.recording input[type=text]::placeholder { color: #e5484d;
+                                                          opacity: 0.9; }
+    #voice-toast { position: fixed; left: 50%; bottom: 96px;
+                   transform: translateX(-50%) translateY(8px);
+                   background: var(--bg-elev); color: var(--text);
+                   border: 1px solid var(--border); border-radius: 10px;
+                   padding: 0.65rem 1rem; font-size: 0.88rem; line-height: 1.35;
+                   box-shadow: 0 8px 24px rgba(0,0,0,0.35);
+                   opacity: 0; pointer-events: none; z-index: 1000;
+                   transition: opacity 0.18s ease, transform 0.18s ease;
+                   max-width: 90vw; text-align: center; }
+    #voice-toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+    #voice-toast .title { display: block; font-weight: 600;
+                          color: var(--accent); margin-bottom: 0.15rem; }
+    #voice-toast kbd { background: var(--bg); border: 1px solid var(--border);
+                       border-radius: 4px; padding: 0 0.35rem; font-size: 0.8rem;
+                       font-family: inherit; color: var(--text); }
+    #log::-webkit-scrollbar, .scroll::-webkit-scrollbar { width: 10px; }
+    #log::-webkit-scrollbar-track, .scroll::-webkit-scrollbar-track { background: transparent; }
+    #log::-webkit-scrollbar-thumb, .scroll::-webkit-scrollbar-thumb { background: var(--border);
                                     border-radius: 5px; border: 2px solid var(--bg); }
-    #log::-webkit-scrollbar-thumb:hover { background: #2e3447; }
+    #log::-webkit-scrollbar-thumb:hover, .scroll::-webkit-scrollbar-thumb:hover { background: #2e3447; }
+
+    /* -- Side panel: panes & tab bar -- */
+    .pane { flex: 1; min-height: 0; display: none; flex-direction: column;
+            overflow: hidden; }
+    .pane.active { display: flex; }
+    .pane-header { padding: 0.75rem 1rem; border-bottom: 1px solid var(--border);
+                   display: flex; justify-content: space-between; align-items: center;
+                   font-weight: 600; font-size: 0.9rem; flex-shrink: 0; }
+    .pane-header button { background: transparent; color: var(--muted);
+                          border: 1px solid var(--border); border-radius: 6px;
+                          padding: 0.2rem 0.6rem; cursor: pointer; font-size: 0.8rem; }
+    .pane-header button:hover { color: var(--text); border-color: var(--accent); }
+    .scroll { overflow-y: auto; flex: 1; min-height: 0; }
+
+    /* Chats list */
+    .session-item { padding: 0.65rem 0.5rem 0.65rem 1rem; cursor: pointer;
+                    border-bottom: 1px solid var(--border);
+                    transition: background 0.1s;
+                    display: flex; align-items: center; gap: 0.4rem; }
+    .session-item:hover { background: rgba(124, 140, 255, 0.08); }
+    .session-item .summary { color: var(--text); font-size: 0.9rem;
+                             overflow: hidden; text-overflow: ellipsis;
+                             white-space: nowrap; flex: 1; min-width: 0; }
+    .session-item .meta { display: none; }
+    .session-item .del-btn { background: transparent; border: 0; color: var(--muted);
+                             width: 26px; height: 26px; border-radius: 6px;
+                             cursor: pointer; display: flex; align-items: center;
+                             justify-content: center; padding: 0; flex-shrink: 0;
+                             opacity: 0; transition: opacity 0.15s, color 0.15s, background 0.15s; }
+    .session-item:hover .del-btn { opacity: 1; }
+    .session-item .del-btn:hover { color: var(--error); background: rgba(255,255,255,0.06); }
+    .session-item .del-btn svg { width: 15px; height: 15px; }
+    .empty { color: var(--muted); font-size: 0.85rem; padding: 1rem; text-align: center; }
+
+    /* Calendar */
+    .cal-toolbar { display: flex; align-items: center; gap: 0.5rem;
+                   padding: 0.5rem 1rem; border-bottom: 1px solid var(--border);
+                   flex-shrink: 0; }
+    .cal-toolbar button { background: transparent; color: var(--text);
+                          border: 1px solid var(--border); border-radius: 6px;
+                          padding: 0.25rem 0.55rem; cursor: pointer; font: inherit;
+                          font-size: 0.85rem; }
+    .cal-toolbar button:hover { border-color: var(--accent); }
+    .cal-toolbar .title { flex: 1; text-align: center; font-weight: 600;
+                          font-size: 0.95rem; }
+    .cal-grid { display: grid; grid-template-columns: repeat(7, 1fr);
+                grid-template-rows: 26px;
+                grid-auto-rows: minmax(95px, 1fr);
+                gap: 1px; padding: 1px; background: var(--border);
+                flex: 1 1 auto; min-height: 0; }
+    .cal-grid .dow { background: var(--bg-elev); padding: 0.3rem;
+                     text-align: center; font-size: 0.7rem;
+                     color: var(--muted); font-weight: 600;
+                     text-transform: uppercase; letter-spacing: 0.05em;
+                     min-height: 0; }
+    .cal-cell { background: var(--bg); padding: 0.3rem;
+                font-size: 0.78rem; cursor: pointer; position: relative;
+                overflow: hidden; transition: background 0.1s; }
+    .cal-cell:hover { background: rgba(124, 140, 255, 0.08); }
+    .cal-cell.empty { background: var(--bg-elev); cursor: default; opacity: 0.3; }
+    .cal-cell.today { outline: 2px solid var(--accent); outline-offset: -2px; }
+    .cal-cell.selected { background: rgba(124, 140, 255, 0.18); }
+    .cal-cell .daynum { color: var(--muted); font-weight: 600;
+                        margin-bottom: 0.15rem; }
+    .cal-cell.today .daynum { color: var(--accent); }
+    .cal-cell .ev { color: var(--text); font-size: 0.7rem;
+                    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .day-detail { flex: 0 0 auto; max-height: 35%; padding: 0.75rem 1rem;
+                  overflow-y: auto; border-top: 1px solid var(--border);
+                  min-height: 80px; }
+    .day-detail h4 { margin: 0 0 0.5rem; font-size: 0.85rem; color: var(--muted);
+                     font-weight: 600; text-transform: uppercase;
+                     letter-spacing: 0.05em; }
+    .day-detail .ev-item { padding: 0.5rem 0; border-bottom: 1px solid var(--border); }
+    .day-detail .ev-item:last-child { border-bottom: 0; }
+    .day-detail .ev-head { color: var(--accent); font-size: 0.8rem; }
+    .day-detail .ev-title { font-weight: 600; margin-top: 0.1rem; }
+    .day-detail .ev-summary { color: var(--muted); font-size: 0.85rem;
+                              margin-top: 0.2rem; }
+
+    /* Topics */
+    .topics-search { padding: 0.5rem 0.75rem; border-bottom: 1px solid var(--border);
+                     flex-shrink: 0; display: flex; gap: 0.4rem; align-items: center; }
+    .topics-search input { flex: 1; background: var(--bg-input); color: var(--text);
+                           border: 1px solid var(--border); border-radius: 8px;
+                           padding: 0.4rem 0.6rem; font: inherit; font-size: 0.85rem;
+                           outline: none; transition: border-color 0.15s, box-shadow 0.15s; }
+    .topics-search input:focus { border-color: var(--accent);
+                                 box-shadow: 0 0 0 2px rgba(124, 140, 255, 0.18); }
+    .topics-search .count { color: var(--muted); font-size: 0.75rem; min-width: 2.2em;
+                            text-align: right; }
+    .topics-body { flex: 1; display: flex; min-height: 0; }
+    .topic-list { width: 38%; min-width: 120px; overflow-y: auto;
+                  flex: 0 0 auto; }
+    #topic-divider { width: 6px; cursor: col-resize; background: var(--border);
+                     flex-shrink: 0; transition: background 0.15s; }
+    #topic-divider:hover, #topic-divider.dragging { background: var(--accent); }
+    .topic-item { padding: 0.55rem 0.8rem; cursor: pointer; font-size: 0.85rem;
+                  border-bottom: 1px solid var(--border); }
+    .topic-item:hover { background: rgba(124, 140, 255, 0.08); }
+    .topic-item.active { background: rgba(124, 140, 255, 0.18); color: var(--accent); }
+    .topic-item .cat { color: var(--muted); font-size: 0.7rem; margin-top: 0.1rem; }
+    .topic-content { flex: 1; overflow-y: auto; min-width: 0; }
+    .topic-toolbar { position: sticky; top: 0; z-index: 5;
+                     background: var(--bg); border-bottom: 1px solid var(--border);
+                     padding: 0.4rem 0.75rem; display: none; gap: 0.35rem;
+                     align-items: center; flex-wrap: wrap; }
+    .topic-toolbar.show { display: flex; }
+    .topic-toolbar button { background: transparent; color: var(--muted);
+                            border: 1px solid var(--border); border-radius: 6px;
+                            padding: 0.25rem 0.6rem; font: inherit; font-size: 0.82rem;
+                            cursor: pointer; transition: background 0.15s, color 0.15s; }
+    .topic-toolbar button:hover { color: var(--text); background: var(--bg-elev); }
+    .topic-toolbar button.primary { background: var(--accent); color: white;
+                                    border-color: var(--accent); }
+    .topic-toolbar button.primary:hover { background: var(--accent-hover); }
+    .topic-toolbar .spacer { flex: 1; }
+    .topic-toolbar .icon { font-weight: 700; min-width: 1.6em; text-align: center; }
+    .topic-toolbar .icon-i { font-style: italic; font-family: serif; }
+    #topic-body { padding: 1rem 1.25rem; }
+    #topic-editor { width: 100%; min-height: calc(100vh - 200px);
+                    box-sizing: border-box; background: var(--bg-input); color: var(--text);
+                    border: 1px solid var(--border); border-radius: 8px;
+                    padding: 0.75rem 1rem; font-family: ui-monospace, "SF Mono", Menlo, monospace;
+                    font-size: 0.9rem; line-height: 1.5; outline: none; resize: vertical;
+                    transition: border-color 0.15s, box-shadow 0.15s; }
+    #topic-editor:focus { border-color: var(--accent);
+                          box-shadow: 0 0 0 2px rgba(124, 140, 255, 0.18); }
+    .topic-content h1, .topic-content h2, .topic-content h3 {
+      margin-top: 1rem; margin-bottom: 0.5rem;
+    }
+    .topic-content pre { background: var(--bg); border: 1px solid var(--border);
+                         padding: 0.75rem; border-radius: 6px; overflow-x: auto; }
+    .topic-content code { font-family: ui-monospace, "SF Mono", Menlo, monospace;
+                          font-size: 0.88em; }
+    .topic-content :not(pre) > code { background: var(--bg); padding: 0.1em 0.35em;
+                                      border-radius: 4px; }
+    .topic-content a { color: var(--accent); }
+    .topic-content table { border-collapse: collapse; margin: 0.75rem 0;
+                           font-size: 0.9rem; width: auto; max-width: 100%;
+                           display: block; overflow-x: auto; }
+    .topic-content table th, .topic-content table td {
+      border: 1px solid var(--border); padding: 0.4rem 0.75rem;
+      text-align: left; vertical-align: top;
+    }
+    .topic-content table thead th { background: var(--bg);
+                                    font-weight: 600; color: var(--text); }
+    .topic-content table tbody tr:nth-child(even) { background: rgba(255,255,255,0.02); }
+    .topic-content ul li:has(> input[type=checkbox]) { list-style: none; margin-left: -1.25rem; }
+    .topic-content input[type=checkbox] { cursor: pointer; margin-right: 0.4rem;
+                                          accent-color: var(--accent); vertical-align: -2px; }
+    .topic-content input[type=checkbox]:disabled { cursor: not-allowed; }
+
+    /* Tab bar is gone — left rail controls which pane is open. */
+    #tabbar { display: none; }
+
+    /* Settings modal: floating panel over a blurred chat backdrop. */
+    #settings-backdrop { position: fixed; inset: 0; z-index: 200;
+                         background: rgba(15, 12, 10, 0.45);
+                         backdrop-filter: blur(8px);
+                         -webkit-backdrop-filter: blur(8px);
+                         display: none; align-items: center; justify-content: center;
+                         padding: 2rem; animation: settings-fade 0.15s ease-out; }
+    #settings-backdrop.open { display: flex; }
+    @keyframes settings-fade {
+      from { opacity: 0; }
+      to { opacity: 1; }
+    }
+    #settings-modal { background: var(--bg-elev); border: 1px solid var(--border);
+                      border-radius: 14px; width: 100%; max-width: 640px;
+                      max-height: 100%; display: flex; flex-direction: column;
+                      box-shadow: 0 20px 60px rgba(0,0,0,0.55);
+                      animation: settings-rise 0.18s ease-out; }
+    @keyframes settings-rise {
+      from { opacity: 0; transform: translateY(8px) scale(0.98); }
+      to { opacity: 1; transform: translateY(0) scale(1); }
+    }
+    .settings-header { display: flex; align-items: center; gap: 0.5rem;
+                       padding: 0.85rem 1rem 0.85rem 1.25rem;
+                       border-bottom: 1px solid var(--border); flex-shrink: 0; }
+    .settings-header .title { flex: 1; font-weight: 600; font-size: 1rem; }
+    .settings-tabs { display: flex; gap: 0.25rem; padding: 0 1rem;
+                     border-bottom: 1px solid var(--border); flex-shrink: 0; }
+    .settings-tab-btn { background: transparent; border: 0; color: var(--muted);
+                        font: inherit; font-size: 0.88rem; padding: 0.6rem 0.9rem;
+                        cursor: pointer; border-bottom: 2px solid transparent;
+                        margin-bottom: -1px; transition: color 0.15s, border-color 0.15s; }
+    .settings-tab-btn:hover { color: var(--text); }
+    .settings-tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
+    .settings-tab { display: none; }
+    .settings-tab.active { display: flex; flex-direction: column; gap: 1.25rem; }
+    .dev-warn { color: var(--warning); font-size: 0.8rem; margin: 0 0 0.5rem;
+                padding: 0.55rem 0.75rem; border: 1px solid var(--warning);
+                border-radius: 8px; background: rgba(255, 170, 70, 0.06); }
+    .settings-close { background: transparent; border: 0; color: var(--muted);
+                      width: 32px; height: 32px; border-radius: 6px; cursor: pointer;
+                      display: flex; align-items: center; justify-content: center;
+                      padding: 0; transition: color 0.15s, background 0.15s; }
+    .settings-close:hover { color: var(--text); background: rgba(255,255,255,0.06); }
+    .settings-close svg { width: 16px; height: 16px; }
+    .settings-body { overflow-y: auto; padding: 1.25rem; display: flex;
+                     flex-direction: column; gap: 1.25rem; }
+    .settings-section h3 { margin: 0 0 0.35rem; font-size: 0.95rem; }
+    .settings-section .desc { color: var(--muted); font-size: 0.85rem;
+                              margin: 0 0 0.75rem; }
+    .settings-row { display: flex; align-items: center; justify-content: space-between;
+                    gap: 1rem; padding: 0.55rem 0;
+                    border-top: 1px solid var(--border); }
+    .settings-row:first-of-type { border-top: 0; }
+    .settings-row .label { font-size: 0.9rem; }
+    .settings-row .value { color: var(--muted); font-size: 0.85rem; }
+    .settings-row select { background: var(--bg-input); color: var(--text);
+                           border: 1px solid var(--border); border-radius: 8px;
+                           padding: 0.4rem 0.6rem; font: inherit; font-size: 0.85rem;
+                           cursor: pointer; outline: none;
+                           transition: border-color 0.15s, box-shadow 0.15s; }
+    .settings-row select:hover { border-color: var(--accent); }
+    .settings-row select:focus { border-color: var(--accent);
+                                 box-shadow: 0 0 0 3px rgba(255,255,255,0.06); }
+    .btn-danger { background: transparent; color: var(--error);
+                  border: 1px solid var(--error); border-radius: 8px;
+                  padding: 0.4rem 0.8rem; font: inherit; font-size: 0.85rem;
+                  cursor: pointer; transition: background 0.15s, color 0.15s; }
+    .btn-danger:hover { background: var(--error); color: white; }
+    .btn-secondary { background: transparent; color: var(--text);
+                     border: 1px solid var(--border); border-radius: 8px;
+                     padding: 0.4rem 0.8rem; font: inherit; font-size: 0.85rem;
+                     cursor: pointer; }
+    .btn-secondary:hover { border-color: var(--accent); color: var(--accent); }
+
+    /* Confirm dialog — stacks above the settings modal. */
+    #confirm-backdrop { position: fixed; inset: 0; z-index: 300;
+                        background: rgba(0,0,0,0.55);
+                        backdrop-filter: blur(4px);
+                        -webkit-backdrop-filter: blur(4px);
+                        display: none; align-items: center; justify-content: center;
+                        padding: 2rem; }
+    #confirm-backdrop.open { display: flex; }
+    #confirm-modal { background: var(--bg-elev); border: 1px solid var(--border);
+                     border-radius: 12px; max-width: 420px; width: 100%;
+                     padding: 1.25rem 1.25rem 1rem;
+                     box-shadow: 0 20px 60px rgba(0,0,0,0.6); }
+    #confirm-modal h3 { margin: 0 0 0.4rem; font-size: 1rem; }
+    #confirm-modal p { margin: 0 0 1.1rem; color: var(--muted); font-size: 0.9rem; }
+    .confirm-actions { display: flex; justify-content: flex-end; gap: 0.5rem; }
+
+    /* Drop overlay & attachment previews */
+    #drop-overlay { position: fixed; inset: 0; background: rgba(124, 140, 255, 0.15);
+                    border: 3px dashed var(--accent); pointer-events: none;
+                    z-index: 100; display: none; align-items: center;
+                    justify-content: center; color: var(--accent); font-size: 1.1rem;
+                    font-weight: 600; }
+    body.drag-over #drop-overlay { display: flex; }
+    #attachments { max-width: 760px; margin: 0 auto 0.5rem; padding: 0 0.5rem;
+                   display: none; flex-wrap: wrap; gap: 0.5rem; }
+    #attachments.has-items { display: flex; }
+    .attach { position: relative; width: 64px; height: 64px; border-radius: 8px;
+              overflow: hidden; border: 1px solid var(--border);
+              background: var(--bg-elev); }
+    .attach img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    .attach.file { display: flex; flex-direction: column; align-items: center;
+                   justify-content: center; padding: 4px; text-align: center;
+                   color: var(--muted); }
+    .attach.file svg { width: 22px; height: 22px; color: var(--accent);
+                       margin-bottom: 2px; }
+    .attach.file .fname { font-size: 0.62rem; line-height: 1.1;
+                          max-width: 100%; overflow: hidden;
+                          text-overflow: ellipsis; white-space: nowrap;
+                          color: var(--text); }
+    .attach .remove { position: absolute; top: 2px; right: 2px; width: 18px;
+                      height: 18px; border-radius: 50%; background: rgba(0,0,0,0.7);
+                      color: white; border: 0; font-size: 12px; line-height: 1;
+                      cursor: pointer; display: flex; align-items: center;
+                      justify-content: center; padding: 0; }
+    .attach .remove:hover { background: var(--error); }
+    /* Attached files & images in the user's bubble — unified chip style. */
+    .msg .attached { display: flex; flex-wrap: wrap; gap: 0.4rem;
+                     margin-bottom: 0.4rem; }
+    .msg.user .attached { justify-content: flex-end; }
+    .msg .att-chip { display: inline-flex; align-items: center; gap: 0.5rem;
+                     padding: 0.35rem 0.7rem 0.35rem 0.4rem; max-width: 240px;
+                     background: rgba(0,0,0,0.18); color: inherit;
+                     border: 1px solid rgba(255,255,255,0.12);
+                     border-radius: 10px; font-size: 0.82rem; cursor: pointer;
+                     text-decoration: none; }
+    .msg .att-chip:hover { background: rgba(0,0,0,0.28); }
+    .msg .att-chip .thumb { width: 28px; height: 28px; border-radius: 6px;
+                            flex-shrink: 0; display: flex; align-items: center;
+                            justify-content: center; overflow: hidden;
+                            background: rgba(0,0,0,0.25); }
+    .msg .att-chip .thumb img { width: 100%; height: 100%; object-fit: cover;
+                                display: block; }
+    .msg .att-chip .thumb svg { width: 18px; height: 18px; color: var(--accent); }
+    .msg.user .att-chip .thumb svg { color: white; }
+    .msg .att-chip .fname { overflow: hidden; text-overflow: ellipsis;
+                            white-space: nowrap; }
   </style>
 </head>
 <body>
-  <header>Aime</header>
-  <div id="log"><div id="log-inner"></div></div>
-  <form id="f">
-    <div class="input-wrap">
-      <input id="i" type="text" autocomplete="off" placeholder="Message Aime…"
-             autofocus>
-      <button type="submit" aria-label="Send">
+  <div id="main">
+    <div id="left-rail">
+      <button class="rail-btn" id="menu-btn" title="Menu" aria-label="Menu"
+              aria-haspopup="true" aria-expanded="false">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
-             stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M5 12h14M13 6l6 6-6 6"/>
+             stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="3" y1="6"  x2="21" y2="6"/>
+          <line x1="3" y1="12" x2="21" y2="12"/>
+          <line x1="3" y1="18" x2="21" y2="18"/>
+        </svg>
+      </button>
+      <button class="rail-btn pane-btn" data-target="chats" title="Chats" aria-label="Chats">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+        </svg>
+      </button>
+      <button class="rail-btn pane-btn" data-target="calendar" title="Calendar" aria-label="Calendar">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="3" y="4" width="18" height="18" rx="2"/>
+          <line x1="16" y1="2" x2="16" y2="6"/>
+          <line x1="8" y1="2" x2="8" y2="6"/>
+          <line x1="3" y1="10" x2="21" y2="10"/>
+        </svg>
+      </button>
+      <button class="rail-btn pane-btn" data-target="topics" title="Topics" aria-label="Topics">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M4 6h16M4 12h16M4 18h10"/>
         </svg>
       </button>
     </div>
-  </form>
+    <div id="app-menu" role="menu">
+      <button type="button" role="menuitem" data-menu="account">Account</button>
+      <button type="button" role="menuitem" data-menu="settings">Settings</button>
+      <button type="button" role="menuitem" data-menu="logout">Log out</button>
+    </div>
+    <div id="side-col">
+      <div class="side-header">
+        <span class="title" id="side-title">Conversations</span>
+        <button class="side-close" id="side-close" title="Close" aria-label="Close">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M6 6l12 12M18 6L6 18"/>
+          </svg>
+        </button>
+      </div>
+      <!-- Chats pane -->
+      <div class="pane" data-pane="chats">
+        <div class="pane-header">
+          <span>Conversations</span>
+          <button data-action="refresh-chats">Refresh</button>
+        </div>
+        <div class="scroll" id="chats-list">
+          <div class="empty">loading…</div>
+        </div>
+      </div>
+
+      <!-- Calendar pane -->
+      <div class="pane" data-pane="calendar">
+        <div class="cal-toolbar">
+          <button data-action="cal-prev">‹</button>
+          <span class="title" id="cal-title">—</span>
+          <button data-action="cal-next">›</button>
+          <button data-action="cal-refresh">Refresh</button>
+        </div>
+        <div class="cal-grid" id="cal-grid"></div>
+        <div class="day-detail" id="day-detail">
+          <div class="empty">select a day</div>
+        </div>
+      </div>
+
+      <!-- Topics pane -->
+      <div class="pane" data-pane="topics">
+        <div class="pane-header">
+          <span>Topics</span>
+          <button data-action="refresh-topics">Refresh</button>
+        </div>
+        <div class="topics-search">
+          <input type="text" id="topic-search" placeholder="Search title or summary…"
+                 autocomplete="off" spellcheck="false">
+          <span class="count" id="topic-count"></span>
+        </div>
+        <div class="topics-body">
+          <div class="topic-list scroll" id="topic-list">
+            <div class="empty">loading…</div>
+          </div>
+          <div id="topic-divider" title="Drag to resize"></div>
+          <div class="topic-content scroll" id="topic-content">
+            <div class="topic-toolbar" id="topic-toolbar">
+              <button id="topic-edit-btn" title="Edit topic">Edit</button>
+              <button id="topic-bold-btn" class="icon" title="Bold (Ctrl+B)" hidden><b>B</b></button>
+              <button id="topic-italic-btn" class="icon icon-i" title="Italic (Ctrl+I)" hidden>I</button>
+              <span class="spacer"></span>
+              <button id="topic-cancel-btn" title="Discard changes" hidden>Cancel</button>
+              <button id="topic-save-btn" class="primary" title="Save changes" hidden>Save</button>
+            </div>
+            <div id="topic-body">
+              <div class="empty">select a topic</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div id="divider" title="Drag to resize"></div>
+    <div id="chat-col">
+      <div id="log"><div id="log-inner"></div></div>
+      <div id="attachments"></div>
+      <form id="f">
+        <div class="input-wrap">
+          <button type="button" class="attach-btn" id="attach-btn"
+                  title="Attach file" aria-label="Attach file">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                 stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="12" y1="5"  x2="12" y2="19"/>
+              <line x1="5"  y1="12" x2="19" y2="12"/>
+            </svg>
+          </button>
+          <input type="file" id="file-picker" multiple
+                 style="display:none"
+                 accept="image/*,.txt,.md,.markdown,.json,.yaml,.yml,.csv,.tsv,.py,.js,.ts,.tsx,.jsx,.html,.css,.xml,.sh,.c,.cpp,.h,.hpp,.java,.rs,.go,.rb,.toml,.ini,.log,text/*">
+          <input id="i" type="text" autocomplete="off" placeholder="Message Aime…"
+                 autofocus>
+          <button type="button" class="new-btn" id="new-chat-btn"
+                  title="New conversation" aria-label="New conversation">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                 stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 20h9"/>
+              <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/>
+            </svg>
+          </button>
+          <button type="button" class="mic-btn" id="mic-btn"
+                  title="Voice input" aria-label="Voice input" aria-pressed="false">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                 stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="9" y="2" width="6" height="12" rx="3"/>
+              <path d="M5 11a7 7 0 0 0 14 0"/>
+              <line x1="12" y1="18" x2="12" y2="22"/>
+              <line x1="8"  y1="22" x2="16" y2="22"/>
+            </svg>
+          </button>
+          <button type="submit" class="send-btn" aria-label="Send">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                 stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M5 12h14M13 6l6 6-6 6"/>
+            </svg>
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>
+  <div id="drop-overlay">Drop images to attach</div>
+  <div id="voice-toast" role="status" aria-live="polite"></div>
+  <div id="settings-backdrop" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+    <div id="settings-modal">
+      <div class="settings-header">
+        <span class="title" id="settings-title">Settings</span>
+        <button class="settings-close" id="settings-close" title="Close" aria-label="Close">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M6 6l12 12M18 6L6 18"/>
+          </svg>
+        </button>
+      </div>
+      <div class="settings-tabs" role="tablist">
+        <button class="settings-tab-btn active" data-tab="user" role="tab"
+                aria-selected="true">User</button>
+        <button class="settings-tab-btn" data-tab="developer" role="tab"
+                aria-selected="false">Developer</button>
+      </div>
+      <div class="settings-body">
+        <div class="settings-tab active" data-tab="user" role="tabpanel">
+          <div class="settings-section">
+            <h3>Appearance</h3>
+            <p class="desc">Visual preferences for the chat interface.</p>
+            <div class="settings-row">
+              <span class="label">Theme</span>
+              <select id="theme-select">
+                <option value="cocoa">Warm Cocoa</option>
+                <option value="midnight">Midnight</option>
+                <option value="forest">Forest</option>
+                <option value="slate">Slate</option>
+                <option value="sunset">Sunset</option>
+                <option value="mint">Mint</option>
+                <option value="parchment">Parchment (light)</option>
+              </select>
+            </div>
+          </div>
+          <div class="settings-section">
+            <h3>Data</h3>
+            <p class="desc">Manage saved conversations.</p>
+            <div class="settings-row">
+              <span class="label">Delete all chats</span>
+              <button class="btn-danger" id="delete-all-btn">Delete all</button>
+            </div>
+          </div>
+          <div class="settings-section">
+            <h3>About</h3>
+            <p class="desc">Aime — your personal assistant.</p>
+          </div>
+        </div>
+        <div class="settings-tab" data-tab="developer" role="tabpanel">
+          <p class="dev-warn">Developer settings. Changing these may affect how Aime responds.</p>
+          <div class="settings-section">
+            <h3>Model</h3>
+            <p class="desc">The assistant backend Aime uses for responses.</p>
+            <div class="settings-row">
+              <span class="label">Active model</span>
+              <span class="value" id="settings-model">—</span>
+            </div>
+          </div>
+          <div class="settings-section">
+            <h3>Speech-to-text</h3>
+            <p class="desc">Whisper model used to transcribe voice input. Larger = more accurate, slower.</p>
+            <div class="settings-row">
+              <span class="label">Active model</span>
+              <select id="stt-model-select"><option value="">(none)</option></select>
+            </div>
+            <p class="desc" id="stt-model-hint" style="margin-top:0.4rem"></p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div id="confirm-backdrop" role="dialog" aria-modal="true" aria-labelledby="confirm-title">
+    <div id="confirm-modal">
+      <h3 id="confirm-title">Are you sure?</h3>
+      <p id="confirm-message">This action cannot be undone.</p>
+      <div class="confirm-actions">
+        <button class="btn-secondary" id="confirm-cancel">Cancel</button>
+        <button class="btn-danger" id="confirm-ok">Delete</button>
+      </div>
+    </div>
+  </div>
 <script>
 const log = document.getElementById("log");
 const logInner = document.getElementById("log-inner");
 const form = document.getElementById("f");
 const input = document.getElementById("i");
+const micBtn = document.getElementById("mic-btn");
+const inputWrap = input.closest(".input-wrap");
 
-let currentAssistant = null;  // active streaming <div> for assistant text
-let pendingHtmlTarget = null; // most-recently-closed assistant <div> awaiting HTML rerender
+// Voice mode (Part 1: UI only).
+// When active, the text input becomes read-only and a hint placeholder is
+// shown. Recording / STT wiring comes in a later part.
+let voiceMode = false;
+const TEXT_PLACEHOLDER = input.placeholder;
+const VOICE_PLACEHOLDER = "Hold space to speak, Enter to send";
+
+function setVoiceMode(on) {
+  const was = voiceMode;
+  voiceMode = !!on;
+  micBtn.classList.toggle("active", voiceMode);
+  micBtn.setAttribute("aria-pressed", voiceMode ? "true" : "false");
+  inputWrap.classList.toggle("voice-mode", voiceMode);
+  input.readOnly = voiceMode;
+  input.placeholder = voiceMode ? VOICE_PLACEHOLDER : TEXT_PLACEHOLDER;
+  if (voiceMode) input.blur(); else input.focus();
+  if (voiceMode && !was) {
+    showVoiceToast(
+      '<span class="title">Voice mode activated</span>' +
+      'Hold <kbd>Space</kbd> to record, <kbd>Enter</kbd> to send.'
+    );
+  }
+}
+
+const voiceToast = document.getElementById("voice-toast");
+let voiceToastTimer = null;
+function showVoiceToast(html, ms = 3200) {
+  voiceToast.innerHTML = html;
+  voiceToast.classList.add("show");
+  if (voiceToastTimer) clearTimeout(voiceToastTimer);
+  voiceToastTimer = setTimeout(() => {
+    voiceToast.classList.remove("show");
+    voiceToastTimer = null;
+  }, ms);
+}
+
+micBtn.addEventListener("click", () => setVoiceMode(!voiceMode));
+
+// --- Audio capture ----------------------------------------------------
+// Hold Space (while voice mode is on) to record; release to transcribe.
+// Captures Float32 PCM through an AudioContext, then downsamples to 16kHz
+// mono 16-bit WAV and POSTs it to /transcribe. We use ScriptProcessorNode
+// for portability — AudioWorklet would need a separate module file.
+
+const TARGET_SR = 16000;
+const voiceRec = {
+  active: false,
+  starting: false,
+  stream: null,
+  ctx: null,
+  source: null,
+  proc: null,
+  chunks: [],
+  inputSampleRate: TARGET_SR,
+};
+
+function floatChunksToMono16kPCM(chunks, inRate) {
+  // Concatenate Float32 chunks.
+  let total = 0;
+  for (const c of chunks) total += c.length;
+  const flat = new Float32Array(total);
+  let off = 0;
+  for (const c of chunks) { flat.set(c, off); off += c.length; }
+
+  // Linear-interpolation resample to TARGET_SR.
+  if (inRate === TARGET_SR) {
+    const out = new Int16Array(flat.length);
+    for (let i = 0; i < flat.length; i++) {
+      const s = Math.max(-1, Math.min(1, flat[i]));
+      out[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+    }
+    return out;
+  }
+  const ratio = inRate / TARGET_SR;
+  const outLen = Math.floor(flat.length / ratio);
+  const out = new Int16Array(outLen);
+  for (let i = 0; i < outLen; i++) {
+    const srcIdx = i * ratio;
+    const i0 = Math.floor(srcIdx);
+    const i1 = Math.min(i0 + 1, flat.length - 1);
+    const frac = srcIdx - i0;
+    const v = flat[i0] * (1 - frac) + flat[i1] * frac;
+    const s = Math.max(-1, Math.min(1, v));
+    out[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+  }
+  return out;
+}
+
+function pcm16ToWav(pcm, sampleRate) {
+  const dataBytes = pcm.length * 2;
+  const buf = new ArrayBuffer(44 + dataBytes);
+  const view = new DataView(buf);
+  const writeStr = (off, s) => { for (let i = 0; i < s.length; i++) view.setUint8(off + i, s.charCodeAt(i)); };
+  writeStr(0, "RIFF");
+  view.setUint32(4, 36 + dataBytes, true);
+  writeStr(8, "WAVE");
+  writeStr(12, "fmt ");
+  view.setUint32(16, 16, true);          // PCM fmt chunk size
+  view.setUint16(20, 1, true);           // PCM format
+  view.setUint16(22, 1, true);           // mono
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);  // byte rate
+  view.setUint16(32, 2, true);           // block align
+  view.setUint16(34, 16, true);          // bits/sample
+  writeStr(36, "data");
+  view.setUint32(40, dataBytes, true);
+  let off = 44;
+  for (let i = 0; i < pcm.length; i++, off += 2) view.setInt16(off, pcm[i], true);
+  return new Blob([buf], {type: "audio/wav"});
+}
+
+async function startVoiceRecording() {
+  if (voiceRec.active || voiceRec.starting) return;
+  voiceRec.starting = true;
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({audio: true});
+    const ACtx = window.AudioContext || window.webkitAudioContext;
+    const ctx = new ACtx();
+    const source = ctx.createMediaStreamSource(stream);
+    // 4096-sample buffer; mono in, mono out (we don't actually output).
+    const proc = ctx.createScriptProcessor(4096, 1, 1);
+    voiceRec.chunks = [];
+    voiceRec.inputSampleRate = ctx.sampleRate;
+    proc.onaudioprocess = (e) => {
+      const ch = e.inputBuffer.getChannelData(0);
+      voiceRec.chunks.push(new Float32Array(ch));
+    };
+    source.connect(proc);
+    // Connect to destination so the processor actually runs in some browsers,
+    // but route through a muted gain so we don't echo the mic to the speakers.
+    const mute = ctx.createGain();
+    mute.gain.value = 0;
+    proc.connect(mute);
+    mute.connect(ctx.destination);
+
+    voiceRec.stream = stream;
+    voiceRec.ctx = ctx;
+    voiceRec.source = source;
+    voiceRec.proc = proc;
+    voiceRec.active = true;
+    inputWrap.classList.add("recording");
+    micBtn.classList.add("recording");
+    input.placeholder = "● Listening…";
+  } catch (err) {
+    appendNotice("microphone unavailable: " + err.message, "error");
+    setVoiceMode(false);
+  } finally {
+    voiceRec.starting = false;
+  }
+}
+
+async function stopVoiceRecordingAndTranscribe() {
+  if (!voiceRec.active) return;
+  voiceRec.active = false;
+  inputWrap.classList.remove("recording");
+  micBtn.classList.remove("recording");
+  const {stream, ctx, source, proc, chunks, inputSampleRate} = voiceRec;
+  try { proc.disconnect(); } catch {}
+  try { source.disconnect(); } catch {}
+  try { stream.getTracks().forEach(t => t.stop()); } catch {}
+  try { await ctx.close(); } catch {}
+  voiceRec.stream = voiceRec.ctx = voiceRec.source = voiceRec.proc = null;
+  voiceRec.chunks = [];
+
+  if (!chunks.length) {
+    input.placeholder = VOICE_PLACEHOLDER;
+    return;
+  }
+
+  input.placeholder = "Transcribing…";
+  try {
+    const pcm = floatChunksToMono16kPCM(chunks, inputSampleRate);
+    const wav = pcm16ToWav(pcm, TARGET_SR);
+    const res = await fetch("/transcribe", {
+      method: "POST",
+      headers: {"Content-Type": "audio/wav"},
+      body: wav,
+    });
+    const data = await res.json().catch(() => ({ok: false, error: "bad response"}));
+    if (!data.ok) {
+      appendNotice("transcription failed: " + (data.error || "unknown"), "error");
+    } else if (data.text) {
+      // Append (with a space) so multiple presses accumulate.
+      input.value = input.value
+        ? input.value.replace(/\s+$/, "") + " " + data.text
+        : data.text;
+    }
+  } catch (err) {
+    appendNotice("transcription failed: " + err.message, "error");
+  } finally {
+    input.placeholder = VOICE_PLACEHOLDER;
+  }
+}
+
+document.addEventListener("keydown", (e) => {
+  if (!voiceMode) return;
+  // Ignore keys while typing in any text-editable field (settings inputs, etc.)
+  const ae = document.activeElement;
+  if (ae && ae !== input && (ae.tagName === "INPUT" || ae.tagName === "TEXTAREA" || ae.isContentEditable)) return;
+  if (e.code === "Space" && !e.repeat) {
+    e.preventDefault();
+    startVoiceRecording();
+  } else if (e.key === "Enter") {
+    e.preventDefault();
+    if (voiceRec.active) {
+      // Finish the in-flight recording first; submit once it lands.
+      stopVoiceRecordingAndTranscribe().then(() => {
+        if (input.value.trim()) form.requestSubmit();
+      });
+    } else if (input.value.trim()) {
+      form.requestSubmit();
+    }
+  } else if (e.key === "Escape" && voiceRec.active) {
+    e.preventDefault();
+    // Cancel without transcribing.
+    voiceRec.chunks = [];
+    stopVoiceRecordingAndTranscribe();
+  }
+});
+
+document.addEventListener("keyup", (e) => {
+  if (!voiceMode) return;
+  if (e.code === "Space") {
+    e.preventDefault();
+    stopVoiceRecordingAndTranscribe();
+  }
+});
+
+let currentAssistant = null;
+let pendingHtmlTarget = null;
+// History snapshot replays as raw payloads; switch to live (typewriter-eligible)
+// mode after the server emits the `history_done` sentinel.
+let liveMode = false;
+
+// -- Typewriter: progressively reveal characters of the server-rendered HTML.
+// One stream-in-flight at a time, since the controller serializes turns.
+const typewriter = {
+  bubble: null,    // .msg element being filled
+  target: "",      // latest cumulative HTML received from server
+  shown: 0,        // visible-char count currently rendered
+  finalized: false,
+  rafId: null,
+};
+
+function visibleLength(html) {
+  const t = document.createElement("template");
+  t.innerHTML = html;
+  return (t.content.textContent || "").length;
+}
+
+function renderHtmlPrefix(container, html, n) {
+  const t = document.createElement("template");
+  t.innerHTML = html;
+  let remaining = n;
+  function walk(node) {
+    let i = 0;
+    while (i < node.childNodes.length) {
+      const c = node.childNodes[i];
+      if (remaining <= 0) {
+        while (node.childNodes.length > i) node.removeChild(node.childNodes[i]);
+        return;
+      }
+      if (c.nodeType === 3) {
+        const txt = c.textContent;
+        if (txt.length <= remaining) {
+          remaining -= txt.length;
+          i++;
+        } else {
+          c.textContent = txt.slice(0, remaining);
+          remaining = 0;
+          i++;
+        }
+      } else if (c.nodeType === 1) {
+        walk(c);
+        i++;
+      } else {
+        i++;
+      }
+    }
+  }
+  walk(t.content);
+  container.innerHTML = "";
+  container.appendChild(t.content);
+}
+
+function typewriterUpdate(bubble, html, finalize) {
+  // New bubble or first update: reset. If we were mid-animating a previous
+  // bubble (multi-block turn: text → tool → more text), lock in its full
+  // content first so it doesn't strand at e.g. "Al" out of "Also, …".
+  if (typewriter.bubble !== bubble) {
+    if (typewriter.bubble && typewriter.target) {
+      typewriter.bubble._content.innerHTML = typewriter.target;
+    }
+    if (typewriter.rafId != null) {
+      cancelAnimationFrame(typewriter.rafId);
+      typewriter.rafId = null;
+    }
+    typewriter.bubble = bubble;
+    typewriter.shown = 0;
+    typewriter.finalized = false;
+    typewriter.target = "";
+  }
+  typewriter.target = html;
+  if (finalize) typewriter.finalized = true;
+  if (typewriter.rafId == null) {
+    typewriter.rafId = requestAnimationFrame(typewriterStep);
+  }
+}
+
+function typewriterStep() {
+  typewriter.rafId = null;
+  const bubble = typewriter.bubble;
+  if (!bubble) return;
+  const total = visibleLength(typewriter.target);
+  if (typewriter.shown >= total) {
+    if (typewriter.finalized) {
+      // Lock in the full HTML — guards against any subtle whitespace
+      // discrepancy between our walker and innerHTML.
+      bubble._content.innerHTML = typewriter.target;
+      typewriter.bubble = null;
+    }
+    return;
+  }
+  // Reveal speed: ~3 chars/frame baseline, scaling up when behind so we
+  // never feel laggy on bursty streams. End feels typewritery, mid feels fast.
+  const remaining = total - typewriter.shown;
+  const step = Math.max(3, Math.ceil(remaining / 18));
+  typewriter.shown = Math.min(total, typewriter.shown + step);
+  renderHtmlPrefix(bubble._content, typewriter.target, typewriter.shown);
+  log.scrollTop = log.scrollHeight;
+  typewriter.rafId = requestAnimationFrame(typewriterStep);
+}
 
 function appendMessage(cls, who, text) {
   const div = document.createElement("div");
@@ -165,42 +1221,129 @@ function ensureAssistant() {
   return currentAssistant;
 }
 
+function attrEscape(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/"/g, "&quot;")
+                  .replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+const FILE_BLOCK_RE = /<aime:file\s+name="([^"]*)">\n?([\s\S]*?)\n?<\/aime:file>\s*/g;
+
+// Pull <aime:file> blocks out of a user message. Returns the cleaned-up
+// display text plus the list of attached files in the unified attachment
+// shape: {kind: "file", name, contents}.
+function extractAttachedFiles(text) {
+  const files = [];
+  const cleaned = (text || "").replace(FILE_BLOCK_RE, (_, name, contents) => {
+    files.push({
+      kind: "file",
+      name: name.replace(/&quot;/g, '"').replace(/&amp;/g, "&")
+                .replace(/&lt;/g, "<").replace(/&gt;/g, ">"),
+      contents,
+    });
+    return "";
+  }).replace(/^\s+|\s+$/g, "");
+  return {text: cleaned, files};
+}
+
+const FILE_CHIP_SVG =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+  'stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+  '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>' +
+  '<polyline points="14 2 14 8 20 8"/></svg>';
+
+// Build a single chip for either an image or a text file. Both render
+// identically (small thumbnail/icon + name), and both download/open on click.
+function makeAttachmentChip(att) {
+  const chip = document.createElement("a");
+  chip.className = "att-chip";
+  chip.title = att.name || "";
+  chip.target = "_blank";
+  const thumb = document.createElement("span");
+  thumb.className = "thumb";
+  if (att.kind === "image") {
+    const src = `data:${att.media_type};base64,${att.data}`;
+    const im = document.createElement("img");
+    im.src = src;
+    thumb.appendChild(im);
+    chip.href = src;
+    if (att.name) chip.download = att.name;
+  } else {
+    thumb.innerHTML = FILE_CHIP_SVG;
+    const blob = new Blob([att.contents || ""], {type: "text/plain"});
+    chip.href = URL.createObjectURL(blob);
+    chip.download = att.name || "file.txt";
+  }
+  chip.appendChild(thumb);
+  const name = document.createElement("span");
+  name.className = "fname";
+  name.textContent = att.name || (att.kind === "image" ? "image" : "file");
+  chip.appendChild(name);
+  return chip;
+}
+
+function renderAttachmentRow(attachments) {
+  if (!attachments.length) return null;
+  const row = document.createElement("div");
+  row.className = "attached";
+  attachments.forEach(a => row.appendChild(makeAttachmentChip(a)));
+  return row;
+}
+
 const es = new EventSource("/stream");
 es.onmessage = (ev) => {
   const e = JSON.parse(ev.data);
   switch (e.kind) {
-    case "user_message_shown":
+    case "user_message_shown": {
       currentAssistant = null;
       pendingHtmlTarget = null;
-      appendMessage("user", "you", e.text);
+      const {text: cleanedText, files} = extractAttachedFiles(e.text);
+      const attachments = (e.attachments || []).concat(files);
+      const msg = appendMessage("user", "you", cleanedText);
+      const row = renderAttachmentRow(attachments);
+      if (row) msg.insertBefore(row, msg._content);
+      if (!cleanedText && attachments.length) msg.classList.add("no-text");
       break;
+    }
     case "user_message_queued":
       appendMessage("user", "you (queued)", e.text);
       break;
     case "assistant_text":
       ensureAssistant()._content.appendChild(document.createTextNode(e.text));
-      // Complete (non-streaming) block — close it so any following tool call
-      // or text block lands in a new div below, keeping the transcript
-      // chronological.
       pendingHtmlTarget = currentAssistant;
       currentAssistant = null;
       log.scrollTop = log.scrollHeight;
       break;
     case "assistant_text_delta":
-      ensureAssistant()._content.appendChild(document.createTextNode(e.text));
-      log.scrollTop = log.scrollHeight;
+      // Don't append raw text — the typewriter is driven by the formatted
+      // HTML companion (assistant_html_partial) that follows each delta.
+      ensureAssistant();
       break;
     case "assistant_text_end":
       pendingHtmlTarget = currentAssistant;
       currentAssistant = null;
       break;
-    case "assistant_html":
-      // Replace the live-streamed plain text with the server-rendered,
-      // Rich-styled HTML for the just-closed assistant block.
-      const target = pendingHtmlTarget || currentAssistant;
-      if (target) target._content.innerHTML = e.text;
+    case "assistant_html_partial": {
+      const bubble = ensureAssistant();
+      typewriterUpdate(bubble, e.text, /*finalize=*/false);
+      break;
+    }
+    case "assistant_html": {
+      // Final/full render. On history replay we have no streaming bubble — make
+      // one and skip the typewriter entirely (replay should appear instantly).
+      let target = pendingHtmlTarget || currentAssistant;
+      if (!target) target = appendMessage("aime", "aime", "");
+      if (liveMode) {
+        typewriterUpdate(target, e.text, /*finalize=*/true);
+      } else {
+        target._content.innerHTML = e.text;
+      }
       pendingHtmlTarget = null;
+      currentAssistant = null;
       log.scrollTop = log.scrollHeight;
+      break;
+    }
+    case "history_done":
+      liveMode = true;
       break;
     case "tool_call":
       appendNotice("· tool: " + e.tool_name +
@@ -223,6 +1366,11 @@ es.onmessage = (ev) => {
       logInner.innerHTML = "";
       currentAssistant = null;
       pendingHtmlTarget = null;
+      if (typewriter.rafId != null) cancelAnimationFrame(typewriter.rafId);
+      typewriter.bubble = null;
+      typewriter.rafId = null;
+      // The chats list may now include a new entry; refresh.
+      loadChats();
       break;
     case "session_terminated":
       appendNotice("session terminated", "error");
@@ -235,15 +1383,1016 @@ es.onmessage = (ev) => {
 
 form.addEventListener("submit", async (ev) => {
   ev.preventDefault();
-  const text = input.value;
-  if (!text.trim()) return;
+  const userText = input.value;
+  const images = pendingImages.slice();
+  const textFiles = pendingTextFiles.slice();
+  if (!userText.trim() && images.length === 0 && textFiles.length === 0) return;
+
+  // Inline attached text files ahead of the user's message so the model sees
+  // them. They're wrapped in <aime:file> sentinels that the frontend strips
+  // and replaces with a chip — both live and on /load replay. Image chips
+  // are driven by the `attachments` field on user_message_shown (controller +
+  // replay populate it from the stored image blocks).
+  const fenced = textFiles
+    .map(tf => `<aime:file name="${attrEscape(tf.name)}">\n${tf.text}\n</aime:file>`)
+    .join("\n\n");
+  const text = fenced ? (userText ? fenced + "\n\n" + userText : fenced)
+                      : userText;
+
   input.value = "";
+  if (images.length || textFiles.length) clearAttachments();
+  await sendText(text, images);
+});
+
+document.getElementById("new-chat-btn").addEventListener("click", () => {
+  sendText("/reset", []);
+});
+
+async function sendText(text, images) {
   await fetch("/send", {
     method: "POST",
     headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({text}),
+    body: JSON.stringify({text, images: images || []}),
+  });
+}
+
+// -- Drag-and-drop image attachments -----------------------------------
+
+const ALLOWED_IMG_TYPES = new Set(["image/png","image/jpeg","image/gif","image/webp"]);
+const attachmentsEl = document.getElementById("attachments");
+const pendingImages = [];  // [{media_type, data, name}]
+const pendingTextFiles = [];  // [{name, text}]
+let dragDepth = 0;
+
+function clearAttachments() {
+  pendingImages.length = 0;
+  pendingTextFiles.length = 0;
+  attachmentsEl.innerHTML = "";
+  attachmentsEl.classList.remove("has-items");
+}
+
+function makeRemoveBtn(onClick) {
+  const rm = document.createElement("button");
+  rm.className = "remove";
+  rm.type = "button";
+  rm.textContent = "×";
+  rm.addEventListener("click", onClick);
+  return rm;
+}
+
+const FILE_ICON_SVG =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+  'stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+  '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>' +
+  '<polyline points="14 2 14 8 20 8"/></svg>';
+
+function renderAttachments() {
+  attachmentsEl.innerHTML = "";
+  pendingImages.forEach((img, idx) => {
+    const wrap = document.createElement("div");
+    wrap.className = "attach";
+    const i = document.createElement("img");
+    i.src = `data:${img.media_type};base64,${img.data}`;
+    i.title = img.name || "";
+    wrap.appendChild(i);
+    wrap.appendChild(makeRemoveBtn(() => {
+      pendingImages.splice(idx, 1);
+      renderAttachments();
+    }));
+    attachmentsEl.appendChild(wrap);
+  });
+  pendingTextFiles.forEach((tf, idx) => {
+    const wrap = document.createElement("div");
+    wrap.className = "attach file";
+    wrap.title = tf.name;
+    wrap.innerHTML = FILE_ICON_SVG;
+    const name = document.createElement("div");
+    name.className = "fname";
+    name.textContent = tf.name;
+    wrap.appendChild(name);
+    wrap.appendChild(makeRemoveBtn(() => {
+      pendingTextFiles.splice(idx, 1);
+      renderAttachments();
+    }));
+    attachmentsEl.appendChild(wrap);
+  });
+  const hasAny = pendingImages.length + pendingTextFiles.length > 0;
+  attachmentsEl.classList.toggle("has-items", hasAny);
+}
+
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => {
+      // result is "data:<mime>;base64,<data>"
+      const s = r.result;
+      const comma = s.indexOf(",");
+      resolve(comma >= 0 ? s.slice(comma + 1) : "");
+    };
+    r.onerror = reject;
+    r.readAsDataURL(file);
+  });
+}
+
+const TEXT_EXT_RE = /\.(txt|md|markdown|json|ya?ml|csv|tsv|log|ini|toml|xml|html?|css|js|jsx|ts|tsx|py|sh|bash|zsh|c|h|cc|cpp|hpp|java|rs|go|rb|php|sql|conf|cfg|env|gitignore|dockerfile|makefile)$/i;
+
+function isTextFile(f) {
+  if (f.type && (f.type.startsWith("text/") || f.type === "application/json" ||
+                  f.type === "application/xml" || f.type === "application/x-yaml")) {
+    return true;
+  }
+  return TEXT_EXT_RE.test(f.name || "");
+}
+
+function fileToText(file) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(r.result || "");
+    r.onerror = reject;
+    r.readAsText(file);
+  });
+}
+
+async function addFiles(files) {
+  for (const f of files) {
+    if (ALLOWED_IMG_TYPES.has(f.type)) {
+      try {
+        const data = await fileToBase64(f);
+        pendingImages.push({media_type: f.type, data, name: f.name});
+      } catch (e) {
+        appendNotice(`failed to read "${f.name}": ${e}`, "error");
+      }
+    } else if (isTextFile(f)) {
+      try {
+        const text = await fileToText(f);
+        pendingTextFiles.push({name: f.name, text});
+      } catch (e) {
+        appendNotice(`failed to read "${f.name}": ${e}`, "error");
+      }
+    } else {
+      appendNotice(`skipped "${f.name}": ${f.type || "unknown type"} — only images and text files are supported`, "warning");
+    }
+  }
+  renderAttachments();
+}
+
+// Attach button -> open native file picker.
+const attachBtn = document.getElementById("attach-btn");
+const filePicker = document.getElementById("file-picker");
+attachBtn.addEventListener("click", () => filePicker.click());
+filePicker.addEventListener("change", () => {
+  const files = Array.from(filePicker.files || []);
+  if (files.length) addFiles(files);
+  filePicker.value = "";  // allow re-picking the same file
+});
+
+window.addEventListener("dragenter", (e) => {
+  if (!e.dataTransfer || !Array.from(e.dataTransfer.types || []).includes("Files")) return;
+  e.preventDefault();
+  dragDepth++;
+  document.body.classList.add("drag-over");
+});
+window.addEventListener("dragover", (e) => {
+  if (!e.dataTransfer || !Array.from(e.dataTransfer.types || []).includes("Files")) return;
+  e.preventDefault();
+  e.dataTransfer.dropEffect = "copy";
+});
+window.addEventListener("dragleave", (e) => {
+  dragDepth = Math.max(0, dragDepth - 1);
+  if (dragDepth === 0) document.body.classList.remove("drag-over");
+});
+window.addEventListener("drop", (e) => {
+  if (!e.dataTransfer) return;
+  e.preventDefault();
+  dragDepth = 0;
+  document.body.classList.remove("drag-over");
+  const files = Array.from(e.dataTransfer.files || []);
+  if (files.length) addFiles(files);
+});
+
+// Paste image from clipboard.
+window.addEventListener("paste", (e) => {
+  if (document.activeElement !== input) return;
+  const items = Array.from((e.clipboardData && e.clipboardData.items) || []);
+  const files = items
+    .filter(it => it.kind === "file")
+    .map(it => it.getAsFile())
+    .filter(Boolean);
+  if (files.length) {
+    e.preventDefault();
+    addFiles(files);
+  }
+});
+
+// -- Left-rail pane toggles --------------------------------------------
+
+const sideColEl = document.getElementById("side-col");
+const sideTitleEl = document.getElementById("side-title");
+const PANE_TITLES = { chats: "Conversations", calendar: "Calendar", topics: "Topics" };
+let activePaneName = null;
+
+document.querySelectorAll(".pane-btn").forEach(btn => {
+  btn.addEventListener("click", () => {
+    const target = btn.dataset.target;
+    if (activePaneName === target) closeSide();
+    else activatePane(target);
   });
 });
+
+document.getElementById("side-close").addEventListener("click", closeSide);
+
+function activatePane(name) {
+  activePaneName = name;
+  sideColEl.classList.add("open");
+  document.body.classList.add("side-open");
+  sideTitleEl.textContent = PANE_TITLES[name] || "";
+  document.querySelectorAll(".pane-btn").forEach(t =>
+    t.classList.toggle("active", t.dataset.target === name));
+  document.querySelectorAll(".pane").forEach(p =>
+    p.classList.toggle("active", p.dataset.pane === name));
+  if (name === "chats") loadChats();
+  else if (name === "calendar") renderCalendar();
+  else if (name === "topics") loadTopics();
+}
+
+function closeSide() {
+  activePaneName = null;
+  sideColEl.classList.remove("open");
+  document.body.classList.remove("side-open");
+  document.querySelectorAll(".pane-btn").forEach(t => t.classList.remove("active"));
+}
+
+// -- Chats --------------------------------------------------------------
+
+const chatsList = document.getElementById("chats-list");
+
+async function loadChats() {
+  chatsList.innerHTML = '<div class="empty">loading…</div>';
+  try {
+    const r = await fetch("/sessions");
+    const data = await r.json();
+    const sessions = data.sessions || [];
+    if (!sessions.length) {
+      chatsList.innerHTML = '<div class="empty">no saved conversations</div>';
+      return;
+    }
+    chatsList.innerHTML = "";
+    sessions.forEach(s => {
+      const item = document.createElement("div");
+      item.className = "session-item";
+      const summary = document.createElement("div");
+      summary.className = "summary";
+      summary.textContent = s.summary || "(untitled conversation)";
+      const meta = document.createElement("div");
+      meta.className = "meta";
+      meta.textContent = s.saved_at || s.id;
+      const del = document.createElement("button");
+      del.className = "del-btn";
+      del.title = "Delete conversation";
+      del.setAttribute("aria-label", "Delete conversation");
+      del.innerHTML =
+        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+        'stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+        '<path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>' +
+        '<path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>' +
+        '<line x1="10" y1="11" x2="10" y2="17"/>' +
+        '<line x1="14" y1="11" x2="14" y2="17"/></svg>';
+      del.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const label = s.summary || "this conversation";
+        confirmAction({
+          title: "Delete conversation?",
+          message: `"${label}" will be permanently removed.`,
+          confirmLabel: "Delete",
+          onConfirm: () => deleteSession(s.id),
+        });
+      });
+      item.appendChild(summary);
+      item.appendChild(meta);
+      item.appendChild(del);
+      item.addEventListener("click", () => sendText("/load " + s.id));
+      chatsList.appendChild(item);
+    });
+  } catch (e) {
+    chatsList.innerHTML = '<div class="empty">error: ' + e + '</div>';
+  }
+}
+
+document.querySelector('[data-action="refresh-chats"]').addEventListener("click", loadChats);
+
+// -- Calendar -----------------------------------------------------------
+
+const MONTH_NAMES = ["January","February","March","April","May","June",
+                     "July","August","September","October","November","December"];
+const now = new Date();
+let calYear = now.getFullYear();
+let calMonth = now.getMonth() + 1;  // 1-indexed
+let calSelectedDay = null;
+
+document.querySelector('[data-action="cal-prev"]').addEventListener("click", () => {
+  calMonth -= 1;
+  if (calMonth < 1) { calMonth = 12; calYear -= 1; }
+  calSelectedDay = null;
+  renderCalendar();
+});
+document.querySelector('[data-action="cal-next"]').addEventListener("click", () => {
+  calMonth += 1;
+  if (calMonth > 12) { calMonth = 1; calYear += 1; }
+  calSelectedDay = null;
+  renderCalendar();
+});
+document.querySelector('[data-action="cal-refresh"]').addEventListener("click", renderCalendar);
+
+async function renderCalendar() {
+  document.getElementById("cal-title").textContent =
+    MONTH_NAMES[calMonth - 1] + " " + calYear;
+  const grid = document.getElementById("cal-grid");
+  grid.innerHTML = "";
+
+  ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"].forEach(d => {
+    const el = document.createElement("div");
+    el.className = "dow";
+    el.textContent = d;
+    grid.appendChild(el);
+  });
+
+  let events = [];
+  try {
+    const r = await fetch(`/calendar/${calYear}/${calMonth}`);
+    const data = await r.json();
+    events = data.events || [];
+  } catch (e) { /* show empty grid */ }
+
+  // Bucket events by day-of-month.
+  const byDay = {};
+  events.forEach(ev => {
+    const d = (ev.date || "").split("/")[0];
+    const n = parseInt(d, 10);
+    if (!Number.isNaN(n)) (byDay[n] = byDay[n] || []).push(ev);
+  });
+
+  // First weekday of month (0=Sun … 6=Sat) — JS getDay() matches our header.
+  const firstDow = new Date(calYear, calMonth - 1, 1).getDay();
+  const daysInMonth = new Date(calYear, calMonth, 0).getDate();
+
+  // Leading blanks
+  for (let i = 0; i < firstDow; i++) {
+    const c = document.createElement("div");
+    c.className = "cal-cell empty";
+    grid.appendChild(c);
+  }
+
+  const isCurrentMonth = (calYear === now.getFullYear() && calMonth === now.getMonth() + 1);
+  for (let d = 1; d <= daysInMonth; d++) {
+    const cell = document.createElement("div");
+    cell.className = "cal-cell";
+    if (isCurrentMonth && d === now.getDate()) cell.classList.add("today");
+    if (calSelectedDay === d) cell.classList.add("selected");
+    const num = document.createElement("div");
+    num.className = "daynum";
+    num.textContent = d;
+    cell.appendChild(num);
+    (byDay[d] || []).slice(0, 3).forEach(ev => {
+      const e = document.createElement("div");
+      e.className = "ev";
+      e.textContent = "• " + (ev.title || ev.name || "(untitled)");
+      cell.appendChild(e);
+    });
+    cell.addEventListener("click", () => selectDay(d));
+    grid.appendChild(cell);
+  }
+
+  if (calSelectedDay !== null) loadDayEvents(calSelectedDay);
+  else document.getElementById("day-detail").innerHTML =
+    '<div class="empty">select a day</div>';
+}
+
+function selectDay(d) {
+  calSelectedDay = d;
+  document.querySelectorAll(".cal-cell").forEach(c => c.classList.remove("selected"));
+  // Find this cell — daynum order in grid corresponds to day index.
+  const cells = document.querySelectorAll("#cal-grid .cal-cell:not(.empty)");
+  if (cells[d - 1]) cells[d - 1].classList.add("selected");
+  loadDayEvents(d);
+}
+
+async function loadDayEvents(d) {
+  const detail = document.getElementById("day-detail");
+  detail.innerHTML = '<div class="empty">loading…</div>';
+  try {
+    const r = await fetch(`/calendar/${calYear}/${calMonth}/${d}`);
+    const data = await r.json();
+    const events = data.events || [];
+    if (!events.length) {
+      detail.innerHTML = `<div class="empty">no events on ${String(d).padStart(2,"0")}/${String(calMonth).padStart(2,"0")}/${calYear}</div>`;
+      return;
+    }
+    detail.innerHTML = `<h4>${String(d).padStart(2,"0")}/${String(calMonth).padStart(2,"0")}/${calYear}</h4>`;
+    events.forEach(ev => {
+      const item = document.createElement("div");
+      item.className = "ev-item";
+      const head = document.createElement("div");
+      head.className = "ev-head";
+      let h = ev.date || "";
+      if (ev.time) h += " " + ev.time;
+      if (ev.category) h += "  #" + ev.category;
+      head.textContent = h;
+      const title = document.createElement("div");
+      title.className = "ev-title";
+      title.textContent = ev.title || ev.name || "(untitled)";
+      item.appendChild(head);
+      item.appendChild(title);
+      if (ev.summary) {
+        const s = document.createElement("div");
+        s.className = "ev-summary";
+        s.textContent = ev.summary;
+        item.appendChild(s);
+      }
+      detail.appendChild(item);
+    });
+  } catch (e) {
+    detail.innerHTML = '<div class="empty">error: ' + e + '</div>';
+  }
+}
+
+// -- Topics -------------------------------------------------------------
+
+const topicListEl = document.getElementById("topic-list");
+const topicContentEl = document.getElementById("topic-content");
+const topicBodyEl = document.getElementById("topic-body");
+const topicToolbarEl = document.getElementById("topic-toolbar");
+const topicEditBtn = document.getElementById("topic-edit-btn");
+const topicBoldBtn = document.getElementById("topic-bold-btn");
+const topicItalicBtn = document.getElementById("topic-italic-btn");
+const topicSaveBtn = document.getElementById("topic-save-btn");
+const topicCancelBtn = document.getElementById("topic-cancel-btn");
+const topicSearchEl = document.getElementById("topic-search");
+const topicCountEl = document.getElementById("topic-count");
+let selectedTopicId = null;
+let allTopics = [];
+
+async function loadTopics() {
+  topicListEl.innerHTML = '<div class="empty">loading…</div>';
+  try {
+    const r = await fetch("/topics");
+    const data = await r.json();
+    allTopics = data.topics || [];
+    if (!allTopics.length) {
+      topicListEl.innerHTML = '<div class="empty">no topics</div>';
+      topicToolbarEl.classList.remove("show");
+      topicBodyEl.innerHTML = '<div class="empty">select a topic</div>';
+      topicCountEl.textContent = "";
+      return;
+    }
+    renderTopicList();
+  } catch (e) {
+    topicListEl.innerHTML = '<div class="empty">error: ' + e + '</div>';
+    topicCountEl.textContent = "";
+  }
+}
+
+function renderTopicList() {
+  const q = (topicSearchEl.value || "").trim().toLowerCase();
+  const filtered = q
+    ? allTopics.filter(t => {
+        const title = (t.title || t.name || "").toLowerCase();
+        const summary = (t.summary || t.description || "").toLowerCase();
+        const category = (t.category || "").toLowerCase();
+        return title.includes(q) || summary.includes(q) || category.includes(q);
+      })
+    : allTopics;
+
+  topicCountEl.textContent = q
+    ? `${filtered.length}/${allTopics.length}`
+    : `${allTopics.length}`;
+
+  if (!filtered.length) {
+    topicListEl.innerHTML = '<div class="empty">no matches</div>';
+    return;
+  }
+  topicListEl.innerHTML = "";
+  filtered.forEach(t => {
+    const item = document.createElement("div");
+    item.className = "topic-item";
+    const tid = t.id || t.topic_id || t.name || t.title;
+    if (tid === selectedTopicId) item.classList.add("active");
+    const title = document.createElement("div");
+    title.textContent = t.title || t.name || "(untitled)";
+    item.appendChild(title);
+    if (t.category) {
+      const c = document.createElement("div");
+      c.className = "cat";
+      c.textContent = "#" + t.category;
+      item.appendChild(c);
+    }
+    item.addEventListener("click", () => selectTopic(tid, item));
+    topicListEl.appendChild(item);
+  });
+}
+
+topicSearchEl.addEventListener("input", renderTopicList);
+topicSearchEl.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") {
+    topicSearchEl.value = "";
+    renderTopicList();
+  }
+});
+
+let currentTopicMarkdown = "";
+let topicEditing = false;
+
+function setTopicEditMode(on) {
+  topicEditing = !!on;
+  topicEditBtn.hidden = topicEditing;
+  topicBoldBtn.hidden = !topicEditing;
+  topicItalicBtn.hidden = !topicEditing;
+  topicSaveBtn.hidden = !topicEditing;
+  topicCancelBtn.hidden = !topicEditing;
+}
+
+async function selectTopic(tid, item) {
+  selectedTopicId = tid;
+  document.querySelectorAll(".topic-item").forEach(t => t.classList.remove("active"));
+  if (item) item.classList.add("active");
+  // Reset any in-progress edit when switching topics.
+  setTopicEditMode(false);
+  topicToolbarEl.classList.remove("show");
+  topicBodyEl.innerHTML = '<div class="empty">loading…</div>';
+  try {
+    const r = await fetch("/topics/" + encodeURIComponent(tid));
+    const data = await r.json();
+    const md = data.contents || "";
+    currentTopicMarkdown = md;
+    topicToolbarEl.classList.add("show");
+    if (!md.trim()) {
+      topicBodyEl.innerHTML = '<div class="empty">(empty)</div>';
+      return;
+    }
+    renderTopicMarkdown(md);
+  } catch (e) {
+    topicBodyEl.innerHTML = '<div class="empty">error: ' + e + '</div>';
+  }
+}
+
+function renderTopicMarkdown(md) {
+  if (window.marked) {
+    // Sanitize parsed markdown — topics are authored by the agent and the
+    // user, both of which could (deliberately or via prompt injection) inject
+    // <script> or onerror= handlers. DOMPurify keeps the safe subset and
+    // strips anything that can execute JS.
+    const rawHtml = window.marked.parse(md);
+    topicBodyEl.innerHTML = window.DOMPurify
+      ? window.DOMPurify.sanitize(rawHtml, {ADD_ATTR: ["checked", "disabled"]})
+      : rawHtml;
+  } else {
+    const pre = document.createElement("pre");
+    pre.textContent = md;
+    topicBodyEl.innerHTML = "";
+    topicBodyEl.appendChild(pre);
+  }
+  // Marked renders task-list items with a disabled checkbox by default.
+  // Enable them and index each so we know which markdown marker to flip.
+  const boxes = topicBodyEl.querySelectorAll('input[type="checkbox"]');
+  boxes.forEach((box, idx) => {
+    box.disabled = false;
+    box.dataset.taskIndex = String(idx);
+    box.addEventListener("change", onTopicCheckboxToggle);
+  });
+}
+
+function enterTopicEditMode() {
+  if (!selectedTopicId) return;
+  setTopicEditMode(true);
+  topicBodyEl.innerHTML = "";
+  const ta = document.createElement("textarea");
+  ta.id = "topic-editor";
+  ta.value = currentTopicMarkdown;
+  ta.spellcheck = true;
+  ta.addEventListener("keydown", (e) => {
+    if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey) {
+      const k = e.key.toLowerCase();
+      if (k === "b") { e.preventDefault(); wrapEditorSelection(ta, "**"); }
+      else if (k === "i") { e.preventDefault(); wrapEditorSelection(ta, "*"); }
+      else if (k === "s") { e.preventDefault(); saveTopicEdits(); }
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      cancelTopicEdits();
+    }
+  });
+  topicBodyEl.appendChild(ta);
+  ta.focus();
+  // Place caret at end so the user can start typing immediately.
+  ta.setSelectionRange(ta.value.length, ta.value.length);
+}
+
+function wrapEditorSelection(ta, marker) {
+  const start = ta.selectionStart;
+  const end = ta.selectionEnd;
+  const before = ta.value.slice(0, start);
+  const sel = ta.value.slice(start, end);
+  const after = ta.value.slice(end);
+  const placeholder = marker === "**" ? "bold text" : "italic text";
+  const content = sel || placeholder;
+  ta.value = before + marker + content + marker + after;
+  // Select the wrapped text so the user can keep typing to replace.
+  const innerStart = start + marker.length;
+  const innerEnd = innerStart + content.length;
+  ta.focus();
+  ta.setSelectionRange(innerStart, innerEnd);
+}
+
+async function saveTopicEdits() {
+  const ta = document.getElementById("topic-editor");
+  if (!ta || !selectedTopicId) return;
+  const newMd = ta.value;
+  topicSaveBtn.disabled = true;
+  topicSaveBtn.textContent = "Saving…";
+  try {
+    const res = await fetch("/topics/" + encodeURIComponent(selectedTopicId), {
+      method: "PUT",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({contents: newMd}),
+    });
+    const data = await res.json().catch(() => ({ok: false}));
+    if (!data.ok) {
+      appendNotice("failed to save topic: " + (data.error || "unknown"), "error");
+      return;
+    }
+    currentTopicMarkdown = newMd;
+    setTopicEditMode(false);
+    if (newMd.trim()) renderTopicMarkdown(newMd);
+    else topicBodyEl.innerHTML = '<div class="empty">(empty)</div>';
+  } catch (err) {
+    appendNotice("failed to save topic: " + err.message, "error");
+  } finally {
+    topicSaveBtn.disabled = false;
+    topicSaveBtn.textContent = "Save";
+  }
+}
+
+function cancelTopicEdits() {
+  setTopicEditMode(false);
+  if (currentTopicMarkdown.trim()) renderTopicMarkdown(currentTopicMarkdown);
+  else topicBodyEl.innerHTML = '<div class="empty">(empty)</div>';
+}
+
+topicEditBtn.addEventListener("click", enterTopicEditMode);
+topicSaveBtn.addEventListener("click", saveTopicEdits);
+topicCancelBtn.addEventListener("click", cancelTopicEdits);
+topicBoldBtn.addEventListener("click", () => {
+  const ta = document.getElementById("topic-editor");
+  if (ta) wrapEditorSelection(ta, "**");
+});
+topicItalicBtn.addEventListener("click", () => {
+  const ta = document.getElementById("topic-editor");
+  if (ta) wrapEditorSelection(ta, "*");
+});
+
+// Regex matches a markdown task-list marker at the start of a list item:
+//   "- [ ]", "* [x]", "+ [X]", with optional leading indent and ordered-list
+// variants like "1. [ ]". Group 1 is the leading prefix (list bullet + space),
+// group 2 is the state char inside the brackets.
+const TASK_RE = /(^|\n)([ \t]*(?:[-*+]|\d+\.)\s+)\[( |x|X)\]/g;
+
+function flipNthTask(md, n, checked) {
+  let i = 0;
+  return md.replace(TASK_RE, (whole, lead, bullet, state) => {
+    if (i++ !== n) return whole;
+    const newState = checked ? "x" : " ";
+    return lead + bullet + "[" + newState + "]";
+  });
+}
+
+let saveInFlight = Promise.resolve();
+async function onTopicCheckboxToggle(e) {
+  const box = e.currentTarget;
+  const idx = parseInt(box.dataset.taskIndex, 10);
+  if (isNaN(idx) || !selectedTopicId) return;
+  const updated = flipNthTask(currentTopicMarkdown, idx, box.checked);
+  if (updated === currentTopicMarkdown) return;
+  currentTopicMarkdown = updated;
+  // Serialize saves so rapid toggles can't reorder on the server.
+  saveInFlight = saveInFlight.then(async () => {
+    try {
+      const res = await fetch("/topics/" + encodeURIComponent(selectedTopicId), {
+        method: "PUT",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({contents: currentTopicMarkdown}),
+      });
+      const data = await res.json().catch(() => ({ok: false}));
+      if (!data.ok) {
+        appendNotice("failed to save topic: " + (data.error || "unknown"), "error");
+      }
+    } catch (err) {
+      appendNotice("failed to save topic: " + err.message, "error");
+    }
+  });
+}
+
+document.querySelector('[data-action="refresh-topics"]').addEventListener("click", loadTopics);
+
+// -- Resizable side panel ----------------------------------------------
+
+const sideCol = document.getElementById("side-col");
+const divider = document.getElementById("divider");
+const SIDE_WIDTH_KEY = "aime.sideWidth";
+const MIN_SIDE = 240;
+const MIN_CHAT = 240;
+
+const savedWidth = parseInt(localStorage.getItem(SIDE_WIDTH_KEY), 10);
+if (!Number.isNaN(savedWidth) && savedWidth >= MIN_SIDE) {
+  sideCol.style.width = savedWidth + "px";
+}
+
+divider.addEventListener("mousedown", (e) => {
+  e.preventDefault();
+  divider.classList.add("dragging");
+  document.body.classList.add("col-resizing");
+
+  const onMove = (ev) => {
+    const winW = window.innerWidth;
+    const sideLeft = sideCol.getBoundingClientRect().left;
+    let newWidth = ev.clientX - sideLeft;
+    const maxSide = winW - sideLeft - MIN_CHAT;
+    if (newWidth < MIN_SIDE) newWidth = MIN_SIDE;
+    if (newWidth > maxSide) newWidth = maxSide;
+    sideCol.style.width = newWidth + "px";
+    // Calendar grid sizes off container width; redraw is cheap.
+    if (document.querySelector('.pane[data-pane="calendar"]').classList.contains("active")) {
+      // nothing to do — CSS grid handles it
+    }
+  };
+
+  const onUp = () => {
+    divider.classList.remove("dragging");
+    document.body.classList.remove("col-resizing");
+    document.removeEventListener("mousemove", onMove);
+    document.removeEventListener("mouseup", onUp);
+    localStorage.setItem(SIDE_WIDTH_KEY, parseInt(sideCol.style.width, 10));
+  };
+
+  document.addEventListener("mousemove", onMove);
+  document.addEventListener("mouseup", onUp);
+});
+
+// -- Resizable topic list ----------------------------------------------
+
+const topicDivider = document.getElementById("topic-divider");
+const TOPIC_WIDTH_KEY = "aime.topicListWidth";
+const MIN_TOPIC_LIST = 100;
+const MIN_TOPIC_CONTENT = 200;
+
+const savedTopicWidth = parseInt(localStorage.getItem(TOPIC_WIDTH_KEY), 10);
+if (!Number.isNaN(savedTopicWidth) && savedTopicWidth >= MIN_TOPIC_LIST) {
+  topicListEl.style.width = savedTopicWidth + "px";
+}
+
+topicDivider.addEventListener("mousedown", (e) => {
+  e.preventDefault();
+  topicDivider.classList.add("dragging");
+  document.body.classList.add("col-resizing");
+
+  const onMove = (ev) => {
+    const rect = topicListEl.getBoundingClientRect();
+    const bodyRect = topicListEl.parentElement.getBoundingClientRect();
+    let newWidth = ev.clientX - rect.left;
+    const maxList = bodyRect.width - MIN_TOPIC_CONTENT - 6;
+    if (newWidth < MIN_TOPIC_LIST) newWidth = MIN_TOPIC_LIST;
+    if (newWidth > maxList) newWidth = maxList;
+    topicListEl.style.width = newWidth + "px";
+  };
+
+  const onUp = () => {
+    topicDivider.classList.remove("dragging");
+    document.body.classList.remove("col-resizing");
+    document.removeEventListener("mousemove", onMove);
+    document.removeEventListener("mouseup", onUp);
+    localStorage.setItem(TOPIC_WIDTH_KEY, parseInt(topicListEl.style.width, 10));
+  };
+
+  document.addEventListener("mousemove", onMove);
+  document.addEventListener("mouseup", onUp);
+});
+
+// -- App menu (left rail) ----------------------------------------------
+
+const menuBtn = document.getElementById("menu-btn");
+const appMenu = document.getElementById("app-menu");
+
+function closeAppMenu() {
+  appMenu.classList.remove("open");
+  menuBtn.classList.remove("active");
+  menuBtn.setAttribute("aria-expanded", "false");
+}
+function openAppMenu() {
+  const rect = menuBtn.getBoundingClientRect();
+  appMenu.style.top = rect.top + "px";
+  appMenu.classList.add("open");
+  menuBtn.classList.add("active");
+  menuBtn.setAttribute("aria-expanded", "true");
+}
+menuBtn.addEventListener("click", (e) => {
+  e.stopPropagation();
+  if (appMenu.classList.contains("open")) closeAppMenu();
+  else openAppMenu();
+});
+document.addEventListener("click", (e) => {
+  if (!appMenu.contains(e.target) && e.target !== menuBtn) closeAppMenu();
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") closeAppMenu();
+});
+async function logout() {
+  try {
+    await fetch("/logout", {method: "POST", credentials: "same-origin"});
+  } catch {}
+  window.location = "/login";
+}
+
+appMenu.querySelectorAll("button").forEach(b => {
+  b.addEventListener("click", () => {
+    const action = b.dataset.menu;
+    closeAppMenu();
+    if (action === "settings") openSettings();
+    else if (action === "logout") logout();
+  });
+});
+
+// -- Theme picker -------------------------------------------------------
+
+const THEME_KEY = "aime.theme";
+const DEFAULT_THEME = "cocoa";
+const themeSelect = document.getElementById("theme-select");
+
+function applyTheme(name) {
+  document.documentElement.setAttribute("data-theme", name);
+}
+
+const savedTheme = localStorage.getItem(THEME_KEY) || DEFAULT_THEME;
+applyTheme(savedTheme);
+themeSelect.value = savedTheme;
+
+themeSelect.addEventListener("change", () => {
+  applyTheme(themeSelect.value);
+  localStorage.setItem(THEME_KEY, themeSelect.value);
+});
+
+// -- Settings modal -----------------------------------------------------
+
+const settingsBackdrop = document.getElementById("settings-backdrop");
+const settingsCloseBtn = document.getElementById("settings-close");
+
+function openSettings() {
+  settingsBackdrop.classList.add("open");
+  refreshSTTModels();
+}
+
+// Settings tabs (User / Developer).
+document.querySelectorAll(".settings-tab-btn").forEach(btn => {
+  btn.addEventListener("click", () => {
+    const target = btn.dataset.tab;
+    document.querySelectorAll(".settings-tab-btn").forEach(b => {
+      const on = b.dataset.tab === target;
+      b.classList.toggle("active", on);
+      b.setAttribute("aria-selected", on ? "true" : "false");
+    });
+    document.querySelectorAll(".settings-tab").forEach(panel => {
+      panel.classList.toggle("active", panel.dataset.tab === target);
+    });
+  });
+});
+
+// -- Speech-to-text model picker ---------------------------------------
+const sttModelSelect = document.getElementById("stt-model-select");
+const sttModelHint = document.getElementById("stt-model-hint");
+
+async function refreshSTTModels() {
+  try {
+    const res = await fetch("/stt/models");
+    const data = await res.json();
+    const models = data.models || [];
+    sttModelSelect.innerHTML = "";
+    if (!models.length) {
+      const opt = document.createElement("option");
+      opt.value = ""; opt.textContent = "(no models installed)";
+      sttModelSelect.appendChild(opt);
+      sttModelSelect.disabled = true;
+      sttModelHint.textContent = "No Whisper models available. Reinstall faster-whisper or rerun scripts/install.sh.";
+      return;
+    }
+    sttModelSelect.disabled = !!data.env_override;
+    for (const name of models) {
+      const opt = document.createElement("option");
+      opt.value = name;
+      opt.textContent = name;
+      sttModelSelect.appendChild(opt);
+    }
+    if (data.selected && models.includes(data.selected)) {
+      sttModelSelect.value = data.selected;
+    }
+    sttModelHint.textContent = data.env_override
+      ? `Overridden by WHISPER_MODEL=${data.env_override}`
+      : "";
+  } catch (err) {
+    sttModelHint.textContent = "Failed to load models: " + err.message;
+  }
+}
+
+sttModelSelect.addEventListener("change", async () => {
+  const name = sttModelSelect.value;
+  if (!name) return;
+  try {
+    const res = await fetch("/stt/models", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({name}),
+    });
+    const data = await res.json();
+    if (!data.ok) {
+      sttModelHint.textContent = "Failed: " + (data.error || "unknown");
+    } else {
+      sttModelHint.textContent = "Saved.";
+      setTimeout(() => { sttModelHint.textContent = ""; }, 1500);
+    }
+  } catch (err) {
+    sttModelHint.textContent = "Failed: " + err.message;
+  }
+});
+function closeSettings() {
+  settingsBackdrop.classList.remove("open");
+}
+settingsCloseBtn.addEventListener("click", closeSettings);
+settingsBackdrop.addEventListener("click", (e) => {
+  if (e.target === settingsBackdrop) closeSettings();
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && settingsBackdrop.classList.contains("open")) closeSettings();
+});
+
+// -- Confirm dialog -----------------------------------------------------
+
+const confirmBackdrop = document.getElementById("confirm-backdrop");
+const confirmTitleEl = document.getElementById("confirm-title");
+const confirmMessageEl = document.getElementById("confirm-message");
+const confirmOkBtn = document.getElementById("confirm-ok");
+const confirmCancelBtn = document.getElementById("confirm-cancel");
+let confirmCallback = null;
+
+function confirmAction({title, message, confirmLabel, onConfirm}) {
+  confirmTitleEl.textContent = title || "Are you sure?";
+  confirmMessageEl.textContent = message || "This action cannot be undone.";
+  confirmOkBtn.textContent = confirmLabel || "Confirm";
+  confirmCallback = onConfirm || null;
+  confirmBackdrop.classList.add("open");
+}
+function closeConfirm() {
+  confirmBackdrop.classList.remove("open");
+  confirmCallback = null;
+}
+confirmCancelBtn.addEventListener("click", closeConfirm);
+confirmOkBtn.addEventListener("click", () => {
+  const cb = confirmCallback;
+  closeConfirm();
+  if (cb) cb();
+});
+confirmBackdrop.addEventListener("click", (e) => {
+  if (e.target === confirmBackdrop) closeConfirm();
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && confirmBackdrop.classList.contains("open")) closeConfirm();
+});
+
+// -- Delete sessions ----------------------------------------------------
+
+async function deleteSession(id) {
+  try {
+    await fetch("/sessions/" + encodeURIComponent(id), {method: "DELETE"});
+    loadChats();
+  } catch (e) {
+    appendNotice("failed to delete conversation: " + e, "error");
+  }
+}
+
+async function deleteAllSessions() {
+  try {
+    await fetch("/sessions", {method: "DELETE"});
+    loadChats();
+  } catch (e) {
+    appendNotice("failed to delete conversations: " + e, "error");
+  }
+}
+
+document.getElementById("delete-all-btn").addEventListener("click", () => {
+  confirmAction({
+    title: "Delete all conversations?",
+    message: "Every saved chat will be permanently removed. This cannot be undone.",
+    confirmLabel: "Delete all",
+    onConfirm: deleteAllSessions,
+  });
+});
+
+// Side panel starts closed; chats reload happens when the user opens it (or
+// after a session_restart that calls loadChats explicitly).
 </script>
 </body>
 </html>
