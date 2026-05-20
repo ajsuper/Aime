@@ -49,9 +49,10 @@ import usage_report as _report  # noqa: E402
 
 app = Flask(__name__)
 
-# Loopback only — see module docstring. The port is overridable but the host
-# is not, on purpose.
-_HOST = "127.0.0.1"
+# Loopback only by default — see module docstring. AIME_USAGE_DASHBOARD_HOST
+# overrides the bind host (e.g. 0.0.0.0 inside a container, where the port is
+# only reachable via an explicit Docker mapping). Leave it unset otherwise.
+_HOST = os.environ.get("AIME_USAGE_DASHBOARD_HOST", "127.0.0.1")
 _PORT = int(os.environ.get("AIME_USAGE_DASHBOARD_PORT", "5050"))
 
 # Allowed auto-refresh intervals, in seconds. 0 = off. Anything else is

@@ -73,3 +73,33 @@ cd /path/to/aime/
 ```
 
 ---
+
+# Run with Docker (optional)
+
+The native install above is the primary, fully-supported path. Docker is an
+optional alternative for running the **web app** without installing g++, uv,
+or sqlite on your host — everything builds inside the image.
+
+**Requires:** Docker with the Compose plugin.
+
+```bash
+cd /path/to/aime/
+cp .env.example .env       # then edit .env and set ANTHROPIC_API_KEY
+docker compose up -d --build
+```
+
+Then open <https://localhost:5000>. HTTPS uses a self-signed certificate, so
+your browser will show a one-time warning — that is expected, and HTTPS is
+required for the microphone (voice input) to work.
+
+* All settings (`AIME_HTTPS`, `AIME_ALLOW_SIGNUP`, `AIME_USAGE_STATS`, ...)
+  are configured in `.env` instead of the interactive prompts.
+* User data, conversations, encryption keys, and the TLS cert persist in the
+  `aime-data` volume. Whisper STT models persist in `aime-models` (the image
+  ships with tiny/base/small pre-downloaded).
+* Logs: `docker compose logs -f`  •  Stop: `docker compose down`
+* Set `AIME_USAGE_DASHBOARD=1` in `.env` to also run the usage dashboard at
+  <http://localhost:5050> (HTTP, host-loopback only). Pairs with
+  `AIME_USAGE_STATS=1`.
+
+---

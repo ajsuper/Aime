@@ -1,0 +1,15 @@
+# Build context excludes — keep the image small and builds reproducible.
+.git
+.gitignore
+.venv
+build
+models
+docs
+**/__pycache__
+**/*.pyc
+**/*.pyo
+*.log
+*.tmp
+*.bak
+*.swp
+.env

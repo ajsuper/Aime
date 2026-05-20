@@ -1,0 +1,42 @@
+# Optional containerized run path for Aime. See the "Run with Docker" section
+# of the README. The native install (scripts/install.sh + systemd/launchd)
+# remains the primary, fully-supported path and is unaffected by this file.
+#
+#   1. cp .env.example .env   and fill in ANTHROPIC_API_KEY
+#   2. docker compose up -d
+#   3. open https://localhost:5000   (self-signed cert — expect a warning)
+
+services:
+  aime:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: aime
+    ports:
+      - "5000:5000"
+      # Usage dashboard. Only reachable when AIME_USAGE_DASHBOARD=1; it can
+      # expose usernames, so keep this bound to localhost on the host side.
+      - "127.0.0.1:5050:5050"
+    env_file:
+      - .env
+    environment:
+      # Defaults shown; override in .env. AIME_BIND stays 0.0.0.0 so the
+      # mapped port is reachable from the host.
+      AIME_HTTPS: "${AIME_HTTPS:-1}"
+      AIME_BIND: "0.0.0.0"
+      AIME_ALLOW_SIGNUP: "${AIME_ALLOW_SIGNUP:-0}"
+      AIME_USAGE_STATS: "${AIME_USAGE_STATS:-0}"
+      AIME_USAGE_LINK_USERS: "${AIME_USAGE_LINK_USERS:-0}"
+      AIME_USAGE_DASHBOARD: "${AIME_USAGE_DASHBOARD:-0}"
+    volumes:
+      # All persistent state: user databases, conversations, encryption keys,
+      # auth, and the self-signed TLS cert. Losing this loses everything.
+      - aime-data:/data
+      # Whisper models. Pre-seeded with tiny/base/small from the image; named
+      # volume so heavier models downloaded on first use also persist.
+      - aime-models:/app/models
+    restart: unless-stopped
+
+volumes:
+  aime-data:
+  aime-models:
