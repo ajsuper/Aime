@@ -64,6 +64,44 @@ if [ -z "$EXISTING_KEY" ]; then
 fi
 unset EXISTING_KEY
 
+# Web server configuration. Prompt the user for each value; pressing Enter
+# accepts the default shown in the prompt.
+printf 'Serve over HTTPS? Enter AIME_HTTPS value (0 = plain HTTP, 1 = HTTPS; enter to use default of 1): '
+read -r AIME_HTTPS
+AIME_HTTPS="${AIME_HTTPS:-1}"
+
+printf 'Enter AIME_BIND value (enter to use default of 127.0.0.1): '
+read -r AIME_BIND
+AIME_BIND="${AIME_BIND:-127.0.0.1}"
+
+echo "Using AIME_HTTPS=$AIME_HTTPS, AIME_BIND=$AIME_BIND"
+
+# Account creation gate. Default 0 (disabled): the admin creates accounts, then
+# runs the server closed so nobody else can register. Set to 1 to allow public
+# signup.
+printf 'Allow new account creation? Enter AIME_ALLOW_SIGNUP value (0 = no, 1 = yes; enter to use default of 0): '
+read -r AIME_ALLOW_SIGNUP
+AIME_ALLOW_SIGNUP="${AIME_ALLOW_SIGNUP:-0}"
+
+echo "Using AIME_ALLOW_SIGNUP=$AIME_ALLOW_SIGNUP"
+
+# Usage statistics. Default 0 (disabled): nothing is collected. When enabled,
+# per-call API token usage and local speech-to-text compute are appended to
+# <database>/usage/usage.jsonl. A second toggle decides whether each record is
+# tagged with the username (1) or kept anonymous (0).
+printf 'Collect usage statistics? Enter AIME_USAGE_STATS value (0 = no, 1 = yes; enter to use default of 0): '
+read -r AIME_USAGE_STATS
+AIME_USAGE_STATS="${AIME_USAGE_STATS:-0}"
+
+AIME_USAGE_LINK_USERS=0
+if [ "$AIME_USAGE_STATS" = "1" ]; then
+    printf 'Link usage statistics to usernames? Enter AIME_USAGE_LINK_USERS value (0 = anonymous, 1 = tag with username; enter to use default of 0): '
+    read -r AIME_USAGE_LINK_USERS
+    AIME_USAGE_LINK_USERS="${AIME_USAGE_LINK_USERS:-0}"
+fi
+
+echo "Using AIME_USAGE_STATS=$AIME_USAGE_STATS, AIME_USAGE_LINK_USERS=$AIME_USAGE_LINK_USERS"
+
 OS="$(uname -s)"
 
 case "$OS" in
@@ -78,6 +116,11 @@ After=network.target aime-serve.service
 [Service]
 WorkingDirectory=$SRC_DIR
 EnvironmentFile=$ENV_FILE
+Environment=AIME_HTTPS=$AIME_HTTPS
+Environment=AIME_BIND=$AIME_BIND
+Environment=AIME_ALLOW_SIGNUP=$AIME_ALLOW_SIGNUP
+Environment=AIME_USAGE_STATS=$AIME_USAGE_STATS
+Environment=AIME_USAGE_LINK_USERS=$AIME_USAGE_LINK_USERS
 ExecStart=$PYTHON_BIN -m frontends.web_app
 Restart=always
 RestartSec=3
@@ -134,6 +177,16 @@ EOF
         <string>$(dirname "$PYTHON_BIN"):/usr/local/bin:/usr/bin:/bin</string>
         <key>ANTHROPIC_API_KEY</key>
         <string>$ANTHROPIC_API_KEY</string>
+        <key>AIME_HTTPS</key>
+        <string>$AIME_HTTPS</string>
+        <key>AIME_BIND</key>
+        <string>$AIME_BIND</string>
+        <key>AIME_ALLOW_SIGNUP</key>
+        <string>$AIME_ALLOW_SIGNUP</string>
+        <key>AIME_USAGE_STATS</key>
+        <string>$AIME_USAGE_STATS</string>
+        <key>AIME_USAGE_LINK_USERS</key>
+        <string>$AIME_USAGE_LINK_USERS</string>
     </dict>
 </dict>
 </plist>

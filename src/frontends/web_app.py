@@ -24,7 +24,9 @@ from flask import (
     Flask, Response, request, jsonify, session, redirect, g, url_for
 )
 from rich.console import Console
-from rich.text import Text
+from rich.markup import Tag, _parse
+from rich.style import Style
+from rich.text import Span, Text
 
 # Allow `python -m frontends.web_app` from src/ to find provider_backend / aime.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -178,6 +180,71 @@ _HR_LINE_RE = re.compile(r"(?m)^[ \t]*---[ \t]*$")
 _HR_SENTINEL = "❦AIMEHR❦"
 
 
+def _safe_markup_text(markup: str) -> Text:
+    """Forgiving version of `Text.from_markup` — render the markup the model
+    *got right* even when part of it is malformed.
+
+    `Text.from_markup` is all-or-nothing: a single stray closing tag, a
+    mismatched close, or an unknown style name raises and the whole message
+    drops to plain text. That is jarring mid-conversation — the formatting was
+    visibly fine while streaming, then a small slip at the end wipes it out.
+
+    Streaming already looks correct because a half-typed message only has
+    *unclosed* tags, which Rich tolerates (it closes them implicitly at the
+    end). This applies the same forgiveness to every render: stray/unmatched
+    closing tags are dropped, unknown style names are shown literally as their
+    `[tag]` text, and anything still open at the end is closed implicitly.
+    """
+    text = Text()
+    normalize = Style.normalize
+    # Stack of (text_offset, span_style_string, normalized_tag_name).
+    style_stack: list[tuple[int, str, str]] = []
+
+    for _position, plain_text, tag in _parse(markup):
+        if plain_text is not None:
+            # `\[` is an escaped open brace, not the start of a tag.
+            text.append(plain_text.replace("\\[", "["))
+            continue
+        if tag is None:
+            continue
+
+        if tag.name.startswith("/"):  # closing tag
+            close_name = normalize(tag.name[1:].strip())
+            idx: int | None = None
+            if close_name:
+                for i in range(len(style_stack) - 1, -1, -1):
+                    if style_stack[i][2] == close_name:
+                        idx = i
+                        break
+            elif style_stack:  # implicit `[/]`
+                idx = len(style_stack) - 1
+            if idx is None:
+                # Stray closing tag with nothing to match — drop it.
+                continue
+            # Close this tag plus any tags left open nested inside it.
+            while len(style_stack) > idx:
+                start, span_style, _name = style_stack.pop()
+                if span_style:
+                    text.spans.append(Span(start, len(text), span_style))
+        else:  # opening tag
+            span_style = str(Tag(normalize(tag.name), tag.parameters))
+            try:
+                Style.parse(span_style)
+            except Exception:
+                # Unknown style name — show the tag itself as literal text.
+                text.append(tag.markup)
+                continue
+            style_stack.append((len(text), span_style, normalize(tag.name)))
+
+    end = len(text)
+    while style_stack:
+        start, span_style, _name = style_stack.pop()
+        if span_style:
+            text.spans.append(Span(start, end, span_style))
+    text.spans.sort(key=lambda span: span.start)
+    return text
+
+
 def _render_markup_to_html(markup: str) -> str:
     """Convert Rich-style markup to inline-styled HTML spans.
 
@@ -194,11 +261,10 @@ def _render_markup_to_html(markup: str) -> str:
         color_system="truecolor",
         width=10_000,
     )
-    try:
-        rendered = Text.from_markup(markup)
-    except Exception:
-        # Malformed markup — fall back to plain text so the user still sees it.
-        rendered = Text(markup)
+    # `_safe_markup_text` repairs malformed markup instead of falling back to
+    # plain text, so a near-miss in the model's formatting keeps the parts it
+    # got right — both while streaming and in the final render.
+    rendered = _safe_markup_text(markup)
     console.print(rendered, soft_wrap=True, end="")
     html = console.export_html(inline_styles=True, code_format="{code}")
     html = html.replace(_HR_SENTINEL, '<hr class="md-hr">')
@@ -217,8 +283,9 @@ class UserContext:
     state (conversation history) is expensive to rebuild and personal use
     won't run into pressure."""
 
-    def __init__(self, user_id: int, dek: bytes):
+    def __init__(self, user_id: int, dek: bytes, username: str | None = None):
         self.user_id = user_id
+        self.username = username
 
         conv_dir = _conversations_dir(user_id)
         os.makedirs(conv_dir, exist_ok=True)
@@ -233,6 +300,7 @@ class UserContext:
             schema_files=aime_config.SCHEMA_FILES,
             conversations_dir=conv_dir,
             dek=dek,
+            usage_label=username,
         )
         backend.new_session()
 
@@ -372,7 +440,7 @@ def _context_for(user_id: int) -> UserContext:
                 # DEK is missing. Raise loudly if it ever happens so the
                 # symptom is clear instead of a confusing decrypt failure.
                 raise RuntimeError(f"no cached DEK for user {user_id}")
-            ctx = UserContext(user_id, dek)
+            ctx = UserContext(user_id, dek, g.get("username"))
             _user_contexts[user_id] = ctx
         return ctx
 
@@ -439,6 +507,19 @@ def _load_page() -> str:
         return f.read()
 
 
+# Account creation is gated by AIME_ALLOW_SIGNUP. Default is off ("0") so a
+# self-hosted instance is closed by default: the admin creates accounts, then
+# runs with signup disabled so nobody else can register. Set AIME_ALLOW_SIGNUP=1
+# to open public registration.
+_ALLOW_SIGNUP = bool(int(os.environ.get("AIME_ALLOW_SIGNUP", "0")))
+
+# When signup is disabled, hide the "Create account" tab and form on the login
+# page so visitors aren't offered something the server will reject.
+_SIGNUP_DISABLED_STYLE = (
+    '<style>[data-tab="signup"],form[data-form="signup"]{display:none!important}</style>'
+)
+
+
 def _load_login_page(login_error: str = "", signup_error: str = "") -> str:
     with open(_LOGIN_PAGE_PATH) as f:
         html = f.read()
@@ -446,6 +527,7 @@ def _load_login_page(login_error: str = "", signup_error: str = "") -> str:
         html
         .replace("__LOGIN_ERROR__", _h(login_error))
         .replace("__SIGNUP_ERROR__", _h(signup_error))
+        .replace("__SIGNUP_DISABLED_STYLE__", "" if _ALLOW_SIGNUP else _SIGNUP_DISABLED_STYLE)
     )
 
 
@@ -540,6 +622,13 @@ def login_submit():
 
 @app.route("/signup", methods=["POST"])
 def signup_submit():
+    # Account creation must be explicitly enabled (AIME_ALLOW_SIGNUP=1).
+    # Closed by default so a self-hosted instance can't be joined by strangers.
+    if not _ALLOW_SIGNUP:
+        return Response(
+            _load_login_page(signup_error="Account creation is disabled on this server."),
+            mimetype="text/html", status=403,
+        )
     # Per-IP throttle so a single host can't bulk-register. Use the direct
     # remote_addr — we don't honor X-Forwarded-For unless explicitly set up
     # to (avoids spoofed-header bypass when running without a trusted proxy).
@@ -629,6 +718,21 @@ def send():
     return jsonify({"ok": True, "quit": should_quit})
 
 
+@app.route("/interrupt", methods=["POST"])
+@login_required
+def interrupt():
+    """Stop the in-flight assistant turn and block until it has actually
+    ended. Clients can safely POST /send as soon as this returns — the
+    controller is guaranteed to be idle. Returns 503 if the turn does not
+    end within the timeout (rare; usually means the model stream is stuck
+    waiting on the network)."""
+    ctx = _context_for(g.user_id)
+    became_idle = ctx.controller.stop_model(timeout=5.0)
+    if not became_idle:
+        return jsonify({"ok": False, "error": "interrupt timed out"}), 503
+    return jsonify({"ok": True})
+
+
 @app.route("/stream")
 @login_required
 def stream():
@@ -640,7 +744,17 @@ def stream():
             for payload in snapshot:
                 yield f"data: {json.dumps(payload)}\n\n"
             # Sentinel: from here on, events are live (typewriter eligible).
-            yield f"data: {json.dumps({'kind': 'history_done'})}\n\n"
+            # `busy` carries the real turn state so a client that just
+            # replayed history (where turn_end/ready don't appear) knows
+            # whether the model is mid-response.
+            yield (
+                "data: "
+                + json.dumps({
+                    "kind": "history_done",
+                    "busy": not ctx.controller.is_idle,
+                })
+                + "\n\n"
+            )
             while True:
                 payload = q.get()
                 yield f"data: {json.dumps(payload)}\n\n"
@@ -732,7 +846,7 @@ def transcribe():
     if not wav_bytes:
         return jsonify({"ok": False, "error": "empty audio"}), 400
     try:
-        text = _stt.transcribe_wav(wav_bytes)
+        text = _stt.transcribe_wav(wav_bytes, user=g.get("username"))
     except _stt.STTError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
     except Exception as exc:  # noqa: BLE001
@@ -782,6 +896,55 @@ def topic_contents_save(topic_id: str):
     return jsonify({"ok": True})
 
 
+def _load_or_create_tls_context():
+    """Return a (certfile, keyfile) pair for HTTPS, generating a persistent
+    self-signed cert in DATABASE_DIR on first use.
+
+    Browsers only expose getUserMedia (mic access) in a secure context, so a
+    phone reaching the app over the LAN IP needs TLS — plain http there has
+    no microphone at all. The cert is self-signed, so the browser shows a
+    one-time "not trusted" warning; because it persists across restarts you
+    only have to accept it once per device."""
+    cert_path = os.path.join(aime_config.DATABASE_DIR, "tls_cert.pem")
+    key_path = os.path.join(aime_config.DATABASE_DIR, "tls_key.pem")
+    if os.path.exists(cert_path) and os.path.exists(key_path):
+        return (cert_path, key_path)
+
+    from datetime import datetime, timedelta, timezone
+    from cryptography import x509
+    from cryptography.x509.oid import NameOID
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Aime")])
+    now = datetime.now(timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(days=1))
+        .not_valid_after(now + timedelta(days=3650))
+        .add_extension(
+            x509.SubjectAlternativeName([x509.DNSName("localhost")]),
+            critical=False,
+        )
+        .sign(key, hashes.SHA256())
+    )
+    with open(key_path, "wb") as fh:
+        fh.write(key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.TraditionalOpenSSL,
+            serialization.NoEncryption(),
+        ))
+    os.chmod(key_path, 0o600)
+    with open(cert_path, "wb") as fh:
+        fh.write(cert.public_bytes(serialization.Encoding.PEM))
+    return (cert_path, key_path)
+
+
 if __name__ == "__main__":
     # threaded=True so the SSE generator and /send can run concurrently.
     # Bind defaults to 127.0.0.1 (loopback only). Set AIME_BIND=0.0.0.0 to
@@ -791,4 +954,10 @@ if __name__ == "__main__":
     # front, the session cookie travels in cleartext.
     host = os.environ.get("AIME_BIND", "127.0.0.1")
     port = int(os.environ.get("AIME_PORT", "5000"))
-    app.run(host=host, port=port, threaded=True, debug=False)
+    # AIME_HTTPS=1 serves over TLS with a persistent self-signed cert. Needed
+    # for microphone/voice input from phones on the LAN (secure-context rule).
+    ssl_context = None
+    if int(os.environ.get("AIME_HTTPS", "0")):
+        ssl_context = _load_or_create_tls_context()
+    app.run(host=host, port=port, threaded=True, debug=False,
+            ssl_context=ssl_context)

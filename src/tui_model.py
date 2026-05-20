@@ -661,7 +661,7 @@ class Aime(App):
             self._stream_buffer = ""
 
         elif kind == "session_terminated":
-            log.write("[red]session terminated[/red]")
+            log.write("[dim]This session has ended. See you next time![/dim]")
 
         elif kind == "error":
             log.write(f"[red]error:[/red] {event.text}")

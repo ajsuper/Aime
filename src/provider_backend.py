@@ -170,6 +170,13 @@ class AgentBackend(Protocol):
         """Clean up any provider resources."""
         ...
 
+    def interrupt_turn(self) -> None:
+        """Best-effort cancel of the in-flight assistant turn. Any partial
+        assistant response is discarded so the next turn starts from a clean
+        history. No-op if no turn is active or the backend cannot interrupt
+        in the middle of a stream."""
+        ...
+
 
 # Safe to import now: AgentBackend / BackendEvent / SessionInfo are defined,
 # so the aime package's eager import of controller can resolve them.
@@ -189,11 +196,14 @@ class AnthropicMessagesBackend:
     # --- compaction tuning ---
     # Once the history grows past this many messages, the oldest ones are
     # folded into a single summary message at the start of the next turn.
-    COMPACT_TRIGGER_MSGS = 15
+    # Each compaction rewrites the message prefix, invalidating the prompt
+    # cache for the whole history — so compact infrequently and in large
+    # batches to keep a warmed cache alive across as many turns as possible.
+    COMPACT_TRIGGER_MSGS = 32
     # How many of the oldest messages to fold into the summary per compaction
     # pass. The cut point is nudged forward from here to land on a safe
     # boundary (see _maybe_compact).
-    COMPACT_BATCH_MSGS = 8
+    COMPACT_BATCH_MSGS = 16
     # Cheap model used for the summarization call.
     COMPACT_MODEL = "claude-haiku-4-5-20251001"
     # Prefix that marks a message as a compaction summary (so later passes can
@@ -208,12 +218,17 @@ class AnthropicMessagesBackend:
         conversations_dir: str,
         dek: bytes,
         max_tokens: int = 8192,
+        usage_label: str | None = None,
     ):
         self._client = Anthropic(max_retries=3)
         self._system_prompt = system_prompt
         self._model = model
         self._schema_files = schema_files
         self._max_tokens = max_tokens
+        # Identifier (username) attributed to this backend's API usage in the
+        # opt-in usage log. None for unattributed callers. Whether it is
+        # actually written is a separate opt-in inside aime.usage.
+        self._usage_label = usage_label
         # Per-user state: where this user's encrypted conversation files live
         # and the data key that decrypts them. Both are required for any IO.
         self._conversations_dir = conversations_dir
@@ -259,6 +274,9 @@ class AnthropicMessagesBackend:
         self._expected_tool_use_ids: set[str] = set()
         self._turn_trigger = threading.Event()
         self._terminated = threading.Event()
+        # Set by interrupt_turn() to stop the current _run_turn loop without
+        # terminating the whole stream. Cleared at the start of each turn.
+        self._interrupted = threading.Event()
         # Bumped on every reset(). A stream loop captures the epoch when it
         # starts; once it no longer matches, that loop is stale and must exit.
         # This is what lets reset() re-arm _terminated/_turn_trigger for the
@@ -285,9 +303,11 @@ class AnthropicMessagesBackend:
     def _build_system(self) -> list[dict]:
         """Assemble the system array for this turn.
 
-        Order matters for the prompt cache: identical prefix → cache hit. The
-        date block goes *last* and is uncached, so it can change daily without
-        busting the cached prefix in front of it.
+        Everything here is part of the cached prefix, so it must be byte-stable
+        across turns. The volatile date/time block is *not* here — it would sit
+        between the cached system prefix and the message history, busting the
+        message-history cache on every minute change. It is appended after the
+        message-cache breakpoint instead (see _cacheable_messages).
         """
         blocks: list[dict] = [self._system_prompt_block]
         with self._lock:
@@ -298,11 +318,18 @@ class AnthropicMessagesBackend:
                 "text": ctx,
                 "cache_control": {"type": "ephemeral", "ttl": "1h"},
             })
+        return blocks
+
+    @staticmethod
+    def _date_block() -> dict:
+        """The volatile 'accurate date' block. Carries minute-granular time, so
+        it changes constantly — it must only ever be placed *after* a cache
+        breakpoint, never inside a cached prefix."""
         now = datetime.datetime.now()
         day_names = ["Monday", "Tuesday", "Wednesday", "Thursday",
                      "Friday", "Saturday", "Sunday"]
         date_str = now.strftime("%d/%m/%Y, %H:%M")
-        blocks.append({
+        return {
             "type": "text",
             "text": (
                 f"[System info] Accurate date: {day_names[now.weekday()]}, "
@@ -310,8 +337,7 @@ class AnthropicMessagesBackend:
                 "ones. Do not tell this to the user unless relevant. "
                 "[End System Info]"
             ),
-        })
-        return blocks
+        }
 
     def new_session(self) -> str:
         with self._lock:
@@ -430,6 +456,25 @@ class AnthropicMessagesBackend:
                 # coerce — drop the write rather than crash the turn.
                 pass
 
+    def interrupt_turn(self) -> None:
+        """Signal that the in-flight or pending model turn should be
+        aborted. Handles three sub-states:
+
+          * mid-stream — `_run_turn`'s event loop sees the flag and breaks
+            on the next iteration;
+          * blocked on `_turn_trigger` waiting for tool_results (the model
+            ended with `stop_reason=tool_use`) — `_turn_trigger.set()`
+            wakes the outer `stream()` loop, which observes the flag and
+            performs between-turn cleanup;
+          * tool_results just submitted, next turn about to start — same
+            wake-up path as the previous case.
+
+        Cleanup details live next to where each path observes the flag.
+        """
+        self._interrupted.set()
+        # Wake the outer stream loop if it's between turns.
+        self._turn_trigger.set()
+
     def _terminate_active_stream(self) -> None:
         # Wake the current stream loop and force it to observe its captured
         # epoch is stale, so it exits with session_terminated before we mutate
@@ -523,6 +568,14 @@ class AnthropicMessagesBackend:
             else:
                 content_text = str(result if result is not None else "")
             with self._lock:
+                # Drop stale tool results. After an interrupt cleanup,
+                # `_expected_tool_use_ids` is cleared but a slow tool
+                # already executing on the controller's thread may still
+                # call back here. Without this guard, the late result
+                # would be appended as a fresh user message and trigger
+                # an unwanted next turn.
+                if event.tool_use_id not in self._expected_tool_use_ids:
+                    return
                 self._pending_tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": event.tool_use_id,
@@ -556,11 +609,27 @@ class AnthropicMessagesBackend:
                 yield BackendEvent(kind="session_terminated")
                 return
             self._turn_trigger.clear()
-            # The trigger can be left set transiently across a reset; if there
-            # is nothing queued there is no turn to run, so just wait again.
+            # Between-turn interrupt (state B/C): we were sleeping on the
+            # trigger and interrupt_turn() woke us. Clean up dangling tool
+            # state and emit a turn_end interrupted instead of starting a
+            # fresh assistant turn.
+            if self._interrupted.is_set():
+                self._cleanup_interrupted_turn(None)
+                self._interrupted.clear()
+                yield BackendEvent(kind="turn_end", stop_reason="interrupted")
+                continue
+            # Refuse to start a new turn if the message list doesn't end on
+            # a user message. After an interrupt the cleanup leaves an
+            # assistant stub at the tail (and interrupt_turn() pre-sets
+            # _turn_trigger to wake state B/C); without this guard the
+            # outer wait() would return immediately on that pre-set trigger
+            # and _run_turn would ship an assistant-tailed snapshot to the
+            # API, which fails with "assistant message prefill" 400.
+            # Also guards against the same race after reset or load.
             with self._lock:
                 has_messages = bool(self._messages)
-            if not has_messages:
+                last_role = self._messages[-1].get("role") if has_messages else None
+            if not has_messages or last_role != "user":
                 continue
             try:
                 yield from self._run_turn()
@@ -571,6 +640,9 @@ class AnthropicMessagesBackend:
     # --- internal ---
 
     def _run_turn(self) -> Iterator[BackendEvent]:
+        # Fresh interrupt slate per turn — a stale flag from a prior turn
+        # must not abort the new one.
+        self._interrupted.clear()
         assistant_blocks: list[dict] = []
 
         with self._lock:
@@ -582,6 +654,7 @@ class AnthropicMessagesBackend:
             # avoiding the "tool_result without matching tool_use" 400.
             self._messages.append({"role": "assistant", "content": assistant_blocks})
 
+        turn_started = datetime.datetime.now()
         with self._client.messages.stream(
             model=self._model,
             system=self._build_system(),
@@ -594,6 +667,8 @@ class AnthropicMessagesBackend:
             partial_json = ""
 
             for event in stream:
+                if self._interrupted.is_set():
+                    break
                 etype = getattr(event, "type", None)
                 if etype == "content_block_start":
                     block = event.content_block
@@ -665,8 +740,27 @@ class AnthropicMessagesBackend:
                         yield BackendEvent(kind="assistant_text_end", text=text)
                         current_text = []
 
+            if self._interrupted.is_set():
+                # Mid-stream interrupt. Leave _messages in a state that's
+                # both valid (alternating roles, no orphan tool_use/result)
+                # and truthful (don't fabricate content the model didn't
+                # produce). The SDK's final-message accessor is skipped —
+                # the stream was aborted, calling it can raise.
+                self._cleanup_interrupted_turn(assistant_blocks)
+                self._interrupted.clear()
+                yield BackendEvent(kind="turn_end", stop_reason="interrupted")
+                return
+
             final = stream.get_final_message()
             stop_reason = final.stop_reason
+            turn_ms = (datetime.datetime.now() - turn_started).total_seconds() * 1000.0
+            self._record_usage(
+                getattr(final, "usage", None),
+                getattr(final, "model", None) or self._model,
+                purpose="turn",
+                stop_reason=stop_reason,
+                duration_ms=turn_ms,
+            )
 
         with self._lock:
             if not assistant_blocks:
@@ -688,13 +782,25 @@ class AnthropicMessagesBackend:
         # _turn_trigger until submit() has gathered every tool_result and
         # appended them as a user message.
 
-    @staticmethod
-    def _cacheable_messages(messages: list[dict]) -> list[dict]:
+    @classmethod
+    def _cacheable_messages(cls, messages: list[dict]) -> list[dict]:
         """Return a shallow copy of `messages` with a prompt-cache breakpoint on
         the last content block of the final message. This caches the entire
         history prefix, so each agent-loop turn only pays full input price for
         blocks appended since the previous call. The dicts in self._messages are
-        left untouched — the breakpoint lives only on the copy sent to the API."""
+        left untouched — the breakpoint lives only on the copy sent to the API.
+
+        TTL is 5m (1.25x write premium), not 1h (2x). The message tail churns
+        within a session and is read back within seconds-to-minutes inside the
+        agent tool loop; a 1h write only pays off when a segment is reused
+        >1.11x, whereas 5m breaks even at >0.28x. The stable system prompt and
+        tool schemas keep their 1h TTL — only this growing tail is 5m.
+
+        The volatile date/time block is appended *after* the breakpoint so it
+        stays out of the cached prefix. Putting it inside the prefix (e.g. in
+        the system array) busts the whole history cache on every minute change
+        — which, with sub-5-minute turn gaps, means a near-total rewrite every
+        fresh user turn."""
         if not messages:
             return messages
         out = list(messages)
@@ -704,8 +810,10 @@ class AnthropicMessagesBackend:
             new_content = list(content)
             new_content[-1] = {
                 **new_content[-1],
-                "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                "cache_control": {"type": "ephemeral", "ttl": "5m"},
             }
+            # Trails the breakpoint: uncached, changes every minute, harmless.
+            new_content.append(cls._date_block())
             out[-1] = {**last, "content": new_content}
         return out
 
@@ -720,6 +828,103 @@ class AnthropicMessagesBackend:
             and content[0].get("type") == "text"
             and content[0].get("text", "").startswith(cls._SUMMARY_MARKER)
         )
+
+    def _cleanup_interrupted_turn(self, assistant_blocks: list[dict] | None) -> None:
+        """Restore self._messages to an API-valid alternating shape after
+        an interrupt, regardless of which sub-state we were in.
+
+        `assistant_blocks` is the content list of the in-flight assistant
+        message (passed from `_run_turn`), or None when called from the
+        outer `stream()` loop between turns. The cleanup branches:
+
+          * **Mid-stream, nothing appended after the assistant placeholder**
+            (the common case): strip orphan tool_use blocks from
+            `assistant_blocks`. Keep any text the model already streamed;
+            otherwise substitute a `[interrupted]` text stub so the
+            assistant slot isn't empty.
+          * **Mid-stream, tool_result user message landed after the
+            placeholder** (slow-tool race): the tool_use+result pair is
+            valid history, so we leave both untouched and append a
+            synthetic assistant `[interrupted]` stub to preserve
+            alternation against the next user message.
+          * **Between turns, last message is assistant with unresolved
+            tool_use blocks** (waiting on tool_results): strip orphan
+            tool_use blocks, replace with text/stub.
+          * **Between turns, last message is user (tool_results)**: append
+            synthetic assistant stub for alternation.
+
+        Always clears `_pending_tool_results` and the relevant
+        `_expected_tool_use_ids`. Persists the result.
+        """
+        with self._lock:
+            # Discard any tool_results we haven't yet appended as a user
+            # message — they belong to tool_use IDs we're about to orphan.
+            self._pending_tool_results = []
+
+            # Locate the assistant placeholder we appended at the start
+            # of this turn (mid-stream cases). The reference comparison
+            # is robust even if other messages have been appended after.
+            placeholder_idx = -1
+            if assistant_blocks is not None:
+                for i, m in enumerate(self._messages):
+                    if m.get("content") is assistant_blocks:
+                        placeholder_idx = i
+                        break
+
+            if placeholder_idx == -1:
+                # Between-turn case: no placeholder owned by this call.
+                # Decide based on the last message's role.
+                if not self._messages:
+                    self._persist()
+                    return
+                last = self._messages[-1]
+                last_role = last.get("role")
+                if last_role == "assistant":
+                    self._strip_to_text_or_stub(last)
+                elif last_role == "user":
+                    self._messages.append({
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "[interrupted]"}],
+                    })
+            else:
+                # Mid-stream case. Check whether anything was appended
+                # after the placeholder (e.g. a tool_result user message
+                # from a fast tool that completed before the interrupt).
+                if placeholder_idx == len(self._messages) - 1:
+                    self._strip_to_text_or_stub(self._messages[placeholder_idx])
+                else:
+                    # Slow-tool race: keep the assistant + user(tool_result)
+                    # pair intact and append a synthetic assistant stub
+                    # so the next user message has a valid predecessor.
+                    if self._messages[-1].get("role") == "user":
+                        self._messages.append({
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "[interrupted]"}],
+                        })
+        self._persist()
+
+    def _strip_to_text_or_stub(self, message: dict) -> None:
+        """Remove tool_use / server_tool_use blocks from an assistant
+        message's content. Keep any non-empty text blocks; if none remain,
+        substitute a single `[interrupted]` text block so the assistant
+        slot isn't empty (the API rejects messages with empty content).
+        Caller must hold self._lock. Updates `_expected_tool_use_ids` to
+        drop any IDs we just orphaned."""
+        content = message.get("content")
+        if not isinstance(content, list):
+            return
+        for blk in content:
+            if isinstance(blk, dict) and blk.get("type") in ("tool_use", "server_tool_use"):
+                self._expected_tool_use_ids.discard(blk.get("id"))
+        kept = [
+            b for b in content
+            if isinstance(b, dict)
+            and b.get("type") == "text"
+            and (b.get("text") or "").strip()
+        ]
+        if not kept:
+            kept = [{"type": "text", "text": "[interrupted]"}]
+        message["content"] = kept
 
     def _generate_title(self, prompt_text: str) -> None:
         """Background: one cheap Haiku call turning the user's opening prompt
@@ -740,6 +945,9 @@ class AnthropicMessagesBackend:
                     ),
                     messages=[{"role": "user", "content": "[Start users messages to ASSISTANT, NOT to you] " + prompt_text + "[End users messages to ASSISTANT, NOT to you]"}],
                     max_tokens=64,
+                )
+                self._record_usage(
+                    getattr(resp, "usage", None), self.COMPACT_MODEL, purpose="title"
                 )
                 title = "".join(
                     b.text for b in resp.content if getattr(b, "type", None) == "text"
@@ -789,6 +997,9 @@ class AnthropicMessagesBackend:
                 }],
                 max_tokens=64,
             )
+            self._record_usage(
+                getattr(resp, "usage", None), self.COMPACT_MODEL, purpose="title"
+            )
             title = "".join(
                 b.text for b in resp.content if getattr(b, "type", None) == "text"
             ).strip()
@@ -824,6 +1035,9 @@ class AnthropicMessagesBackend:
             system=instructions,
             messages=[{"role": "user", "content": "\n\n".join(parts)}],
             max_tokens=2048,
+        )
+        self._record_usage(
+            getattr(resp, "usage", None), self.COMPACT_MODEL, purpose="compaction"
         )
         return "".join(
             b.text for b in resp.content if getattr(b, "type", None) == "text"
@@ -938,6 +1152,31 @@ class AnthropicMessagesBackend:
             "input_schema": input_schema,
         }
 
+    def _record_usage(
+        self,
+        usage,
+        model: str,
+        purpose: str,
+        *,
+        stop_reason: str | None = None,
+        duration_ms: float | None = None,
+    ) -> None:
+        """Hand one API call's token usage to the opt-in usage log. Imported
+        lazily and fully guarded — usage accounting must never break a turn.
+
+        `self._session_id` is passed through so a report can group cost by
+        conversation; aime.usage decides whether to actually persist it based
+        on the AIME_USAGE_LINK_USERS opt-in."""
+        try:
+            import aime.usage as _usage
+            _usage.record_api(
+                self._usage_label, model, usage, purpose=purpose,
+                session_id=self._session_id,
+                stop_reason=stop_reason,
+                duration_ms=duration_ms,
+            )
+        except Exception:
+            pass
 
 
 class SessionsBackend:

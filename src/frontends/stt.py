@@ -17,6 +17,7 @@ Sizes (English-only variants are faster and more accurate for en):
 import io
 import os
 import threading
+import time
 import wave
 
 
@@ -131,8 +132,12 @@ def _get_model():
         return _model
 
 
-def transcribe_wav(wav_bytes: bytes) -> str:
-    """Transcribe a complete WAV blob. Mono 16-bit PCM at any common rate."""
+def transcribe_wav(wav_bytes: bytes, user: str | None = None) -> str:
+    """Transcribe a complete WAV blob. Mono 16-bit PCM at any common rate.
+
+    `user` is the username to attribute this transcription to in the opt-in
+    usage log; pass None to leave it unattributed.
+    """
     # Validate the WAV header up front so we return a clean error instead of
     # whatever faster-whisper's ffmpeg layer would emit.
     try:
@@ -144,10 +149,15 @@ def transcribe_wav(wav_bytes: bytes) -> str:
             raise STTError("audio must be mono")
         if wf.getsampwidth() != 2:
             raise STTError("audio must be 16-bit PCM")
+        # Audio duration, captured here while the header is open so the usage
+        # log can record how much audio each user transcribes.
+        rate = wf.getframerate() or 0
+        audio_seconds = (wf.getnframes() / rate) if rate else 0.0
     finally:
         wf.close()
 
     model = _get_model()
+    started = time.monotonic()
     try:
         beam_size = int(os.environ.get("WHISPER_BEAM_SIZE", "1"))
         segments, _info = model.transcribe(
@@ -160,4 +170,18 @@ def transcribe_wav(wav_bytes: bytes) -> str:
         pieces = [seg.text.strip() for seg in segments]
     except Exception as e:
         raise STTError(f"transcription failed: {e}") from e
+
+    # Best-effort: record local compute spent. Never let a stats failure
+    # affect the transcription result.
+    try:
+        import aime.usage as _usage
+        _usage.record_stt(
+            user,
+            _resolve_model_name(),
+            audio_seconds,
+            (time.monotonic() - started) * 1000.0,
+        )
+    except Exception:
+        pass
+
     return " ".join(p for p in pieces if p).strip()

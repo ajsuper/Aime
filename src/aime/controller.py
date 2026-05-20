@@ -17,6 +17,7 @@ event (worker thread for agent output; calling thread for input handlers);
 frontends are responsible for thread-marshaling if their UI toolkit needs it.
 """
 
+import threading
 from dataclasses import dataclass, field
 from typing import Callable, Literal
 
@@ -91,6 +92,12 @@ class ConversationController:
         # Conversation-level state. Presentation flags (e.g. whether the
         # "thinking…" line is visible) live in the frontend, not here.
         self._is_idle = True
+        # Mirrors _is_idle as a threading.Event so stop_model() can block
+        # until the in-flight turn has actually ended (so a follow-up
+        # /send POSTed by the frontend is dispatched as the next turn
+        # rather than landing in the queue during the gap and being lost).
+        self._idle_event = threading.Event()
+        self._idle_event.set()
         self._pending_user_messages: list[str] = []
         self._user_first_interaction = True
         self._log_model_thinking = False
@@ -205,12 +212,39 @@ class ConversationController:
                 kind="user_send_message", text=text, images=images,
             ))
             self._is_idle = False
+            self._idle_event.clear()
         except Exception as exc:
             self._emit(CoreEvent(kind="error", text=f"send failed: {exc}"))
 
     # --- session operations ---
 
+    def stop_model(self, timeout: float = 5.0) -> bool:
+        """Halt whatever the model is doing right now — generating a reply,
+        running a tool, or waiting between tool calls — and block until the
+        turn has fully ended.
+
+        This is the single stop primitive. `/interrupt`, `reset()` (new
+        conversation) and `load()` (switching conversations) all funnel
+        through it, so the model never keeps replying into a conversation the
+        user has already moved on from. The synchronicity matters: when this
+        returns, `_is_idle` is True, so a follow-up `/send` dispatches
+        immediately instead of racing into `_pending_user_messages` and being
+        discarded when turn_end fires.
+
+        Returns True if the controller became idle within the timeout, False
+        if the deadline expired (a stuck model stream). reset()/load() ignore
+        the result and swap the session out regardless; `/interrupt` surfaces
+        it. No-op if already idle.
+        """
+        if self._idle_event.is_set():
+            return True
+        self._backend.interrupt_turn()
+        return self._idle_event.wait(timeout=timeout)
+
     def reset(self) -> None:
+        # Stop any in-flight turn first so the old conversation's reply can't
+        # bleed events into the fresh one.
+        self.stop_model()
         self._backend.reset()
         self._reset_internal_state()
         # session_restart = "clear the transcript / wipe presentation state".
@@ -219,13 +253,14 @@ class ConversationController:
         self._emit(CoreEvent(kind="session_restart", restart_reason="reset"))
         self._emit(CoreEvent(
             kind="notice",
-            severity="warning",
-            text="The current conversation has ended because you typed "
-                 "'/reset'. Begin a new conversation.",
+            severity="success",
+            text="New conversation started.",
         ))
         self._spawn_worker(self.run_stream_loop)
 
     def load(self, session_id: str) -> None:
+        # Switching conversations stops the model mid-turn — see stop_model().
+        self.stop_model()
         try:
             self._backend.load_session(session_id)
         except (OSError, ValueError) as exc:
@@ -242,19 +277,39 @@ class ConversationController:
         from .replay import replay_messages
         for event in replay_messages(self._backend.messages_snapshot()):
             self._emit(event)
+        title = ""
+        for info in self._backend.list_sessions():
+            if info.id == session_id:
+                title = (info.summary or "").strip()
+                break
+        if title:
+            preview = title if len(title) <= 40 else title[:40].rstrip() + "..."
+            loaded_text = (
+                f'Loaded conversation "{preview}". Continue where you left off.'
+            )
+        else:
+            loaded_text = "Loaded conversation. Continue where you left off."
         self._emit(CoreEvent(
             kind="notice",
             severity="success",
-            text=f"Loaded conversation '{session_id}'. Continue where you left off.",
+            text=loaded_text,
         ))
         self._spawn_worker(self.run_stream_loop)
 
     def _reset_internal_state(self) -> None:
         self._user_first_interaction = True
         self._is_idle = True
+        self._idle_event.set()
         self._pending_user_messages = []
 
     # --- queries used by frontends (e.g. autocomplete) ---
+
+    @property
+    def is_idle(self) -> bool:
+        """True when no assistant turn is in flight. A frontend that missed
+        the live `turn_end`/`ready` events (e.g. one that just connected and
+        replayed history) can read this to recover the real busy state."""
+        return self._is_idle
 
     def list_sessions(self) -> list[SessionInfo]:
         return self._backend.list_sessions()
@@ -303,13 +358,20 @@ class ConversationController:
                 kind="turn_end",
                 stop_reason=event.stop_reason or "",
             ))
-            if event.stop_reason == "end_turn":
+            if event.stop_reason in ("end_turn", "interrupted"):
                 self._is_idle = True
-                if self._pending_user_messages:
-                    next_text, next_images = self._pending_user_messages.pop(0)
-                    self._dispatch_user_message(next_text, images=next_images)
-                else:
-                    self._emit(CoreEvent(kind="ready"))
+                # Drafts that arrived during the turn are held client-side
+                # (see #queued-bar in web_chat.html) and sent only when the
+                # user explicitly clicks the queued pill's stop button —
+                # the backend never auto-dispatches them on turn_end. Any
+                # entries in self._pending_user_messages are leftovers from
+                # racy POSTs and are discarded silently.
+                self._pending_user_messages.clear()
+                # Wake stop_model() (and any other waiter) *after* we've
+                # cleared the queue and flipped _is_idle, so a follow-up
+                # /send that unblocks here sees a fully-idle controller.
+                self._idle_event.set()
+                self._emit(CoreEvent(kind="ready"))
         elif kind == "session_terminated":
             self._emit(CoreEvent(kind="session_terminated"))
         elif kind == "error":

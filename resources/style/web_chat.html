@@ -2,6 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
   <title>Aime</title>
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
@@ -126,22 +127,14 @@
     .rail-btn:hover { color: var(--text); background: rgba(255,255,255,0.05); }
     .rail-btn.active { color: var(--accent); background: rgba(124,140,255,0.12); }
     .rail-btn svg { width: 20px; height: 20px; }
-
-    /* Menu popover anchored to the rail button. */
-    #app-menu { position: fixed; left: 52px; top: 0.5rem;
-                background: var(--bg-elev); border: 1px solid var(--border);
-                border-radius: 10px; padding: 0.35rem; min-width: 160px;
-                box-shadow: 0 8px 24px rgba(0,0,0,0.4); z-index: 50;
-                display: none; }
-    #app-menu.open { display: block; }
-    #app-menu button { display: block; width: 100%; text-align: left;
-                       background: transparent; border: 0; color: var(--text);
-                       font: inherit; font-size: 0.9rem; padding: 0.45rem 0.7rem;
-                       border-radius: 6px; cursor: pointer; }
-    #app-menu button:hover { background: rgba(124,140,255,0.12); color: var(--accent); }
+    /* Divider between the pane buttons and the account/settings buttons. */
+    .rail-sep { width: 22px; height: 1px; background: var(--border);
+                margin: 0.2rem 0; flex-shrink: 0; }
 
     /* Main row: rail, optional side panel, then chat. */
-    #main { flex: 1; display: flex; min-height: 0; }
+    /* `overflow: hidden` clips the side panel while it sits off-screen
+       (negative margin) during the open/close slide. */
+    #main { flex: 1; display: flex; min-height: 0; overflow: hidden; }
     #chat-col { flex: 1; display: flex; flex-direction: column; min-width: 240px; }
     #divider { width: 6px; cursor: col-resize; background: var(--border);
                flex-shrink: 0; transition: background 0.15s; position: relative; }
@@ -154,7 +147,31 @@
                 display: none; flex-direction: column; min-height: 0;
                 background: var(--bg-elev); flex-shrink: 0;
                 border-right: 1px solid var(--border); }
-    #side-col.open { display: flex; }
+    /* Open/close animate `margin-left` so the flex row reflows in step —
+       the divider, chat transcript and prompt bar slide along with the
+       panel instead of jumping the instant it appears. Mobile (the fixed
+       overlay variant) overrides this with a transform slide further down. */
+    #side-col:focus { outline: none; }
+    #side-col.open { display: flex;
+                     animation: side-open 0.22s cubic-bezier(0.22, 0.85, 0.3, 1) both; }
+    #side-col.closing { display: flex;
+                        animation: side-close 0.2s cubic-bezier(0.4, 0, 0.5, 1) both; }
+    @keyframes side-open {
+      from { margin-left: -420px; opacity: 0.5; }
+      to   { margin-left: 0;      opacity: 1; }
+    }
+    @keyframes side-close {
+      from { margin-left: 0;      opacity: 1; }
+      to   { margin-left: -420px; opacity: 0.5; }
+    }
+    @keyframes side-open-mobile {
+      from { transform: translateX(-100%); opacity: 0.4; }
+      to   { transform: translateX(0);     opacity: 1; }
+    }
+    @keyframes side-close-mobile {
+      from { transform: translateX(0);     opacity: 1; }
+      to   { transform: translateX(-100%); opacity: 0.4; }
+    }
     body:not(.side-open) #divider { display: none; }
     .side-header { display: flex; align-items: center;
                    padding: 0.6rem 0.5rem 0.6rem 1rem; gap: 0.5rem;
@@ -196,6 +213,56 @@
     .msg.user.no-text { background: transparent; padding: 0;
                         box-shadow: none; color: var(--text); }
     .msg.user.no-text .content { display: none; }
+    /* Queued message bar: a hold-back draft displayed above the prompt
+       while the model is still responding. Sending it requires clicking
+       the stop button — the model's in-flight reply is interrupted and
+       the draft is dispatched as the next user message. */
+    #queued-bar { max-width: 960px; margin: 0 auto 0.4rem; width: 100%;
+                  display: flex; align-items: center; gap: 0.5rem;
+                  background: var(--bg-input); border: 1px dashed var(--border);
+                  border-radius: 16px; padding: 0.35rem 0.5rem 0.35rem 0.85rem;
+                  color: var(--muted); animation: queued-fade 0.18s ease-out; }
+    #queued-bar[hidden] { display: none; }
+    @keyframes queued-fade {
+      from { opacity: 0; transform: translateY(4px); }
+      to   { opacity: 1; transform: translateY(0);   }
+    }
+    /* Jump-to-bottom button — floats just above the composer while the user
+       is scrolled up away from the latest messages. */
+    #f { position: relative; }
+    #scroll-bottom-btn {
+      position: absolute; left: 50%; top: -3rem;
+      width: 38px; height: 38px; border-radius: 50%;
+      background: var(--bg-elev); border: 1px solid var(--border);
+      color: var(--muted); cursor: pointer; z-index: 5;
+      display: flex; align-items: center; justify-content: center;
+      box-shadow: 0 3px 12px rgba(0, 0, 0, 0.35);
+      opacity: 0; pointer-events: none;
+      transform: translateX(-50%) translateY(8px) scale(0.9);
+      transition: opacity 0.15s ease, transform 0.15s ease;
+    }
+    #scroll-bottom-btn.show {
+      opacity: 1; pointer-events: auto;
+      transform: translateX(-50%) translateY(0) scale(1);
+    }
+    #scroll-bottom-btn:hover { color: var(--text); border-color: var(--accent); }
+    #scroll-bottom-btn svg { width: 20px; height: 20px; }
+    .queued-label { font-size: 0.72rem; text-transform: uppercase;
+                    letter-spacing: 0.05em; color: var(--muted);
+                    opacity: 0.85; flex-shrink: 0; }
+    .queued-text { flex: 1; min-width: 0; color: var(--text); opacity: 0.85;
+                   font-style: italic; white-space: nowrap;
+                   overflow: hidden; text-overflow: ellipsis; }
+    .queued-stop { background: transparent; color: var(--muted);
+                   border: 1px solid var(--border); border-radius: 50%;
+                   width: 28px; height: 28px; padding: 0;
+                   display: inline-flex; align-items: center;
+                   justify-content: center; cursor: pointer; flex-shrink: 0;
+                   transition: color 0.15s, border-color 0.15s, background 0.15s; }
+    .queued-stop:hover { color: white; border-color: var(--error);
+                         background: var(--error); }
+    .queued-stop:disabled { opacity: 0.5; cursor: default; }
+    .queued-stop svg { width: 12px; height: 12px; }
     .msg.notice { color: var(--muted); font-size: 0.85rem;
                   font-style: normal; opacity: 0.85; }
     .msg.notice::before {
@@ -234,11 +301,102 @@
     form { display: flex; padding: 1rem; gap: 0.5rem;
            background: var(--bg); border-top: 1px solid var(--border);
            flex-shrink: 0; }
-    .input-wrap { max-width: 760px; margin: 0 auto; width: 100%;
+    /* Small CSS-only tooltip: anchor with `data-tip="..."` and `tip-anchor`.
+       A pill appears above the element on hover/focus, after a short delay
+       so it doesn't flicker on cursor flyovers. Doesn't fight the browser's
+       native `title` tooltip — we drop `title` from the same elements. */
+    .tip-anchor { position: relative; }
+    .tip-anchor::after {
+      content: attr(data-tip);
+      position: absolute; bottom: calc(100% + 6px); left: 50%;
+      transform: translateX(-50%) translateY(2px);
+      background: var(--bg-elev); color: var(--text);
+      border: 1px solid var(--border); border-radius: 6px;
+      padding: 0.3rem 0.55rem; font-size: 0.78rem; line-height: 1.2;
+      white-space: nowrap; pointer-events: none;
+      opacity: 0; transition: opacity 0.12s ease, transform 0.12s ease;
+      transition-delay: 0s; z-index: 50;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.25);
+    }
+    .tip-anchor:hover::after, .tip-anchor:focus-visible::after {
+      opacity: 1; transform: translateX(-50%) translateY(0);
+      transition-delay: 0.35s;
+    }
+    /* Composer row: gear · toggles · input pill · new-chat pill. */
+    .composer-row { max-width: 960px; margin: 0 auto; width: 100%;
+                    display: flex; gap: 0.5rem; align-items: center;
+                    flex-wrap: wrap; }
+    .composer-icon-btn { background: transparent; color: var(--muted); border: 0;
+                         border-radius: 50%; width: 38px; height: 38px;
+                         cursor: pointer; display: flex; align-items: center;
+                         justify-content: center; flex-shrink: 0;
+                         transition: color 0.15s, background 0.15s; }
+    .composer-icon-btn:hover { color: var(--text); background: var(--bg-elev); }
+    .composer-icon-btn svg { width: 20px; height: 20px; }
+    /* Pill-style toggle: icon on the left, a track switch on the right.
+       The hidden checkbox is the source of truth. */
+    .composer-toggle { display: inline-flex; align-items: center; gap: 0.4rem;
+                       background: var(--bg-input); border: 1px solid var(--border);
+                       border-radius: 999px; padding: 0.25rem 0.55rem 0.25rem 0.6rem;
+                       cursor: pointer; user-select: none; flex-shrink: 0;
+                       transition: border-color 0.15s, background 0.15s; }
+    .composer-toggle:hover { border-color: var(--accent); }
+    .composer-toggle input { position: absolute; opacity: 0;
+                             pointer-events: none; width: 0; height: 0; }
+    .composer-toggle-icon { width: 18px; height: 18px; color: var(--muted);
+                            transition: color 0.15s; flex-shrink: 0; }
+    .composer-toggle-track { width: 28px; height: 16px; border-radius: 999px;
+                             background: rgba(255,255,255,0.12); position: relative;
+                             transition: background 0.15s; flex-shrink: 0; }
+    .composer-toggle-track::after { content: ""; position: absolute; left: 2px;
+                                    top: 2px; width: 12px; height: 12px;
+                                    border-radius: 50%; background: var(--muted);
+                                    transition: left 0.15s, background 0.15s; }
+    .composer-toggle.on .composer-toggle-icon { color: var(--accent); }
+    .composer-toggle.on .composer-toggle-track { background: var(--accent); }
+    .composer-toggle.on .composer-toggle-track::after { left: 14px; background: white; }
+    /* The new-conversation pill: icon + label, sits to the right of the input. */
+    .new-chat-pill { display: inline-flex; align-items: center; gap: 0.35rem;
+                     background: transparent; color: var(--muted);
+                     border: 1px solid var(--border); border-radius: 999px;
+                     padding: 0.4rem 0.85rem 0.4rem 0.7rem; cursor: pointer;
+                     font: inherit; font-size: 0.88rem; flex-shrink: 0;
+                     transition: color 0.15s, border-color 0.15s, background 0.15s; }
+    .new-chat-pill:hover { color: var(--text); border-color: var(--accent);
+                           background: var(--bg-elev); }
+    .new-chat-pill svg { width: 16px; height: 16px; }
+    .input-wrap { flex: 1 1 320px; min-width: 0; position: relative;
                   display: flex; gap: 0.5rem; align-items: center;
                   background: var(--bg-input); border: 1px solid var(--border);
                   border-radius: 24px; padding: 0.35rem;
                   transition: border-color 0.15s, box-shadow 0.15s; }
+    /* Small "typing disabled" popup that appears above the composer when the
+       user clicks the input while in voice mode. Pairs with a red jiggle on
+       the voice toggle so the user knows where to disable it. */
+    .typing-disabled-pop { position: absolute; bottom: calc(100% + 8px);
+                           left: 50%; transform: translateX(-50%) translateY(4px);
+                           background: var(--bg-elev); color: var(--text);
+                           border: 1px solid var(--border); border-radius: 8px;
+                           padding: 0.45rem 0.7rem; font-size: 0.82rem;
+                           white-space: nowrap; opacity: 0; pointer-events: none;
+                           box-shadow: 0 4px 12px rgba(0,0,0,0.3); z-index: 100;
+                           transition: opacity 0.18s ease, transform 0.18s ease; }
+    .typing-disabled-pop.show { opacity: 1;
+                                transform: translateX(-50%) translateY(0); }
+    @keyframes warn-jiggle {
+      0%, 100% { transform: translateX(0); }
+      12% { transform: translateX(-5px); }
+      24% { transform: translateX(5px); }
+      36% { transform: translateX(-4px); }
+      48% { transform: translateX(4px); }
+      60% { transform: translateX(-3px); }
+      72% { transform: translateX(3px); }
+      85% { transform: translateX(-1px); }
+    }
+    .composer-toggle.warn-flash { animation: warn-jiggle 0.6s ease-in-out;
+                                  border-color: #e5484d;
+                                  box-shadow: 0 0 0 3px rgba(229, 72, 77, 0.35),
+                                              0 0 14px rgba(229, 72, 77, 0.55); }
     .attach-btn { background: transparent; color: var(--muted); border: 0;
                   border-radius: 50%; width: 36px; height: 36px; cursor: pointer;
                   display: flex; align-items: center; justify-content: center;
@@ -261,16 +419,13 @@
     .send-btn:active:not(:disabled) { transform: scale(0.96); }
     .send-btn:disabled { opacity: 0.4; cursor: default; }
     .send-btn svg { width: 18px; height: 18px; }
-    .new-btn { background: transparent; color: var(--muted); border: 0;
-               border-radius: 50%; width: 36px; height: 36px; cursor: pointer;
-               display: flex; align-items: center; justify-content: center;
-               transition: color 0.15s, background 0.15s; flex-shrink: 0; }
-    .new-btn:hover { color: var(--text); background: var(--bg-elev); }
-    .new-btn svg { width: 18px; height: 18px; }
     .mic-btn { background: transparent; color: var(--muted); border: 0;
                border-radius: 50%; width: 36px; height: 36px; cursor: pointer;
                display: flex; align-items: center; justify-content: center;
                transition: color 0.15s, background 0.15s; flex-shrink: 0; }
+    /* The author-set `display: flex` above otherwise overrides the
+       [hidden] attribute's user-agent `display: none`. */
+    .mic-btn[hidden] { display: none; }
     .mic-btn:hover { color: var(--text); background: var(--bg-elev); }
     .mic-btn svg { width: 18px; height: 18px; }
     .mic-btn.active { color: white; background: var(--accent); }
@@ -282,8 +437,18 @@
       0%, 100% { box-shadow: 0 0 0 0 rgba(229, 72, 77, 0.55); }
       50%      { box-shadow: 0 0 0 8px rgba(229, 72, 77, 0); }
     }
-    .input-wrap.voice-mode input[type=text] { color: var(--muted);
-                                              font-style: italic; cursor: default; }
+    /* Voice mode: the composer bubble switches to an accented look so the
+       user can tell at a glance that typing is disabled and the keyboard
+       belongs to the mic. */
+    .input-wrap.voice-mode { border-color: var(--accent);
+                             background: rgba(124, 140, 255, 0.08);
+                             box-shadow: 0 0 0 2px rgba(124, 140, 255, 0.18); }
+    .input-wrap.voice-mode input[type=text] { color: var(--accent);
+                                              font-weight: 500;
+                                              cursor: default; caret-color: transparent; }
+    .input-wrap.voice-mode input[type=text]::placeholder { color: var(--accent);
+                                                           opacity: 0.85;
+                                                           font-weight: 500; }
     .input-wrap.recording { border-color: #e5484d;
                             animation: input-rec-glow 1.4s ease-in-out infinite; }
     @keyframes input-rec-glow {
@@ -318,15 +483,14 @@
     /* -- Side panel: panes & tab bar -- */
     .pane { flex: 1; min-height: 0; display: none; flex-direction: column;
             overflow: hidden; }
-    .pane.active { display: flex; }
-    .pane-header { padding: 0.75rem 1rem; border-bottom: 1px solid var(--border);
-                   display: flex; justify-content: space-between; align-items: center;
-                   font-weight: 600; font-size: 0.9rem; flex-shrink: 0; }
-    .pane-header button { background: transparent; color: var(--muted);
-                          border: 1px solid var(--border); border-radius: 6px;
-                          padding: 0.2rem 0.6rem; cursor: pointer; font-size: 0.8rem; }
-    .pane-header button:hover { color: var(--text); border-color: var(--accent); }
-    .scroll { overflow-y: auto; flex: 1; min-height: 0; }
+    .pane.active { display: flex;
+                   animation: pane-fade 0.2s ease-out 0.04s both; }
+    @keyframes pane-fade {
+      from { opacity: 0; transform: translateY(6px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+    .scroll { overflow-y: auto; flex: 1; min-height: 0;
+              overscroll-behavior: contain; }
 
     /* Chats list */
     .session-item { padding: 0.65rem 0.5rem 0.65rem 1rem; cursor: pointer;
@@ -383,7 +547,7 @@
                     overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .day-detail { flex: 0 0 auto; max-height: 35%; padding: 0.75rem 1rem;
                   overflow-y: auto; border-top: 1px solid var(--border);
-                  min-height: 80px; }
+                  min-height: 80px; overscroll-behavior: contain; }
     .day-detail h4 { margin: 0 0 0.5rem; font-size: 0.85rem; color: var(--muted);
                      font-weight: 600; text-transform: uppercase;
                      letter-spacing: 0.05em; }
@@ -422,6 +586,9 @@
                      padding: 0.4rem 0.75rem; display: none; gap: 0.35rem;
                      align-items: center; flex-wrap: wrap; }
     .topic-toolbar.show { display: flex; }
+    /* Back arrow — hidden on desktop, revealed by the mobile media query. */
+    .topic-back-btn { display: none; align-items: center; justify-content: center; }
+    .topic-back-btn svg { width: 16px; height: 16px; }
     .topic-toolbar button { background: transparent; color: var(--muted);
                             border: 1px solid var(--border); border-radius: 6px;
                             padding: 0.25rem 0.6rem; font: inherit; font-size: 0.82rem;
@@ -471,18 +638,19 @@
     #tabbar { display: none; }
 
     /* Settings modal: floating panel over a blurred chat backdrop. */
-    #settings-backdrop { position: fixed; inset: 0; z-index: 200;
+    #settings-backdrop, #account-backdrop {
+                         position: fixed; inset: 0; z-index: 200;
                          background: rgba(15, 12, 10, 0.45);
                          backdrop-filter: blur(8px);
                          -webkit-backdrop-filter: blur(8px);
                          display: none; align-items: center; justify-content: center;
                          padding: 2rem; animation: settings-fade 0.15s ease-out; }
-    #settings-backdrop.open { display: flex; }
+    #settings-backdrop.open, #account-backdrop.open { display: flex; }
     @keyframes settings-fade {
       from { opacity: 0; }
       to { opacity: 1; }
     }
-    #settings-modal { background: var(--bg-elev); border: 1px solid var(--border);
+    #settings-modal, #account-modal { background: var(--bg-elev); border: 1px solid var(--border);
                       border-radius: 14px; width: 100%; max-width: 640px;
                       max-height: 100%; display: flex; flex-direction: column;
                       box-shadow: 0 20px 60px rgba(0,0,0,0.55);
@@ -516,7 +684,9 @@
     .settings-close svg { width: 16px; height: 16px; }
     .settings-body { overflow-y: auto; padding: 1.25rem; display: flex;
                      flex-direction: column; gap: 1.25rem; }
-    .settings-section h3 { margin: 0 0 0.35rem; font-size: 0.95rem; }
+    .settings-section h3 { margin: 0 0 0.35rem; font-size: 1.15rem; font-weight: 600; }
+    .settings-section + .settings-section { border-top: 1px solid var(--border);
+                                            padding-top: 1.25rem; }
     .settings-section .desc { color: var(--muted); font-size: 0.85rem;
                               margin: 0 0 0.75rem; }
     .settings-row { display: flex; align-items: center; justify-content: space-between;
@@ -610,20 +780,129 @@
     .msg.user .att-chip .thumb svg { color: white; }
     .msg .att-chip .fname { overflow: hidden; text-overflow: ellipsis;
                             white-space: nowrap; }
+
+    /* ----------------------------------------------------------------------
+       Mobile framework
+       ----------------------------------------------------------------------
+       Two hooks for writing mobile-specific styles:
+         1. `@media (max-width: 768px) { ... }` for pure-CSS overrides.
+         2. `body.mobile .foo { ... }` for cases where the JS-driven class
+            is cleaner (e.g. combining with other body classes like
+            `.side-open`). The class is added/removed by a matchMedia
+            listener in the boot script.
+       Mobile breakpoint is 768px wide — bump that single constant in both
+       places if it ever needs to change. Bigger text and chunkier targets
+       are the goal: easier to read, easier to tap, no platform-specific
+       workarounds. */
+    @media (max-width: 768px) {
+      body { font-size: 17px; }
+
+      /* The 420px side panel overflows a phone. Make it a full-width overlay
+         starting below the floating top rail (rail height + gap = ~58px). */
+      #side-col { position: fixed; top: 58px; left: 0; right: 0; bottom: 0;
+                  width: auto; z-index: 60;
+                  box-shadow: 0 0 24px rgba(0,0,0,0.4); }
+      /* Fixed overlay can't push the chat — slide it with a transform. */
+      #side-col.open { animation-name: side-open-mobile; }
+      #side-col.closing { animation-name: side-close-mobile; }
+      #divider { display: none !important; }
+
+      /* Left rail flattens into a horizontal row of floating, accent-tinted
+         glass bubbles across the top. No background bar, no layout space
+         taken — the chat flows under them. They sit above the side-panel
+         overlay (z-index 70 > 60) so the user can always reach Menu / pane
+         toggles. */
+      #left-rail { position: fixed; top: 0.5rem; left: 0.5rem; right: 0.5rem;
+                   bottom: auto; width: auto; height: auto;
+                   flex-direction: row; background: transparent;
+                   border-right: 0; padding: 0; gap: 0.5rem; z-index: 70; }
+      .rail-btn { width: 42px; height: 42px; border-radius: 50%;
+                  background: color-mix(in srgb, var(--accent) 28%, transparent);
+                  backdrop-filter: blur(14px) saturate(1.4);
+                  -webkit-backdrop-filter: blur(14px) saturate(1.4);
+                  border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+                  color: var(--text);
+                  box-shadow: 0 4px 14px rgba(0,0,0,0.35); }
+      .rail-btn svg { width: 22px; height: 22px; }
+      .rail-btn:hover, .rail-btn.active {
+        background: color-mix(in srgb, var(--accent) 45%, transparent);
+        color: white;
+      }
+      /* The rail is horizontal on mobile — the separator turns vertical. */
+      .rail-sep { width: 1px; height: 24px; margin: 0 0.2rem; }
+
+      /* Push the chat scroll viewport (and the composer below it) down so
+         nothing scrolls under the floating top rail. Padding on the column,
+         not on #log itself — padding inside the scroll container would
+         only space the first message and the rest would still slide under
+         the bubbles. */
+      #chat-col { padding-top: 58px; }
+
+      /* Tighten outer chrome so content gets more room. The extra bottom
+         padding clears the home indicator / rounded display corners via
+         the safe-area inset (viewport-fit=cover exposes it). */
+      #log { padding: 0.75rem 0.6rem 0.5rem; }
+      form { padding: 0.6rem 0.5rem calc(0.6rem + env(safe-area-inset-bottom) * 0.5);
+             gap: 0.4rem; }
+      .composer-row { gap: 0.4rem; }
+      .msg.user { max-width: 88%; }
+
+      /* Composer stacks into two rows: the controls (settings, toggles,
+         new-chat) on top, the input pill full-width below. `order` pushes
+         the input last and a 100% basis forces it onto its own line. */
+      .input-wrap { order: 1; flex: 1 1 100%; }
+
+      /* Bigger composer controls. */
+      .composer-icon-btn { width: 44px; height: 44px; }
+      .composer-icon-btn svg { width: 24px; height: 24px; }
+      .send-btn, .mic-btn, .attach-btn { width: 42px; height: 42px; }
+      .send-btn svg, .mic-btn svg, .attach-btn svg { width: 22px; height: 22px; }
+      .input-wrap { border-radius: 26px; padding: 0.4rem; }
+
+      /* Calendar: collapse the two fixed regions (grid + event list) into a
+         single scroll so the bottom week can't overlap the events, and the
+         user can scroll down to give the event list as much room as needed.
+         The month banner scrolls away with the grid — it is not sticky. */
+      .pane[data-pane="calendar"].active { overflow-y: auto;
+                                           overscroll-behavior: contain; }
+      .pane[data-pane="calendar"] .cal-grid { flex: 0 0 auto;
+                                              grid-auto-rows: minmax(66px, auto); }
+      .pane[data-pane="calendar"] .day-detail { flex: 0 0 auto; max-height: none;
+                                                overflow: visible; }
+
+      /* Topics pane: the list fills the pane; selecting a topic slides its
+         content in over the full window (see `.topic-open` below). */
+      .topics-body { flex-direction: column; }
+      .topic-list { width: 100% !important; max-height: none; flex: 1 1 auto; }
+      #topic-divider { display: none; }
+      .pane[data-pane="topics"] { position: relative; overflow: hidden; }
+      .pane[data-pane="topics"] .topic-content {
+        position: absolute; inset: 0; width: 100%; z-index: 3;
+        background: var(--bg-elev); transform: translateX(100%);
+        transition: transform 0.26s cubic-bezier(0.22, 0.85, 0.3, 1); }
+      .pane[data-pane="topics"].topic-open .topic-content { transform: translateX(0); }
+      .topic-back-btn { display: inline-flex !important; }
+    }
   </style>
 </head>
 <body>
   <div id="main">
     <div id="left-rail">
-      <button class="rail-btn" id="menu-btn" title="Menu" aria-label="Menu"
-              aria-haspopup="true" aria-expanded="false">
+      <button class="rail-btn" id="account-btn" title="Account" aria-label="Account">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
              stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <line x1="3" y1="6"  x2="21" y2="6"/>
-          <line x1="3" y1="12" x2="21" y2="12"/>
-          <line x1="3" y1="18" x2="21" y2="18"/>
+          <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/>
+          <circle cx="12" cy="7" r="4"/>
         </svg>
       </button>
+      <button class="rail-btn" id="settings-btn" title="Settings" aria-label="Settings">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="3"/>
+          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.01a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.01a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+        </svg>
+      </button>
+      <div class="rail-sep" aria-hidden="true"></div>
       <button class="rail-btn pane-btn" data-target="chats" title="Chats" aria-label="Chats">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
              stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -646,14 +925,17 @@
         </svg>
       </button>
     </div>
-    <div id="app-menu" role="menu">
-      <button type="button" role="menuitem" data-menu="account">Account</button>
-      <button type="button" role="menuitem" data-menu="settings">Settings</button>
-      <button type="button" role="menuitem" data-menu="logout">Log out</button>
-    </div>
-    <div id="side-col">
+    <div id="side-col" tabindex="-1">
       <div class="side-header">
         <span class="title" id="side-title">Conversations</span>
+        <button class="side-close" id="side-refresh" title="Refresh" aria-label="Refresh">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="23 4 23 10 17 10"/>
+            <polyline points="1 20 1 14 7 14"/>
+            <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+          </svg>
+        </button>
         <button class="side-close" id="side-close" title="Close" aria-label="Close">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
                stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
@@ -663,10 +945,6 @@
       </div>
       <!-- Chats pane -->
       <div class="pane" data-pane="chats">
-        <div class="pane-header">
-          <span>Conversations</span>
-          <button data-action="refresh-chats">Refresh</button>
-        </div>
         <div class="scroll" id="chats-list">
           <div class="empty">loading…</div>
         </div>
@@ -678,7 +956,6 @@
           <button data-action="cal-prev">‹</button>
           <span class="title" id="cal-title">—</span>
           <button data-action="cal-next">›</button>
-          <button data-action="cal-refresh">Refresh</button>
         </div>
         <div class="cal-grid" id="cal-grid"></div>
         <div class="day-detail" id="day-detail">
@@ -688,10 +965,6 @@
 
       <!-- Topics pane -->
       <div class="pane" data-pane="topics">
-        <div class="pane-header">
-          <span>Topics</span>
-          <button data-action="refresh-topics">Refresh</button>
-        </div>
         <div class="topics-search">
           <input type="text" id="topic-search" placeholder="Search title or summary…"
                  autocomplete="off" spellcheck="false">
@@ -704,6 +977,14 @@
           <div id="topic-divider" title="Drag to resize"></div>
           <div class="topic-content scroll" id="topic-content">
             <div class="topic-toolbar" id="topic-toolbar">
+              <button id="topic-back-btn" class="topic-back-btn"
+                      title="Back to topics" aria-label="Back to topics">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                     stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <line x1="19" y1="12" x2="5" y2="12"/>
+                  <polyline points="12 19 5 12 12 5"/>
+                </svg>
+              </button>
               <button id="topic-edit-btn" title="Edit topic">Edit</button>
               <button id="topic-bold-btn" class="icon" title="Bold (Ctrl+B)" hidden><b>B</b></button>
               <button id="topic-italic-btn" class="icon icon-i" title="Italic (Ctrl+I)" hidden>I</button>
@@ -722,44 +1003,70 @@
     <div id="chat-col">
       <div id="log"><div id="log-inner"></div></div>
       <div id="attachments"></div>
+      <div id="queued-bar" hidden></div>
       <form id="f">
-        <div class="input-wrap">
-          <button type="button" class="attach-btn" id="attach-btn"
-                  title="Attach file" aria-label="Attach file">
+        <button type="button" id="scroll-bottom-btn"
+                aria-label="Scroll to latest messages" title="Scroll to latest">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="12" y1="5" x2="12" y2="19"/>
+            <polyline points="19 12 12 19 5 12"/>
+          </svg>
+        </button>
+        <div class="composer-row">
+          <label class="composer-toggle tip-anchor" id="voice-toggle"
+                 data-tip="Voice input — Space to talk, Enter to send" aria-label="Voice input">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                 stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <line x1="12" y1="5"  x2="12" y2="19"/>
-              <line x1="5"  y1="12" x2="19" y2="12"/>
-            </svg>
-          </button>
-          <input type="file" id="file-picker" multiple
-                 style="display:none"
-                 accept="image/*,.txt,.md,.markdown,.json,.yaml,.yml,.csv,.tsv,.py,.js,.ts,.tsx,.jsx,.html,.css,.xml,.sh,.c,.cpp,.h,.hpp,.java,.rs,.go,.rb,.toml,.ini,.log,text/*">
-          <input id="i" type="text" autocomplete="off" placeholder="Message Aime…"
-                 autofocus>
-          <button type="button" class="new-btn" id="new-chat-btn"
-                  title="New conversation" aria-label="New conversation">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                 stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M12 20h9"/>
-              <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/>
-            </svg>
-          </button>
-          <button type="button" class="mic-btn" id="mic-btn"
-                  title="Voice input" aria-label="Voice input" aria-pressed="false">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                 stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                 stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+                 class="composer-toggle-icon">
               <rect x="9" y="2" width="6" height="12" rx="3"/>
               <path d="M5 11a7 7 0 0 0 14 0"/>
               <line x1="12" y1="18" x2="12" y2="22"/>
               <line x1="8"  y1="22" x2="16" y2="22"/>
             </svg>
-          </button>
-          <button type="submit" class="send-btn" aria-label="Send">
+            <input type="checkbox" id="voice-toggle-input">
+            <span class="composer-toggle-track" aria-hidden="true"></span>
+          </label>
+          <div class="input-wrap">
+            <button type="button" class="attach-btn" id="attach-btn"
+                    title="Attach file" aria-label="Attach file">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                   stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <line x1="12" y1="5"  x2="12" y2="19"/>
+                <line x1="5"  y1="12" x2="19" y2="12"/>
+              </svg>
+            </button>
+            <input type="file" id="file-picker" multiple
+                   style="display:none"
+                   accept="image/*,.txt,.md,.markdown,.json,.yaml,.yml,.csv,.tsv,.py,.js,.ts,.tsx,.jsx,.html,.css,.xml,.sh,.c,.cpp,.h,.hpp,.java,.rs,.go,.rb,.toml,.ini,.log,text/*">
+            <input id="i" type="text" autocomplete="off" placeholder="Message Aime…"
+                   autofocus>
+            <button type="button" class="mic-btn tip-anchor" id="mic-btn"
+                    data-tip="Hold Space to speak"
+                    aria-label="Hold Space to speak" hidden>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                   stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="9" y="2" width="6" height="12" rx="3"/>
+                <path d="M5 11a7 7 0 0 0 14 0"/>
+                <line x1="12" y1="18" x2="12" y2="22"/>
+                <line x1="8"  y1="22" x2="16" y2="22"/>
+              </svg>
+            </button>
+            <button type="submit" class="send-btn" aria-label="Send">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                   stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M5 12h14M13 6l6 6-6 6"/>
+              </svg>
+            </button>
+          </div>
+          <button type="button" class="new-chat-pill tip-anchor" id="new-chat-btn"
+                  data-tip="Start a new conversation" aria-label="New conversation">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                 stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M5 12h14M13 6l6 6-6 6"/>
+                 stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="12" y1="5"  x2="12" y2="19"/>
+              <line x1="5"  y1="12" x2="19" y2="12"/>
             </svg>
+            <span>New conversation</span>
           </button>
         </div>
       </form>
@@ -803,14 +1110,6 @@
             </div>
           </div>
           <div class="settings-section">
-            <h3>Data</h3>
-            <p class="desc">Manage saved conversations.</p>
-            <div class="settings-row">
-              <span class="label">Delete all chats</span>
-              <button class="btn-danger" id="delete-all-btn">Delete all</button>
-            </div>
-          </div>
-          <div class="settings-section">
             <h3>About</h3>
             <p class="desc">Aime — your personal assistant.</p>
           </div>
@@ -838,6 +1137,44 @@
       </div>
     </div>
   </div>
+  <div id="account-backdrop" role="dialog" aria-modal="true" aria-labelledby="account-title">
+    <div id="account-modal">
+      <div class="settings-header">
+        <span class="title" id="account-title">Account</span>
+        <button class="settings-close" id="account-close" title="Close" aria-label="Close">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M6 6l12 12M18 6L6 18"/>
+          </svg>
+        </button>
+      </div>
+      <div class="settings-body">
+        <div class="settings-section">
+          <h3>Profile</h3>
+          <p class="desc">Your Aime account.</p>
+          <div class="settings-row">
+            <span class="label">Username</span>
+            <span class="value" id="account-username">—</span>
+          </div>
+        </div>
+        <div class="settings-section">
+          <h3>Data</h3>
+          <p class="desc">Manage saved conversations.</p>
+          <div class="settings-row">
+            <span class="label" style="color: var(--error)">Delete all conversations</span>
+            <button class="btn-danger" id="account-delete-all-btn">Delete all</button>
+          </div>
+        </div>
+        <div class="settings-section">
+          <h3>Session</h3>
+          <div class="settings-row">
+            <span class="label" style="color: var(--error)">Log out</span>
+            <button class="btn-danger" id="account-logout-btn">Log out</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
   <div id="confirm-backdrop" role="dialog" aria-modal="true" aria-labelledby="confirm-title">
     <div id="confirm-modal">
       <h3 id="confirm-title">Are you sure?</h3>
@@ -849,36 +1186,109 @@
     </div>
   </div>
 <script>
+// Mobile framework: toggle `body.mobile` whenever the viewport crosses the
+// 768px breakpoint. Mirrors the CSS @media query — see the "Mobile framework"
+// section in the stylesheet. Mobile-specific JS can branch on this class
+// (or the `mobileMQ.matches` boolean) without reimplementing media queries.
+const mobileMQ = window.matchMedia("(max-width: 768px)");
+function applyMobileClass(mq) {
+  document.body.classList.toggle("mobile", mq.matches);
+}
+applyMobileClass(mobileMQ);
+mobileMQ.addEventListener("change", applyMobileClass);
+
 const log = document.getElementById("log");
 const logInner = document.getElementById("log-inner");
+const scrollBottomBtn = document.getElementById("scroll-bottom-btn");
 const form = document.getElementById("f");
+
+// --- Scroll following ------------------------------------------------------
+// While the model streams, the log keeps growing. We only auto-scroll if the
+// user is already parked at the bottom ("following"). If they scroll up to
+// read earlier messages we leave them there and surface a jump-to-bottom
+// button instead. `following` is re-derived purely from `scroll` events:
+// content growth never fires a scroll event, so scrolling up latches
+// following=false until the user (or the button) returns to the bottom.
+let following = true;
+
+function isAtBottom() {
+  return log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+}
+
+function updateScrollBtn() {
+  scrollBottomBtn.classList.toggle("show", !isAtBottom());
+}
+
+// Snap to the bottom. Auto-follow scrolls are instant (so they can't be
+// out-raced by streaming text); an explicit jump uses smooth scrolling.
+function scrollToBottom(force) {
+  if (force || following) {
+    log.scrollTo({ top: log.scrollHeight, behavior: force ? "smooth" : "instant" });
+    following = true;
+  }
+  updateScrollBtn();
+}
+
+log.addEventListener("scroll", () => {
+  following = isAtBottom();
+  updateScrollBtn();
+});
+
+scrollBottomBtn.addEventListener("click", () => scrollToBottom(true));
 const input = document.getElementById("i");
 const micBtn = document.getElementById("mic-btn");
 const inputWrap = input.closest(".input-wrap");
+const voiceToggle = document.getElementById("voice-toggle");
+const voiceToggleInput = document.getElementById("voice-toggle-input");
 
-// Voice mode (Part 1: UI only).
-// When active, the text input becomes read-only and a hint placeholder is
-// shown. Recording / STT wiring comes in a later part.
+// Voice mode is enabled by the dedicated toggle in the composer toolbar.
+// When on, typing is disabled, the input shows a hint ("Space to talk,
+// Enter to send"), the inline mic button appears as a visual cue, and the
+// Space bar is hold-to-talk. Pressing Enter submits the transcribed text.
 let voiceMode = false;
 const TEXT_PLACEHOLDER = input.placeholder;
-const VOICE_PLACEHOLDER = "Hold space to speak, Enter to send";
+const VOICE_PLACEHOLDER = "Space to talk, Enter to send";
 
 function setVoiceMode(on) {
   const was = voiceMode;
   voiceMode = !!on;
-  micBtn.classList.toggle("active", voiceMode);
-  micBtn.setAttribute("aria-pressed", voiceMode ? "true" : "false");
+  voiceToggle.classList.toggle("on", voiceMode);
+  voiceToggleInput.checked = voiceMode;
+  micBtn.hidden = !voiceMode;
   inputWrap.classList.toggle("voice-mode", voiceMode);
   input.readOnly = voiceMode;
   input.placeholder = voiceMode ? VOICE_PLACEHOLDER : TEXT_PLACEHOLDER;
-  if (voiceMode) input.blur(); else input.focus();
+  input.focus();
   if (voiceMode && !was) {
     showVoiceToast(
-      '<span class="title">Voice mode activated</span>' +
-      'Hold <kbd>Space</kbd> to record, <kbd>Enter</kbd> to send.'
+      '<span class="title">Voice mode on</span>' +
+      'Hold <kbd>Space</kbd> to talk, press <kbd>Enter</kbd> to send.'
     );
   }
 }
+
+// If the user clicks the input while voice mode is on, surface a small
+// popup explaining typing is disabled and jiggle/flash the voice toggle red
+// so they know where to switch back to typing.
+const typingDisabledPop = document.createElement("div");
+typingDisabledPop.className = "typing-disabled-pop";
+typingDisabledPop.textContent = "Typing disabled in voice mode. Disable it to type.";
+inputWrap.appendChild(typingDisabledPop);
+let typingWarnTimer = null;
+function warnTypingDisabled() {
+  typingDisabledPop.classList.add("show");
+  // Restart the animation if it's already running.
+  voiceToggle.classList.remove("warn-flash");
+  void voiceToggle.offsetWidth;
+  voiceToggle.classList.add("warn-flash");
+  if (typingWarnTimer) clearTimeout(typingWarnTimer);
+  typingWarnTimer = setTimeout(() => {
+    typingDisabledPop.classList.remove("show");
+    voiceToggle.classList.remove("warn-flash");
+    typingWarnTimer = null;
+  }, 1800);
+}
+input.addEventListener("click", () => { if (voiceMode) warnTypingDisabled(); });
 
 const voiceToast = document.getElementById("voice-toast");
 let voiceToastTimer = null;
@@ -892,7 +1302,76 @@ function showVoiceToast(html, ms = 3200) {
   }, ms);
 }
 
-micBtn.addEventListener("click", () => setVoiceMode(!voiceMode));
+// Probe for a usable microphone before entering voice mode. Two distinct
+// failure modes worth telling the user apart:
+//   - insecure context: getUserMedia is absent entirely on plain-http
+//     origins (e.g. a phone hitting the LAN IP). Only localhost / https
+//     get it. This is the usual "no mic on phone" cause.
+//   - no audioinput device present at all.
+async function checkMicrophone() {
+  if (!window.isSecureContext || !navigator.mediaDevices
+      || !navigator.mediaDevices.getUserMedia) {
+    return {ok: false, message: "Voice input needs a secure connection. "
+      + "Open Aime via https:// or on localhost — over plain http (e.g. a "
+      + "phone on the LAN IP) the browser blocks microphone access."};
+  }
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    if (!devices.some(d => d.kind === "audioinput")) {
+      return {ok: false, message: "Microphone not detected."};
+    }
+  } catch (_) {
+    // enumerateDevices failed — fall through and let the real getUserMedia
+    // call at record time surface the error rather than blocking here.
+  }
+  return {ok: true};
+}
+
+// The toolbar voice toggle is the source of truth for voice mode.
+voiceToggle.addEventListener("click", async (ev) => {
+  // Prevent the default <label> behavior firing setVoiceMode twice (once
+  // from the click, once from the implicit checkbox change).
+  ev.preventDefault();
+  // Turning voice mode ON: verify a mic is reachable first so the user
+  // gets a clear reason here instead of a failure mid hold-to-talk.
+  if (!voiceMode) {
+    const check = await checkMicrophone();
+    if (!check.ok) {
+      appendNotice(check.message, "warning");
+      voiceToggle.classList.remove("warn-flash");
+      void voiceToggle.offsetWidth;
+      voiceToggle.classList.add("warn-flash");
+      setTimeout(() => voiceToggle.classList.remove("warn-flash"), 700);
+      return;
+    }
+  }
+  setVoiceMode(!voiceMode);
+});
+
+// The inline mic button is only visible in voice mode and is hold-to-talk:
+// press to start recording, release to transcribe and insert the text into
+// the input. Releasing outside the button still ends recording so the user
+// can't get stuck in a half-recorded state.
+micBtn.addEventListener("pointerdown", (ev) => {
+  if (!voiceMode) return;
+  ev.preventDefault();
+  micBtn.setPointerCapture(ev.pointerId);
+  startVoiceRecording();
+});
+function endHoldToTalk(ev) {
+  if (!voiceRec.active && !voiceRec.starting) return;
+  if (ev && ev.pointerId !== undefined && micBtn.hasPointerCapture(ev.pointerId)) {
+    micBtn.releasePointerCapture(ev.pointerId);
+  }
+  stopVoiceRecordingAndTranscribe();
+}
+micBtn.addEventListener("pointerup", endHoldToTalk);
+micBtn.addEventListener("pointercancel", endHoldToTalk);
+micBtn.addEventListener("pointerleave", (ev) => {
+  // Only end if the pointer is no longer pressed (button held down keeps
+  // recording even if it drifts off the icon).
+  if (ev.buttons === 0) endHoldToTalk(ev);
+});
 
 // --- Audio capture ----------------------------------------------------
 // Hold Space (while voice mode is on) to record; release to transcribe.
@@ -1000,8 +1479,25 @@ async function startVoiceRecording() {
     micBtn.classList.add("recording");
     input.placeholder = "● Listening…";
   } catch (err) {
-    appendNotice("microphone unavailable: " + err.message, "error");
+    // Friendly messages instead of raw browser error strings. The most
+    // common case on a phone or headless laptop is just "no mic" — say so.
+    const name = err && err.name;
+    let msg = "Microphone not detected.";
+    if (name === "NotAllowedError" || name === "SecurityError") {
+      msg = "Microphone access blocked. Allow it in your browser to use voice input.";
+    } else if (name === "NotReadableError") {
+      msg = "Microphone is in use by another app.";
+    }
+    appendNotice(msg, "warning");
     setVoiceMode(false);
+    // Defensive: roll back any in-flight recording state and the UI flags
+    // that startVoiceRecording would normally clean up on stop, so a failed
+    // start can't leave the composer wedged in a recording / busy state.
+    voiceRec.active = false;
+    voiceRec.chunks = [];
+    voiceRec.stream = voiceRec.ctx = voiceRec.source = voiceRec.proc = null;
+    inputWrap.classList.remove("recording");
+    micBtn.classList.remove("recording");
   } finally {
     voiceRec.starting = false;
   }
@@ -1050,22 +1546,25 @@ async function stopVoiceRecordingAndTranscribe() {
   }
 }
 
+// Voice keyboard shortcut: in voice mode the input is read-only, so plain
+// Space is hold-to-talk and Enter submits the transcribed text. We still
+// skip key handling when another editable field (settings inputs, topic
+// editor) owns focus so this doesn't bleed into them.
 document.addEventListener("keydown", (e) => {
   if (!voiceMode) return;
-  // Ignore keys while typing in any text-editable field (settings inputs, etc.)
   const ae = document.activeElement;
-  if (ae && ae !== input && (ae.tagName === "INPUT" || ae.tagName === "TEXTAREA" || ae.isContentEditable)) return;
-  if (e.code === "Space" && !e.repeat) {
-    e.preventDefault();
-    startVoiceRecording();
-  } else if (e.key === "Enter") {
+  if (ae && ae !== input && (ae.tagName === "INPUT" || ae.tagName === "TEXTAREA"
+                             || ae.isContentEditable)) return;
+  const noMods = !e.ctrlKey && !e.shiftKey && !e.altKey && !e.metaKey;
+  if (e.code === "Space" && noMods) {
+    e.preventDefault();   // also suppresses repeats and button re-activation
+    if (!e.repeat) startVoiceRecording();
+  } else if (e.key === "Enter" && noMods) {
     e.preventDefault();
     if (voiceRec.active) {
-      // Finish the in-flight recording first; submit once it lands.
-      stopVoiceRecordingAndTranscribe().then(() => {
-        if (input.value.trim()) form.requestSubmit();
-      });
-    } else if (input.value.trim()) {
+      // Stop, then submit once the transcription has landed in the input.
+      stopVoiceRecordingAndTranscribe().then(() => form.requestSubmit());
+    } else {
       form.requestSubmit();
     }
   } else if (e.key === "Escape" && voiceRec.active) {
@@ -1078,7 +1577,7 @@ document.addEventListener("keydown", (e) => {
 
 document.addEventListener("keyup", (e) => {
   if (!voiceMode) return;
-  if (e.code === "Space") {
+  if (voiceRec.active && e.code === "Space") {
     e.preventDefault();
     stopVoiceRecordingAndTranscribe();
   }
@@ -1086,6 +1585,10 @@ document.addEventListener("keyup", (e) => {
 
 let currentAssistant = null;
 let pendingHtmlTarget = null;
+// True while the assistant is responding to a turn. Used to gate form
+// submission: if the user sends a message while busy, it's held back as
+// a draft (#queued-bar) instead of being POSTed to /send.
+let modelBusy = false;
 // History snapshot replays as raw payloads; switch to live (typewriter-eligible)
 // mode after the server emits the `history_done` sentinel.
 let liveMode = false;
@@ -1176,6 +1679,7 @@ function typewriterStep() {
       // discrepancy between our walker and innerHTML.
       bubble._content.innerHTML = typewriter.target;
       typewriter.bubble = null;
+      scrollToBottom();
     }
     return;
   }
@@ -1185,7 +1689,7 @@ function typewriterStep() {
   const step = Math.max(3, Math.ceil(remaining / 18));
   typewriter.shown = Math.min(total, typewriter.shown + step);
   renderHtmlPrefix(bubble._content, typewriter.target, typewriter.shown);
-  log.scrollTop = log.scrollHeight;
+  scrollToBottom();
   typewriter.rafId = requestAnimationFrame(typewriterStep);
 }
 
@@ -1202,7 +1706,7 @@ function appendMessage(cls, who, text) {
   div.appendChild(content);
   div._content = content;
   logInner.appendChild(div);
-  log.scrollTop = log.scrollHeight;
+  scrollToBottom();
   return div;
 }
 
@@ -1211,7 +1715,7 @@ function appendNotice(text, severity) {
   div.className = "msg notice " + (severity || "info");
   div.textContent = text;
   logInner.appendChild(div);
-  log.scrollTop = log.scrollHeight;
+  scrollToBottom();
 }
 
 function ensureAssistant() {
@@ -1302,16 +1806,27 @@ es.onmessage = (ev) => {
       const row = renderAttachmentRow(attachments);
       if (row) msg.insertBefore(row, msg._content);
       if (!cleanedText && attachments.length) msg.classList.add("no-text");
+      // Only a *live* user message starts a turn. Replayed history (loading
+      // or switching conversations) must not flip the busy gate — otherwise
+      // the first message in the loaded conversation gets held as a queued
+      // draft instead of being sent.
+      if (!e.from_replay) {
+        modelBusy = true;
+        // Snap to the message even if the user had scrolled up.
+        scrollToBottom(true);
+      }
       break;
     }
     case "user_message_queued":
-      appendMessage("user", "you (queued)", e.text);
+      // Backend-driven queue notifications are unused — the frontend gates
+      // sending while the model is busy and renders the queued draft
+      // itself in #queued-bar. Ignore.
       break;
     case "assistant_text":
       ensureAssistant()._content.appendChild(document.createTextNode(e.text));
       pendingHtmlTarget = currentAssistant;
       currentAssistant = null;
-      log.scrollTop = log.scrollHeight;
+      scrollToBottom();
       break;
     case "assistant_text_delta":
       // Don't append raw text — the typewriter is driven by the formatted
@@ -1339,11 +1854,16 @@ es.onmessage = (ev) => {
       }
       pendingHtmlTarget = null;
       currentAssistant = null;
-      log.scrollTop = log.scrollHeight;
+      scrollToBottom();
       break;
     }
     case "history_done":
       liveMode = true;
+      // Authoritative busy state from the server. Replayed history contains
+      // user_message_shown (which flips modelBusy true) but never the
+      // matching turn_end, so without this a reloaded conversation would
+      // wrongly hold the first new message back as a queued draft.
+      modelBusy = e.busy === true;
       break;
     case "tool_call":
       appendNotice("· tool: " + e.tool_name +
@@ -1356,6 +1876,18 @@ es.onmessage = (ev) => {
       break;
     case "turn_end":
       if (e.stop_reason === "end_turn") currentAssistant = null;
+      if (e.stop_reason === "end_turn" || e.stop_reason === "interrupted") {
+        modelBusy = false;
+        // Auto-send the queued draft on natural turn completion. The stop
+        // button remains the explicit interrupt-and-send path; this is
+        // the "wait for the model to finish, then send my follow-up"
+        // path. For "interrupted" we don't auto-send — that turn ended
+        // because the user explicitly clicked stop, which already
+        // dispatched the draft, so we just clear the flag.
+        if (e.stop_reason === "end_turn" && queuedDraft) {
+          flushQueuedDraft();
+        }
+      }
       break;
     case "ready":
       break;
@@ -1366,9 +1898,13 @@ es.onmessage = (ev) => {
       logInner.innerHTML = "";
       currentAssistant = null;
       pendingHtmlTarget = null;
+      modelBusy = false;
+      clearQueuedDraft();
       if (typewriter.rafId != null) cancelAnimationFrame(typewriter.rafId);
       typewriter.bubble = null;
       typewriter.rafId = null;
+      following = true;
+      updateScrollBtn();
       // The chats list may now include a new entry; refresh.
       loadChats();
       break;
@@ -1401,6 +1937,16 @@ form.addEventListener("submit", async (ev) => {
 
   input.value = "";
   if (images.length || textFiles.length) clearAttachments();
+  // While the model is mid-response, hold the new message back as a draft
+  // instead of POSTing it. The user must click the queued pill's stop
+  // button to actually send (which also interrupts the current reply).
+  if (modelBusy) {
+    setQueuedDraft({text, images, displayText: userText});
+    return;
+  }
+  // Set optimistically so a rapid second submit before user_message_shown
+  // arrives is correctly held back as a draft, not POSTed as a queued send.
+  modelBusy = true;
   await sendText(text, images);
 });
 
@@ -1414,6 +1960,76 @@ async function sendText(text, images) {
     headers: {"Content-Type": "application/json"},
     body: JSON.stringify({text, images: images || []}),
   });
+}
+
+// --- Queued draft (above the prompt) ------------------------------------
+// A single hold-back draft. Submitting again while one is held replaces
+// it so the most recent message is what gets sent on stop. The draft does
+// *not* auto-send when the model finishes naturally — it waits for the
+// user to click the stop button.
+
+const queuedBar = document.getElementById("queued-bar");
+let queuedDraft = null;  // {text, images, displayText} or null
+
+function setQueuedDraft(draft) {
+  queuedDraft = draft;
+  renderQueuedDraft();
+}
+
+function clearQueuedDraft() {
+  queuedDraft = null;
+  queuedBar.hidden = true;
+  queuedBar.innerHTML = "";
+}
+
+async function flushQueuedDraft() {
+  // Dispatch the held draft without going through /interrupt — called
+  // when the model finishes its turn naturally and there's a draft
+  // waiting. Optimistically mark busy so a chained submit doesn't race.
+  if (!queuedDraft) return;
+  const draft = queuedDraft;
+  clearQueuedDraft();
+  modelBusy = true;
+  await sendText(draft.text, draft.images);
+}
+
+function renderQueuedDraft() {
+  if (!queuedDraft) { clearQueuedDraft(); return; }
+  queuedBar.innerHTML = "";
+  const label = document.createElement("span");
+  label.className = "queued-label";
+  label.textContent = "Queued";
+  queuedBar.appendChild(label);
+  const text = document.createElement("span");
+  text.className = "queued-text";
+  text.textContent = queuedDraft.displayText || queuedDraft.text;
+  queuedBar.appendChild(text);
+  const stop = document.createElement("button");
+  stop.type = "button";
+  stop.className = "queued-stop tip-anchor";
+  stop.setAttribute("data-tip", "Stop response and send this instead");
+  stop.setAttribute("aria-label", "Stop and send");
+  stop.innerHTML =
+    '<svg viewBox="0 0 24 24" fill="currentColor">' +
+    '<rect x="6" y="6" width="12" height="12" rx="1"/></svg>';
+  stop.addEventListener("click", async () => {
+    if (!queuedDraft) return;
+    stop.disabled = true;
+    const draft = queuedDraft;
+    try {
+      if (modelBusy) {
+        // Best-effort interrupt — even if it errors we still try the send,
+        // and a no-op interrupt on an idle backend is harmless.
+        await fetch("/interrupt", {method: "POST"}).catch(() => {});
+      }
+      await sendText(draft.text, draft.images);
+      clearQueuedDraft();
+    } catch (_) {
+      stop.disabled = false;
+    }
+  });
+  queuedBar.appendChild(stop);
+  queuedBar.hidden = false;
 }
 
 // -- Drag-and-drop image attachments -----------------------------------
@@ -1601,8 +2217,26 @@ document.querySelectorAll(".pane-btn").forEach(btn => {
 
 document.getElementById("side-close").addEventListener("click", closeSide);
 
+// One refresh button in the shared header — reloads whichever pane is open.
+document.getElementById("side-refresh").addEventListener("click", () => {
+  if (activePaneName === "chats") loadChats();
+  else if (activePaneName === "calendar") renderCalendar();
+  else if (activePaneName === "topics") loadTopics();
+});
+
 function activatePane(name) {
   activePaneName = name;
+  // Mobile: the chat input keeps focus (and the on-screen keyboard) when the
+  // panel opens, so the first tap inside the panel is spent dismissing the
+  // keyboard / blurring rather than acting. Drop focus to the panel up front
+  // so the very first tap or swipe lands on the panel.
+  if (mobileMQ.matches) {
+    if (document.activeElement && document.activeElement.blur) {
+      document.activeElement.blur();
+    }
+    sideColEl.focus({preventScroll: true});
+  }
+  sideColEl.classList.remove("closing");
   sideColEl.classList.add("open");
   document.body.classList.add("side-open");
   sideTitleEl.textContent = PANE_TITLES[name] || "";
@@ -1617,9 +2251,19 @@ function activatePane(name) {
 
 function closeSide() {
   activePaneName = null;
-  sideColEl.classList.remove("open");
   document.body.classList.remove("side-open");
   document.querySelectorAll(".pane-btn").forEach(t => t.classList.remove("active"));
+  // Play the slide-out, then drop `display` once it ends. `.closing` keeps
+  // the panel rendered for the duration of the animation.
+  if (sideColEl.classList.contains("open")) {
+    sideColEl.classList.remove("open");
+    sideColEl.classList.add("closing");
+    sideColEl.addEventListener("animationend", function handler(e) {
+      if (e.target !== sideColEl) return;
+      sideColEl.classList.remove("closing");
+      sideColEl.removeEventListener("animationend", handler);
+    });
+  }
 }
 
 // -- Chats --------------------------------------------------------------
@@ -1670,15 +2314,17 @@ async function loadChats() {
       item.appendChild(summary);
       item.appendChild(meta);
       item.appendChild(del);
-      item.addEventListener("click", () => sendText("/load " + s.id));
+      item.addEventListener("click", () => {
+        sendText("/load " + s.id);
+        // Mobile: drop back to the conversation after picking one.
+        if (mobileMQ.matches) closeSide();
+      });
       chatsList.appendChild(item);
     });
   } catch (e) {
     chatsList.innerHTML = '<div class="empty">error: ' + e + '</div>';
   }
 }
-
-document.querySelector('[data-action="refresh-chats"]').addEventListener("click", loadChats);
 
 // -- Calendar -----------------------------------------------------------
 
@@ -1701,8 +2347,6 @@ document.querySelector('[data-action="cal-next"]').addEventListener("click", () 
   calSelectedDay = null;
   renderCalendar();
 });
-document.querySelector('[data-action="cal-refresh"]').addEventListener("click", renderCalendar);
-
 async function renderCalendar() {
   document.getElementById("cal-title").textContent =
     MONTH_NAMES[calMonth - 1] + " " + calYear;
@@ -1817,10 +2461,15 @@ async function loadDayEvents(d) {
 
 // -- Topics -------------------------------------------------------------
 
+const topicsPaneEl = document.querySelector('.pane[data-pane="topics"]');
 const topicListEl = document.getElementById("topic-list");
 const topicContentEl = document.getElementById("topic-content");
 const topicBodyEl = document.getElementById("topic-body");
 const topicToolbarEl = document.getElementById("topic-toolbar");
+const topicBackBtn = document.getElementById("topic-back-btn");
+topicBackBtn.addEventListener("click", () => {
+  topicsPaneEl.classList.remove("topic-open");
+});
 const topicEditBtn = document.getElementById("topic-edit-btn");
 const topicBoldBtn = document.getElementById("topic-bold-btn");
 const topicItalicBtn = document.getElementById("topic-italic-btn");
@@ -1832,6 +2481,8 @@ let selectedTopicId = null;
 let allTopics = [];
 
 async function loadTopics() {
+  // Reopening the pane always lands on the browser, not a stale topic view.
+  topicsPaneEl.classList.remove("topic-open");
   topicListEl.innerHTML = '<div class="empty">loading…</div>';
   try {
     const r = await fetch("/topics");
@@ -1918,6 +2569,14 @@ async function selectTopic(tid, item) {
   setTopicEditMode(false);
   topicToolbarEl.classList.remove("show");
   topicBodyEl.innerHTML = '<div class="empty">loading…</div>';
+  // Mobile: slide the topic content in over the full window. The toolbar
+  // (which carries the back arrow) is shown up front so the user can leave
+  // even while the topic is still loading.
+  if (mobileMQ.matches) {
+    topicToolbarEl.classList.add("show");
+    topicsPaneEl.classList.add("topic-open");
+    topicContentEl.scrollTop = 0;
+  }
   try {
     const r = await fetch("/topics/" + encodeURIComponent(tid));
     const data = await r.json();
@@ -2089,8 +2748,6 @@ async function onTopicCheckboxToggle(e) {
   });
 }
 
-document.querySelector('[data-action="refresh-topics"]').addEventListener("click", loadTopics);
-
 // -- Resizable side panel ----------------------------------------------
 
 const sideCol = document.getElementById("side-col");
@@ -2174,34 +2831,8 @@ topicDivider.addEventListener("mousedown", (e) => {
   document.addEventListener("mouseup", onUp);
 });
 
-// -- App menu (left rail) ----------------------------------------------
+// -- Account / Settings (left rail) ------------------------------------
 
-const menuBtn = document.getElementById("menu-btn");
-const appMenu = document.getElementById("app-menu");
-
-function closeAppMenu() {
-  appMenu.classList.remove("open");
-  menuBtn.classList.remove("active");
-  menuBtn.setAttribute("aria-expanded", "false");
-}
-function openAppMenu() {
-  const rect = menuBtn.getBoundingClientRect();
-  appMenu.style.top = rect.top + "px";
-  appMenu.classList.add("open");
-  menuBtn.classList.add("active");
-  menuBtn.setAttribute("aria-expanded", "true");
-}
-menuBtn.addEventListener("click", (e) => {
-  e.stopPropagation();
-  if (appMenu.classList.contains("open")) closeAppMenu();
-  else openAppMenu();
-});
-document.addEventListener("click", (e) => {
-  if (!appMenu.contains(e.target) && e.target !== menuBtn) closeAppMenu();
-});
-document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape") closeAppMenu();
-});
 async function logout() {
   try {
     await fetch("/logout", {method: "POST", credentials: "same-origin"});
@@ -2209,14 +2840,8 @@ async function logout() {
   window.location = "/login";
 }
 
-appMenu.querySelectorAll("button").forEach(b => {
-  b.addEventListener("click", () => {
-    const action = b.dataset.menu;
-    closeAppMenu();
-    if (action === "settings") openSettings();
-    else if (action === "logout") logout();
-  });
-});
+document.getElementById("settings-btn").addEventListener("click", openSettings);
+document.getElementById("account-btn").addEventListener("click", openAccount);
 
 // -- Theme picker -------------------------------------------------------
 
@@ -2329,6 +2954,33 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && settingsBackdrop.classList.contains("open")) closeSettings();
 });
 
+// -- Account modal ------------------------------------------------------
+
+const accountBackdrop = document.getElementById("account-backdrop");
+const accountUsernameEl = document.getElementById("account-username");
+
+async function openAccount() {
+  accountBackdrop.classList.add("open");
+  try {
+    const r = await fetch("/me", {credentials: "same-origin"});
+    const data = await r.json();
+    accountUsernameEl.textContent = data.username || "—";
+  } catch {
+    accountUsernameEl.textContent = "—";
+  }
+}
+function closeAccount() {
+  accountBackdrop.classList.remove("open");
+}
+document.getElementById("account-close").addEventListener("click", closeAccount);
+accountBackdrop.addEventListener("click", (e) => {
+  if (e.target === accountBackdrop) closeAccount();
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && accountBackdrop.classList.contains("open")) closeAccount();
+});
+document.getElementById("account-logout-btn").addEventListener("click", logout);
+
 // -- Confirm dialog -----------------------------------------------------
 
 const confirmBackdrop = document.getElementById("confirm-backdrop");
@@ -2382,7 +3034,7 @@ async function deleteAllSessions() {
   }
 }
 
-document.getElementById("delete-all-btn").addEventListener("click", () => {
+document.getElementById("account-delete-all-btn").addEventListener("click", () => {
   confirmAction({
     title: "Delete all conversations?",
     message: "Every saved chat will be permanently removed. This cannot be undone.",
