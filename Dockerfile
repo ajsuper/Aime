@@ -52,6 +52,11 @@ COPY src ./src
 COPY resources ./resources
 COPY --from=backend-build /build/serve.o ./build/serve.o
 
+# The usage dashboard imports scripts/usage_report.py (it adds <repo>/scripts
+# to sys.path). Copy it in so the dashboard can start; without it the
+# dashboard process crashes on import.
+COPY scripts/usage_report.py ./scripts/usage_report.py
+
 # Pre-download the practical, commonly-used Whisper STT models (tiny / base /
 # small, ~700MB total) so voice input is instant out of the box. The heavier
 # models (medium, large-v3, large-v3-turbo) still work — faster-whisper just

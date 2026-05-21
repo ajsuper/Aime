@@ -25,6 +25,9 @@ services:
       AIME_HTTPS: "${AIME_HTTPS:-1}"
       AIME_BIND: "0.0.0.0"
       AIME_ALLOW_SIGNUP: "${AIME_ALLOW_SIGNUP:-0}"
+      # "keys" (safe default) requires an invite key before a user can send;
+      # "open" drops the send-gate. See docs/access-control.md.
+      AIME_ACCESS_MODE: "${AIME_ACCESS_MODE:-keys}"
       AIME_USAGE_STATS: "${AIME_USAGE_STATS:-0}"
       AIME_USAGE_LINK_USERS: "${AIME_USAGE_LINK_USERS:-0}"
       AIME_USAGE_DASHBOARD: "${AIME_USAGE_DASHBOARD:-0}"

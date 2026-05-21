@@ -3,6 +3,10 @@
 # Optional: installs a user service that runs the Flask web frontend
 # (frontends/web_app.py), exposing Aime as a web app at http://localhost:5000.
 # Requires the venv set up by ./install.sh (flask is in requirements.txt).
+#
+# Configuration is read entirely from the repo .env file (the same file the
+# Docker path uses). Copy .env.example to .env and fill it in first; this
+# script no longer prompts for anything.
 
 set -e
 
@@ -10,8 +14,7 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SRC_DIR="$REPO_ROOT/src"
 LOG_DIR="$HOME/.local/share/aime-assistant"
 VENV_DIR="$REPO_ROOT/.venv"
-ENV_DIR="$HOME/.config/aime-assistant"
-ENV_FILE="$ENV_DIR/env"
+ENV_FILE="$REPO_ROOT/.env"
 mkdir -p "$LOG_DIR"
 
 PYTHON_BIN="$VENV_DIR/bin/python"
@@ -22,85 +25,55 @@ if [ ! -x "$PYTHON_BIN" ]; then
     exit 1
 fi
 
-# Provision the API key env file (mode 600, outside the repo so it can never
-# be committed). Reuse the existing key if one is already stored; otherwise
-# prompt the user with no echo.
-mkdir -p "$ENV_DIR"
-chmod 700 "$ENV_DIR"
+# Load configuration from the repo .env file. This is the single source of
+# truth for both this native install path and the Docker path.
+if [ ! -f "$ENV_FILE" ]; then
+    echo "Error: $ENV_FILE not found." >&2
+    echo "Copy .env.example to .env and fill it in first." >&2
+    exit 1
+fi
+# shellcheck disable=SC1090
+set -a
+. "$ENV_FILE"
+set +a
 
-EXISTING_KEY=""
-if [ -f "$ENV_FILE" ]; then
-    # shellcheck disable=SC1090
-    EXISTING_KEY="$(. "$ENV_FILE" >/dev/null 2>&1 && printf '%s' "${ANTHROPIC_API_KEY:-}")"
+# Required key.
+if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+    echo "Error: ANTHROPIC_API_KEY is empty in $ENV_FILE." >&2
+    exit 1
 fi
 
-if [ -n "$EXISTING_KEY" ]; then
-    printf 'Found existing ANTHROPIC_API_KEY in %s. Replace it? [y/N] ' "$ENV_FILE"
-    read -r REPLACE
-    case "$REPLACE" in
-        y|Y|yes|YES) EXISTING_KEY="" ;;
-    esac
-fi
-
-if [ -z "$EXISTING_KEY" ]; then
-    printf 'Enter your ANTHROPIC_API_KEY (input hidden): '
-    stty -echo
-    trap 'stty echo' EXIT INT TERM
-    read -r NEW_KEY
-    stty echo
-    trap - EXIT INT TERM
-    printf '\n'
-    if [ -z "$NEW_KEY" ]; then
-        echo "Error: empty API key." >&2
-        exit 1
-    fi
-    umask 077
-    TMP_ENV="$(mktemp "$ENV_DIR/.env.XXXXXX")"
-    printf 'ANTHROPIC_API_KEY=%s\n' "$NEW_KEY" > "$TMP_ENV"
-    chmod 600 "$TMP_ENV"
-    mv "$TMP_ENV" "$ENV_FILE"
-    unset NEW_KEY
-    echo "Saved API key to $ENV_FILE (mode 600)."
-fi
-unset EXISTING_KEY
-
-# Web server configuration. Prompt the user for each value; pressing Enter
-# accepts the default shown in the prompt.
-printf 'Serve over HTTPS? Enter AIME_HTTPS value (0 = plain HTTP, 1 = HTTPS; enter to use default of 1): '
-read -r AIME_HTTPS
+# Web server configuration. Apply the documented defaults for anything the
+# .env file leaves unset.
 AIME_HTTPS="${AIME_HTTPS:-1}"
-
-printf 'Enter AIME_BIND value (enter to use default of 127.0.0.1): '
-read -r AIME_BIND
 AIME_BIND="${AIME_BIND:-127.0.0.1}"
+AIME_ALLOW_SIGNUP="${AIME_ALLOW_SIGNUP:-0}"
+AIME_ACCESS_MODE="${AIME_ACCESS_MODE:-keys}"
+case "$AIME_ACCESS_MODE" in
+    open|keys) ;;
+    *) echo "Unrecognised AIME_ACCESS_MODE '$AIME_ACCESS_MODE'; using 'open'." >&2
+       AIME_ACCESS_MODE="open" ;;
+esac
+AIME_USAGE_STATS="${AIME_USAGE_STATS:-0}"
+AIME_USAGE_LINK_USERS="${AIME_USAGE_LINK_USERS:-0}"
+if [ "$AIME_USAGE_STATS" != "1" ]; then
+    AIME_USAGE_LINK_USERS=0
+fi
 
 echo "Using AIME_HTTPS=$AIME_HTTPS, AIME_BIND=$AIME_BIND"
-
-# Account creation gate. Default 0 (disabled): the admin creates accounts, then
-# runs the server closed so nobody else can register. Set to 1 to allow public
-# signup.
-printf 'Allow new account creation? Enter AIME_ALLOW_SIGNUP value (0 = no, 1 = yes; enter to use default of 0): '
-read -r AIME_ALLOW_SIGNUP
-AIME_ALLOW_SIGNUP="${AIME_ALLOW_SIGNUP:-0}"
-
-echo "Using AIME_ALLOW_SIGNUP=$AIME_ALLOW_SIGNUP"
-
-# Usage statistics. Default 0 (disabled): nothing is collected. When enabled,
-# per-call API token usage and local speech-to-text compute are appended to
-# <database>/usage/usage.jsonl. A second toggle decides whether each record is
-# tagged with the username (1) or kept anonymous (0).
-printf 'Collect usage statistics? Enter AIME_USAGE_STATS value (0 = no, 1 = yes; enter to use default of 0): '
-read -r AIME_USAGE_STATS
-AIME_USAGE_STATS="${AIME_USAGE_STATS:-0}"
-
-AIME_USAGE_LINK_USERS=0
-if [ "$AIME_USAGE_STATS" = "1" ]; then
-    printf 'Link usage statistics to usernames? Enter AIME_USAGE_LINK_USERS value (0 = anonymous, 1 = tag with username; enter to use default of 0): '
-    read -r AIME_USAGE_LINK_USERS
-    AIME_USAGE_LINK_USERS="${AIME_USAGE_LINK_USERS:-0}"
-fi
-
+echo "Using AIME_ALLOW_SIGNUP=$AIME_ALLOW_SIGNUP, AIME_ACCESS_MODE=$AIME_ACCESS_MODE"
 echo "Using AIME_USAGE_STATS=$AIME_USAGE_STATS, AIME_USAGE_LINK_USERS=$AIME_USAGE_LINK_USERS"
+
+# Bill-bomb guard: reachable off-host + open signup + no send-gate means any
+# stranger can register and immediately spend the Anthropic API budget.
+if [ "$AIME_BIND" != "127.0.0.1" ] && [ "$AIME_ALLOW_SIGNUP" = "1" ] \
+   && [ "$AIME_ACCESS_MODE" = "open" ]; then
+    echo "" >&2
+    echo "WARNING: AIME_BIND=$AIME_BIND + AIME_ALLOW_SIGNUP=1 + AIME_ACCESS_MODE=open" >&2
+    echo "  lets anyone who can reach this server create an account and" >&2
+    echo "  immediately spend your Anthropic API budget. For a public" >&2
+    echo "  deployment set AIME_ACCESS_MODE=keys. See docs/access-control.md." >&2
+fi
 
 OS="$(uname -s)"
 
@@ -119,6 +92,7 @@ EnvironmentFile=$ENV_FILE
 Environment=AIME_HTTPS=$AIME_HTTPS
 Environment=AIME_BIND=$AIME_BIND
 Environment=AIME_ALLOW_SIGNUP=$AIME_ALLOW_SIGNUP
+Environment=AIME_ACCESS_MODE=$AIME_ACCESS_MODE
 Environment=AIME_USAGE_STATS=$AIME_USAGE_STATS
 Environment=AIME_USAGE_LINK_USERS=$AIME_USAGE_LINK_USERS
 ExecStart=$PYTHON_BIN -m frontends.web_app
@@ -140,11 +114,8 @@ EOF
         PLIST_DIR="$HOME/Library/LaunchAgents"
         mkdir -p "$PLIST_DIR"
         PLIST="$PLIST_DIR/com.aime.webapp.plist"
-        # launchd has no EnvironmentFile equivalent — pull the key out of the
-        # secure env file and embed it into the plist, then chmod the plist
-        # so it inherits the same restrictions as $ENV_FILE.
-        # shellcheck disable=SC1090
-        ANTHROPIC_API_KEY="$(. "$ENV_FILE" && printf '%s' "$ANTHROPIC_API_KEY")"
+        # launchd has no EnvironmentFile equivalent — embed the values pulled
+        # from .env into the plist, then chmod it so the API key is protected.
         umask 077
         cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -183,6 +154,8 @@ EOF
         <string>$AIME_BIND</string>
         <key>AIME_ALLOW_SIGNUP</key>
         <string>$AIME_ALLOW_SIGNUP</string>
+        <key>AIME_ACCESS_MODE</key>
+        <string>$AIME_ACCESS_MODE</string>
         <key>AIME_USAGE_STATS</key>
         <string>$AIME_USAGE_STATS</string>
         <key>AIME_USAGE_LINK_USERS</key>
@@ -192,7 +165,6 @@ EOF
 </plist>
 EOF
         chmod 600 "$PLIST"
-        unset ANTHROPIC_API_KEY
         launchctl unload "$PLIST" 2>/dev/null || true
         launchctl load -w "$PLIST"
         echo "aime-webapp installed and (re)started via launchd."

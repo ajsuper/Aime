@@ -1,38 +1,47 @@
-"""Local-only web dashboard for Aime usage statistics.
+"""Web admin dashboard for Aime.
 
-A small Flask app that loads the append-only usage log written by
-`aime.usage` (<database>/usage/usage.jsonl) and presents it as a readable
-page instead of a terminal table.
+A small Flask app that combines two things behind one password-gated login:
 
-Two tabs:
-  * Overview        — per-user / per-day / per-model token cost.
-  * Cache Efficacy  — whether prompt caching is actually saving money:
-                      reuse factors, hypothetical no-cache cost, and a
-                      warning when message spacing outlives the 5m cache.
+  * **Usage statistics** — the append-only usage log written by `aime.usage`
+    (<database>/usage/usage.jsonl), presented as readable tables:
+      - Overview        — per-user / per-day / per-model token cost.
+      - Cache Efficacy  — whether prompt caching is actually saving money.
+  * **Administration** — a web equivalent of the `scripts/` admin CLIs, so a
+    container deployment can be managed without shell access:
+      - Accounts — list / grant / revoke send access, soft-delete, restore,
+                   and purge expired accounts (wraps aime.auth + aime.accounts,
+                   the same surface as scripts/access_keys.py + manage_users.py).
+      - Keys     — mint and revoke single-use invite keys.
 
-The figures refresh on a selectable interval (1s / 30s / 5m, or off). The
-refresh re-fetches only the data region (an HTML fragment) and swaps it in
-place — the filter form, its focus, and the page scroll position are left
-untouched.
+Because the admin tabs can disable accounts, delete data, and spend money, the
+whole dashboard sits behind a password gate: set `AIME_ADMIN_PASSWORD` and the
+app refuses to start without it. A signed session cookie keeps the admin
+logged in; `SameSite=Lax` plus a per-session CSRF token guard the state-
+changing POSTs. It still binds loopback by default — `AIME_USAGE_DASHBOARD_HOST`
+must be set explicitly (e.g. 0.0.0.0 inside a container, behind a host-only
+port mapping) to listen more widely.
 
-Deliberately **loopback-only**: the usage log can carry usernames and
-per-conversation ids (when AIME_USAGE_LINK_USERS is on), so this server binds
-127.0.0.1 and refuses to advertise itself on the network. It is a read-only
-viewer — it never writes the log.
+The usage tabs refresh on a selectable interval (1s / 30s / 5m, or off); the
+refresh re-fetches only the data region and swaps it in place. The admin tabs
+do not auto-refresh — they carry forms.
 
 Run from the project's `src/` directory:
 
-    python -m frontends.usage_dashboard
+    AIME_ADMIN_PASSWORD=... python -m frontends.usage_dashboard
 
 then open http://127.0.0.1:5050/.
 """
 
 import os
 import sys
+import secrets
 import datetime
+from functools import wraps
 from urllib.parse import urlencode
 
-from flask import Flask, render_template_string, request
+from flask import (
+    Flask, render_template_string, request, session, redirect, url_for,
+)
 
 # Allow `python -m frontends.usage_dashboard` from src/ to find the aime
 # package and the scripts/ directory.
@@ -43,17 +52,45 @@ sys.path.insert(0, os.path.join(_REPO, "scripts"))
 
 # Reuse the exact cost model, aggregation, and log-path resolution from the
 # CLI report so the web view and `usage_report.py` can never disagree on a
-# dollar figure. Importing this module is cheap — it pulls in no Anthropic SDK
-# or `aime` package machinery.
+# dollar figure.
 import usage_report as _report  # noqa: E402
 
+# Account / key administration — the dashboard is a thin wrapper over exactly
+# these, the same as the scripts/ CLIs.
+from aime import config as _config  # noqa: E402
+from aime import auth as _auth  # noqa: E402
+from aime import accounts as _accounts  # noqa: E402
+
 app = Flask(__name__)
+
+# Session signing key — persisted on disk so a dashboard restart does not log
+# the admin out. Mode 0600, alongside the rest of the app data.
+app.secret_key = _auth.load_or_create_secret_key(
+    os.path.join(_config.DATABASE_DIR, "admin_dashboard_secret.key")
+)
+# The dashboard is plain HTTP (loopback / host-only port), so SECURE stays
+# off; HTTPONLY + SameSite=Lax still block cross-site cookie use, which —
+# together with the per-session CSRF token — defends the state-changing POSTs.
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+)
 
 # Loopback only by default — see module docstring. AIME_USAGE_DASHBOARD_HOST
 # overrides the bind host (e.g. 0.0.0.0 inside a container, where the port is
 # only reachable via an explicit Docker mapping). Leave it unset otherwise.
 _HOST = os.environ.get("AIME_USAGE_DASHBOARD_HOST", "127.0.0.1")
 _PORT = int(os.environ.get("AIME_USAGE_DASHBOARD_PORT", "5050"))
+
+# The gate. Empty means the dashboard refuses to start (see main()).
+_ADMIN_PASSWORD = os.environ.get("AIME_ADMIN_PASSWORD", "")
+
+# Per-IP brute-force throttle on the login form: 10 attempts / 5 minutes.
+_login_limiter = _auth.IPRateLimiter(limit=10, window_seconds=300)
+
+# Grace period for soft-deleted accounts, mirrored from the CLI default so the
+# web and CLI tooling agree on when an account becomes purge-eligible.
+_GRACE_DAYS = _accounts.DEFAULT_GRACE_DAYS
 
 # Allowed auto-refresh intervals, in seconds. 0 = off. Anything else is
 # rejected back to the default so a hand-edited query string can't wedge the
@@ -64,6 +101,19 @@ _REFRESH_DEFAULT = 1
 # 5-minute cache TTL, in seconds. Median request spacing above this means a
 # 5m-TTL cache write tends to expire before it is ever read back.
 _CACHE_5M_TTL = 300
+
+# Lazily-built shared auth backend (holds a sqlite connection). Built on first
+# admin use so a usage-only glance never opens auth.sql.
+_auth_backend_singleton: _auth.LocalAuthBackend | None = None
+
+
+def _auth_backend() -> _auth.LocalAuthBackend:
+    global _auth_backend_singleton
+    if _auth_backend_singleton is None:
+        _auth_backend_singleton = _auth.LocalAuthBackend(
+            os.path.join(_config.DATABASE_DIR, "auth.sql")
+        )
+    return _auth_backend_singleton
 
 
 def _log_path() -> str:
@@ -208,6 +258,59 @@ def _aggregate_cache(records):
             and u["w5m"] > 0
         )
     return users
+
+
+# ---------------------------------------------------------------------------
+# Auth helpers
+# ---------------------------------------------------------------------------
+
+
+def _csrf_token() -> str:
+    """The current session's CSRF token, minting one on first use. Embedded in
+    every state-changing form and checked on the matching POST."""
+    token = session.get("csrf")
+    if not token:
+        token = secrets.token_urlsafe(24)
+        session["csrf"] = token
+    return token
+
+
+def _check_csrf() -> bool:
+    """True if the submitted form carries this session's CSRF token."""
+    sent = request.form.get("csrf", "")
+    have = session.get("csrf", "")
+    return bool(have) and secrets.compare_digest(sent, have)
+
+
+def _flash(level: str, msg: str) -> None:
+    """Queue a one-shot message (level: ok / warn / bad) for the next page."""
+    queued = session.get("flash", [])
+    queued.append({"level": level, "msg": msg})
+    session["flash"] = queued
+
+
+def admin_required(view):
+    """Gate a view behind a logged-in admin session."""
+    @wraps(view)
+    def wrapper(*args, **kwargs):
+        if not session.get("admin"):
+            return redirect(url_for("login"))
+        return view(*args, **kwargs)
+    return wrapper
+
+
+def admin_post(view):
+    """Gate a state-changing POST: admin session + a valid CSRF token. A
+    failed CSRF check is dropped with a flash rather than executed."""
+    @wraps(view)
+    def wrapper(*args, **kwargs):
+        if not session.get("admin"):
+            return redirect(url_for("login"))
+        if not _check_csrf():
+            _flash("bad", "Security check failed — action ignored. Try again.")
+            return redirect(url_for("index", tab="accounts"))
+        return view(*args, **kwargs)
+    return wrapper
 
 
 # ---------------------------------------------------------------------------
@@ -441,11 +544,171 @@ _FRAGMENT_CACHE = """<div class="meta">
   {% endif %}"""
 
 
+# Accounts admin. A web equivalent of scripts/access_keys.py (grant/revoke,
+# revoke-all) + scripts/manage_users.py (delete/restore/purge). Every form
+# carries the session CSRF token.
+_FRAGMENT_ACCOUNTS = """
+  <h2 title="Every active account. 'Send access' is the api_access flag — whether the user may send messages through the paid model backend.">Active accounts</h2>
+  {% if not active_users %}
+    <p class="empty">No active accounts.</p>
+  {% else %}
+  <table>
+    <thead>
+      <tr>
+        <th title="Internal account id.">ID</th>
+        <th title="Account username.">Username</th>
+        <th title="The api_access flag: whether this user may send messages through the paid model backend.">Send access</th>
+        <th title="Grant/revoke send access, or soft-delete the account.">Actions</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for u in active_users %}
+      <tr>
+        <td>#{{ u.id }}</td>
+        <td>{{ u.username }}</td>
+        <td class="{{ 'good' if u.api_access else 'bad' }}">{{ 'yes' if u.api_access else 'no' }}</td>
+        <td class="actions">
+          <form method="post" action="accounts/access">
+            <input type="hidden" name="csrf" value="{{ csrf }}">
+            <input type="hidden" name="username" value="{{ u.username }}">
+            <input type="hidden" name="grant" value="{{ '0' if u.api_access else '1' }}">
+            <button type="submit">{{ 'Revoke access' if u.api_access else 'Grant access' }}</button>
+          </form>
+          <form method="post" action="accounts/delete"
+            onsubmit="return confirm('Soft-delete {{ u.username }}? The account is disabled but its data is kept, and it can be restored within the {{ grace_days }}-day grace period.')">
+            <input type="hidden" name="csrf" value="{{ csrf }}">
+            <input type="hidden" name="username" value="{{ u.username }}">
+            <button type="submit" class="danger">Delete</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <form method="post" action="accounts/revoke-all" class="inline-action"
+    onsubmit="return confirm('Revoke send access for ALL users? This is the billing-cutover action.')">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <button type="submit" class="danger">Revoke send access for everyone</button>
+    <span class="note">Zeroes api_access for every account (billing cutover).</span>
+  </form>
+  {% endif %}
+
+  <h2 title="Accounts that have been soft-deleted. Their data is retained until the grace period expires, then a purge can permanently remove them.">Soft-deleted accounts</h2>
+  {% if not pending %}
+    <p class="empty">No soft-deleted accounts.</p>
+  {% else %}
+  <table>
+    <thead>
+      <tr>
+        <th title="Internal account id.">ID</th>
+        <th title="Account username.">Username</th>
+        <th title="When the account was soft-deleted (UTC).">Deleted</th>
+        <th title="Whether the grace period has expired. Once past grace, the account can be permanently purged.">Status</th>
+        <th title="Restore the account, undoing the soft delete.">Actions</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for p in pending %}
+      <tr>
+        <td>#{{ p.user.id }}</td>
+        <td>{{ p.user.username }}</td>
+        <td>{{ p.deleted_at }} ({{ p.days_deleted }}d ago)</td>
+        <td class="{{ 'bad' if p.expired else 'warn' }}">
+          {%- if p.expired -%}past grace — eligible for purge
+          {%- else -%}{{ grace_days - p.days_deleted }}d until purge{%- endif -%}
+        </td>
+        <td class="actions">
+          <form method="post" action="accounts/restore">
+            <input type="hidden" name="csrf" value="{{ csrf }}">
+            <input type="hidden" name="username" value="{{ p.user.username }}">
+            <button type="submit">Restore</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <form method="post" action="accounts/purge" class="inline-action"
+    onsubmit="return confirm('Permanently purge {{ expired_count }} expired account(s)? A final backup zip is written first, then the data is deleted. This cannot be undone.')">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <button type="submit" class="danger" {{ 'disabled' if not expired_count else '' }}>
+      Purge {{ expired_count }} expired account(s)</button>
+    <span class="note">Only accounts past the {{ grace_days }}-day grace
+      period are purged. A backup is taken first.</span>
+  </form>
+  {% endif %}"""
+
+
+# Invite-key admin. A web equivalent of scripts/access_keys.py gen / list /
+# revoke-key. Raw keys are shown exactly once, right after generation.
+_FRAGMENT_KEYS = """
+  {% if flash_keys %}
+  <div class="banner good">
+    <strong>New invite keys — copy them now, they are not shown again:</strong>
+    <ul class="keylist">
+      {% for k in flash_keys %}<li><code>{{ k }}</code></li>{% endfor %}
+    </ul>
+  </div>
+  {% endif %}
+
+  <h2 title="Mint single-use invite keys. Each key lets one account gain send access by redeeming it.">Generate invite keys</h2>
+  <form method="post" action="keys/gen" class="genform">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <label>Count
+      <input type="number" name="count" value="1" min="1" max="50">
+    </label>
+    <label>Note (optional)
+      <input type="text" name="note" placeholder="e.g. Alice" maxlength="80">
+    </label>
+    <button type="submit">Generate</button>
+  </form>
+
+  <h2 title="Every invite key, newest last. Only the SHA-256 hash is stored — the raw key is shown once at generation.">Invite keys ({{ keys|length }})</h2>
+  {% if not keys %}
+    <p class="empty">No invite keys yet.</p>
+  {% else %}
+  <table>
+    <thead>
+      <tr>
+        <th title="A prefix of the key's SHA-256 hash. The raw key is never stored.">Key (hash)</th>
+        <th title="Optional label set when the key was generated.">Note</th>
+        <th title="When the key was minted.">Created</th>
+        <th title="Whether the key has been redeemed, and by whom.">Status</th>
+        <th title="Revoke an unredeemed key so it can never be used.">Actions</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for k in keys %}
+      <tr>
+        <td><code>{{ k.key_hash[:16] }}…</code></td>
+        <td>{{ k.note or '—' }}</td>
+        <td>{{ k.created_at }}</td>
+        <td class="{{ 'good' if k.redeemed else '' }}">
+          {%- if k.redeemed -%}
+            redeemed by {{ k.redeemed_by_username or '(deleted user)' }} at {{ k.redeemed_at }}
+          {%- else -%}unredeemed{%- endif -%}
+        </td>
+        <td class="actions">
+          {% if k.redeemed %}—{% else %}
+          <form method="post" action="keys/revoke">
+            <input type="hidden" name="csrf" value="{{ csrf }}">
+            <input type="hidden" name="key_hash" value="{{ k.key_hash }}">
+            <button type="submit" class="danger">Revoke</button>
+          </form>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}"""
+
+
 _PAGE = """<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Aime usage</title>
+  <title>Aime admin</title>
   <style>
     :root { color-scheme: light dark; }
     body { font: 15px/1.5 system-ui, sans-serif; margin: 2rem auto; max-width: 1000px; padding: 0 1rem; }
@@ -470,6 +733,11 @@ _PAGE = """<!doctype html>
     .blue   { color: #2f6fd0; }
     .purple { color: #8a4fd0; }
     td.good, td.warn, td.bad { font-weight: 600; }
+
+    /* header */
+    .topbar { display: flex; justify-content: space-between; align-items: baseline; }
+    .topbar form { margin: 0; }
+    .logout { font-size: .85rem; }
 
     /* tabs */
     nav.tabs { display: flex; gap: .3rem; border-bottom: 2px solid #8884; margin-bottom: 1rem; }
@@ -505,6 +773,30 @@ _PAGE = """<!doctype html>
     .banner.warn { background: #c8860a22; border: 1px solid #c8860a88; }
     .banner.bad  { background: #d2333322; border: 1px solid #d2333388; }
 
+    /* flash messages */
+    .flash { padding: .5rem .8rem; border-radius: 6px; margin-bottom: .6rem; font-size: .9rem; }
+    .flash.ok   { background: #2e9e4f22; border: 1px solid #2e9e4f88; }
+    .flash.warn { background: #c8860a22; border: 1px solid #c8860a88; }
+    .flash.bad  { background: #d2333322; border: 1px solid #d2333388; }
+
+    /* admin action forms */
+    td.actions { display: flex; gap: .4rem; justify-content: flex-end; flex-wrap: wrap; }
+    td.actions form { margin: 0; }
+    button { font: inherit; padding: .25rem .7rem; cursor: pointer;
+      border: 1px solid #8886; border-radius: 5px; background: #8881; color: inherit; }
+    button:hover:not(:disabled) { background: #8883; }
+    button:disabled { opacity: .5; cursor: default; }
+    button.danger { border-color: #d2336688; color: #d23; }
+    button.danger:hover:not(:disabled) { background: #d2333322; }
+    .inline-action { margin: .2rem 0 1rem; display: flex; gap: .6rem; align-items: center; }
+    .inline-action .note { margin: 0; }
+    form.genform { display: flex; gap: .8rem; align-items: end; flex-wrap: wrap;
+      margin-bottom: 1rem; padding: .8rem; border: 1px solid #8884; border-radius: 6px; }
+    form.genform label { display: flex; flex-direction: column; font-size: .8rem; color: #888; }
+    form.genform input { font: inherit; padding: .25rem .4rem; }
+    .keylist { margin: .4rem 0 0; }
+    .keylist code, td code { font-size: .9em; }
+
     .auto { font-size: .85rem; color: #888; }
 
     /* Custom tooltips. The `title` attributes in the markup are moved to
@@ -527,15 +819,30 @@ _PAGE = """<!doctype html>
   </style>
 </head>
 <body>
-  <h1 title="Read-only viewer for Aime's usage log (usage.jsonl). Loopback-only — never exposed on the network.">Aime usage</h1>
+  <div class="topbar">
+    <h1 title="Aime admin dashboard: usage statistics plus account and invite-key management.">Aime admin</h1>
+    <form method="post" action="logout" class="logout-form">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <button type="submit" class="logout">Log out</button>
+    </form>
+  </div>
 
   <nav class="tabs">
     <a href="?{{ qs_overview }}" class="{{ 'active' if tab == 'overview' else '' }}"
       title="Per-user, per-day and per-model token usage and cost.">Overview</a>
     <a href="?{{ qs_cache }}" class="{{ 'active' if tab == 'cache' else '' }}"
       title="Whether prompt caching is actually saving money — reuse factors, hypothetical no-cache cost, and 5-minute-TTL warnings.">Cache Efficacy</a>
+    <a href="?{{ qs_accounts }}" class="{{ 'active' if tab == 'accounts' else '' }}"
+      title="List, grant/revoke, soft-delete, restore and purge user accounts.">Accounts</a>
+    <a href="?{{ qs_keys }}" class="{{ 'active' if tab == 'keys' else '' }}"
+      title="Mint and revoke single-use invite keys.">Keys</a>
   </nav>
 
+  {% for f in flashes %}
+  <div class="flash {{ f.level }}">{{ f.msg }}</div>
+  {% endfor %}
+
+  {% if tab in ('overview', 'cache') %}
   <form class="filter" method="get">
     <input type="hidden" name="tab" value="{{ tab }}">
     <label title="Only include records on or after this date. Accepts YYYY-MM-DD or a full ISO-8601 timestamp. Leave blank for no lower bound.">Since
@@ -571,6 +878,7 @@ _PAGE = """<!doctype html>
     <button type="submit" title="Apply the filters above and reload the data.">Apply</button>
     <a href="{{ request.path }}?tab={{ tab }}" title="Clear all filters and return to the all-time view on this tab.">reset</a>
   </form>
+  {% endif %}
 
   <div id="data">{{ fragment|safe }}</div>
 
@@ -634,6 +942,40 @@ _PAGE = """<!doctype html>
     }, {{ auto }} * 1000);
   </script>
   {% endif %}
+</body>
+</html>"""
+
+
+_LOGIN_PAGE = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Aime admin — sign in</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font: 15px/1.5 system-ui, sans-serif; min-height: 100vh; margin: 0;
+      display: flex; align-items: center; justify-content: center; }
+    form { display: flex; flex-direction: column; gap: .8rem; width: 280px;
+      padding: 1.6rem; border: 1px solid #8884; border-radius: 10px; }
+    h1 { margin: 0; font-size: 1.3rem; }
+    .sub { margin: 0; color: #888; font-size: .88rem; }
+    input { font: inherit; padding: .5rem .6rem; border: 1px solid #8886;
+      border-radius: 6px; background: transparent; color: inherit; }
+    button { font: inherit; font-weight: 600; padding: .5rem; cursor: pointer;
+      border: 1px solid #8886; border-radius: 6px; background: #8881; color: inherit; }
+    button:hover { background: #8883; }
+    .err { color: #d23; font-size: .85rem; margin: 0; }
+  </style>
+</head>
+<body>
+  <form method="post">
+    <h1>Aime admin</h1>
+    <p class="sub">Enter the admin password to manage usage, accounts, and keys.</p>
+    {% if error %}<p class="err">{{ error }}</p>{% endif %}
+    <input type="password" name="password" placeholder="Admin password" autofocus required>
+    <button type="submit">Sign in</button>
+  </form>
 </body>
 </html>"""
 
@@ -747,44 +1089,230 @@ def _compute(args):
     )
 
 
+def _accounts_context() -> dict:
+    """Template context for the Accounts tab — active accounts plus the
+    soft-deleted ones annotated with their purge countdown."""
+    backend = _auth_backend()
+    pending = _accounts.list_pending(backend, grace_days=_GRACE_DAYS)
+    return dict(
+        active_users=backend.list_users(),
+        pending=pending,
+        expired_count=sum(1 for p in pending if p.expired),
+        grace_days=_GRACE_DAYS,
+    )
+
+
+def _keys_context() -> dict:
+    """Template context for the Keys tab."""
+    return dict(keys=_auth_backend().list_access_keys())
+
+
 def _tab(args) -> str:
-    return "cache" if args.get("tab") == "cache" else "overview"
+    t = args.get("tab")
+    return t if t in ("overview", "cache", "accounts", "keys") else "overview"
 
 
 def _render_fragment(ctx, tab) -> str:
-    template = _FRAGMENT_CACHE if tab == "cache" else _FRAGMENT_OVERVIEW
+    template = {
+        "cache": _FRAGMENT_CACHE,
+        "accounts": _FRAGMENT_ACCOUNTS,
+        "keys": _FRAGMENT_KEYS,
+    }.get(tab, _FRAGMENT_OVERVIEW)
     return render_template_string(template, **ctx)
 
 
+# ---------------------------------------------------------------------------
+# Routes — authentication
+# ---------------------------------------------------------------------------
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if session.get("admin"):
+        return redirect(url_for("index"))
+    error = ""
+    if request.method == "POST":
+        if not _login_limiter.hit(request.remote_addr or "unknown"):
+            error = "Too many attempts. Wait a few minutes and try again."
+        elif secrets.compare_digest(request.form.get("password", ""),
+                                    _ADMIN_PASSWORD):
+            # Fresh session id on login — no fixation, and a new CSRF token.
+            session.clear()
+            session["admin"] = True
+            return redirect(url_for("index"))
+        else:
+            error = "Incorrect password."
+    return render_template_string(_LOGIN_PAGE, error=error)
+
+
+@app.route("/logout", methods=["POST"])
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
+
+# ---------------------------------------------------------------------------
+# Routes — pages
+# ---------------------------------------------------------------------------
+
+
 @app.route("/")
+@admin_required
 def index():
-    ctx = _compute(request.args)
     tab = _tab(request.args)
-    auto = _refresh_seconds(request.args)
+    csrf = _csrf_token()
+    flashes = session.pop("flash", [])
+    flash_keys = session.pop("flash_keys", [])
+
+    if tab == "accounts":
+        ctx = _accounts_context()
+        ctx["csrf"] = csrf
+        auto = 0
+        page_ctx = dict(since_raw="", until_raw="", user_raw="", all_users=[])
+    elif tab == "keys":
+        ctx = _keys_context()
+        ctx["csrf"] = csrf
+        ctx["flash_keys"] = flash_keys
+        auto = 0
+        page_ctx = dict(since_raw="", until_raw="", user_raw="", all_users=[])
+    else:
+        ctx = _compute(request.args)
+        auto = _refresh_seconds(request.args)
+        page_ctx = {k: ctx[k] for k in
+                    ("since_raw", "until_raw", "user_raw", "all_users")}
+
     fragment = _render_fragment(ctx, tab)
 
-    # Tab links carry the active filter (since/until/user/auto) across.
+    # Tab links carry the active usage filter (since/until/user/auto) across.
     keep = {k: request.args.get(k) for k in ("since", "until", "user", "auto")
             if request.args.get(k)}
-    qs_overview = urlencode({**keep, "tab": "overview"})
-    qs_cache = urlencode({**keep, "tab": "cache"})
+    qs = {t: urlencode({**keep, "tab": t})
+          for t in ("overview", "cache", "accounts", "keys")}
 
     return render_template_string(
         _PAGE, fragment=fragment, tab=tab, auto=auto,
         auto_label=_AUTO_LABELS.get(auto, "second"),
-        qs_overview=qs_overview, qs_cache=qs_cache, **ctx,
+        csrf=csrf, flashes=flashes,
+        qs_overview=qs["overview"], qs_cache=qs["cache"],
+        qs_accounts=qs["accounts"], qs_keys=qs["keys"], **page_ctx,
     )
 
 
 @app.route("/fragment")
+@admin_required
 def fragment():
-    """The data region only — polled on the refresh interval by the open page."""
+    """The data region only — polled on the refresh interval by the usage
+    tabs. Admin tabs do not poll, so only overview/cache reach here."""
     ctx = _compute(request.args)
     return _render_fragment(ctx, _tab(request.args))
 
 
+# ---------------------------------------------------------------------------
+# Routes — account administration
+# ---------------------------------------------------------------------------
+
+
+@app.route("/accounts/access", methods=["POST"])
+@admin_post
+def account_access():
+    username = (request.form.get("username") or "").strip()
+    grant = request.form.get("grant") == "1"
+    if _auth_backend().set_api_access_by_username(username, grant):
+        verb = "Granted" if grant else "Revoked"
+        _flash("ok", f"{verb} send access for {username!r}.")
+    else:
+        _flash("bad", f"No such user: {username!r}.")
+    return redirect(url_for("index", tab="accounts"))
+
+
+@app.route("/accounts/delete", methods=["POST"])
+@admin_post
+def account_delete():
+    username = (request.form.get("username") or "").strip()
+    if _auth_backend().soft_delete_by_username(username):
+        _flash("ok", f"Soft-deleted {username!r}. It can be restored within "
+                     f"the {_GRACE_DAYS}-day grace period.")
+    else:
+        _flash("bad", f"No such active user: {username!r}.")
+    return redirect(url_for("index", tab="accounts"))
+
+
+@app.route("/accounts/restore", methods=["POST"])
+@admin_post
+def account_restore():
+    username = (request.form.get("username") or "").strip()
+    if _auth_backend().restore_by_username(username):
+        _flash("ok", f"Restored {username!r}; the account is active again.")
+    else:
+        _flash("bad", f"No soft-deleted user named {username!r}.")
+    return redirect(url_for("index", tab="accounts"))
+
+
+@app.route("/accounts/purge", methods=["POST"])
+@admin_post
+def account_purge():
+    results = _accounts.purge_expired(_auth_backend(), grace_days=_GRACE_DAYS)
+    if results:
+        names = ", ".join(repr(p.user.username) for p, _ in results)
+        _flash("ok", f"Purged {len(results)} account(s): {names}. "
+                     f"A final backup was written for each.")
+    else:
+        _flash("warn", "Nothing to purge — no account is past the grace period.")
+    return redirect(url_for("index", tab="accounts"))
+
+
+@app.route("/accounts/revoke-all", methods=["POST"])
+@admin_post
+def account_revoke_all():
+    n = _auth_backend().revoke_all_access()
+    _flash("ok", f"Revoked send access for {n} user(s).")
+    return redirect(url_for("index", tab="accounts"))
+
+
+# ---------------------------------------------------------------------------
+# Routes — invite-key administration
+# ---------------------------------------------------------------------------
+
+
+@app.route("/keys/gen", methods=["POST"])
+@admin_post
+def keys_gen():
+    try:
+        count = int(request.form.get("count", "1"))
+    except (TypeError, ValueError):
+        count = 1
+    count = max(1, min(count, 50))
+    note = (request.form.get("note") or "").strip()
+    backend = _auth_backend()
+    # Raw keys are unrecoverable after this — stash them for a one-shot display
+    # on the redirect target, then they are gone.
+    session["flash_keys"] = [backend.generate_access_key(note) for _ in range(count)]
+    _flash("ok", f"Generated {count} invite key(s). Copy them now — they are "
+                 f"not shown again.")
+    return redirect(url_for("index", tab="keys"))
+
+
+@app.route("/keys/revoke", methods=["POST"])
+@admin_post
+def keys_revoke():
+    key_hash = (request.form.get("key_hash") or "").strip()
+    if _auth_backend().revoke_access_key_by_hash(key_hash):
+        _flash("ok", "Invite key revoked; it can no longer be redeemed.")
+    else:
+        _flash("bad", "Key not found or already redeemed.")
+    return redirect(url_for("index", tab="keys"))
+
+
 def main() -> None:
-    print(f"Aime usage dashboard → http://{_HOST}:{_PORT}/  (loopback only)")
+    if not _ADMIN_PASSWORD:
+        sys.stderr.write(
+            "Error: AIME_ADMIN_PASSWORD is not set.\n"
+            "The admin dashboard manages accounts and invite keys, so it "
+            "requires a password.\nSet AIME_ADMIN_PASSWORD in the environment "
+            "(or .env) and start it again.\n"
+        )
+        raise SystemExit(1)
+    print(f"Aime admin dashboard → http://{_HOST}:{_PORT}/")
     app.run(host=_HOST, port=_PORT, debug=False)
 
 

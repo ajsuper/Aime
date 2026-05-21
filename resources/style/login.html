@@ -51,12 +51,27 @@
     .hint { color: var(--muted); font-size: 0.75rem; margin: -0.2rem 0 0; }
     .error { color: var(--error); font-size: 0.85rem; margin: 0;
              min-height: 1.1rem; }
+    /* Informational line above the sign-in form (e.g. after a recovery).
+       Hidden entirely when the server interpolates nothing into it. */
+    .notice { color: var(--accent); font-size: 0.85rem;
+              margin: 0 0 1rem; line-height: 1.4; }
+    .notice:empty { display: none; }
+    /* Account-recovery prompt — shown in place of the sign-in/signup UI when
+       the user logs into a soft-deleted account. Toggled on by the script
+       below when the server fills in the account name. */
+    .recover { display: none; flex-direction: column; gap: 0.9rem; }
+    .recover-msg { margin: 0; font-size: 0.92rem; line-height: 1.5; }
+    .recover-actions { display: flex; flex-direction: column; gap: 0.6rem; }
+    .recover-no { text-align: center; color: var(--muted);
+                  font-size: 0.88rem; text-decoration: none; }
+    .recover-no:hover { color: var(--text); }
   </style>
 </head>
 <body>
   <div class="card">
     <h1>Aime</h1>
     <p class="subtitle">Your personal assistant.</p>
+    <p class="notice" data-notice>__LOGIN_NOTICE__</p>
 
     <div class="tabs" role="tablist">
       <button class="tab active" data-tab="login" role="tab" aria-selected="true">Sign in</button>
@@ -66,7 +81,8 @@
     <form class="active" data-form="login" method="post" action="/login" autocomplete="on">
       <label for="login-username">Username</label>
       <input id="login-username" name="username" type="text" autocomplete="username"
-             autocapitalize="off" autocorrect="off" required autofocus>
+             autocapitalize="off" autocorrect="off" value="__LOGIN_USERNAME__"
+             required autofocus>
       <label for="login-password">Password</label>
       <input id="login-password" name="password" type="password"
              autocomplete="current-password" required>
@@ -89,6 +105,18 @@
       <p class="error" data-error="signup">__SIGNUP_ERROR__</p>
       <button class="submit" type="submit">Create account</button>
     </form>
+
+    <div class="recover" data-recover-username="__RECOVER_USERNAME__">
+      <p class="recover-msg">Uh oh! This account no longer exists. Do you want
+        to recover it?</p>
+      <div class="recover-actions">
+        <form method="post" action="/account/recover" style="display:flex">
+          <button class="submit" type="submit" style="flex:1;margin-top:0">
+            Yes, recover it</button>
+        </form>
+        <a class="recover-no" href="/login">No</a>
+      </div>
+    </div>
   </div>
   <script>
     const tabs = document.querySelectorAll(".tab");
@@ -124,6 +152,16 @@
         document.querySelector(`.tab[data-tab="${target}"]`).click();
         break;
       }
+    }
+
+    // Account recovery: when the server marked this account as soft-deleted,
+    // it fills in the account name. Show the recovery prompt in place of the
+    // sign-in / signup UI so the choice is unambiguous.
+    const recover = document.querySelector(".recover");
+    if (recover && recover.dataset.recoverUsername.trim()) {
+      document.querySelector(".tabs").style.display = "none";
+      forms.forEach(f => { f.style.display = "none"; });
+      recover.style.display = "flex";
     }
   </script>
 </body>

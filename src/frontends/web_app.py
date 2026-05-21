@@ -16,9 +16,15 @@ import re
 import sys
 import json
 import queue
+import shutil
+import zipfile
+import tempfile
+import datetime
 import threading
 from functools import wraps
-from io import StringIO
+from io import StringIO, BytesIO
+
+import requests
 
 from flask import (
     Flask, Response, request, jsonify, session, redirect, g, url_for
@@ -44,6 +50,7 @@ from aime import (
 from aime.services import sort_events_by_date
 from aime import auth as _auth
 from aime import encryption as _enc
+from aime import backup as _backup
 
 from . import stt as _stt
 
@@ -513,6 +520,14 @@ def _load_page() -> str:
 # to open public registration.
 _ALLOW_SIGNUP = bool(int(os.environ.get("AIME_ALLOW_SIGNUP", "0")))
 
+# Access mode — see docs/access-control.md. "keys" (the default) gates /send
+# behind each user's api_access flag; new accounts start with no send access
+# and must redeem an invite key. "open" disarms the gate entirely. An
+# unrecognised value is treated as "keys" so a typo fails closed.
+_ACCESS_MODE = os.environ.get("AIME_ACCESS_MODE", "keys").strip().lower()
+if _ACCESS_MODE not in ("keys", "open"):
+    _ACCESS_MODE = "keys"
+
 # When signup is disabled, hide the "Create account" tab and form on the login
 # page so visitors aren't offered something the server will reject.
 _SIGNUP_DISABLED_STYLE = (
@@ -520,13 +535,30 @@ _SIGNUP_DISABLED_STYLE = (
 )
 
 
-def _load_login_page(login_error: str = "", signup_error: str = "") -> str:
+def _load_login_page(
+    login_error: str = "",
+    signup_error: str = "",
+    *,
+    notice: str = "",
+    recover_username: str = "",
+    login_username: str = "",
+) -> str:
+    """Render the login page.
+
+    `notice` shows an informational line above the sign-in form (e.g. after a
+    recovery). `recover_username`, when set, switches the page into its
+    account-recovery prompt for that account. `login_username` pre-fills the
+    sign-in username field.
+    """
     with open(_LOGIN_PAGE_PATH) as f:
         html = f.read()
     return (
         html
         .replace("__LOGIN_ERROR__", _h(login_error))
         .replace("__SIGNUP_ERROR__", _h(signup_error))
+        .replace("__LOGIN_NOTICE__", _h(notice))
+        .replace("__RECOVER_USERNAME__", _h(recover_username))
+        .replace("__LOGIN_USERNAME__", _h(login_username))
         .replace("__SIGNUP_DISABLED_STYLE__", "" if _ALLOW_SIGNUP else _SIGNUP_DISABLED_STYLE)
     )
 
@@ -584,6 +616,28 @@ def login_required(view):
             return redirect(url_for("login_page"))
         g.user_id = user.id
         g.username = user.username
+        # api_access gates message sending only; login itself never depends
+        # on it, so a user with no send access can still log in and read all
+        # their data (topics, calendar, past conversations).
+        g.api_access = user.api_access
+        return view(*args, **kwargs)
+    return wrapper
+
+
+def api_access_required(view):
+    """Gate a route behind the user's send access. Applies *under*
+    login_required (which populates g.api_access). In "open" access mode the
+    gate is disarmed and this is a pass-through; in "keys" mode a user without
+    api_access gets a 403 telling them to redeem an invite key."""
+    @wraps(view)
+    def wrapper(*args, **kwargs):
+        if _ACCESS_MODE == "keys" and not g.get("api_access", False):
+            return jsonify({
+                "ok": False,
+                "error": "no_access",
+                "message": "This account doesn't have message access yet. "
+                           "Add an invite key in your profile settings.",
+            }), 403
         return view(*args, **kwargs)
     return wrapper
 
@@ -592,6 +646,9 @@ def login_required(view):
 def login_page():
     if session.get("user_id"):
         return redirect("/")
+    # Drop any stale recovery handoff (e.g. the user navigated back here, or
+    # chose "No" on the recovery prompt, which links to /login).
+    session.pop("recover_user_id", None)
     return Response(_load_login_page(), mimetype="text/html")
 
 
@@ -605,6 +662,17 @@ def login_submit():
         return Response(
             _load_login_page(login_error=str(e)),
             mimetype="text/html", status=429,
+        )
+    except _auth.AccountDeleted as e:
+        # Password was correct, but the account is soft-deleted. Stash the id
+        # in the signed session so /account/recover can act on it without the
+        # password being re-entered or carried through the page, and show the
+        # recovery prompt.
+        session.clear()
+        session["recover_user_id"] = e.user_id
+        return Response(
+            _load_login_page(recover_username=username),
+            mimetype="text/html", status=200,
         )
     except _auth.AuthError:
         return Response(
@@ -646,7 +714,12 @@ def signup_submit():
             mimetype="text/html", status=400,
         )
     try:
-        user, dek = _auth_backend.create(username, password)
+        # Stamp the new account's send access from the deployment mode:
+        # "open" grants it immediately, "keys" withholds it until the user
+        # redeems an invite key. See docs/access-control.md.
+        user, dek = _auth_backend.create(
+            username, password, api_access=(_ACCESS_MODE == "open")
+        )
     except _auth.UsernameTaken:
         return Response(
             _load_login_page(signup_error="That username is already taken."),
@@ -682,10 +755,291 @@ def logout():
     return redirect(url_for("login_page"))
 
 
+@app.route("/account/recover", methods=["POST"])
+def account_recover():
+    """Restore a soft-deleted account the user just tried to log into.
+
+    Reached only from the recovery prompt: login_submit() puts the verified
+    user id into the signed session as `recover_user_id`. Restoring just
+    clears the soft-delete flag — we do not log the user in here, because the
+    session needs the password-derived DEK, so they sign in again normally
+    (which rebuilds it).
+    """
+    uid = session.get("recover_user_id")
+    session.pop("recover_user_id", None)
+    if not uid:
+        # No handoff in the session — nothing to recover. Back to login.
+        return redirect(url_for("login_page"))
+    _auth_backend.restore(uid)
+    user = _auth_backend.lookup(uid)
+    return Response(
+        _load_login_page(
+            notice="Your account has been recovered. Please sign in.",
+            login_username=user.username if user else "",
+        ),
+        mimetype="text/html",
+    )
+
+
 @app.route("/me")
 @login_required
 def me():
-    return jsonify({"id": g.user_id, "username": g.username})
+    # access_mode + api_access let the frontend show the invite-key field in
+    # profile settings and disable the composer when sending is gated.
+    return jsonify({
+        "id": g.user_id,
+        "username": g.username,
+        "access_mode": _ACCESS_MODE,
+        "api_access": g.api_access,
+    })
+
+
+@app.route("/redeem", methods=["POST"])
+@login_required
+def redeem():
+    """Redeem an invite key for the logged-in user. On success the user's
+    api_access flag is set and message sending unlocks. Available in any
+    access mode (redeeming in "open" mode just pre-grants access)."""
+    data = request.get_json(silent=True) or {}
+    key = (data.get("key") or "").strip()
+    if not key:
+        return jsonify({"ok": False, "error": "empty",
+                        "message": "Enter an invite key."}), 400
+    if _auth_backend.redeem_key(g.user_id, key):
+        return jsonify({"ok": True})
+    return jsonify({"ok": False, "error": "invalid",
+                    "message": "That key is invalid or has already been used."}), 400
+
+
+# ---------------------------------------------------------------------------
+# Account data export / import
+#
+# A user can download their whole data set as an unencrypted zip bundle and
+# upload one back (e.g. migrating from a local install). The bundle layout:
+#   aime-export.json        manifest (format tag, version, username, date)
+#   database.sql            calendar + topic metadata
+#   topics/<file>.md        topic content files
+#   conversations/<id>.json decrypted conversation transcripts
+# Import re-encrypts conversations under the importing account's key.
+# ---------------------------------------------------------------------------
+
+_BUNDLE_MANIFEST = "aime-export.json"
+_BUNDLE_FORMAT = "aime-data-export"
+
+
+def _safe_bundle_member(name: str) -> bool:
+    """True if a zip entry name is one we accept from an uploaded bundle.
+    Rejects path traversal and anything outside the known layout."""
+    if name in (_BUNDLE_MANIFEST, "database.sql"):
+        return True
+    if name.startswith("/") or "\\" in name or ".." in name.split("/"):
+        return False
+    parts = name.split("/")
+    if len(parts) != 2 or not parts[1]:
+        return False
+    if parts[0] == "topics" and parts[1].endswith(".md"):
+        return True
+    if parts[0] == "conversations" and parts[1].endswith(".json"):
+        return True
+    return False
+
+
+def _evict_user_context(user_id: int) -> None:
+    """Drop the cached UserContext so the next request rebuilds it from disk.
+    Used after an import replaces the user's files out from under it."""
+    with _user_contexts_lock:
+        ctx = _user_contexts.pop(user_id, None)
+    if ctx is not None:
+        try:
+            ctx.controller.shutdown()
+        except Exception as e:  # noqa: BLE001 - teardown must not fail import
+            print(f"[import] controller shutdown failed: {e}", file=sys.stderr)
+
+
+def _reload_backend_database(user_id: int) -> None:
+    """Ask the C++ backend to drop its cached sqlite handle for this user so
+    it re-opens database.sql after an import. Best-effort — a backend restart
+    would achieve the same, so a failure here is logged, not fatal."""
+    try:
+        requests.post(
+            aime_config.API_URL,
+            json={"tool_name": "reload_database", "user_id": user_id},
+            timeout=5,
+        )
+    except requests.RequestException as e:
+        print(f"[import] reload_database call failed: {e}", file=sys.stderr)
+
+
+@app.route("/account/export")
+@login_required
+def account_export():
+    """Stream the logged-in user's data as an unencrypted zip bundle."""
+    user_id = g.user_id
+    with _dek_cache_lock:
+        dek = _dek_cache.get(user_id)
+    if dek is None:
+        return jsonify({"ok": False, "error": "auth required"}), 401
+
+    user_dir = _user_dir(user_id)
+    buf = BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(_BUNDLE_MANIFEST, json.dumps({
+            "format": _BUNDLE_FORMAT,
+            "version": 1,
+            "user_id": user_id,
+            "username": g.username,
+            "exported_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        }, indent=2))
+
+        db_path = os.path.join(user_dir, "database.sql")
+        if os.path.exists(db_path):
+            # Consistent snapshot — the backend may hold the file open.
+            with tempfile.NamedTemporaryFile(delete=False) as tmp:
+                tmp_path = tmp.name
+            try:
+                _backup.snapshot_sqlite(db_path, tmp_path)
+                zf.write(tmp_path, "database.sql")
+            finally:
+                os.unlink(tmp_path)
+
+        topics_dir = os.path.join(user_dir, "topics")
+        if os.path.isdir(topics_dir):
+            for name in sorted(os.listdir(topics_dir)):
+                path = os.path.join(topics_dir, name)
+                if os.path.isfile(path):
+                    zf.write(path, f"topics/{name}")
+
+        conv_dir = _conversations_dir(user_id)
+        if os.path.isdir(conv_dir):
+            for name in sorted(os.listdir(conv_dir)):
+                if not name.endswith(".json.enc"):
+                    continue
+                session_id = name[: -len(".json.enc")]
+                try:
+                    with open(os.path.join(conv_dir, name), "rb") as f:
+                        blob = f.read()
+                    plaintext = _enc.decrypt_blob(
+                        dek, blob, aad=session_id.encode("utf-8")
+                    )
+                except Exception as e:  # noqa: BLE001 - skip a corrupt file
+                    print(f"[export] skipped {name}: {e}", file=sys.stderr)
+                    continue
+                zf.writestr(f"conversations/{session_id}.json", plaintext)
+
+    stamp = datetime.datetime.now().strftime("%Y%m%d")
+    fname = f"aime-export-{g.username}-{stamp}.zip"
+    return Response(
+        buf.getvalue(),
+        mimetype="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
+
+
+@app.route("/account/import", methods=["POST"])
+@login_required
+def account_import():
+    """Replace the logged-in user's data with an uploaded bundle. The current
+    data is backed up first; conversations are re-encrypted under this
+    account's key."""
+    user_id = g.user_id
+    with _dek_cache_lock:
+        dek = _dek_cache.get(user_id)
+    if dek is None:
+        return jsonify({"ok": False, "error": "auth required"}), 401
+
+    upload = request.files.get("bundle")
+    if upload is None:
+        return jsonify({"ok": False, "error": "no_file",
+                        "message": "No bundle file was uploaded."}), 400
+    try:
+        zf = zipfile.ZipFile(BytesIO(upload.read()))
+    except zipfile.BadZipFile:
+        return jsonify({"ok": False, "error": "bad_zip",
+                        "message": "That file is not a valid zip bundle."}), 400
+
+    with zf:
+        # Validate the bundle by its contents, never by a manifest — a
+        # hand-assembled bundle (e.g. zipping a local install's data directory
+        # straight up) has no manifest, and a manifest could be forged anyway.
+        # These guards always run.
+        members = [n for n in zf.namelist() if not n.endswith("/")]
+        # Reject anything outside the known, traversal-free layout before we
+        # write a single byte.
+        for name in members:
+            if not _safe_bundle_member(name):
+                return jsonify({"ok": False, "error": "bad_member",
+                                "message": f"Unexpected entry in bundle: {name}"}), 400
+        # Sanity floor: a real bundle carries the calendar/topics database.
+        # This also stops an empty or unrelated zip from wiping the account.
+        if "database.sql" not in members:
+            return jsonify({"ok": False, "error": "bad_bundle",
+                            "message": "Bundle has no database.sql — it does "
+                                       "not look like Aime data."}), 400
+
+        # Safety net: snapshot the current data before replacing it.
+        backup_path = _backup.backup_user_data(user_id, reason="import")
+
+        # Detach the in-memory session so nothing writes during the swap.
+        _evict_user_context(user_id)
+
+        user_dir = _user_dir(user_id)
+        os.makedirs(user_dir, exist_ok=True)
+        db_dst = os.path.join(user_dir, "database.sql")
+        topics_dst = os.path.join(user_dir, "topics")
+        conv_dst = os.path.join(user_dir, "conversations")
+        if os.path.exists(db_dst):
+            os.remove(db_dst)
+        shutil.rmtree(topics_dst, ignore_errors=True)
+        shutil.rmtree(conv_dst, ignore_errors=True)
+        os.makedirs(topics_dst, exist_ok=True)
+        os.makedirs(conv_dst, exist_ok=True)
+
+        for name in members:
+            if name == _BUNDLE_MANIFEST:
+                continue
+            if name == "database.sql":
+                with open(db_dst, "wb") as f:
+                    f.write(zf.read(name))
+            elif name.startswith("topics/"):
+                with open(os.path.join(user_dir, name), "wb") as f:
+                    f.write(zf.read(name))
+            elif name.startswith("conversations/"):
+                session_id = os.path.basename(name)[: -len(".json")]
+                blob = _enc.encrypt_blob(
+                    dek, zf.read(name), aad=session_id.encode("utf-8")
+                )
+                with open(os.path.join(conv_dst, session_id + ".json.enc"), "wb") as f:
+                    f.write(blob)
+
+    # Make the C++ backend re-open the freshly written database.sql.
+    _reload_backend_database(user_id)
+
+    return jsonify({
+        "ok": True,
+        "backup": os.path.basename(backup_path) if backup_path else None,
+        "message": "Data imported successfully. The page will now reload.",
+    })
+
+
+@app.route("/account/delete", methods=["POST"])
+@login_required
+def account_delete():
+    """Soft-delete the logged-in user's own account.
+
+    This is a *reversible* deactivation: the account row is flagged (see
+    aime.auth.soft_delete) but the data directory is left fully intact, so the
+    user can recover it by signing in again during the grace period. The
+    permanent purge is a separate admin step (scripts/manage_users.py purge).
+    """
+    uid = g.user_id
+    _auth_backend.soft_delete(uid)
+    # Tear down the in-memory session and drop the cached DEK — the account is
+    # now disabled and the next request must not resolve to it.
+    _evict_user_context(uid)
+    session.clear()
+    with _dek_cache_lock:
+        _dek_cache.pop(uid, None)
+    return jsonify({"ok": True})
 
 
 @app.route("/")
@@ -699,6 +1053,7 @@ _ALLOWED_IMAGE_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
 
 @app.route("/send", methods=["POST"])
 @login_required
+@api_access_required
 def send():
     data = request.get_json(silent=True) or {}
     text = (data.get("text") or "").strip()

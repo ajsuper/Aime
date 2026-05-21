@@ -48,11 +48,17 @@ done
 # working directory must be src/.
 cd "$REPO_ROOT/src"
 
-# Optionally start the usage dashboard (frontends/usage_dashboard.py) when
+# Optionally start the admin dashboard (frontends/usage_dashboard.py) when
 # AIME_USAGE_DASHBOARD=1. It binds 0.0.0.0 so the mapped Docker port works;
-# the dashboard can expose usernames, so only map its port on a trusted host.
+# the dashboard manages accounts and shows usernames, so only map its port on
+# a trusted host. It is password-gated: without AIME_ADMIN_PASSWORD it exits
+# immediately, logging an error.
 if [ "${AIME_USAGE_DASHBOARD:-0}" = "1" ]; then
-    echo "Starting usage dashboard on port ${AIME_USAGE_DASHBOARD_PORT:-5050} ..."
+    if [ -z "${AIME_ADMIN_PASSWORD:-}" ]; then
+        echo "Warning: AIME_USAGE_DASHBOARD=1 but AIME_ADMIN_PASSWORD is unset" >&2
+        echo "  — the admin dashboard will not start. Set it in your .env." >&2
+    fi
+    echo "Starting admin dashboard on port ${AIME_USAGE_DASHBOARD_PORT:-5050} ..."
     AIME_USAGE_DASHBOARD_HOST="${AIME_USAGE_DASHBOARD_HOST:-0.0.0.0}" \
         python -m frontends.usage_dashboard &
     DASHBOARD_PID=$!

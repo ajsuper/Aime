@@ -684,15 +684,14 @@
     .settings-close svg { width: 16px; height: 16px; }
     .settings-body { overflow-y: auto; padding: 1.25rem; display: flex;
                      flex-direction: column; gap: 1.25rem; }
-    .settings-section h3 { margin: 0 0 0.35rem; font-size: 1.15rem; font-weight: 600; }
+    .settings-section h3 { margin: 0 0 0.35rem; font-size: 1.15rem; font-weight: 600;
+                           text-align: center; }
     .settings-section + .settings-section { border-top: 1px solid var(--border);
                                             padding-top: 1.25rem; }
     .settings-section .desc { color: var(--muted); font-size: 0.85rem;
-                              margin: 0 0 0.75rem; }
+                              margin: 0 0 0.75rem; text-align: center; }
     .settings-row { display: flex; align-items: center; justify-content: space-between;
-                    gap: 1rem; padding: 0.55rem 0;
-                    border-top: 1px solid var(--border); }
-    .settings-row:first-of-type { border-top: 0; }
+                    gap: 1rem; padding: 0.55rem 0; }
     .settings-row .label { font-size: 0.9rem; }
     .settings-row .value { color: var(--muted); font-size: 0.85rem; }
     .settings-row select { background: var(--bg-input); color: var(--text);
@@ -1157,9 +1156,49 @@
             <span class="value" id="account-username">—</span>
           </div>
         </div>
+        <div class="settings-section" id="account-access-section" style="display:none">
+          <h3>Aime access</h3>
+          <p class="desc" id="account-access-desc">—</p>
+          <div class="settings-row" id="account-redeem-row" style="display:none">
+            <input id="account-key-input" type="text" autocomplete="off"
+                   placeholder="Invite key"
+                   style="flex:1;min-width:0;margin-right:0.5rem;background:var(--bg-input);
+                          color:var(--text);border:1px solid var(--border);
+                          border-radius:8px;padding:0.4rem 0.6rem;font-size:0.85rem">
+            <button class="btn-primary" id="account-redeem-btn"
+                    style="background:var(--accent);color:#fff;border:0;border-radius:8px;
+                           padding:0.4rem 0.9rem;cursor:pointer;font-size:0.85rem">
+              Redeem
+            </button>
+          </div>
+          <p class="desc" id="account-redeem-msg" style="display:none;margin-top:0.4rem"></p>
+        </div>
         <div class="settings-section">
           <h3>Data</h3>
-          <p class="desc">Manage saved conversations.</p>
+          <p class="desc">Download your full data set as a zip, restore one,
+            or delete saved conversations.</p>
+          <div class="settings-row">
+            <span class="label">Export my data</span>
+            <button class="btn-neutral" id="account-export-btn"
+                    style="background:var(--bg-input);color:var(--text);
+                           border:1px solid var(--border);border-radius:8px;
+                           padding:0.4rem 0.9rem;cursor:pointer;font-size:0.85rem">
+              Download .zip
+            </button>
+          </div>
+          <div class="settings-row">
+            <span class="label">Import data</span>
+            <button class="btn-neutral" id="account-import-btn"
+                    style="background:var(--bg-input);color:var(--text);
+                           border:1px solid var(--border);border-radius:8px;
+                           padding:0.4rem 0.9rem;cursor:pointer;font-size:0.85rem">
+              Upload .zip…
+            </button>
+          </div>
+          <input type="file" id="account-import-file"
+                 accept=".zip,application/zip" style="display:none">
+          <p class="desc" id="account-import-msg"
+             style="display:none;margin-top:0.4rem"></p>
           <div class="settings-row">
             <span class="label" style="color: var(--error)">Delete all conversations</span>
             <button class="btn-danger" id="account-delete-all-btn">Delete all</button>
@@ -1170,6 +1209,16 @@
           <div class="settings-row">
             <span class="label" style="color: var(--error)">Log out</span>
             <button class="btn-danger" id="account-logout-btn">Log out</button>
+          </div>
+        </div>
+        <div class="settings-section">
+          <h3>Delete account</h3>
+          <p class="desc">Deactivates your account — it will appear to no
+            longer exist. You can recover it by signing in again. After 30
+            days it is permanently deleted.</p>
+          <div class="settings-row">
+            <span class="label" style="color: var(--error)">Delete my account</span>
+            <button class="btn-danger" id="account-delete-btn">Delete account</button>
           </div>
         </div>
       </div>
@@ -1955,11 +2004,17 @@ document.getElementById("new-chat-btn").addEventListener("click", () => {
 });
 
 async function sendText(text, images) {
-  await fetch("/send", {
+  const r = await fetch("/send", {
     method: "POST",
     headers: {"Content-Type": "application/json"},
     body: JSON.stringify({text, images: images || []}),
   });
+  // Defense in depth: if access was revoked since the page loaded, the
+  // server answers 403 — sync the UI so the composer locks immediately.
+  if (r.status === 403) {
+    __apiAccess = false;
+    applyAccessState();
+  }
 }
 
 // --- Queued draft (above the prompt) ------------------------------------
@@ -2959,15 +3014,96 @@ document.addEventListener("keydown", (e) => {
 const accountBackdrop = document.getElementById("account-backdrop");
 const accountUsernameEl = document.getElementById("account-username");
 
-async function openAccount() {
-  accountBackdrop.classList.add("open");
+// Access state (see docs/access-control.md). Optimistic defaults until the
+// first /me resolves; the server-side /send gate is the real guard.
+let __accessMode = "open";
+let __apiAccess = true;
+
+const accessSection = document.getElementById("account-access-section");
+const accessDesc = document.getElementById("account-access-desc");
+const redeemRow = document.getElementById("account-redeem-row");
+const keyInput = document.getElementById("account-key-input");
+const redeemBtn = document.getElementById("account-redeem-btn");
+const redeemMsg = document.getElementById("account-redeem-msg");
+
+// Reflect access state into the composer and the Account modal. Sending is
+// locked only in "keys" mode for a user without api_access — login and all
+// data browsing stay available regardless.
+function applyAccessState() {
+  const locked = (__accessMode === "keys" && !__apiAccess);
+  const input = document.getElementById("i");
+  const sendBtn = document.querySelector(".send-btn");
+  if (input) {
+    input.disabled = locked;
+    if (locked) input.placeholder = "Add an invite key in Account settings to send messages";
+    else if (input.placeholder.startsWith("Add an invite key")) input.placeholder = "Message Aime…";
+  }
+  if (sendBtn) sendBtn.disabled = locked;
+
+  if (__accessMode !== "keys") { accessSection.style.display = "none"; return; }
+  accessSection.style.display = "";
+  if (__apiAccess) {
+    accessDesc.textContent = "Message access is active on this account.";
+    redeemRow.style.display = "none";
+  } else {
+    accessDesc.textContent = "This account can browse topics and past "
+      + "conversations, but needs an invite key before it can send messages "
+      + "to Aime.";
+    redeemRow.style.display = "";
+  }
+}
+
+async function refreshMe() {
   try {
     const r = await fetch("/me", {credentials: "same-origin"});
     const data = await r.json();
     accountUsernameEl.textContent = data.username || "—";
+    __accessMode = data.access_mode || "open";
+    __apiAccess = !!data.api_access;
   } catch {
     accountUsernameEl.textContent = "—";
   }
+  applyAccessState();
+}
+
+redeemBtn.addEventListener("click", async () => {
+  const key = keyInput.value.trim();
+  redeemMsg.style.display = "none";
+  if (!key) return;
+  redeemBtn.disabled = true;
+  try {
+    const r = await fetch("/redeem", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      credentials: "same-origin",
+      body: JSON.stringify({key}),
+    });
+    const data = await r.json();
+    if (data.ok) {
+      __apiAccess = true;
+      keyInput.value = "";
+      redeemMsg.textContent = "Key accepted — message access unlocked.";
+      redeemMsg.style.color = "var(--muted)";
+      applyAccessState();
+    } else {
+      redeemMsg.textContent = data.message || "That key could not be redeemed.";
+      redeemMsg.style.color = "var(--error)";
+    }
+  } catch {
+    redeemMsg.textContent = "Network error — try again.";
+    redeemMsg.style.color = "var(--error)";
+  }
+  redeemMsg.style.display = "";
+  redeemBtn.disabled = false;
+});
+keyInput.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); redeemBtn.click(); }
+});
+
+async function openAccount() {
+  accountBackdrop.classList.add("open");
+  redeemMsg.style.display = "none";
+  await refreshMe();
 }
 function closeAccount() {
   accountBackdrop.classList.remove("open");
@@ -2980,6 +3116,10 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && accountBackdrop.classList.contains("open")) closeAccount();
 });
 document.getElementById("account-logout-btn").addEventListener("click", logout);
+
+// Resolve access state at startup so the composer is correctly locked/unlocked
+// on page load, without waiting for the user to open the Account modal.
+refreshMe();
 
 // -- Confirm dialog -----------------------------------------------------
 
@@ -3014,6 +3154,58 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && confirmBackdrop.classList.contains("open")) closeConfirm();
 });
 
+// -- Data export / import ----------------------------------------------
+
+document.getElementById("account-export-btn").addEventListener("click", () => {
+  // The endpoint replies with Content-Disposition: attachment, so navigating
+  // to it triggers a download without leaving the page.
+  window.location = "/account/export";
+});
+
+const importFileInput = document.getElementById("account-import-file");
+const importMsg = document.getElementById("account-import-msg");
+
+document.getElementById("account-import-btn").addEventListener("click", () => {
+  importFileInput.click();
+});
+
+importFileInput.addEventListener("change", () => {
+  const file = importFileInput.files[0];
+  importFileInput.value = "";  // allow re-selecting the same file later
+  if (!file) return;
+  confirmAction({
+    title: "Import data?",
+    message: "This replaces ALL of this account's data with the uploaded "
+      + "bundle. Your current data is backed up first, then the page reloads.",
+    confirmLabel: "Import",
+    onConfirm: () => doImport(file),
+  });
+});
+
+async function doImport(file) {
+  importMsg.style.display = "";
+  importMsg.style.color = "var(--muted)";
+  importMsg.textContent = "Importing…";
+  const form = new FormData();
+  form.append("bundle", file);
+  try {
+    const r = await fetch("/account/import", {
+      method: "POST", body: form, credentials: "same-origin",
+    });
+    const data = await r.json();
+    if (data.ok) {
+      importMsg.textContent = "Imported — reloading…";
+      setTimeout(() => window.location.reload(), 800);
+    } else {
+      importMsg.style.color = "var(--error)";
+      importMsg.textContent = data.message || "Import failed.";
+    }
+  } catch {
+    importMsg.style.color = "var(--error)";
+    importMsg.textContent = "Network error during import.";
+  }
+}
+
 // -- Delete sessions ----------------------------------------------------
 
 async function deleteSession(id) {
@@ -3040,6 +3232,36 @@ document.getElementById("account-delete-all-btn").addEventListener("click", () =
     message: "Every saved chat will be permanently removed. This cannot be undone.",
     confirmLabel: "Delete all",
     onConfirm: deleteAllSessions,
+  });
+});
+
+// -- Delete account -----------------------------------------------------
+
+async function deleteAccount() {
+  try {
+    const r = await fetch("/account/delete", {
+      method: "POST", credentials: "same-origin",
+    });
+    if (r.ok) {
+      // The account is now soft-deleted and the session is gone server-side;
+      // send the user to the login page.
+      window.location = "/login";
+    } else {
+      appendNotice("failed to delete account (status " + r.status + ")", "error");
+    }
+  } catch (e) {
+    appendNotice("failed to delete account: " + e, "error");
+  }
+}
+
+document.getElementById("account-delete-btn").addEventListener("click", () => {
+  confirmAction({
+    title: "Delete your account?",
+    message: "Your account will be deactivated and will appear to no longer "
+      + "exist. You can recover it by signing in again within 30 days, after "
+      + "which it is permanently deleted.",
+    confirmLabel: "Delete account",
+    onConfirm: deleteAccount,
   });
 });
 

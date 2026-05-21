@@ -934,6 +934,21 @@ static sqlite3* getUserDb(int user_id) {
     return db;
 }
 
+// Drop a user's cached sqlite handle so the next request re-opens
+// database.sql from disk. Called via the "reload_database" API action after
+// the web frontend replaces a user's database during a data import. The
+// caller must ensure no other request for this user is in flight — the import
+// flow is a single, deliberate user action — since handed-out handles are
+// used lock-free.
+static void eraseUserDb(int user_id) {
+    std::lock_guard<std::mutex> lock(g_user_dbs_mu);
+    auto it = g_user_dbs.find(user_id);
+    if (it != g_user_dbs.end()) {
+        sqlite3_close(it->second);
+        g_user_dbs.erase(it);
+    }
+}
+
 // Move a legacy single-user layout under <root>/database.sql + <root>/topics/
 // to user 1 so existing data keeps working after the multi-user switch.
 // Idempotent: if user 1 already has data, the legacy files are left alone
@@ -1019,6 +1034,17 @@ int main(int argc, char* argv[]) {
         if (!requireUserId(jsonData, user_id, authErr)) {
             return authErr;
         }
+        // Maintenance action: drop this user's cached sqlite handle so the
+        // next request re-opens database.sql from disk. The web frontend
+        // calls this after replacing a user's database during a data import,
+        // so the backend stops writing to the stale (pre-import) handle.
+        if (jsonData["tool_name"] == "reload_database") {
+            eraseUserDb(user_id);
+            crow::json::wvalue response;
+            response["ok"] = true;
+            return crow::response(200, response);
+        }
+
         sqlite3* database = getUserDb(user_id);
 
         if (jsonData["tool_name"] == "get_events") {
