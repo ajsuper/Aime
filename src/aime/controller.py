@@ -216,6 +216,11 @@ class ConversationController:
         except Exception as exc:
             self._emit(CoreEvent(kind="error", text=f"send failed: {exc}"))
 
+    def set_client_timezone(self, tz: str) -> None:
+        """Forward the client's IANA timezone to the backend so per-turn
+        timestamps reflect the user's local time rather than the server's."""
+        self._backend.set_client_timezone(tz)
+
     # --- session operations ---
 
     def stop_model(self, timeout: float = 5.0) -> bool:

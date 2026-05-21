@@ -2081,13 +2081,24 @@ document.getElementById("new-chat-btn").addEventListener("click", () => {
   sendText("/reset", []);
 });
 
+// The browser's IANA timezone (e.g. "America/New_York"), resolved fresh on
+// each send so per-turn timestamps the model sees track the user's local
+// time — and self-correct if the user changes timezone mid-session.
+function clientTimezone() {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || "";
+  } catch (_) {
+    return "";
+  }
+}
+
 async function sendText(text, images) {
   let r;
   try {
     r = await fetch("/send", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({text, images: images || []}),
+      body: JSON.stringify({text, images: images || [], tz: clientTimezone()}),
     });
   } catch (e) {
     // Network failure before the request landed — drop the "Sending…"

@@ -1139,6 +1139,12 @@ def send():
     if not text and not images:
         return jsonify({"ok": False, "error": "empty"}), 400
     ctx = _context_for(g.user_id)
+    # The browser sends its IANA timezone (e.g. "America/New_York") with each
+    # message so per-turn timestamps the model sees track the user's local
+    # time. Refreshed every send — self-corrects if the user travels.
+    tz = data.get("tz")
+    if isinstance(tz, str) and tz:
+        ctx.controller.set_client_timezone(tz)
     should_quit = ctx.controller.dispatch_input(text, images=images or None)
     return jsonify({"ok": True, "quit": should_quit})
 

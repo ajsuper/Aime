@@ -9,6 +9,7 @@ import os
 import hashlib
 import threading
 import datetime
+import zoneinfo
 from dataclasses import dataclass
 from typing import Iterator, Literal, Protocol, runtime_checkable
 
@@ -146,6 +147,12 @@ class AgentBackend(Protocol):
         without entering the message history. Cleared on new_session/load."""
         ...
 
+    def set_client_timezone(self, tz: str) -> None:
+        """Record the client's IANA timezone (e.g. 'America/New_York') so any
+        per-turn date/time the model sees reflects the user's local time
+        rather than the server's. Empty string => server-local time."""
+        ...
+
     def submit(self, event: BackendEvent) -> None:
         """Push a user/system/tool-result event into the conversation."""
         ...
@@ -255,6 +262,10 @@ class AnthropicMessagesBackend:
         # in the system array rather than the message history so it stays out
         # of compaction and doesn't get replayed inside user turns.
         self._session_context: str = ""
+        # Client's IANA timezone, refreshed from each /send. Drives the
+        # per-turn date block so the model sees the *user's* local time
+        # rather than the server's. Empty => fall back to server-local time.
+        self._client_tz: str = ""
 
         self._session_id: str | None = None
         # One-sentence human-readable description of the session, shown in
@@ -300,6 +311,13 @@ class AnthropicMessagesBackend:
         with self._lock:
             self._session_context = text or ""
 
+    def set_client_timezone(self, tz: str) -> None:
+        """Record the client's IANA timezone so the per-turn date block
+        reflects the user's local time. Survives new_session/load — a user's
+        timezone is a property of the client, not of any one conversation."""
+        with self._lock:
+            self._client_tz = tz or ""
+
     def _build_system(self) -> list[dict]:
         """Assemble the system array for this turn.
 
@@ -320,12 +338,23 @@ class AnthropicMessagesBackend:
             })
         return blocks
 
-    @staticmethod
-    def _date_block() -> dict:
+    def _date_block(self) -> dict:
         """The volatile 'accurate date' block. Carries minute-granular time, so
         it changes constantly — it must only ever be placed *after* a cache
-        breakpoint, never inside a cached prefix."""
-        now = datetime.datetime.now()
+        breakpoint, never inside a cached prefix.
+
+        Formatted in the client's timezone when one is known, so the model
+        sees the *user's* local time; an unset or unrecognised zone falls
+        back to server-local time."""
+        tz = self._client_tz
+        now = None
+        if tz:
+            try:
+                now = datetime.datetime.now(zoneinfo.ZoneInfo(tz))
+            except Exception:
+                now = None  # unknown zone / missing tzdata — fall back below
+        if now is None:
+            now = datetime.datetime.now()
         day_names = ["Monday", "Tuesday", "Wednesday", "Thursday",
                      "Friday", "Saturday", "Sunday"]
         date_str = now.strftime("%d/%m/%Y, %H:%M")
@@ -782,8 +811,7 @@ class AnthropicMessagesBackend:
         # _turn_trigger until submit() has gathered every tool_result and
         # appended them as a user message.
 
-    @classmethod
-    def _cacheable_messages(cls, messages: list[dict]) -> list[dict]:
+    def _cacheable_messages(self, messages: list[dict]) -> list[dict]:
         """Return a shallow copy of `messages` with a prompt-cache breakpoint on
         the last content block of the final message. This caches the entire
         history prefix, so each agent-loop turn only pays full input price for
@@ -813,7 +841,7 @@ class AnthropicMessagesBackend:
                 "cache_control": {"type": "ephemeral", "ttl": "5m"},
             }
             # Trails the breakpoint: uncached, changes every minute, harmless.
-            new_content.append(cls._date_block())
+            new_content.append(self._date_block())
             out[-1] = {**last, "content": new_content}
         return out
 
@@ -1236,6 +1264,11 @@ class SessionsBackend:
     def set_session_context(self, text: str) -> None:
         # Beta Sessions backend manages its own server-side state; nothing to
         # attach client-side. Kept to satisfy the AgentBackend protocol.
+        return
+
+    def set_client_timezone(self, tz: str) -> None:
+        # Date/time is handled server-side by the Beta Sessions agent; nothing
+        # to inject client-side. Kept to satisfy the AgentBackend protocol.
         return
 
     def messages_snapshot(self) -> list[dict]:
