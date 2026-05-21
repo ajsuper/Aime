@@ -523,11 +523,17 @@
     .cal-toolbar button:hover { border-color: var(--accent); }
     .cal-toolbar .title { flex: 1; text-align: center; font-weight: 600;
                           font-size: 0.95rem; }
+    /* Calendar pane scrolls as a single column: the month grid and the
+       day's event list share one scroll, so the event list can use the
+       full window height and the last week's events are never clipped
+       behind it (they used to overlap on desktop's fixed-region layout). */
+    .pane[data-pane="calendar"].active { overflow-y: auto;
+                                         overscroll-behavior: contain; }
     .cal-grid { display: grid; grid-template-columns: repeat(7, 1fr);
                 grid-template-rows: 26px;
-                grid-auto-rows: minmax(95px, 1fr);
+                grid-auto-rows: minmax(95px, auto);
                 gap: 1px; padding: 1px; background: var(--border);
-                flex: 1 1 auto; min-height: 0; }
+                flex: 0 0 auto; }
     .cal-grid .dow { background: var(--bg-elev); padding: 0.3rem;
                      text-align: center; font-size: 0.7rem;
                      color: var(--muted); font-weight: 600;
@@ -545,9 +551,8 @@
     .cal-cell.today .daynum { color: var(--accent); }
     .cal-cell .ev { color: var(--text); font-size: 0.7rem;
                     overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .day-detail { flex: 0 0 auto; max-height: 35%; padding: 0.75rem 1rem;
-                  overflow-y: auto; border-top: 1px solid var(--border);
-                  min-height: 80px; overscroll-behavior: contain; }
+    .day-detail { flex: 0 0 auto; padding: 0.75rem 1rem;
+                  border-top: 1px solid var(--border); min-height: 80px; }
     .day-detail h4 { margin: 0 0 0.5rem; font-size: 0.85rem; color: var(--muted);
                      font-weight: 600; text-transform: uppercase;
                      letter-spacing: 0.05em; }
@@ -586,9 +591,10 @@
                      padding: 0.4rem 0.75rem; display: none; gap: 0.35rem;
                      align-items: center; flex-wrap: wrap; }
     .topic-toolbar.show { display: flex; }
-    /* Back arrow — hidden on desktop, revealed by the mobile media query. */
-    .topic-back-btn { display: none; align-items: center; justify-content: center; }
-    .topic-back-btn svg { width: 16px; height: 16px; }
+    /* Back arrow — lives in the side header next to the X. Hidden on
+       desktop and whenever no topic is open; revealed by the mobile media
+       query only while a topic detail is showing. */
+    .topic-back-btn { display: none; }
     .topic-toolbar button { background: transparent; color: var(--muted);
                             border: 1px solid var(--border); border-radius: 6px;
                             padding: 0.25rem 0.6rem; font: inherit; font-size: 0.82rem;
@@ -886,16 +892,9 @@
       .send-btn svg, .mic-btn svg, .attach-btn svg { width: 22px; height: 22px; }
       .input-wrap { border-radius: 26px; padding: 0.4rem; }
 
-      /* Calendar: collapse the two fixed regions (grid + event list) into a
-         single scroll so the bottom week can't overlap the events, and the
-         user can scroll down to give the event list as much room as needed.
-         The month banner scrolls away with the grid — it is not sticky. */
-      .pane[data-pane="calendar"].active { overflow-y: auto;
-                                           overscroll-behavior: contain; }
-      .pane[data-pane="calendar"] .cal-grid { flex: 0 0 auto;
-                                              grid-auto-rows: minmax(66px, auto); }
-      .pane[data-pane="calendar"] .day-detail { flex: 0 0 auto; max-height: none;
-                                                overflow: visible; }
+      /* Calendar single-scroll layout is now the default (see .cal-grid);
+         phones just get shorter cells so more weeks fit before a scroll. */
+      .pane[data-pane="calendar"] .cal-grid { grid-auto-rows: minmax(66px, auto); }
 
       /* Topics pane: the list fills the pane; selecting a topic slides its
          content in over the full window (see `.topic-open` below). */
@@ -907,8 +906,8 @@
         position: absolute; inset: 0; width: 100%; z-index: 3;
         background: var(--bg-elev); transform: translateX(100%);
         transition: transform 0.26s cubic-bezier(0.22, 0.85, 0.3, 1); }
-      .pane[data-pane="topics"].topic-open .topic-content { transform: translateX(0); }
-      .topic-back-btn { display: inline-flex !important; }
+      #side-col.topic-open .topic-content { transform: translateX(0); }
+      #side-col.topic-open .topic-back-btn { display: flex; }
     }
   </style>
 </head>
@@ -963,6 +962,14 @@
             <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
           </svg>
         </button>
+        <button class="side-close topic-back-btn" id="topic-back-btn"
+                title="Back to topics" aria-label="Back to topics">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="19" y1="12" x2="5" y2="12"/>
+            <polyline points="12 19 5 12 12 5"/>
+          </svg>
+        </button>
         <button class="side-close" id="side-close" title="Close" aria-label="Close">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
                stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
@@ -1004,14 +1011,6 @@
           <div id="topic-divider" title="Drag to resize"></div>
           <div class="topic-content scroll" id="topic-content">
             <div class="topic-toolbar" id="topic-toolbar">
-              <button id="topic-back-btn" class="topic-back-btn"
-                      title="Back to topics" aria-label="Back to topics">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                     stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                  <line x1="19" y1="12" x2="5" y2="12"/>
-                  <polyline points="12 19 5 12 12 5"/>
-                </svg>
-              </button>
               <button id="topic-edit-btn" title="Edit topic">Edit</button>
               <button id="topic-bold-btn" class="icon" title="Bold (Ctrl+B)" hidden><b>B</b></button>
               <button id="topic-italic-btn" class="icon icon-i" title="Italic (Ctrl+I)" hidden>I</button>
@@ -2506,6 +2505,9 @@ document.getElementById("side-refresh").addEventListener("click", () => {
 
 function activatePane(name) {
   activePaneName = name;
+  // Switching panes always leaves any open topic detail — clears the
+  // back arrow so it can't linger in the header of another pane.
+  sideColEl.classList.remove("topic-open");
   // Mobile: the chat input keeps focus (and the on-screen keyboard) when the
   // panel opens, so the first tap inside the panel is spent dismissing the
   // keyboard / blurring rather than acting. Drop focus to the panel up front
@@ -2531,6 +2533,7 @@ function activatePane(name) {
 
 function closeSide() {
   activePaneName = null;
+  sideColEl.classList.remove("topic-open");
   document.body.classList.remove("side-open");
   document.querySelectorAll(".pane-btn").forEach(t => t.classList.remove("active"));
   // Play the slide-out, then drop `display` once it ends. `.closing` keeps
@@ -2741,14 +2744,13 @@ async function loadDayEvents(d) {
 
 // -- Topics -------------------------------------------------------------
 
-const topicsPaneEl = document.querySelector('.pane[data-pane="topics"]');
 const topicListEl = document.getElementById("topic-list");
 const topicContentEl = document.getElementById("topic-content");
 const topicBodyEl = document.getElementById("topic-body");
 const topicToolbarEl = document.getElementById("topic-toolbar");
 const topicBackBtn = document.getElementById("topic-back-btn");
 topicBackBtn.addEventListener("click", () => {
-  topicsPaneEl.classList.remove("topic-open");
+  sideColEl.classList.remove("topic-open");
 });
 const topicEditBtn = document.getElementById("topic-edit-btn");
 const topicBoldBtn = document.getElementById("topic-bold-btn");
@@ -2762,7 +2764,7 @@ let allTopics = [];
 
 async function loadTopics() {
   // Reopening the pane always lands on the browser, not a stale topic view.
-  topicsPaneEl.classList.remove("topic-open");
+  sideColEl.classList.remove("topic-open");
   topicListEl.innerHTML = '<div class="empty">loading…</div>';
   try {
     const r = await fetch("/topics");
@@ -2854,7 +2856,7 @@ async function selectTopic(tid, item) {
   // even while the topic is still loading.
   if (mobileMQ.matches) {
     topicToolbarEl.classList.add("show");
-    topicsPaneEl.classList.add("topic-open");
+    sideColEl.classList.add("topic-open");
     topicContentEl.scrollTop = 0;
   }
   try {
