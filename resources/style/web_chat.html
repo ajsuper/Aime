@@ -758,6 +758,19 @@
                       cursor: pointer; display: flex; align-items: center;
                       justify-content: center; padding: 0; }
     .attach .remove:hover { background: var(--error); }
+    /* Spinner shown on a chip while a file is being read / downscaled, and
+       on the send button while a still-processing attachment is awaited. */
+    .attach.loading { display: flex; align-items: center; justify-content: center; }
+    .spinner { width: 20px; height: 20px; border-radius: 50%;
+               border: 2.5px solid rgba(255,255,255,0.18);
+               border-top-color: var(--accent); box-sizing: border-box;
+               animation: spin 0.7s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .send-btn.busy svg { display: none; }
+    .send-btn.busy::after { content: ""; width: 16px; height: 16px;
+               box-sizing: border-box; border-radius: 50%;
+               border: 2.5px solid rgba(255,255,255,0.35);
+               border-top-color: #fff; animation: spin 0.7s linear infinite; }
     /* Attached files & images in the user's bubble — unified chip style. */
     .msg .attached { display: flex; flex-wrap: wrap; gap: 0.4rem;
                      margin-bottom: 0.4rem; }
@@ -1969,9 +1982,21 @@ es.onmessage = (ev) => {
 form.addEventListener("submit", async (ev) => {
   ev.preventDefault();
   const userText = input.value;
+  if (!userText.trim() && pendingImages.length === 0 && pendingTextFiles.length === 0) return;
+
+  input.value = "";
+
+  // Attachments are read and downscaled the moment they're picked, so they
+  // are usually ready by now. If a large image is still being processed,
+  // show the send button as busy and wait rather than dropping it.
+  if (attachmentsProcessing()) {
+    setSending(true);
+    await waitForAttachments();
+    setSending(false);
+  }
+
   const images = pendingImages.slice();
   const textFiles = pendingTextFiles.slice();
-  if (!userText.trim() && images.length === 0 && textFiles.length === 0) return;
 
   // Inline attached text files ahead of the user's message so the model sees
   // them. They're wrapped in <aime:file> sentinels that the frontend strips
@@ -1984,7 +2009,6 @@ form.addEventListener("submit", async (ev) => {
   const text = fenced ? (userText ? fenced + "\n\n" + userText : fenced)
                       : userText;
 
-  input.value = "";
   if (images.length || textFiles.length) clearAttachments();
   // While the model is mid-response, hold the new message back as a draft
   // instead of POSTing it. The user must click the queued pill's stop
@@ -2111,6 +2135,45 @@ function makeRemoveBtn(onClick) {
   return rm;
 }
 
+function makeSpinner() {
+  const s = document.createElement("div");
+  s.className = "spinner";
+  return s;
+}
+
+// Attachment-processing bookkeeping. Files are read (and large images
+// downscaled) the moment they're attached, so the work is already done —
+// or nearly done — by the time the user hits send.
+const attachmentTasks = new Set();
+
+function trackTask(p) {
+  attachmentTasks.add(p);
+  p.finally(() => attachmentTasks.delete(p));
+  return p;
+}
+
+function attachmentsProcessing() {
+  return pendingImages.some(x => x.loading) ||
+         pendingTextFiles.some(x => x.loading);
+}
+
+async function waitForAttachments() {
+  while (attachmentTasks.size) {
+    await Promise.allSettled([...attachmentTasks]);
+  }
+}
+
+const sendBtnEl = document.querySelector(".send-btn");
+
+// Show the send button as a spinner while a still-processing attachment
+// is being awaited after a submit.
+function setSending(on) {
+  if (!sendBtnEl) return;
+  sendBtnEl.classList.toggle("busy", on);
+  if (on) sendBtnEl.disabled = true;
+  else applyAccessState();  // restores disabled state per access mode
+}
+
 const FILE_ICON_SVG =
   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
   'stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
@@ -2122,10 +2185,15 @@ function renderAttachments() {
   pendingImages.forEach((img, idx) => {
     const wrap = document.createElement("div");
     wrap.className = "attach";
-    const i = document.createElement("img");
-    i.src = `data:${img.media_type};base64,${img.data}`;
-    i.title = img.name || "";
-    wrap.appendChild(i);
+    wrap.title = img.name || "";
+    if (img.loading) {
+      wrap.classList.add("loading");
+      wrap.appendChild(makeSpinner());
+    } else {
+      const i = document.createElement("img");
+      i.src = `data:${img.media_type};base64,${img.data}`;
+      wrap.appendChild(i);
+    }
     wrap.appendChild(makeRemoveBtn(() => {
       pendingImages.splice(idx, 1);
       renderAttachments();
@@ -2136,11 +2204,16 @@ function renderAttachments() {
     const wrap = document.createElement("div");
     wrap.className = "attach file";
     wrap.title = tf.name;
-    wrap.innerHTML = FILE_ICON_SVG;
-    const name = document.createElement("div");
-    name.className = "fname";
-    name.textContent = tf.name;
-    wrap.appendChild(name);
+    if (tf.loading) {
+      wrap.classList.add("loading");
+      wrap.appendChild(makeSpinner());
+    } else {
+      wrap.innerHTML = FILE_ICON_SVG;
+      const name = document.createElement("div");
+      name.className = "fname";
+      name.textContent = tf.name;
+      wrap.appendChild(name);
+    }
     wrap.appendChild(makeRemoveBtn(() => {
       pendingTextFiles.splice(idx, 1);
       renderAttachments();
@@ -2165,6 +2238,67 @@ function fileToBase64(file) {
   });
 }
 
+// The model API rejects images larger than 5 MB. Target a bit under that
+// so re-encoding overhead and base64 estimation slop can't push us over.
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+const IMAGE_SIZE_TARGET = Math.floor(4.5 * 1024 * 1024);
+
+// Approximate decoded byte count of a base64 string (4 chars -> 3 bytes).
+function base64Bytes(b64) {
+  return Math.floor((b64.length * 3) / 4);
+}
+
+function loadImageEl(file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => { URL.revokeObjectURL(url); resolve(img); };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("could not decode image")); };
+    img.src = url;
+  });
+}
+
+// Read an image and, if it's too large to send, downscale / re-encode it
+// until it fits under the size cap. Returns {media_type, data, oversize}.
+// Animated GIFs are passed through untouched — drawing one to a canvas
+// would flatten it to a single frame.
+async function processImage(file) {
+  const rawB64 = await fileToBase64(file);
+  if (file.type === "image/gif" || base64Bytes(rawB64) <= IMAGE_SIZE_TARGET) {
+    return {
+      media_type: file.type,
+      data: rawB64,
+      oversize: base64Bytes(rawB64) > MAX_IMAGE_BYTES,
+    };
+  }
+  const img = await loadImageEl(file);
+  // Re-encode as WebP for images that may have transparency, JPEG
+  // otherwise — both are accepted by the backend and compress well.
+  const hasAlpha = file.type === "image/png" || file.type === "image/webp";
+  const outType = hasAlpha ? "image/webp" : "image/jpeg";
+  let scale = 1;
+  let quality = 0.9;
+  let best = {media_type: file.type, data: rawB64};
+  // Alternate between lowering quality and shrinking dimensions until the
+  // encoded result fits, capped so a pathological image can't loop forever.
+  for (let attempt = 0; attempt < 16; attempt++) {
+    const w = Math.max(1, Math.round(img.width * scale));
+    const h = Math.max(1, Math.round(img.height * scale));
+    const canvas = document.createElement("canvas");
+    canvas.width = w;
+    canvas.height = h;
+    canvas.getContext("2d").drawImage(img, 0, 0, w, h);
+    const b64 = (canvas.toDataURL(outType, quality).split(",")[1]) || "";
+    best = {media_type: outType, data: b64};
+    if (base64Bytes(b64) <= IMAGE_SIZE_TARGET) {
+      return {...best, oversize: false};
+    }
+    if (quality > 0.5) quality -= 0.15;
+    else scale *= 0.8;
+  }
+  return {...best, oversize: base64Bytes(best.data) > MAX_IMAGE_BYTES};
+}
+
 const TEXT_EXT_RE = /\.(txt|md|markdown|json|ya?ml|csv|tsv|log|ini|toml|xml|html?|css|js|jsx|ts|tsx|py|sh|bash|zsh|c|h|cc|cpp|hpp|java|rs|go|rb|php|sql|conf|cfg|env|gitignore|dockerfile|makefile)$/i;
 
 function isTextFile(f) {
@@ -2184,27 +2318,49 @@ function fileToText(file) {
   });
 }
 
-async function addFiles(files) {
+// Attach files immediately as placeholder chips with a spinner, then read
+// (and downscale, for images) them in the background. Doing the heavy work
+// up front means there's nothing left to wait for when the user hits send.
+function addFiles(files) {
   for (const f of files) {
     if (ALLOWED_IMG_TYPES.has(f.type)) {
-      try {
-        const data = await fileToBase64(f);
-        pendingImages.push({media_type: f.type, data, name: f.name});
-      } catch (e) {
-        appendNotice(`failed to read "${f.name}": ${e}`, "error");
-      }
+      const entry = {media_type: f.type, data: "", name: f.name, loading: true};
+      pendingImages.push(entry);
+      trackTask((async () => {
+        try {
+          const out = await processImage(f);
+          entry.media_type = out.media_type;
+          entry.data = out.data;
+          entry.loading = false;
+          if (out.oversize) {
+            appendNotice(`"${f.name}" is still larger than 5 MB after compression and may be rejected`, "warning");
+          }
+        } catch (e) {
+          const idx = pendingImages.indexOf(entry);
+          if (idx >= 0) pendingImages.splice(idx, 1);
+          appendNotice(`failed to read "${f.name}": ${e}`, "error");
+        }
+        renderAttachments();
+      })());
     } else if (isTextFile(f)) {
-      try {
-        const text = await fileToText(f);
-        pendingTextFiles.push({name: f.name, text});
-      } catch (e) {
-        appendNotice(`failed to read "${f.name}": ${e}`, "error");
-      }
+      const entry = {name: f.name, text: "", loading: true};
+      pendingTextFiles.push(entry);
+      trackTask((async () => {
+        try {
+          entry.text = await fileToText(f);
+          entry.loading = false;
+        } catch (e) {
+          const idx = pendingTextFiles.indexOf(entry);
+          if (idx >= 0) pendingTextFiles.splice(idx, 1);
+          appendNotice(`failed to read "${f.name}": ${e}`, "error");
+        }
+        renderAttachments();
+      })());
     } else {
       appendNotice(`skipped "${f.name}": ${f.type || "unknown type"} — only images and text files are supported`, "warning");
     }
   }
-  renderAttachments();
+  renderAttachments();  // show placeholder chips right away
 }
 
 // Attach button -> open native file picker.
