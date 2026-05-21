@@ -793,6 +793,21 @@
     .msg .att-chip .fname { overflow: hidden; text-overflow: ellipsis;
                             white-space: nowrap; }
 
+    /* "Sending…" indicator shown under an optimistic user message while the
+       /send POST is in flight (large uploads / slow connections). Removed
+       once the server echoes the message back as user_message_shown. */
+    .msg.sending { opacity: 0.7; }
+    .sending-indicator { display: block; margin-top: 0.25rem;
+                         font-size: 0.72rem; color: var(--muted); }
+    .msg.user .sending-indicator { text-align: right; }
+    .sending-indicator::after { content: ""; animation: sending-dots 1.4s steps(4) infinite; }
+    @keyframes sending-dots {
+      0%   { content: ""; }
+      25%  { content: "."; }
+      50%  { content: ".."; }
+      75%, 100% { content: "..."; }
+    }
+
     /* ----------------------------------------------------------------------
        Mobile framework
        ----------------------------------------------------------------------
@@ -1855,6 +1870,41 @@ function renderAttachmentRow(attachments) {
   return row;
 }
 
+// Optimistic user message. The server doesn't echo a message back (as
+// user_message_shown) until the /send POST — including any image upload —
+// completes, which on a slow connection leaves the composer empty with no
+// sign the message went anywhere. To bridge that gap we render the user's
+// message locally the instant they hit send, with a "Sending…" indicator
+// underneath. When the real user_message_shown arrives we drop this
+// placeholder and let the server-rendered bubble take its place.
+let pendingSendBubble = null;
+
+function showOptimisticUserMessage(displayText, images) {
+  clearOptimisticUserMessage();
+  const {text: cleanedText} = extractAttachedFiles(displayText || "");
+  const msg = appendMessage("user", "you", cleanedText);
+  msg.classList.add("sending");
+  const attachments = (images || []).map(img => ({
+    kind: "image", media_type: img.media_type, data: img.data, name: img.name,
+  }));
+  const row = renderAttachmentRow(attachments);
+  if (row) msg.insertBefore(row, msg._content);
+  if (!cleanedText && attachments.length) msg.classList.add("no-text");
+  const sending = document.createElement("span");
+  sending.className = "sending-indicator";
+  sending.textContent = "Sending";
+  msg.appendChild(sending);
+  pendingSendBubble = msg;
+  scrollToBottom(true);
+}
+
+function clearOptimisticUserMessage() {
+  if (pendingSendBubble) {
+    pendingSendBubble.remove();
+    pendingSendBubble = null;
+  }
+}
+
 const es = new EventSource("/stream");
 es.onmessage = (ev) => {
   const e = JSON.parse(ev.data);
@@ -1862,6 +1912,9 @@ es.onmessage = (ev) => {
     case "user_message_shown": {
       currentAssistant = null;
       pendingHtmlTarget = null;
+      // The server has echoed the message back — drop the local "Sending…"
+      // placeholder so the authoritative bubble replaces it.
+      if (!e.from_replay) clearOptimisticUserMessage();
       const {text: cleanedText, files} = extractAttachedFiles(e.text);
       const attachments = (e.attachments || []).concat(files);
       const msg = appendMessage("user", "you", cleanedText);
@@ -1960,6 +2013,7 @@ es.onmessage = (ev) => {
       logInner.innerHTML = "";
       currentAssistant = null;
       pendingHtmlTarget = null;
+      pendingSendBubble = null;
       modelBusy = false;
       clearQueuedDraft();
       if (typewriter.rafId != null) cancelAnimationFrame(typewriter.rafId);
@@ -2020,6 +2074,7 @@ form.addEventListener("submit", async (ev) => {
   // Set optimistically so a rapid second submit before user_message_shown
   // arrives is correctly held back as a draft, not POSTed as a queued send.
   modelBusy = true;
+  showOptimisticUserMessage(userText, images);
   await sendText(text, images);
 });
 
@@ -2028,16 +2083,28 @@ document.getElementById("new-chat-btn").addEventListener("click", () => {
 });
 
 async function sendText(text, images) {
-  const r = await fetch("/send", {
-    method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({text, images: images || []}),
-  });
+  let r;
+  try {
+    r = await fetch("/send", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({text, images: images || []}),
+    });
+  } catch (e) {
+    // Network failure before the request landed — drop the "Sending…"
+    // placeholder and surface the error so the message isn't silently lost.
+    clearOptimisticUserMessage();
+    modelBusy = false;
+    appendNotice("failed to send message: " + e, "error");
+    return;
+  }
   // Defense in depth: if access was revoked since the page loaded, the
   // server answers 403 — sync the UI so the composer locks immediately.
   if (r.status === 403) {
     __apiAccess = false;
     applyAccessState();
+    clearOptimisticUserMessage();
+    modelBusy = false;
   }
 }
 
@@ -2069,6 +2136,7 @@ async function flushQueuedDraft() {
   const draft = queuedDraft;
   clearQueuedDraft();
   modelBusy = true;
+  showOptimisticUserMessage(draft.displayText, draft.images);
   await sendText(draft.text, draft.images);
 }
 
@@ -2101,6 +2169,7 @@ function renderQueuedDraft() {
         // and a no-op interrupt on an idle backend is harmless.
         await fetch("/interrupt", {method: "POST"}).catch(() => {});
       }
+      showOptimisticUserMessage(draft.displayText, draft.images);
       await sendText(draft.text, draft.images);
       clearQueuedDraft();
     } catch (_) {
