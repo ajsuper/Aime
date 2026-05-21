@@ -1063,8 +1063,7 @@
               </svg>
             </button>
             <input type="file" id="file-picker" multiple
-                   style="display:none"
-                   accept="image/*,.txt,.md,.markdown,.json,.yaml,.yml,.csv,.tsv,.py,.js,.ts,.tsx,.jsx,.html,.css,.xml,.sh,.c,.cpp,.h,.hpp,.java,.rs,.go,.rb,.toml,.ini,.log,text/*">
+                   style="display:none">
             <input id="i" type="text" autocomplete="off" placeholder="Message Aime…"
                    autofocus>
             <button type="button" class="mic-btn tip-anchor" id="mic-btn"
@@ -1098,7 +1097,7 @@
       </form>
     </div>
   </div>
-  <div id="drop-overlay">Drop images to attach</div>
+  <div id="drop-overlay">Drop files to attach</div>
   <div id="voice-toast" role="status" aria-live="polite"></div>
   <div id="settings-backdrop" role="dialog" aria-modal="true" aria-labelledby="settings-title">
     <div id="settings-modal">
@@ -2190,9 +2189,8 @@ function renderQueuedDraft() {
   queuedBar.hidden = false;
 }
 
-// -- Drag-and-drop image attachments -----------------------------------
+// -- Drag-and-drop file attachments ------------------------------------
 
-const ALLOWED_IMG_TYPES = new Set(["image/png","image/jpeg","image/gif","image/webp"]);
 const attachmentsEl = document.getElementById("attachments");
 const pendingImages = [];  // [{media_type, data, name}]
 const pendingTextFiles = [];  // [{name, text}]
@@ -2303,141 +2301,69 @@ function renderAttachments() {
   attachmentsEl.classList.toggle("has-items", hasAny);
 }
 
-function fileToBase64(file) {
-  return new Promise((resolve, reject) => {
-    const r = new FileReader();
-    r.onload = () => {
-      // result is "data:<mime>;base64,<data>"
-      const s = r.result;
-      const comma = s.indexOf(",");
-      resolve(comma >= 0 ? s.slice(comma + 1) : "");
-    };
-    r.onerror = reject;
-    r.readAsDataURL(file);
-  });
-}
-
-// The model API rejects images larger than 5 MB. Target a bit under that
-// so re-encoding overhead and base64 estimation slop can't push us over.
-const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
-const IMAGE_SIZE_TARGET = Math.floor(4.5 * 1024 * 1024);
-
-// Approximate decoded byte count of a base64 string (4 chars -> 3 bytes).
-function base64Bytes(b64) {
-  return Math.floor((b64.length * 3) / 4);
-}
-
-function loadImageEl(file) {
-  return new Promise((resolve, reject) => {
-    const url = URL.createObjectURL(file);
-    const img = new Image();
-    img.onload = () => { URL.revokeObjectURL(url); resolve(img); };
-    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("could not decode image")); };
-    img.src = url;
-  });
-}
-
-// Read an image and, if it's too large to send, downscale / re-encode it
-// until it fits under the size cap. Returns {media_type, data, oversize}.
-// Animated GIFs are passed through untouched — drawing one to a canvas
-// would flatten it to a single frame.
-async function processImage(file) {
-  const rawB64 = await fileToBase64(file);
-  if (file.type === "image/gif" || base64Bytes(rawB64) <= IMAGE_SIZE_TARGET) {
-    return {
-      media_type: file.type,
-      data: rawB64,
-      oversize: base64Bytes(rawB64) > MAX_IMAGE_BYTES,
-    };
+// Hand a picked file to the server, which decodes images of any format
+// (HEIC, TIFF, BMP, …) into PNG/JPEG via Pillow and reads everything else as
+// text. The server is authoritative about what a file actually is — the
+// browser's reported MIME type is only a hint and is often wrong or empty.
+async function uploadFile(file) {
+  const form = new FormData();
+  form.append("file", file);
+  const r = await fetch("/upload", {method: "POST", body: form});
+  let body = {};
+  try { body = await r.json(); } catch (_) { /* non-JSON error page */ }
+  if (!r.ok || !body.ok) {
+    throw new Error(body.message || body.error || `HTTP ${r.status}`);
   }
-  const img = await loadImageEl(file);
-  // Re-encode as WebP for images that may have transparency, JPEG
-  // otherwise — both are accepted by the backend and compress well.
-  const hasAlpha = file.type === "image/png" || file.type === "image/webp";
-  const outType = hasAlpha ? "image/webp" : "image/jpeg";
-  let scale = 1;
-  let quality = 0.9;
-  let best = {media_type: file.type, data: rawB64};
-  // Alternate between lowering quality and shrinking dimensions until the
-  // encoded result fits, capped so a pathological image can't loop forever.
-  for (let attempt = 0; attempt < 16; attempt++) {
-    const w = Math.max(1, Math.round(img.width * scale));
-    const h = Math.max(1, Math.round(img.height * scale));
-    const canvas = document.createElement("canvas");
-    canvas.width = w;
-    canvas.height = h;
-    canvas.getContext("2d").drawImage(img, 0, 0, w, h);
-    const b64 = (canvas.toDataURL(outType, quality).split(",")[1]) || "";
-    best = {media_type: outType, data: b64};
-    if (base64Bytes(b64) <= IMAGE_SIZE_TARGET) {
-      return {...best, oversize: false};
-    }
-    if (quality > 0.5) quality -= 0.15;
-    else scale *= 0.8;
-  }
-  return {...best, oversize: base64Bytes(best.data) > MAX_IMAGE_BYTES};
+  return body;
 }
 
-const TEXT_EXT_RE = /\.(txt|md|markdown|json|ya?ml|csv|tsv|log|ini|toml|xml|html?|css|js|jsx|ts|tsx|py|sh|bash|zsh|c|h|cc|cpp|hpp|java|rs|go|rb|php|sql|conf|cfg|env|gitignore|dockerfile|makefile)$/i;
-
-function isTextFile(f) {
-  if (f.type && (f.type.startsWith("text/") || f.type === "application/json" ||
-                  f.type === "application/xml" || f.type === "application/x-yaml")) {
-    return true;
-  }
-  return TEXT_EXT_RE.test(f.name || "");
-}
-
-function fileToText(file) {
-  return new Promise((resolve, reject) => {
-    const r = new FileReader();
-    r.onload = () => resolve(r.result || "");
-    r.onerror = reject;
-    r.readAsText(file);
-  });
-}
-
-// Attach files immediately as placeholder chips with a spinner, then read
-// (and downscale, for images) them in the background. Doing the heavy work
-// up front means there's nothing left to wait for when the user hits send.
+// Attach files immediately as placeholder chips with a spinner, then upload
+// them in the background. Each file is guessed as image-or-text from its
+// MIME type for the initial chip, and moved to the other list if the server
+// disagrees once it has actually decoded the bytes.
 function addFiles(files) {
   for (const f of files) {
-    if (ALLOWED_IMG_TYPES.has(f.type)) {
-      const entry = {media_type: f.type, data: "", name: f.name, loading: true};
-      pendingImages.push(entry);
-      trackTask((async () => {
-        try {
-          const out = await processImage(f);
-          entry.media_type = out.media_type;
-          entry.data = out.data;
-          entry.loading = false;
-          if (out.oversize) {
-            appendNotice(`"${f.name}" is still larger than 5 MB after compression and may be rejected`, "warning");
+    const looksImage = (f.type || "").startsWith("image/");
+    const imgEntry = looksImage
+      ? {media_type: f.type, data: "", name: f.name, loading: true} : null;
+    const fileEntry = looksImage
+      ? null : {name: f.name, text: "", loading: true};
+    if (imgEntry) pendingImages.push(imgEntry);
+    else pendingTextFiles.push(fileEntry);
+
+    trackTask((async () => {
+      try {
+        const res = await uploadFile(f);
+        // Drop whichever placeholder we optimistically created.
+        if (imgEntry) {
+          const i = pendingImages.indexOf(imgEntry);
+          if (i >= 0) pendingImages.splice(i, 1);
+        } else {
+          const i = pendingTextFiles.indexOf(fileEntry);
+          if (i >= 0) pendingTextFiles.splice(i, 1);
+        }
+        if (res.kind === "image") {
+          pendingImages.push({media_type: res.media_type, data: res.data,
+                              name: res.name, loading: false});
+        } else {
+          pendingTextFiles.push({name: res.name, text: res.text,
+                                 loading: false});
+          if (res.truncated) {
+            appendNotice(`"${f.name}" was large — only the first part was attached`, "warning");
           }
-        } catch (e) {
-          const idx = pendingImages.indexOf(entry);
-          if (idx >= 0) pendingImages.splice(idx, 1);
-          appendNotice(`failed to read "${f.name}": ${e}`, "error");
         }
-        renderAttachments();
-      })());
-    } else if (isTextFile(f)) {
-      const entry = {name: f.name, text: "", loading: true};
-      pendingTextFiles.push(entry);
-      trackTask((async () => {
-        try {
-          entry.text = await fileToText(f);
-          entry.loading = false;
-        } catch (e) {
-          const idx = pendingTextFiles.indexOf(entry);
-          if (idx >= 0) pendingTextFiles.splice(idx, 1);
-          appendNotice(`failed to read "${f.name}": ${e}`, "error");
+      } catch (e) {
+        if (imgEntry) {
+          const i = pendingImages.indexOf(imgEntry);
+          if (i >= 0) pendingImages.splice(i, 1);
+        } else {
+          const i = pendingTextFiles.indexOf(fileEntry);
+          if (i >= 0) pendingTextFiles.splice(i, 1);
         }
-        renderAttachments();
-      })());
-    } else {
-      appendNotice(`skipped "${f.name}": ${f.type || "unknown type"} — only images and text files are supported`, "warning");
-    }
+        appendNotice(`failed to attach "${f.name}": ${e.message || e}`, "error");
+      }
+      renderAttachments();
+    })());
   }
   renderAttachments();  // show placeholder chips right away
 }
@@ -2476,7 +2402,7 @@ window.addEventListener("drop", (e) => {
   if (files.length) addFiles(files);
 });
 
-// Paste image from clipboard.
+// Paste a file from the clipboard.
 window.addEventListener("paste", (e) => {
   if (document.activeElement !== input) return;
   const items = Array.from((e.clipboardData && e.clipboardData.items) || []);

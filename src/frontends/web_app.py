@@ -17,6 +17,7 @@ import sys
 import json
 import queue
 import shutil
+import base64
 import zipfile
 import tempfile
 import datetime
@@ -25,6 +26,21 @@ from functools import wraps
 from io import StringIO, BytesIO
 
 import requests
+
+# Pillow normalises uploaded images (HEIC, TIFF, BMP, …) into PNG/JPEG so the
+# model can consume anything the user attaches. Both are optional: if the
+# import fails the /upload endpoint simply falls back to treating files as
+# text rather than crashing the whole app.
+try:
+    from PIL import Image, ImageOps
+    try:
+        from pillow_heif import register_heif_opener
+        register_heif_opener()  # teaches Pillow to open HEIC/HEIF/AVIF
+    except Exception:  # noqa: BLE001 - HEIC support is a nice-to-have
+        pass
+    _PIL_AVAILABLE = True
+except Exception:  # noqa: BLE001 - image conversion is best-effort
+    _PIL_AVAILABLE = False
 
 from flask import (
     Flask, Response, request, jsonify, session, redirect, g, url_for
@@ -1119,6 +1135,104 @@ def index():
 
 
 _ALLOWED_IMAGE_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
+
+# The model API rejects images larger than 5 MB; aim under that so the base64
+# overhead the attachment picks up in transit can't push it back over.
+_IMAGE_SIZE_TARGET = int(4.5 * 1024 * 1024)
+# Upper bound on how much text we inline from an arbitrary uploaded file, so a
+# huge log or binary blob can't blow up the conversation context.
+_MAX_TEXT_CHARS = 200_000
+
+
+def _convert_image(raw: bytes) -> dict | None:
+    """Decode `raw` with Pillow and re-encode it as PNG or JPEG, downscaling
+    until it fits `_IMAGE_SIZE_TARGET`. Returns a {"media_type", "data"} dict
+    with base64 data, or None if the bytes are not a decodable image."""
+    if not _PIL_AVAILABLE:
+        return None
+    try:
+        im = Image.open(BytesIO(raw))
+        im.load()
+    except Exception:  # noqa: BLE001 - not an image (or an unsupported one)
+        return None
+    # An animated GIF survives re-encoding only as a single flattened frame,
+    # so pass the original through untouched when it already fits.
+    if (im.format or "").upper() == "GIF" and getattr(im, "is_animated", False) \
+            and len(raw) <= _IMAGE_SIZE_TARGET:
+        return {"media_type": "image/gif",
+                "data": base64.b64encode(raw).decode("ascii")}
+    # Honour any EXIF orientation, then flatten to a mode the encoders accept.
+    im = ImageOps.exif_transpose(im) or im
+    has_alpha = im.mode in ("RGBA", "LA") or (
+        im.mode == "P" and "transparency" in im.info)
+    if has_alpha:
+        im = im.convert("RGBA")
+        out_fmt, media_type = "PNG", "image/png"
+    else:
+        im = im.convert("RGB")
+        out_fmt, media_type = "JPEG", "image/jpeg"
+    quality = 90
+    scale = 1.0
+    best = b""
+    # Alternate between lowering JPEG quality and shrinking dimensions until
+    # the encoded result fits, capped so a pathological image can't loop on.
+    for _ in range(16):
+        if scale != 1.0:
+            w = max(1, int(im.width * scale))
+            h = max(1, int(im.height * scale))
+            frame = im.resize((w, h))
+        else:
+            frame = im
+        buf = BytesIO()
+        if out_fmt == "JPEG":
+            frame.save(buf, "JPEG", quality=quality)
+        else:
+            frame.save(buf, "PNG", optimize=True)
+        best = buf.getvalue()
+        if len(best) <= _IMAGE_SIZE_TARGET:
+            break
+        if out_fmt == "JPEG" and quality > 50:
+            quality -= 15
+        else:
+            scale *= 0.8
+    return {"media_type": media_type,
+            "data": base64.b64encode(best).decode("ascii")}
+
+
+@app.route("/upload", methods=["POST"])
+@login_required
+@api_access_required
+def upload():
+    """Normalise an arbitrary uploaded file into an attachment the model can
+    consume. Images of any format are decoded and re-encoded as PNG/JPEG via
+    Pillow; everything else is read as text so that, worst case, the user
+    still gets *something* through rather than a hard rejection."""
+    f = request.files.get("file")
+    if f is None:
+        return jsonify({"ok": False, "error": "no_file",
+                        "message": "No file was uploaded."}), 400
+    name = os.path.basename(f.filename or "") or "file"
+    raw = f.read()
+    if not raw:
+        return jsonify({"ok": False, "error": "empty_file",
+                        "message": "That file is empty."}), 400
+
+    img = _convert_image(raw)
+    if img is not None:
+        return jsonify({"ok": True, "kind": "image", "name": name,
+                        "media_type": img["media_type"], "data": img["data"]})
+
+    # Not a decodable image — fall back to text. Decode tolerantly so even a
+    # binary file yields readable content instead of failing the upload.
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        text = raw.decode("utf-8", errors="replace")
+    truncated = len(text) > _MAX_TEXT_CHARS
+    if truncated:
+        text = text[:_MAX_TEXT_CHARS] + "\n…[truncated]"
+    return jsonify({"ok": True, "kind": "file", "name": name,
+                    "text": text, "truncated": truncated})
 
 
 @app.route("/send", methods=["POST"])
