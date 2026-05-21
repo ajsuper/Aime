@@ -61,7 +61,7 @@ COPY --from=backend-build /build/serve.o ./build/serve.o
 # /app/models/whisper here, and reads the default UI choice from .selected.
 ARG WHISPER_MODEL=small.en
 RUN mkdir -p /app/models/whisper && \
-    python - /app/models/whisper <<'PY' && \
+    python - /app/models/whisper <<'PY'
 import sys
 from faster_whisper import WhisperModel
 cache = sys.argv[1]
