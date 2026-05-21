@@ -827,21 +827,96 @@ _BUNDLE_MANIFEST = "aime-export.json"
 _BUNDLE_FORMAT = "aime-data-export"
 
 
-def _safe_bundle_member(name: str) -> bool:
-    """True if a zip entry name is one we accept from an uploaded bundle.
-    Rejects path traversal and anything outside the known layout."""
-    if name in (_BUNDLE_MANIFEST, "database.sql"):
+# Directory components and filenames that operating systems and archive
+# tools scatter into zips. They carry no Aime data, are often invisible in
+# the user's file manager, and must never break or be rejected by an import.
+_BUNDLE_JUNK_DIRS = {
+    "__MACOSX", ".Spotlight-V100", ".Trashes", ".fseventsd",
+    ".TemporaryItems", ".DocumentRevisions-V100", "$RECYCLE.BIN",
+    "System Volume Information",
+}
+_BUNDLE_JUNK_FILES = {".DS_Store", "Thumbs.db", "desktop.ini"}
+
+
+def _is_bundle_junk(name: str) -> bool:
+    """True for OS / archiver cruft that should be silently ignored — macOS
+    __MACOSX entries and AppleDouble ._ sidecars, .DS_Store, Windows
+    Thumbs.db, and friends."""
+    parts = [p for p in name.split("/") if p]
+    if not parts:
         return True
-    if name.startswith("/") or "\\" in name or ".." in name.split("/"):
-        return False
-    parts = name.split("/")
-    if len(parts) != 2 or not parts[1]:
-        return False
-    if parts[0] == "topics" and parts[1].endswith(".md"):
+    if any(p in _BUNDLE_JUNK_DIRS for p in parts):
         return True
-    if parts[0] == "conversations" and parts[1].endswith(".json"):
+    leaf = parts[-1]
+    if leaf in _BUNDLE_JUNK_FILES:
+        return True
+    if leaf.startswith("._"):  # AppleDouble resource-fork sidecar
         return True
     return False
+
+
+def _bundle_path_is_safe(name: str) -> bool:
+    """Reject path traversal and absolute paths before any file is written."""
+    if name.startswith("/") or "\\" in name:
+        return False
+    return ".." not in name.split("/")
+
+
+def _classify_bundle(zf: zipfile.ZipFile) -> tuple[dict | None, str | None]:
+    """Inspect an uploaded zip and locate the Aime data inside it.
+
+    Tolerates a wrapping folder (a zip of a directory rather than its
+    contents) and OS junk: database.sql is found wherever it sits, and its
+    location fixes the bundle root. topics/ and conversations/ are both
+    optional. Unknown extra files are ignored rather than rejected.
+
+    Returns (plan, None) on success or (None, error_message) on failure.
+    plan = {"db": <zip name>,
+            "topics": [(zip name, leaf), ...],
+            "conversations": [(zip name, session_id), ...],
+            "skipped": <int>}
+    """
+    entries: list[str] = []
+    for info in zf.infolist():
+        name = info.filename
+        if name.endswith("/"):
+            continue  # directory entry
+        if _is_bundle_junk(name):
+            continue
+        if not _bundle_path_is_safe(name):
+            return None, f"Unsafe path in bundle: {name}"
+        entries.append(name)
+
+    db_candidates = [n for n in entries if n.rsplit("/", 1)[-1] == "database.sql"]
+    if not db_candidates:
+        return None, ("Bundle has no database.sql — it does not look like "
+                       "Aime data.")
+    if len(db_candidates) > 1:
+        return None, ("Bundle contains multiple database.sql files — unzip it "
+                       "and upload just one account's data.")
+    db_name = db_candidates[0]
+    root = db_name[: -len("database.sql")]  # "" (flat) or "MyBackup/"
+
+    topics: list[tuple[str, str]] = []
+    conversations: list[tuple[str, str]] = []
+    skipped = 0
+    for name in entries:
+        if name == db_name:
+            continue
+        if not name.startswith(root):
+            skipped += 1  # sits outside the bundle root — unrelated file
+            continue
+        parts = name[len(root):].split("/")
+        if len(parts) == 2 and parts[0] == "topics" and parts[1].endswith(".md"):
+            topics.append((name, parts[1]))
+        elif (len(parts) == 2 and parts[0] == "conversations"
+              and parts[1].endswith(".json")):
+            conversations.append((name, parts[1][: -len(".json")]))
+        elif parts[-1] != _BUNDLE_MANIFEST:
+            skipped += 1  # unknown extra file — ignore, don't fail
+
+    return {"db": db_name, "topics": topics,
+            "conversations": conversations, "skipped": skipped}, None
 
 
 def _evict_user_context(user_id: int) -> None:
@@ -961,20 +1036,13 @@ def account_import():
         # Validate the bundle by its contents, never by a manifest — a
         # hand-assembled bundle (e.g. zipping a local install's data directory
         # straight up) has no manifest, and a manifest could be forged anyway.
-        # These guards always run.
-        members = [n for n in zf.namelist() if not n.endswith("/")]
-        # Reject anything outside the known, traversal-free layout before we
-        # write a single byte.
-        for name in members:
-            if not _safe_bundle_member(name):
-                return jsonify({"ok": False, "error": "bad_member",
-                                "message": f"Unexpected entry in bundle: {name}"}), 400
-        # Sanity floor: a real bundle carries the calendar/topics database.
-        # This also stops an empty or unrelated zip from wiping the account.
-        if "database.sql" not in members:
+        # _classify_bundle tolerates a wrapping folder and ignores OS junk
+        # (macOS __MACOSX/._ sidecars, .DS_Store, Windows Thumbs.db, …) so a
+        # bundle the user can't easily clean up still imports cleanly.
+        plan, err = _classify_bundle(zf)
+        if plan is None:
             return jsonify({"ok": False, "error": "bad_bundle",
-                            "message": "Bundle has no database.sql — it does "
-                                       "not look like Aime data."}), 400
+                            "message": err}), 400
 
         # Safety net: snapshot the current data before replacing it.
         backup_path = _backup.backup_user_data(user_id, reason="import")
@@ -994,30 +1062,32 @@ def account_import():
         os.makedirs(topics_dst, exist_ok=True)
         os.makedirs(conv_dst, exist_ok=True)
 
-        for name in members:
-            if name == _BUNDLE_MANIFEST:
-                continue
-            if name == "database.sql":
-                with open(db_dst, "wb") as f:
-                    f.write(zf.read(name))
-            elif name.startswith("topics/"):
-                with open(os.path.join(user_dir, name), "wb") as f:
-                    f.write(zf.read(name))
-            elif name.startswith("conversations/"):
-                session_id = os.path.basename(name)[: -len(".json")]
-                blob = _enc.encrypt_blob(
-                    dek, zf.read(name), aad=session_id.encode("utf-8")
-                )
-                with open(os.path.join(conv_dst, session_id + ".json.enc"), "wb") as f:
-                    f.write(blob)
+        # Write everything into the current standard layout, regardless of
+        # how the uploaded bundle was structured.
+        with open(db_dst, "wb") as f:
+            f.write(zf.read(plan["db"]))
+        for name, leaf in plan["topics"]:
+            with open(os.path.join(topics_dst, leaf), "wb") as f:
+                f.write(zf.read(name))
+        for name, session_id in plan["conversations"]:
+            blob = _enc.encrypt_blob(
+                dek, zf.read(name), aad=session_id.encode("utf-8")
+            )
+            with open(os.path.join(conv_dst, session_id + ".json.enc"), "wb") as f:
+                f.write(blob)
 
     # Make the C++ backend re-open the freshly written database.sql.
     _reload_backend_database(user_id)
 
+    summary = (f"Imported {len(plan['topics'])} topic(s) and "
+               f"{len(plan['conversations'])} conversation(s).")
+    if plan["skipped"]:
+        summary += f" {plan['skipped']} unrecognized file(s) were ignored."
+
     return jsonify({
         "ok": True,
         "backup": os.path.basename(backup_path) if backup_path else None,
-        "message": "Data imported successfully. The page will now reload.",
+        "message": summary + " The page will now reload.",
     })
 
 
