@@ -70,7 +70,8 @@ for name in ["tiny.en", "base.en", "small.en"]:
     WhisperModel(name, device="cpu", compute_type="int8", download_root=cache)
 print(f"Whisper models cached under {cache}")
 PY
-    echo "$WHISPER_MODEL" > /app/models/whisper/.selected
+
+RUN echo "$WHISPER_MODEL" > /app/models/whisper/.selected
 
 # HOME drives every data path: aime/config.py derives DATABASE_DIR, the
 # conversations dir, and CONFIG_PATH from it. Point it at /data so a single
