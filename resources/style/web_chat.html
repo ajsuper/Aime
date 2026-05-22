@@ -19,6 +19,10 @@
       --muted: #8A8273;
       --accent: #E3A4AF;
       --accent-hover: #EBB4BD;
+      /* CTA — deeper and saturated, deliberately outside the pastel palette
+         so the primary action leads instead of blending in. */
+      --cta: #CF4D66;
+      --cta-hover: #DC5E78;
       --user-bubble: #EBD3D8;
       --user-bubble-text: #3A2C30;
       /* Pastel-rainbow accent — hard color stops, never blended. */
@@ -43,6 +47,10 @@
       --muted: #998F7E;
       --accent: #E0AAB4;
       --accent-hover: #E8BAC3;
+      /* CTA — deeper and saturated, deliberately outside the pastel palette
+         so the primary action leads instead of blending in. */
+      --cta: #DC6076;
+      --cta-hover: #E67288;
       --user-bubble: #5C4A4F;
       --user-bubble-text: #F3E8EC;
       /* Pastel-rainbow accent — hard color stops, never blended. */
@@ -364,6 +372,57 @@
        define --rainbow only; transparent fallback elsewhere). */
     form::before { content: ""; position: absolute; top: -1px; left: 0;
                    right: 0; height: 2px; background: var(--rainbow, transparent); }
+
+    /* ── Signature: the pastel rainbow comes alive at meaningful moments ──
+       Idle, it stays calm — the static strips and per-message bars. At key
+       interactions a single one-shot animation plays. Hard colour stops are
+       preserved throughout: the bands wipe, glint or ripple — never blur. */
+
+    /* (A) User sends a message — a bright glint sweeps the composer strip. */
+    form::after { content: ""; position: absolute; top: -1px; left: 0; right: 0;
+                  height: 2px; pointer-events: none; opacity: 0;
+                  background: linear-gradient(90deg, transparent 38%,
+                    rgba(255,255,255,0.92) 50%, transparent 62%); }
+    form.sent::after { animation: rb-glint 0.6s ease-out; }
+    @keyframes rb-glint {
+      0%   { opacity: 0; transform: translateX(-100%); }
+      15%  { opacity: 1; }
+      85%  { opacity: 1; }
+      100% { opacity: 0; transform: translateX(100%); }
+    }
+
+    /* (B) Aime responds — the message's rainbow bar draws itself in. */
+    .msg.aime.fresh::before { animation: rb-wipe 0.55s ease-out; }
+    @keyframes rb-wipe {
+      from { clip-path: inset(0 0 100% 0); }
+      to   { clip-path: inset(0 0 0 0); }
+    }
+
+    /* (C) Speech-to-text toggled — the rainbow track gives a quick pop. */
+    .composer-toggle.stt-pulse .composer-toggle-track { animation: rb-pop 0.45s ease-out; }
+    @keyframes rb-pop {
+      0%   { transform: scale(1); }
+      45%  { transform: scale(1.22); }
+      100% { transform: scale(1); }
+    }
+
+    /* (D) Image / file attached — a pastel-rainbow ripple from the button.
+       Sits behind the icon (z-index) so the glyph stays crisp. */
+    .attach-btn.burst::after { content: ""; position: absolute; inset: 0;
+                  z-index: -1; border-radius: 50%; pointer-events: none;
+                  background: var(--rainbow, var(--accent));
+                  animation: rb-burst 0.6s ease-out; }
+    @keyframes rb-burst {
+      0%   { opacity: 0;    transform: scale(0.55); }
+      25%  { opacity: 0.6;  }
+      100% { opacity: 0;    transform: scale(2); }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      form.sent::after, .msg.aime.fresh::before,
+      .composer-toggle.stt-pulse .composer-toggle-track,
+      .attach-btn.burst::after { animation: none; }
+    }
     /* Small CSS-only tooltip: anchor with `data-tip="..."` and `tip-anchor`.
        A pill appears above the element on hover/focus, after a short delay
        so it doesn't flicker on cursor flyovers. Doesn't fight the browser's
@@ -416,7 +475,7 @@
                                     border-radius: 50%; background: var(--muted);
                                     transition: left 0.15s, background 0.15s; }
     .composer-toggle.on .composer-toggle-icon { color: var(--accent); }
-    .composer-toggle.on .composer-toggle-track { background: var(--accent); }
+    .composer-toggle.on .composer-toggle-track { background: var(--rainbow, var(--accent)); }
     .composer-toggle.on .composer-toggle-track::after { left: 14px; background: white; }
     /* The new-conversation pill: icon + label, sits to the right of the input. */
     .new-chat-pill { display: inline-flex; align-items: center; gap: 0.35rem;
@@ -464,23 +523,29 @@
                   border-radius: 50%; width: 36px; height: 36px; cursor: pointer;
                   display: flex; align-items: center; justify-content: center;
                   transition: color 0.15s, background 0.15s; flex-shrink: 0;
-                  padding: 0; }
+                  padding: 0; position: relative; isolation: isolate; }
     .attach-btn:hover { color: var(--text); background: rgba(255,255,255,0.05); }
     .attach-btn svg { width: 20px; height: 20px; }
-    .input-wrap:focus-within { border-color: var(--accent);
-                               box-shadow: 0 0 0 3px rgba(124, 140, 255, 0.15); }
+    .input-wrap:focus-within { border-color: var(--cta, var(--accent));
+                               box-shadow: 0 0 0 3px color-mix(in srgb,
+                                 var(--cta, var(--accent)) 16%, transparent); }
     input[type=text] { flex: 1; background: transparent; color: var(--text);
                        border: 0; outline: none; padding: 0.5rem 0;
                        font: inherit; }
     input[type=text]::placeholder { color: var(--muted); }
-    .send-btn { background: var(--accent); color: white; border: 0;
-             border-radius: 50%; width: 36px; height: 36px;
+    /* Primary CTA: own colour (--cta), a touch larger than the secondary
+       icon buttons, and a soft tinted lift so it reads as *the* action. */
+    .send-btn { background: var(--cta, var(--accent)); color: white; border: 0;
+             border-radius: 50%; width: 40px; height: 40px;
              font: inherit; cursor: pointer; display: flex;
              align-items: center; justify-content: center;
-             transition: background 0.15s, transform 0.05s; flex-shrink: 0; }
-    .send-btn:hover:not(:disabled) { background: var(--accent-hover); }
+             box-shadow: 0 3px 10px color-mix(in srgb, var(--cta, var(--accent)) 38%, transparent);
+             transition: background 0.15s, transform 0.05s, box-shadow 0.15s;
+             flex-shrink: 0; }
+    .send-btn:hover:not(:disabled) { background: var(--cta-hover, var(--accent-hover));
+             box-shadow: 0 4px 15px color-mix(in srgb, var(--cta, var(--accent)) 52%, transparent); }
     .send-btn:active:not(:disabled) { transform: scale(0.96); }
-    .send-btn:disabled { opacity: 0.4; cursor: default; }
+    .send-btn:disabled { opacity: 0.4; cursor: default; box-shadow: none; }
     .send-btn svg { width: 18px; height: 18px; }
     .mic-btn { background: transparent; color: var(--muted); border: 0;
                border-radius: 50%; width: 36px; height: 36px; cursor: pointer;
@@ -1396,6 +1461,8 @@ const VOICE_PLACEHOLDER = "Space to talk, Enter to send";
 function setVoiceMode(on) {
   const was = voiceMode;
   voiceMode = !!on;
+  // Toggling speech-to-text is a signature moment: pop the rainbow track.
+  if (was !== voiceMode) rainbowMoment(voiceToggle, "stt-pulse", 500);
   voiceToggle.classList.toggle("on", voiceMode);
   voiceToggleInput.checked = voiceMode;
   micBtn.hidden = !voiceMode;
@@ -1837,9 +1904,25 @@ function typewriterStep() {
   typewriter.rafId = requestAnimationFrame(typewriterStep);
 }
 
+// Signature rainbow: replay a one-shot animation class at a meaningful
+// moment. Strips + re-adds the class (with a forced reflow) so it restarts
+// even if it fired moments ago, then clears it once the animation is done.
+function rainbowMoment(el, cls, ms) {
+  if (!el) return;
+  el.classList.remove(cls);
+  void el.offsetWidth;            // force reflow so the animation restarts
+  el.classList.add(cls);
+  setTimeout(() => el.classList.remove(cls), ms);
+}
+
 function appendMessage(cls, who, text) {
   const div = document.createElement("div");
   div.className = "msg " + cls;
+  // Aime responding is a signature moment — its rainbow bar wipes in.
+  if (cls === "aime") {
+    div.classList.add("fresh");
+    setTimeout(() => div.classList.remove("fresh"), 700);
+  }
   const w = document.createElement("span");
   w.className = "who";
   w.textContent = who + "  ";
@@ -2106,6 +2189,7 @@ form.addEventListener("submit", async (ev) => {
   if (!userText.trim() && pendingImages.length === 0 && pendingTextFiles.length === 0) return;
 
   input.value = "";
+  rainbowMoment(form, "sent", 650);   // signature moment: a glint sweeps the strip
 
   // Attachments are read and downscaled the moment they're picked, so they
   // are usually ready by now. If a large image is still being processed,
@@ -2391,6 +2475,8 @@ async function uploadFile(file) {
 // MIME type for the initial chip, and moved to the other list if the server
 // disagrees once it has actually decoded the bytes.
 function addFiles(files) {
+  // Attaching an image or file is a signature moment: ripple the rainbow.
+  if (files.length) rainbowMoment(attachBtn, "burst", 650);
   for (const f of files) {
     const looksImage = (f.type || "").startsWith("image/");
     const imgEntry = looksImage
