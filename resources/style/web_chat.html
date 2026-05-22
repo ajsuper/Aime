@@ -14,7 +14,15 @@
   <style>
     :root { color-scheme: light;
             --font-body: "Hanken Grotesk", ui-sans-serif, system-ui, -apple-system, sans-serif;
-            --font-display: "Fraunces", Georgia, "Times New Roman", serif; }
+            --font-display: "Fraunces", Georgia, "Times New Roman", serif;
+            /* One deliberate corner-radius scale. Soft-squared rather than
+               fully-rounded pills — calmer and more crafted than the default
+               SaaS look. (Circular icon buttons and the toggle switch keep
+               their own geometry — those are affordances, not surfaces.) */
+            --r-xs: 6px;
+            --r-sm: 10px;
+            --r-md: 14px;
+            --r-lg: 20px; }
     /* Default theme — Creativity (light). Retro-Apple offwhite with pastel-rainbow accents. */
     :root, :root[data-theme="creativity"] {
       color-scheme: light;
@@ -203,7 +211,7 @@
     #left-rail::before { content: ""; position: absolute; top: 0; left: 0;
                          right: 0; height: 3px;
                          background: var(--rainbow, transparent); }
-    .rail-btn { width: 32px; height: 32px; border-radius: 8px; border: 0;
+    .rail-btn { width: 32px; height: 32px; border-radius: var(--r-sm); border: 0;
                 background: transparent; color: var(--muted); cursor: pointer;
                 display: flex; align-items: center; justify-content: center;
                 transition: color 0.15s, background 0.15s; padding: 0; }
@@ -281,6 +289,16 @@
            scroll-behavior: smooth; }
     #log-inner { max-width: 760px; margin: 0 auto; display: flex;
                  flex-direction: column; gap: 0.75rem; }
+    /* Empty-state / welcome: with no messages yet, the log shows the Aime
+       wordmark — the logo's home. Pure CSS (:empty); the moment the first
+       message is appended it stops matching and the mark disappears. */
+    #log-inner:empty { height: 100%; align-items: center; justify-content: center; }
+    #log-inner:empty::before {
+      content: "Aime"; font-family: var(--font-display); font-weight: 600;
+      font-size: 3.2rem; line-height: 1; color: var(--text); }
+    #log-inner:empty::after {
+      content: ""; width: 92px; height: 4px; border-radius: 2px;
+      margin-top: 0.6rem; background: var(--rainbow, var(--accent)); }
     .msg { word-wrap: break-word;
            animation: fade-in 0.2s ease-out; }
     .msg.user, .msg.notice, .msg.aime { white-space: pre-wrap; }
@@ -322,7 +340,7 @@
     #queued-bar { max-width: 960px; margin: 0 auto 0.4rem; width: 100%;
                   display: flex; align-items: center; gap: 0.5rem;
                   background: var(--bg-input); border: 1px dashed var(--border);
-                  border-radius: 16px; padding: 0.35rem 0.5rem 0.35rem 0.85rem;
+                  border-radius: var(--r-md); padding: 0.35rem 0.5rem 0.35rem 0.85rem;
                   color: var(--muted); animation: queued-fade 0.18s ease-out; }
     #queued-bar[hidden] { display: none; }
     @keyframes queued-fade {
@@ -518,7 +536,7 @@
        The hidden checkbox is the source of truth. */
     .composer-toggle { display: inline-flex; align-items: center; gap: 0.4rem;
                        background: var(--bg-input); border: 1px solid var(--border);
-                       border-radius: 999px; padding: 0.25rem 0.55rem 0.25rem 0.6rem;
+                       border-radius: var(--r-sm); padding: 0.25rem 0.55rem 0.25rem 0.6rem;
                        cursor: pointer; user-select: none; flex-shrink: 0;
                        transition: border-color 0.15s, background 0.15s; }
     .composer-toggle:hover { border-color: var(--accent); }
@@ -539,7 +557,7 @@
     /* The new-conversation pill: icon + label, sits to the right of the input. */
     .new-chat-pill { display: inline-flex; align-items: center; gap: 0.35rem;
                      background: transparent; color: var(--muted);
-                     border: 1px solid var(--border); border-radius: 999px;
+                     border: 1px solid var(--border); border-radius: var(--r-sm);
                      padding: 0.4rem 0.85rem 0.4rem 0.7rem; cursor: pointer;
                      font: inherit; font-size: 0.88rem; flex-shrink: 0;
                      transition: color 0.15s, border-color 0.15s, background 0.15s; }
@@ -549,7 +567,7 @@
     .input-wrap { flex: 1 1 320px; min-width: 0; position: relative;
                   display: flex; gap: 0.5rem; align-items: center;
                   background: var(--bg-input); border: 1px solid var(--border);
-                  border-radius: 24px; padding: 0.35rem;
+                  border-radius: var(--r-lg); padding: 0.35rem;
                   box-shadow: inset 0 1px 0 var(--edge-light, transparent),
                               var(--shadow-1, none);
                   transition: border-color 0.15s, box-shadow 0.15s; }
@@ -848,7 +866,7 @@
       to { opacity: 1; }
     }
     #settings-modal { background: var(--bg-elev); border: 1px solid var(--border);
-                      border-radius: 14px; width: 100%; max-width: 640px;
+                      border-radius: var(--r-md); width: 100%; max-width: 640px;
                       max-height: 100%; display: flex; flex-direction: column;
                       box-shadow: inset 0 1px 0 var(--edge-light, transparent),
                                   var(--shadow-2, 0 20px 60px rgba(0,0,0,0.55));
@@ -883,11 +901,13 @@
     .settings-close svg { width: 16px; height: 16px; }
     .settings-body { overflow-y: auto; padding: 1.25rem; display: flex;
                      flex-direction: column; gap: 1.25rem; }
+    /* Each settings group is a softly recessed card rather than a region
+       split by hairline rules — clearer grouping, a touch of depth. */
+    .settings-section { background: var(--bg); border: 1px solid var(--border);
+                        border-radius: var(--r-md); padding: 1rem 1.1rem; }
     .settings-section h3 { margin: 0 0 0.35rem; font-size: 1.3rem; font-weight: 600;
                            font-family: var(--font-display); letter-spacing: 0.01em;
                            text-align: center; }
-    .settings-section + .settings-section { border-top: 1px solid var(--border);
-                                            padding-top: 1.25rem; }
     .settings-section .desc { color: var(--muted); font-size: 0.85rem;
                               margin: 0 0 0.75rem; text-align: center; }
     /* Wordmark — the 'Aime' name set in the display face, underscored by a
@@ -942,7 +962,7 @@
                         padding: 2rem; }
     #confirm-backdrop.open { display: flex; }
     #confirm-modal { background: var(--bg-elev); border: 1px solid var(--border);
-                     border-radius: 12px; max-width: 420px; width: 100%;
+                     border-radius: var(--r-md); max-width: 420px; width: 100%;
                      padding: 1.25rem 1.25rem 1rem;
                      box-shadow: inset 0 1px 0 var(--edge-light, transparent),
                                  var(--shadow-2, 0 20px 60px rgba(0,0,0,0.6)); }
@@ -1110,7 +1130,7 @@
       .composer-icon-btn svg { width: 24px; height: 24px; }
       .send-btn, .mic-btn, .attach-btn { width: 42px; height: 42px; }
       .send-btn svg, .mic-btn svg, .attach-btn svg { width: 22px; height: 22px; }
-      .input-wrap { border-radius: 26px; padding: 0.4rem; }
+      .input-wrap { border-radius: var(--r-lg); padding: 0.4rem; }
 
       /* Calendar single-scroll layout is now the default (see .cal-grid);
          phones just get shorter cells so more weeks fit before a scroll. */
