@@ -373,16 +373,17 @@
     .queued-text { flex: 1; min-width: 0; color: var(--text); opacity: 0.85;
                    font-style: italic; white-space: nowrap;
                    overflow: hidden; text-overflow: ellipsis; }
-    .queued-stop { background: transparent; color: var(--muted);
-                   border: 1px solid var(--border); border-radius: 50%;
-                   width: 28px; height: 28px; padding: 0;
-                   display: inline-flex; align-items: center;
-                   justify-content: center; cursor: pointer; flex-shrink: 0;
-                   transition: color 0.15s, border-color 0.15s, background 0.15s; }
-    .queued-stop:hover { color: white; border-color: var(--error);
-                         background: var(--error); }
+    .queued-stop { background: var(--error); color: white;
+                   border: 1px solid var(--error); border-radius: var(--r-sm);
+                   height: 34px; padding: 0 0.7rem;
+                   display: inline-flex; align-items: center; gap: 0.4rem;
+                   font-size: 0.72rem; font-weight: 600;
+                   text-transform: uppercase; letter-spacing: 0.04em;
+                   cursor: pointer; flex-shrink: 0;
+                   transition: filter 0.15s; }
+    .queued-stop:hover { filter: brightness(1.12); }
     .queued-stop:disabled { opacity: 0.5; cursor: default; }
-    .queued-stop svg { width: 12px; height: 12px; }
+    .queued-stop svg { width: 15px; height: 15px; }
     .msg.notice { color: var(--muted); font-size: 0.85rem;
                   font-style: normal; opacity: 0.85; }
     .msg.notice::before {
@@ -1368,6 +1369,17 @@
                 <option value="parchment">Parchment (light)</option>
               </select>
             </div>
+            <div class="settings-row">
+              <span class="label">Information detail</span>
+              <select id="verbosity-select">
+                <option value="minimal">Minimal</option>
+                <option value="standard">Standard</option>
+                <option value="verbose">Verbose</option>
+              </select>
+            </div>
+            <p class="desc">Minimal hides tool activity behind a status line.
+              Standard shows a line per step. Verbose shows tool names,
+              details, and full error text.</p>
           </div>
           <div class="settings-section">
             <h3>About</h3>
@@ -2037,6 +2049,26 @@ function appendNotice(text, severity) {
   scrollToBottom();
 }
 
+// Minimal-verbosity status line: a single reusable "Working…" notice shown
+// while tools run, instead of one notice per call. `showWorkingIndicator`
+// moves it to the end of the log so it stays as the latest line.
+let workingIndicator = null;
+function showWorkingIndicator() {
+  if (!workingIndicator) {
+    workingIndicator = document.createElement("div");
+    workingIndicator.className = "msg notice info";
+    workingIndicator.textContent = "Working…";
+  }
+  logInner.appendChild(workingIndicator);  // append, or move existing to end
+  scrollToBottom();
+}
+function clearWorkingIndicator() {
+  if (workingIndicator) {
+    workingIndicator.remove();
+    workingIndicator = null;
+  }
+}
+
 function ensureAssistant() {
   if (!currentAssistant) {
     currentAssistant = appendMessage("aime", "aime", "");
@@ -2221,17 +2253,29 @@ es.onmessage = (ev) => {
       // matching turn_end, so without this a reloaded conversation would
       // wrongly hold the first new message back as a queued draft.
       modelBusy = e.busy === true;
+      // Replayed history has no turn_end, so a "Working…" line added while
+      // replaying tool calls would otherwise linger — drop it here.
+      clearWorkingIndicator();
       break;
     case "tool_call":
-      appendNotice("· tool: " + e.tool_name +
-                   (e.tool_details ? " — " + e.tool_details : ""), "info");
+      if (verbosity === "verbose") {
+        appendNotice("· tool: " + e.tool_name +
+                     (e.tool_details ? " — " + e.tool_details : ""), "info");
+      } else if (verbosity === "standard") {
+        appendNotice("Filtering events…", "info");
+      } else {  // minimal — a single shared status line
+        showWorkingIndicator();
+      }
       break;
     case "tool_result":
-      appendNotice("· tool done: " + e.tool_name +
-                   (e.tool_result_summary ? " — " + e.tool_result_summary : ""),
-                   "info");
+      if (verbosity === "verbose") {
+        appendNotice("· tool done: " + e.tool_name +
+                     (e.tool_result_summary ? " — " + e.tool_result_summary : ""),
+                     "info");
+      }
       break;
     case "turn_end":
+      clearWorkingIndicator();
       if (e.stop_reason === "end_turn") currentAssistant = null;
       if (e.stop_reason === "end_turn" || e.stop_reason === "interrupted") {
         modelBusy = false;
@@ -2249,10 +2293,31 @@ es.onmessage = (ev) => {
     case "ready":
       break;
     case "notice":
-      appendNotice(e.text, e.severity);
+      // A conversation was auto-recovered from a corrupted history. Verbose
+      // gets the technical phrasing; the calmer tiers get a friendly line.
+      if (e.severity === "recovery") {
+        if (verbosity === "verbose") {
+          appendNotice("Recovered this conversation after a technical issue" +
+                       (e.text ? " — " + e.text : ""), "info");
+        } else {
+          appendNotice("Picked up this conversation where you left off.",
+                       "info");
+        }
+        break;
+      }
+      // Errors are collapsed to a calm generic line outside Verbose; the
+      // real text still goes to the console for debugging. Warnings and
+      // info notices are always shown as-is.
+      if (e.severity === "error" && verbosity !== "verbose") {
+        console.error("Aime notice:", e.text);
+        appendNotice("Aime encountered an issue", "error");
+      } else {
+        appendNotice(e.text, e.severity);
+      }
       break;
     case "session_restart":
       logInner.innerHTML = "";
+      workingIndicator = null;
       currentAssistant = null;
       pendingHtmlTarget = null;
       pendingSendBubble = null;
@@ -2267,10 +2332,20 @@ es.onmessage = (ev) => {
       loadChats();
       break;
     case "session_terminated":
-      appendNotice("session terminated", "error");
+      if (verbosity === "verbose") {
+        appendNotice("session terminated", "error");
+      } else {
+        console.error("Aime: session terminated");
+        appendNotice("Aime encountered an issue", "error");
+      }
       break;
     case "error":
-      appendNotice("error: " + e.text, "error");
+      if (verbosity === "verbose") {
+        appendNotice("error: " + e.text, "error");
+      } else {
+        console.error("Aime error:", e.text);
+        appendNotice("Aime encountered an issue", "error");
+      }
       break;
   }
 };
@@ -2412,7 +2487,8 @@ function renderQueuedDraft() {
   stop.setAttribute("aria-label", "Stop and send");
   stop.innerHTML =
     '<svg viewBox="0 0 24 24" fill="currentColor">' +
-    '<rect x="6" y="6" width="12" height="12" rx="1"/></svg>';
+    '<rect x="6" y="6" width="12" height="12" rx="1"/></svg>' +
+    '<span>Force send</span>';
   stop.addEventListener("click", async () => {
     if (!queuedDraft) return;
     stop.disabled = true;
@@ -3350,6 +3426,22 @@ themeSelect.value = savedTheme;
 themeSelect.addEventListener("change", () => {
   applyTheme(themeSelect.value);
   localStorage.setItem(THEME_KEY, themeSelect.value);
+});
+
+// -- Information detail (verbosity) -------------------------------------
+// Controls how much tool/error chatter the transcript shows. Read by the
+// SSE event handler above. `minimal` keeps the UI calm by default.
+
+const VERBOSITY_KEY = "aime.verbosity";
+const DEFAULT_VERBOSITY = "minimal";
+const verbositySelect = document.getElementById("verbosity-select");
+
+let verbosity = localStorage.getItem(VERBOSITY_KEY) || DEFAULT_VERBOSITY;
+verbositySelect.value = verbosity;
+
+verbositySelect.addEventListener("change", () => {
+  verbosity = verbositySelect.value;
+  localStorage.setItem(VERBOSITY_KEY, verbosity);
 });
 
 // -- Settings modal -----------------------------------------------------

@@ -50,7 +50,7 @@ CoreEventKind = Literal[
 ]
 
 
-Severity = Literal["info", "warning", "error", "success"]
+Severity = Literal["info", "warning", "error", "success", "recovery"]
 RestartReason = Literal["reset", "load"]
 
 
@@ -379,6 +379,13 @@ class ConversationController:
                 self._emit(CoreEvent(kind="ready"))
         elif kind == "session_terminated":
             self._emit(CoreEvent(kind="session_terminated"))
+        elif kind == "history_recovered":
+            # A broken history was auto-flattened so the turn could proceed.
+            # Surfaced as a notice with the dedicated "recovery" severity so
+            # the frontend can phrase it per the user's verbosity setting.
+            self._emit(CoreEvent(
+                kind="notice", severity="recovery", text=event.text or "",
+            ))
         elif kind == "error":
             self._emit(CoreEvent(kind="error", text=event.error or ""))
 

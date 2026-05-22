@@ -10,6 +10,8 @@ block, not a separate display event).
 
 from typing import Iterator
 
+from provider_backend import RECOVERY_MARKER
+
 from .controller import CoreEvent
 
 
@@ -20,6 +22,19 @@ def replay_messages(messages: list[dict]) -> Iterator[CoreEvent]:
         if not isinstance(content, list):
             continue
         if role == "user":
+            # A recovery-flattened message holds a condensed transcript meant
+            # for the model, not for display — surface it as a short recovery
+            # notice rather than a giant verbatim bubble.
+            first_text = next(
+                (b.get("text", "") for b in content
+                 if isinstance(b, dict) and b.get("type") == "text"),
+                "",
+            )
+            if first_text.startswith(RECOVERY_MARKER):
+                yield CoreEvent(
+                    kind="notice", severity="recovery", from_replay=True,
+                )
+                continue
             # A user message can mix one or more text blocks with image blocks.
             # Collapse them into a single user_message_shown event so the
             # frontend can render attachments in the same bubble as the text.

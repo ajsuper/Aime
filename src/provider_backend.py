@@ -13,7 +13,7 @@ import zoneinfo
 from dataclasses import dataclass
 from typing import Iterator, Literal, Protocol, runtime_checkable
 
-from anthropic import Anthropic
+from anthropic import Anthropic, BadRequestError
 from cryptography.exceptions import InvalidTag
 
 # `aime.encryption` is imported lazily at the bottom of this file. Importing
@@ -24,6 +24,12 @@ from cryptography.exceptions import InvalidTag
 # Suffix used for on-disk conversation files. Each is AES-GCM encrypted
 # under the owning user's DEK; the bytes are not JSON anymore.
 _CONV_SUFFIX = ".json.enc"
+
+# Sentinel at the very start of a recovery-flattened message (see
+# AnthropicMessagesBackend._recover_history). Lets history replay render such
+# a conversation as a short recovery notice instead of dumping the condensed
+# transcript into one giant verbatim bubble.
+RECOVERY_MARKER = "[Aime conversation recovered]"
 
 
 def _jsonable(obj):
@@ -81,6 +87,8 @@ EventKind = Literal[
     "turn_end",
     "error",
     "session_terminated",
+    # A structurally broken history was flattened so the turn could proceed.
+    "history_recovered",
 ]
 
 
@@ -660,18 +668,234 @@ class AnthropicMessagesBackend:
                 last_role = self._messages[-1].get("role") if has_messages else None
             if not has_messages or last_role != "user":
                 continue
-            try:
-                yield from self._run_turn()
-            except Exception as exc:
-                yield BackendEvent(kind="error", error=str(exc))
-                yield BackendEvent(kind="turn_end", stop_reason="error")
+            yield from self._turn_with_recovery()
 
     # --- internal ---
+
+    def _turn_with_recovery(self) -> Iterator[BackendEvent]:
+        """Run one assistant turn, recovering from a structurally broken
+        history instead of letting it brick the conversation.
+
+        Two layers of defense:
+          * `_run_turn` proactively validates the history and flattens it
+            (see `_recover_history`) before sending if its cheap checker
+            flags a problem — so a known-bad history never reaches the API.
+          * This wrapper additionally catches a 400 the validator didn't
+            anticipate (an incompatible attachment, an orphan tool pair we
+            didn't model), flattens, and retries the turn exactly once.
+
+        Anything that isn't a malformed-request 400 (network blips, 429s,
+        500s) is surfaced as a plain error — those are transient and must
+        not trigger a destructive history rewrite.
+        """
+        try:
+            yield from self._run_turn()
+            return
+        except Exception as exc:
+            if not self._is_malformed_history_error(exc):
+                self._discard_failed_assistant_placeholder()
+                yield BackendEvent(kind="error", error=str(exc))
+                yield BackendEvent(kind="turn_end", stop_reason="error")
+                return
+            # The API rejected the request itself as malformed. Flatten the
+            # history to a single valid message and retry the turn once.
+            self._discard_failed_assistant_placeholder()
+            reason = f"the conversation could not be processed ({exc})"
+            self._recover_history(reason)
+            yield BackendEvent(kind="history_recovered", text=reason)
+        try:
+            yield from self._run_turn()
+        except Exception as exc:
+            self._discard_failed_assistant_placeholder()
+            yield BackendEvent(kind="error", error=str(exc))
+            yield BackendEvent(kind="turn_end", stop_reason="error")
+
+    @staticmethod
+    def _is_malformed_history_error(exc: Exception) -> bool:
+        """True when `exc` is the API rejecting the request as structurally
+        invalid (HTTP 400) — the signature of a corrupted history — rather
+        than a transient network/server failure."""
+        return (
+            isinstance(exc, BadRequestError)
+            or getattr(exc, "status_code", None) == 400
+        )
+
+    @staticmethod
+    def _history_problem(messages: list[dict]) -> str | None:
+        """Cheap structural check of the message history. Returns a short
+        description of the first API-invalid condition found, or None when
+        the history looks safe to send.
+
+        Deliberately conservative: it only flags conditions the Messages
+        API genuinely rejects (bad roles, broken alternation, orphan
+        tool_use/tool_result pairs, a web search with no result, empty or
+        malformed content) so a healthy conversation is never needlessly
+        flattened and stripped of its prompt cache."""
+        if not messages:
+            return None
+        for i, msg in enumerate(messages):
+            if not isinstance(msg, dict):
+                return "a message is not an object"
+            role = msg.get("role")
+            if role not in ("user", "assistant"):
+                return f"unexpected message role {role!r}"
+            if i == 0 and role != "user":
+                return "history does not start with a user message"
+            if i > 0:
+                prev = messages[i - 1]
+                prev_role = prev.get("role") if isinstance(prev, dict) else None
+                if role == prev_role:
+                    return "two consecutive messages share a role"
+            content = msg.get("content")
+            if isinstance(content, str):
+                continue
+            if not isinstance(content, list) or not content:
+                return "a message has empty or non-list content"
+            for blk in content:
+                if not isinstance(blk, dict) or not blk.get("type"):
+                    return "a message has a malformed content block"
+            if role == "assistant":
+                # Every tool_use must be answered in the next (user) message.
+                tool_use_ids = [b["id"] for b in content
+                                if b.get("type") == "tool_use" and b.get("id")]
+                if tool_use_ids:
+                    nxt = messages[i + 1] if i + 1 < len(messages) else None
+                    answered: set = set()
+                    if (isinstance(nxt, dict) and nxt.get("role") == "user"
+                            and isinstance(nxt.get("content"), list)):
+                        answered = {
+                            b.get("tool_use_id") for b in nxt["content"]
+                            if isinstance(b, dict)
+                            and b.get("type") == "tool_result"
+                        }
+                    if any(tid not in answered for tid in tool_use_ids):
+                        return "a tool call has no matching tool result"
+                # A server tool use (web search) must carry its own result.
+                server_ids = [b["id"] for b in content
+                              if b.get("type") == "server_tool_use" and b.get("id")]
+                if server_ids:
+                    got = {b.get("tool_use_id") for b in content
+                           if b.get("type") == "web_search_tool_result"}
+                    if any(sid not in got for sid in server_ids):
+                        return "a web search has no matching result"
+            else:  # user
+                results = [b for b in content if b.get("type") == "tool_result"]
+                if results:
+                    prev = messages[i - 1] if i > 0 else None
+                    prev_ids: set = set()
+                    if (isinstance(prev, dict) and prev.get("role") == "assistant"
+                            and isinstance(prev.get("content"), list)):
+                        prev_ids = {
+                            b.get("id") for b in prev["content"]
+                            if isinstance(b, dict)
+                            and b.get("type") in ("tool_use", "server_tool_use")
+                        }
+                    if any(b.get("tool_use_id") not in prev_ids for b in results):
+                        return "a tool result has no matching tool call"
+        return None
+
+    def _flatten_messages(self, messages: list[dict]) -> str:
+        """Render the message history as a plain-text transcript. Used to
+        rebuild a structurally broken history as one valid user message."""
+        lines: list[str] = []
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            speaker = "User" if msg.get("role") == "user" else "Aime"
+            content = msg.get("content")
+            if isinstance(content, str):
+                if content.strip():
+                    lines.append(f"{speaker}: {content.strip()}")
+                continue
+            if not isinstance(content, list):
+                continue
+            for blk in content:
+                if not isinstance(blk, dict):
+                    continue
+                btype = blk.get("type")
+                if btype == "text":
+                    txt = (blk.get("text") or "").strip()
+                    if txt:
+                        lines.append(f"{speaker}: {txt}")
+                elif btype == "image":
+                    lines.append(f"{speaker}: [image attachment]")
+                elif btype in ("tool_use", "server_tool_use"):
+                    name = blk.get("name") or "a tool"
+                    try:
+                        inp = json.dumps(blk.get("input") or {}, ensure_ascii=False)
+                    except (TypeError, ValueError):
+                        inp = "{}"
+                    lines.append(f"[Aime used {name}: {inp[:800]}]")
+                elif btype == "tool_result":
+                    res = blk.get("content")
+                    if not isinstance(res, str):
+                        try:
+                            res = json.dumps(res, ensure_ascii=False, default=str)
+                        except (TypeError, ValueError):
+                            res = str(res)
+                    lines.append(f"[Tool result: {res[:1500]}]")
+                elif btype == "web_search_tool_result":
+                    lines.append("[Web search results]")
+        return "\n\n".join(lines)
+
+    def _recover_history(self, reason: str) -> None:
+        """Replace a structurally broken message history with a single
+        plain-text user message holding the whole transcript.
+
+        A lone user message is always a valid request, so this can never
+        fail to send — it trades the structured tool history (already
+        broken) for a conversation the user can keep using. A short note
+        is prepended so the model still has the context to explain, calmly,
+        what happened if the user asks. The result is persisted so the
+        conversation is permanently un-bricked, not just for this turn.
+
+        Caller must NOT hold self._lock."""
+        with self._lock:
+            transcript = self._flatten_messages(self._messages)
+            note = (
+                "[System note: the earlier conversation history hit a "
+                "technical problem and has been condensed into the transcript "
+                "below. Treat it as the full prior context. If the user asks "
+                "what happened, about a missing result, or a lost attachment, "
+                "briefly and calmly explain there was a technical hiccup and "
+                "offer to continue. Do not quote this note verbatim. "
+                f"(Internal detail: {reason})]"
+            )
+            parts = [RECOVERY_MARKER, note]
+            if transcript:
+                parts.append(transcript)
+            body = "\n\n".join(parts)
+            self._messages = [{
+                "role": "user",
+                "content": [{"type": "text", "text": body}],
+            }]
+            self._pending_tool_results = []
+            self._expected_tool_use_ids = set()
+        self._persist()
+
+    def _discard_failed_assistant_placeholder(self) -> None:
+        """Drop the empty assistant message `_run_turn` reserves at the tail
+        when a turn raised before producing any output — leaving it would
+        itself add an empty-content message (a 400) to the history."""
+        with self._lock:
+            if (self._messages
+                    and isinstance(self._messages[-1], dict)
+                    and self._messages[-1].get("role") == "assistant"
+                    and not self._messages[-1].get("content")):
+                self._messages.pop()
 
     def _run_turn(self) -> Iterator[BackendEvent]:
         # Fresh interrupt slate per turn — a stale flag from a prior turn
         # must not abort the new one.
         self._interrupted.clear()
+        # Proactive corruption guard: a structurally broken history would be
+        # rejected by the API with a 400 and brick the conversation. Detect
+        # it cheaply and flatten to one valid message before we ever send.
+        with self._lock:
+            problem = self._history_problem(self._messages)
+        if problem:
+            self._recover_history(problem)
+            yield BackendEvent(kind="history_recovered", text=problem)
         assistant_blocks: list[dict] = []
 
         with self._lock:
