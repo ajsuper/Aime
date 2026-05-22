@@ -7,9 +7,43 @@
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
   <style>
-    :root { color-scheme: dark; }
-    /* Default theme — Warm Cocoa. */
-    :root, :root[data-theme="cocoa"] {
+    :root { color-scheme: light; }
+    /* Default theme — Creativity (light). Retro-Apple offwhite with pastel-rainbow accents. */
+    :root, :root[data-theme="creativity"] {
+      color-scheme: light;
+      --bg: #F4F0E6;
+      --bg-elev: #FBF8F0;
+      --bg-input: #FFFFFF;
+      --border: #DFD9C8;
+      --text: #2C2A24;
+      --muted: #8A8273;
+      --accent: #E78C9B;
+      --accent-hover: #EE9FAC;
+      --user-bubble: linear-gradient(135deg, #A8D5BA 0%, #F5E3A1 22%, #F5C39B 42%, #F0A6A6 62%, #C9B3E0 81%, #A3C9E8 100%);
+      --user-bubble-text: #2C2A24;
+      --warning: #E0AE55;
+      --error: #D9817F;
+      --success: #6DAE84;
+    }
+    /* Creativity (dark) — same pastel-rainbow language on a warm near-black. */
+    :root[data-theme="creativity-dark"] {
+      color-scheme: dark;
+      --bg: #1E1C18;
+      --bg-elev: #28251F;
+      --bg-input: #302C25;
+      --border: #3B362D;
+      --text: #EDE8DD;
+      --muted: #998F7E;
+      --accent: #F0AEB8;
+      --accent-hover: #F4BEC6;
+      --user-bubble: linear-gradient(135deg, #9AD0AE 0%, #F0DA9A 22%, #F2C197 42%, #EFA1A1 62%, #C9B0E4 81%, #9EC4E8 100%);
+      --user-bubble-text: #1E1C18;
+      --warning: #EDC777;
+      --error: #EC9090;
+      --success: #8FC9A4;
+    }
+    :root[data-theme="cocoa"] {
+      color-scheme: dark;
       --bg: #1F1B1A;
       --bg-elev: #2B2522;
       --bg-input: #34302D;
@@ -24,6 +58,7 @@
       --success: #A3C9A8;
     }
     :root[data-theme="midnight"] {
+      color-scheme: dark;
       --bg: #0F1115;
       --bg-elev: #161922;
       --bg-input: #1C2030;
@@ -38,6 +73,7 @@
       --success: #5DD39E;
     }
     :root[data-theme="forest"] {
+      color-scheme: dark;
       --bg: #131A17;
       --bg-elev: #1C2622;
       --bg-input: #232F2A;
@@ -52,6 +88,7 @@
       --success: #8FBF9F;
     }
     :root[data-theme="slate"] {
+      color-scheme: dark;
       --bg: #14171C;
       --bg-elev: #1D2127;
       --bg-input: #262B33;
@@ -66,6 +103,7 @@
       --success: #6BD3A0;
     }
     :root[data-theme="sunset"] {
+      color-scheme: dark;
       --bg: #1B1320;
       --bg-elev: #261A2D;
       --bg-input: #2F2237;
@@ -80,6 +118,7 @@
       --success: #B5D49E;
     }
     :root[data-theme="mint"] {
+      color-scheme: dark;
       --bg: #101817;
       --bg-elev: #182322;
       --bg-input: #1F2D2B;
@@ -207,7 +246,7 @@
        suppress the avatar on the follow-up. */
     .msg.aime + .msg.aime::before { display: none; }
     .msg.user { align-self: flex-end; max-width: 80%;
-                background: var(--user-bubble); color: white;
+                background: var(--user-bubble); color: var(--user-bubble-text, white);
                 padding: 0.65rem 1rem; border-radius: 18px 18px 4px 18px;
                 box-shadow: 0 2px 10px rgba(124, 140, 255, 0.15); }
     .msg.user.no-text { background: transparent; padding: 0;
@@ -1124,6 +1163,8 @@
             <div class="settings-row">
               <span class="label">Theme</span>
               <select id="theme-select">
+                <option value="creativity">Creativity (light)</option>
+                <option value="creativity-dark">Creativity (dark)</option>
                 <option value="cocoa">Warm Cocoa</option>
                 <option value="midnight">Midnight</option>
                 <option value="forest">Forest</option>
@@ -3065,7 +3106,7 @@ document.getElementById("account-btn").addEventListener("click", openAccount);
 // -- Theme picker -------------------------------------------------------
 
 const THEME_KEY = "aime.theme";
-const DEFAULT_THEME = "cocoa";
+const DEFAULT_THEME = "creativity";
 const themeSelect = document.getElementById("theme-select");
 
 function applyTheme(name) {
