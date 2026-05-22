@@ -394,6 +394,13 @@
     .msg.notice.warning { color: var(--warning); }
     .msg.notice.error   { color: var(--error); }
     .msg.notice.success { color: var(--success); }
+    /* The "loaded conversation" line: centered, no bullet dot, and fades out
+       once the user sends a message so the transcript reads as one
+       continuous conversation. */
+    .msg.notice.loaded { text-align: center; padding-left: 0;
+                         transition: opacity 0.45s ease; }
+    .msg.notice.loaded::before { display: none; }
+    .msg.notice.loaded.fading { opacity: 0; }
     .msg .content :is(pre, code) {
       font-family: ui-monospace, "SF Mono", Menlo, monospace;
       font-size: 0.88em;
@@ -2047,7 +2054,12 @@ function appendNotice(text, severity) {
   div.textContent = text;
   logInner.appendChild(div);
   scrollToBottom();
+  return div;
 }
+
+// The "Loaded conversation…" line, kept so it can be faded out the moment
+// the user sends a message — see the user_message_shown handler.
+let loadedNotice = null;
 
 // Minimal-verbosity status line: a single reusable "Working…" notice shown
 // while tools run, instead of one notice per call. `showWorkingIndicator`
@@ -2201,6 +2213,15 @@ es.onmessage = (ev) => {
       // draft instead of being sent.
       if (!e.from_replay) {
         modelBusy = true;
+        // Fade out the "Loaded conversation…" line — once the user has sent
+        // a message the transcript should read as one continuous chat.
+        if (loadedNotice) {
+          const n = loadedNotice;
+          loadedNotice = null;
+          n.classList.add("fading");
+          n.addEventListener("transitionend", () => n.remove(), {once: true});
+          setTimeout(() => n.remove(), 700);  // fallback if no transition
+        }
         // Snap to the message even if the user had scrolled up.
         scrollToBottom(true);
       }
@@ -2293,6 +2314,12 @@ es.onmessage = (ev) => {
     case "ready":
       break;
     case "notice":
+      // The "Loaded conversation…" line — centered, and tracked so it can
+      // fade out once the user sends their first message.
+      if (e.severity === "loaded") {
+        loadedNotice = appendNotice(e.text, "loaded");
+        break;
+      }
       // A conversation was auto-recovered from a corrupted history. Verbose
       // gets the technical phrasing; the calmer tiers get a friendly line.
       if (e.severity === "recovery") {
@@ -2318,6 +2345,7 @@ es.onmessage = (ev) => {
     case "session_restart":
       logInner.innerHTML = "";
       workingIndicator = null;
+      loadedNotice = null;
       currentAssistant = null;
       pendingHtmlTarget = null;
       pendingSendBubble = null;
@@ -2332,12 +2360,10 @@ es.onmessage = (ev) => {
       loadChats();
       break;
     case "session_terminated":
-      if (verbosity === "verbose") {
-        appendNotice("session terminated", "error");
-      } else {
-        console.error("Aime: session terminated");
-        appendNotice("Aime encountered an issue", "error");
-      }
+      // Fires routinely whenever an old stream is swapped out (every /load
+      // and /reset), so it's noise rather than signal — never surfaced to
+      // the user. Logged to the console only, for debugging.
+      console.debug("Aime: backend session terminated");
       break;
     case "error":
       if (verbosity === "verbose") {

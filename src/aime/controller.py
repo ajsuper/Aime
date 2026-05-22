@@ -50,7 +50,7 @@ CoreEventKind = Literal[
 ]
 
 
-Severity = Literal["info", "warning", "error", "success", "recovery"]
+Severity = Literal["info", "warning", "error", "success", "recovery", "loaded"]
 RestartReason = Literal["reset", "load"]
 
 
@@ -294,9 +294,11 @@ class ConversationController:
             )
         else:
             loaded_text = "Loaded conversation. Continue where you left off."
+        # "loaded" severity (not "success") so the frontend can center it and
+        # fade it away once the user sends a message — see web_chat.html.
         self._emit(CoreEvent(
             kind="notice",
-            severity="success",
+            severity="loaded",
             text=loaded_text,
         ))
         self._spawn_worker(self.run_stream_loop)
