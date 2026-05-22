@@ -210,6 +210,15 @@
     .rail-btn:hover { color: var(--text); background: rgba(255,255,255,0.05); }
     .rail-btn.active { color: var(--accent); background: rgba(124,140,255,0.12); }
     .rail-btn svg { width: 20px; height: 20px; }
+    /* Aime logo button — single entry point for the account & settings menu.
+       A compact wordmark: 'Aime' in the display face over a rainbow rule. */
+    .rail-btn.logo { flex-direction: column; gap: 2px; }
+    .rail-btn.logo .logo-text { font-family: var(--font-display); font-weight: 600;
+                                font-size: 0.62rem; line-height: 1; letter-spacing: 0.01em;
+                                color: var(--text); }
+    .rail-btn.logo .logo-bar { width: 20px; height: 2px; border-radius: 1px;
+                               background: var(--rainbow, var(--accent)); }
+    .rail-btn.logo:hover { background: rgba(255,255,255,0.05); }
     /* Divider between the pane buttons and the account/settings buttons. */
     .rail-sep { width: 22px; height: 1px; background: var(--border);
                 margin: 0.2rem 0; flex-shrink: 0; }
@@ -826,22 +835,23 @@
     #tabbar { display: none; }
 
     /* Settings modal: floating panel over a blurred chat backdrop. */
-    #settings-backdrop, #account-backdrop {
+    #settings-backdrop {
                          position: fixed; inset: 0; z-index: 200;
                          background: rgba(15, 12, 10, 0.45);
                          backdrop-filter: blur(8px);
                          -webkit-backdrop-filter: blur(8px);
                          display: none; align-items: center; justify-content: center;
                          padding: 2rem; animation: settings-fade 0.15s ease-out; }
-    #settings-backdrop.open, #account-backdrop.open { display: flex; }
+    #settings-backdrop.open { display: flex; }
     @keyframes settings-fade {
       from { opacity: 0; }
       to { opacity: 1; }
     }
-    #settings-modal, #account-modal { background: var(--bg-elev); border: 1px solid var(--border);
+    #settings-modal { background: var(--bg-elev); border: 1px solid var(--border);
                       border-radius: 14px; width: 100%; max-width: 640px;
                       max-height: 100%; display: flex; flex-direction: column;
-                      box-shadow: 0 20px 60px rgba(0,0,0,0.55);
+                      box-shadow: inset 0 1px 0 var(--edge-light, transparent),
+                                  var(--shadow-2, 0 20px 60px rgba(0,0,0,0.55));
                       animation: settings-rise 0.18s ease-out; }
     @keyframes settings-rise {
       from { opacity: 0; transform: translateY(8px) scale(0.98); }
@@ -1124,19 +1134,10 @@
 <body>
   <div id="main">
     <div id="left-rail">
-      <button class="rail-btn" id="account-btn" title="Account" aria-label="Account">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
-             stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/>
-          <circle cx="12" cy="7" r="4"/>
-        </svg>
-      </button>
-      <button class="rail-btn" id="settings-btn" title="Settings" aria-label="Settings">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
-             stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <circle cx="12" cy="12" r="3"/>
-          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.01a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.01a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
-        </svg>
+      <button class="rail-btn logo" id="menu-btn"
+              title="Account & settings" aria-label="Account and settings">
+        <span class="logo-text">Aime</span>
+        <span class="logo-bar" aria-hidden="true"></span>
       </button>
       <div class="rail-sep" aria-hidden="true"></div>
       <button class="rail-btn pane-btn" data-target="chats" title="Chats" aria-label="Chats">
@@ -1322,7 +1323,9 @@
       </div>
       <div class="settings-tabs" role="tablist">
         <button class="settings-tab-btn active" data-tab="user" role="tab"
-                aria-selected="true">User</button>
+                aria-selected="true">General</button>
+        <button class="settings-tab-btn" data-tab="account" role="tab"
+                aria-selected="false">Account</button>
         <button class="settings-tab-btn" data-tab="developer" role="tab"
                 aria-selected="false">Developer</button>
       </div>
@@ -1352,6 +1355,81 @@
             <p class="desc">Your personal assistant.</p>
           </div>
         </div>
+        <div class="settings-tab" data-tab="account" role="tabpanel">
+          <div class="settings-section">
+            <h3>Profile</h3>
+            <p class="desc">Your Aime account.</p>
+            <div class="settings-row">
+              <span class="label">Username</span>
+              <span class="value" id="account-username">—</span>
+            </div>
+          </div>
+          <div class="settings-section" id="account-access-section" style="display:none">
+            <h3>Aime access</h3>
+            <p class="desc" id="account-access-desc">—</p>
+            <div class="settings-row" id="account-redeem-row" style="display:none">
+              <input id="account-key-input" type="text" autocomplete="off"
+                     placeholder="Invite key"
+                     style="flex:1;min-width:0;margin-right:0.5rem;background:var(--bg-input);
+                            color:var(--text);border:1px solid var(--border);
+                            border-radius:8px;padding:0.4rem 0.6rem;font-size:0.85rem">
+              <button class="btn-primary" id="account-redeem-btn"
+                      style="background:var(--accent);color:#fff;border:0;border-radius:8px;
+                             padding:0.4rem 0.9rem;cursor:pointer;font-size:0.85rem">
+                Redeem
+              </button>
+            </div>
+            <p class="desc" id="account-redeem-msg" style="display:none;margin-top:0.4rem"></p>
+          </div>
+          <div class="settings-section">
+            <h3>Data</h3>
+            <p class="desc">Download your full data set as a zip, restore one,
+              or delete saved conversations.</p>
+            <div class="settings-row">
+              <span class="label">Export my data</span>
+              <button class="btn-neutral" id="account-export-btn"
+                      style="background:var(--bg-input);color:var(--text);
+                             border:1px solid var(--border);border-radius:8px;
+                             padding:0.4rem 0.9rem;cursor:pointer;font-size:0.85rem">
+                Download .zip
+              </button>
+            </div>
+            <div class="settings-row">
+              <span class="label">Import data</span>
+              <button class="btn-neutral" id="account-import-btn"
+                      style="background:var(--bg-input);color:var(--text);
+                             border:1px solid var(--border);border-radius:8px;
+                             padding:0.4rem 0.9rem;cursor:pointer;font-size:0.85rem">
+                Upload .zip…
+              </button>
+            </div>
+            <input type="file" id="account-import-file"
+                   accept=".zip,application/zip" style="display:none">
+            <p class="desc" id="account-import-msg"
+               style="display:none;margin-top:0.4rem"></p>
+            <div class="settings-row">
+              <span class="label" style="color: var(--error)">Delete all conversations</span>
+              <button class="btn-danger" id="account-delete-all-btn">Delete all</button>
+            </div>
+          </div>
+          <div class="settings-section">
+            <h3>Session</h3>
+            <div class="settings-row">
+              <span class="label" style="color: var(--error)">Log out</span>
+              <button class="btn-danger" id="account-logout-btn">Log out</button>
+            </div>
+          </div>
+          <div class="settings-section">
+            <h3>Delete account</h3>
+            <p class="desc">Deactivates your account — it will appear to no
+              longer exist. You can recover it by signing in again. After 30
+              days it is permanently deleted.</p>
+            <div class="settings-row">
+              <span class="label" style="color: var(--error)">Delete my account</span>
+              <button class="btn-danger" id="account-delete-btn">Delete account</button>
+            </div>
+          </div>
+        </div>
         <div class="settings-tab" data-tab="developer" role="tabpanel">
           <p class="dev-warn">Developer settings. Changing these may affect how Aime responds.</p>
           <div class="settings-section">
@@ -1370,94 +1448,6 @@
               <select id="stt-model-select"><option value="">(none)</option></select>
             </div>
             <p class="desc" id="stt-model-hint" style="margin-top:0.4rem"></p>
-          </div>
-        </div>
-      </div>
-    </div>
-  </div>
-  <div id="account-backdrop" role="dialog" aria-modal="true" aria-labelledby="account-title">
-    <div id="account-modal">
-      <div class="settings-header">
-        <span class="title" id="account-title">Account</span>
-        <button class="settings-close" id="account-close" title="Close" aria-label="Close">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
-               stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M6 6l12 12M18 6L6 18"/>
-          </svg>
-        </button>
-      </div>
-      <div class="settings-body">
-        <div class="settings-section">
-          <h3>Profile</h3>
-          <p class="desc">Your Aime account.</p>
-          <div class="settings-row">
-            <span class="label">Username</span>
-            <span class="value" id="account-username">—</span>
-          </div>
-        </div>
-        <div class="settings-section" id="account-access-section" style="display:none">
-          <h3>Aime access</h3>
-          <p class="desc" id="account-access-desc">—</p>
-          <div class="settings-row" id="account-redeem-row" style="display:none">
-            <input id="account-key-input" type="text" autocomplete="off"
-                   placeholder="Invite key"
-                   style="flex:1;min-width:0;margin-right:0.5rem;background:var(--bg-input);
-                          color:var(--text);border:1px solid var(--border);
-                          border-radius:8px;padding:0.4rem 0.6rem;font-size:0.85rem">
-            <button class="btn-primary" id="account-redeem-btn"
-                    style="background:var(--accent);color:#fff;border:0;border-radius:8px;
-                           padding:0.4rem 0.9rem;cursor:pointer;font-size:0.85rem">
-              Redeem
-            </button>
-          </div>
-          <p class="desc" id="account-redeem-msg" style="display:none;margin-top:0.4rem"></p>
-        </div>
-        <div class="settings-section">
-          <h3>Data</h3>
-          <p class="desc">Download your full data set as a zip, restore one,
-            or delete saved conversations.</p>
-          <div class="settings-row">
-            <span class="label">Export my data</span>
-            <button class="btn-neutral" id="account-export-btn"
-                    style="background:var(--bg-input);color:var(--text);
-                           border:1px solid var(--border);border-radius:8px;
-                           padding:0.4rem 0.9rem;cursor:pointer;font-size:0.85rem">
-              Download .zip
-            </button>
-          </div>
-          <div class="settings-row">
-            <span class="label">Import data</span>
-            <button class="btn-neutral" id="account-import-btn"
-                    style="background:var(--bg-input);color:var(--text);
-                           border:1px solid var(--border);border-radius:8px;
-                           padding:0.4rem 0.9rem;cursor:pointer;font-size:0.85rem">
-              Upload .zip…
-            </button>
-          </div>
-          <input type="file" id="account-import-file"
-                 accept=".zip,application/zip" style="display:none">
-          <p class="desc" id="account-import-msg"
-             style="display:none;margin-top:0.4rem"></p>
-          <div class="settings-row">
-            <span class="label" style="color: var(--error)">Delete all conversations</span>
-            <button class="btn-danger" id="account-delete-all-btn">Delete all</button>
-          </div>
-        </div>
-        <div class="settings-section">
-          <h3>Session</h3>
-          <div class="settings-row">
-            <span class="label" style="color: var(--error)">Log out</span>
-            <button class="btn-danger" id="account-logout-btn">Log out</button>
-          </div>
-        </div>
-        <div class="settings-section">
-          <h3>Delete account</h3>
-          <p class="desc">Deactivates your account — it will appear to no
-            longer exist. You can recover it by signing in again. After 30
-            days it is permanently deleted.</p>
-          <div class="settings-row">
-            <span class="label" style="color: var(--error)">Delete my account</span>
-            <button class="btn-danger" id="account-delete-btn">Delete account</button>
           </div>
         </div>
       </div>
@@ -3296,8 +3286,8 @@ async function logout() {
   window.location = "/login";
 }
 
-document.getElementById("settings-btn").addEventListener("click", openSettings);
-document.getElementById("account-btn").addEventListener("click", openAccount);
+// Single entry point: the Aime logo opens the merged account & settings menu.
+document.getElementById("menu-btn").addEventListener("click", openSettings);
 
 // -- Theme picker -------------------------------------------------------
 
@@ -3326,6 +3316,9 @@ const settingsCloseBtn = document.getElementById("settings-close");
 function openSettings() {
   settingsBackdrop.classList.add("open");
   refreshSTTModels();
+  // The Account tab lives in this same modal now — refresh its data too.
+  redeemMsg.style.display = "none";
+  refreshMe();
 }
 
 // Settings tabs (User / Developer).
@@ -3410,9 +3403,8 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && settingsBackdrop.classList.contains("open")) closeSettings();
 });
 
-// -- Account modal ------------------------------------------------------
+// -- Account (a tab in the settings modal) ------------------------------
 
-const accountBackdrop = document.getElementById("account-backdrop");
 const accountUsernameEl = document.getElementById("account-username");
 
 // Access state (see docs/access-control.md). Optimistic defaults until the
@@ -3501,21 +3493,6 @@ keyInput.addEventListener("keydown", (e) => {
   if (e.key === "Enter") { e.preventDefault(); redeemBtn.click(); }
 });
 
-async function openAccount() {
-  accountBackdrop.classList.add("open");
-  redeemMsg.style.display = "none";
-  await refreshMe();
-}
-function closeAccount() {
-  accountBackdrop.classList.remove("open");
-}
-document.getElementById("account-close").addEventListener("click", closeAccount);
-accountBackdrop.addEventListener("click", (e) => {
-  if (e.target === accountBackdrop) closeAccount();
-});
-document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape" && accountBackdrop.classList.contains("open")) closeAccount();
-});
 document.getElementById("account-logout-btn").addEventListener("click", logout);
 
 // Resolve access state at startup so the composer is correctly locked/unlocked
