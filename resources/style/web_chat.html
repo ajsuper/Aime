@@ -17,10 +17,14 @@
       --border: #DFD9C8;
       --text: #2C2A24;
       --muted: #8A8273;
-      --accent: #E78C9B;
-      --accent-hover: #EE9FAC;
-      --user-bubble: linear-gradient(135deg, #A8D5BA 0%, #F5E3A1 22%, #F5C39B 42%, #F0A6A6 62%, #C9B3E0 81%, #A3C9E8 100%);
-      --user-bubble-text: #2C2A24;
+      --accent: #E3A4AF;
+      --accent-hover: #EBB4BD;
+      --user-bubble: #EBD3D8;
+      --user-bubble-text: #3A2C30;
+      /* Pastel-rainbow accent — hard color stops, never blended. */
+      --rainbow: linear-gradient(90deg,
+        #C6E2D0 0 16.66%, #F2E6BA 16.66% 33.33%, #F2D2B8 33.33% 50%,
+        #F0CBCB 50% 66.66%, #D6CAE6 66.66% 83.33%, #C2DAEC 83.33% 100%);
       --warning: #E0AE55;
       --error: #D9817F;
       --success: #6DAE84;
@@ -34,10 +38,14 @@
       --border: #3B362D;
       --text: #EDE8DD;
       --muted: #998F7E;
-      --accent: #F0AEB8;
-      --accent-hover: #F4BEC6;
-      --user-bubble: linear-gradient(135deg, #9AD0AE 0%, #F0DA9A 22%, #F2C197 42%, #EFA1A1 62%, #C9B0E4 81%, #9EC4E8 100%);
-      --user-bubble-text: #1E1C18;
+      --accent: #E0AAB4;
+      --accent-hover: #E8BAC3;
+      --user-bubble: #5C4A4F;
+      --user-bubble-text: #F3E8EC;
+      /* Pastel-rainbow accent — hard color stops, never blended. */
+      --rainbow: linear-gradient(90deg,
+        #9CC2A9 0 16.66%, #D6C690 16.66% 33.33%, #D6B594 33.33% 50%,
+        #D2A8A8 50% 66.66%, #B4A4C6 66.66% 83.33%, #9EB6CC 83.33% 100%);
       --warning: #EDC777;
       --error: #EC9090;
       --success: #8FC9A4;
@@ -158,7 +166,12 @@
     #left-rail { width: 44px; flex-shrink: 0; background: var(--bg-elev);
                  border-right: 1px solid var(--border);
                  display: flex; flex-direction: column; align-items: center;
-                 padding: 0.5rem 0; gap: 0.5rem; }
+                 padding: 0.5rem 0; gap: 0.5rem; position: relative; }
+    /* Pastel-rainbow accent strip along the top of the rail (themes that
+       define --rainbow only; harmless elsewhere via the transparent fallback). */
+    #left-rail::before { content: ""; position: absolute; top: 0; left: 0;
+                         right: 0; height: 3px;
+                         background: var(--rainbow, transparent); }
     .rail-btn { width: 32px; height: 32px; border-radius: 8px; border: 0;
                 background: transparent; color: var(--muted); cursor: pointer;
                 display: flex; align-items: center; justify-content: center;
