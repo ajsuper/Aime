@@ -299,6 +299,22 @@
     #log-inner:empty::after {
       content: ""; width: 92px; height: 4px; border-radius: 2px;
       margin-top: 0.6rem; background: var(--rainbow, var(--accent)); }
+    /* New-conversation welcome: the same centered Aime mark as the empty
+       state, plus a caption. Rendered as a real element (so it can carry
+       the caption and fade out on the first message) — it fills the log and
+       centers itself, mirroring the #log-inner:empty layout. */
+    .new-session-splash { flex: 1; display: flex; flex-direction: column;
+                          align-items: center; justify-content: center;
+                          gap: 0.55rem; transition: opacity 0.45s ease;
+                          animation: fade-in 0.3s ease-out; }
+    .new-session-splash.fading { opacity: 0; }
+    .new-session-splash .ns-logo { font-family: var(--font-display);
+                          font-weight: 600; font-size: 3.2rem; line-height: 1;
+                          color: var(--text); }
+    .new-session-splash .ns-bar { width: 92px; height: 4px; border-radius: 2px;
+                          background: var(--rainbow, var(--accent)); }
+    .new-session-splash .ns-text { color: var(--muted); font-size: 0.9rem;
+                          margin-top: 0.15rem; }
     .msg { word-wrap: break-word;
            animation: fade-in 0.2s ease-out; }
     .msg.user, .msg.notice, .msg.aime { white-space: pre-wrap; }
@@ -2057,9 +2073,30 @@ function appendNotice(text, severity) {
   return div;
 }
 
-// The "Loaded conversation…" line, kept so it can be faded out the moment
-// the user sends a message — see the user_message_shown handler.
+// The "Loaded conversation…" line and the new-conversation welcome splash —
+// kept so both can be faded out the moment the user sends a message (see the
+// user_message_shown handler).
 let loadedNotice = null;
+let newSessionSplash = null;
+
+// Build the centered Aime-logo welcome shown when a new conversation starts.
+function appendNewSessionSplash(text) {
+  const wrap = document.createElement("div");
+  wrap.className = "new-session-splash";
+  const logo = document.createElement("div");
+  logo.className = "ns-logo";
+  logo.textContent = "Aime";
+  const bar = document.createElement("div");
+  bar.className = "ns-bar";
+  const caption = document.createElement("div");
+  caption.className = "ns-text";
+  caption.textContent = text;
+  wrap.appendChild(logo);
+  wrap.appendChild(bar);
+  wrap.appendChild(caption);
+  logInner.appendChild(wrap);
+  return wrap;
+}
 
 // Minimal-verbosity status line: a single reusable "Working…" notice shown
 // while tools run, instead of one notice per call. `showWorkingIndicator`
@@ -2213,15 +2250,17 @@ es.onmessage = (ev) => {
       // draft instead of being sent.
       if (!e.from_replay) {
         modelBusy = true;
-        // Fade out the "Loaded conversation…" line — once the user has sent
-        // a message the transcript should read as one continuous chat.
-        if (loadedNotice) {
-          const n = loadedNotice;
-          loadedNotice = null;
-          n.classList.add("fading");
-          n.addEventListener("transitionend", () => n.remove(), {once: true});
-          setTimeout(() => n.remove(), 700);  // fallback if no transition
+        // Fade out the "Loaded conversation…" line / new-conversation splash
+        // — once the user has sent a message the transcript should read as
+        // one continuous chat.
+        for (const el of [loadedNotice, newSessionSplash]) {
+          if (!el) continue;
+          el.classList.add("fading");
+          el.addEventListener("transitionend", () => el.remove(), {once: true});
+          setTimeout(() => el.remove(), 700);  // fallback if no transition
         }
+        loadedNotice = null;
+        newSessionSplash = null;
         // Snap to the message even if the user had scrolled up.
         scrollToBottom(true);
       }
@@ -2320,6 +2359,12 @@ es.onmessage = (ev) => {
         loadedNotice = appendNotice(e.text, "loaded");
         break;
       }
+      // New conversation: a centered Aime-logo welcome splash instead of a
+      // corner notice. Faded out on the first user message.
+      if (e.severity === "new_session") {
+        newSessionSplash = appendNewSessionSplash(e.text);
+        break;
+      }
       // A conversation was auto-recovered from a corrupted history. Verbose
       // gets the technical phrasing; the calmer tiers get a friendly line.
       if (e.severity === "recovery") {
@@ -2346,6 +2391,7 @@ es.onmessage = (ev) => {
       logInner.innerHTML = "";
       workingIndicator = null;
       loadedNotice = null;
+      newSessionSplash = null;
       currentAssistant = null;
       pendingHtmlTarget = null;
       pendingSendBubble = null;

@@ -50,7 +50,9 @@ CoreEventKind = Literal[
 ]
 
 
-Severity = Literal["info", "warning", "error", "success", "recovery", "loaded"]
+Severity = Literal[
+    "info", "warning", "error", "success", "recovery", "loaded", "new_session",
+]
 RestartReason = Literal["reset", "load"]
 
 
@@ -256,10 +258,12 @@ class ConversationController:
         # The banner text follows separately as a notice so the frontend can
         # render it after the clear.
         self._emit(CoreEvent(kind="session_restart", restart_reason="reset"))
+        # "new_session" severity (not "success") so the frontend renders it
+        # as a centered Aime-logo welcome splash rather than a corner notice.
         self._emit(CoreEvent(
             kind="notice",
-            severity="success",
-            text="New conversation started.",
+            severity="new_session",
+            text="New conversation started",
         ))
         self._spawn_worker(self.run_stream_loop)
 
