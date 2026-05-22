@@ -220,11 +220,11 @@
     .rail-btn svg { width: 20px; height: 20px; }
     /* Aime logo button — single entry point for the account & settings menu.
        A compact wordmark: 'Aime' in the display face over a rainbow rule. */
-    .rail-btn.logo { flex-direction: column; gap: 2px; }
+    .rail-btn.logo { flex-direction: column; gap: 3px; width: 40px; height: 40px; }
     .rail-btn.logo .logo-text { font-family: var(--font-display); font-weight: 600;
-                                font-size: 0.62rem; line-height: 1; letter-spacing: 0.01em;
+                                font-size: 0.82rem; line-height: 1; letter-spacing: 0.01em;
                                 color: var(--text); }
-    .rail-btn.logo .logo-bar { width: 20px; height: 2px; border-radius: 1px;
+    .rail-btn.logo .logo-bar { width: 28px; height: 2px; border-radius: 1px;
                                background: var(--rainbow, var(--accent)); }
     .rail-btn.logo:hover { background: rgba(255,255,255,0.05); }
     /* Divider between the pane buttons and the account/settings buttons. */
@@ -2781,11 +2781,35 @@ async function loadChats() {
       item.appendChild(summary);
       item.appendChild(meta);
       item.appendChild(del);
-      item.addEventListener("click", () => {
+
+      const openSession = () => {
         sendText("/load " + s.id);
         // Mobile: drop back to the conversation after picking one.
         if (mobileMQ.matches) closeSide();
+      };
+      // On mobile the panel often opens while the on-screen keyboard is still
+      // retracting; the viewport reflows mid-tap and the browser cancels the
+      // synthetic `click`, so the first tap appears to do nothing. `touchend`
+      // fires regardless of reflow — handle the tap there (when it didn't
+      // turn into a scroll) and suppress the now-redundant ghost click.
+      let touchStartY = null, touchMoved = false;
+      item.addEventListener("touchstart", (e) => {
+        touchStartY = e.touches[0].clientY;
+        touchMoved = false;
+      }, {passive: true});
+      item.addEventListener("touchmove", (e) => {
+        if (touchStartY !== null &&
+            Math.abs(e.touches[0].clientY - touchStartY) > 10) {
+          touchMoved = true;
+        }
+      }, {passive: true});
+      item.addEventListener("touchend", (e) => {
+        // Let taps on the delete button run their own handler.
+        if (touchMoved || e.target.closest(".del-btn")) return;
+        e.preventDefault();  // cancel the ghost click so it doesn't double-fire
+        openSession();
       });
+      item.addEventListener("click", openSession);
       chatsList.appendChild(item);
     });
   } catch (e) {

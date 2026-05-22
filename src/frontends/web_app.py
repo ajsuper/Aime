@@ -203,7 +203,7 @@ _HR_LINE_RE = re.compile(r"(?m)^[ \t]*---[ \t]*$")
 _HR_SENTINEL = "❦AIMEHR❦"
 
 
-def _safe_markup_text(markup: str) -> Text:
+def _safe_markup_text(markup: str, final: bool = False) -> Text:
     """Forgiving version of `Text.from_markup` — render the markup the model
     *got right* even when part of it is malformed.
 
@@ -215,8 +215,18 @@ def _safe_markup_text(markup: str) -> Text:
     Streaming already looks correct because a half-typed message only has
     *unclosed* tags, which Rich tolerates (it closes them implicitly at the
     end). This applies the same forgiveness to every render: stray/unmatched
-    closing tags are dropped, unknown style names are shown literally as their
-    `[tag]` text, and anything still open at the end is closed implicitly.
+    closing tags are dropped and unknown style names are shown literally as
+    their `[tag]` text.
+
+    For an unclosed opening tag the behaviour depends on `final`:
+
+    * While streaming (`final=False`) it's still open simply because the rest
+      of the message hasn't arrived — close it implicitly so the text in
+      flight looks styled.
+    * In the final render (`final=True`) it's a genuine formatting mistake by
+      the model. Rather than guess a closing point and paint half the message
+      in a stray colour, drop the tag entirely — the text it wrapped renders
+      as plain text. Correctly closed tags elsewhere keep their styling.
     """
     text = Text()
     normalize = Style.normalize
@@ -262,13 +272,15 @@ def _safe_markup_text(markup: str) -> Text:
     end = len(text)
     while style_stack:
         start, span_style, _name = style_stack.pop()
-        if span_style:
+        # An unclosed tag in the final render is a model mistake — drop it so
+        # its text shows plain. While streaming, close it implicitly instead.
+        if span_style and not final:
             text.spans.append(Span(start, end, span_style))
     text.spans.sort(key=lambda span: span.start)
     return text
 
 
-def _render_markup_to_html(markup: str) -> str:
+def _render_markup_to_html(markup: str, final: bool = False) -> str:
     """Convert Rich-style markup to inline-styled HTML spans.
 
     Lines containing only `---` are treated as horizontal rules — the model
@@ -287,7 +299,7 @@ def _render_markup_to_html(markup: str) -> str:
     # `_safe_markup_text` repairs malformed markup instead of falling back to
     # plain text, so a near-miss in the model's formatting keeps the parts it
     # got right — both while streaming and in the final render.
-    rendered = _safe_markup_text(markup)
+    rendered = _safe_markup_text(markup, final=final)
     console.print(rendered, soft_wrap=True, end="")
     html = console.export_html(inline_styles=True, code_format="{code}")
     html = html.replace(_HR_SENTINEL, '<hr class="md-hr">')
@@ -431,12 +443,12 @@ class UserContext:
             if full:
                 self._broadcast({
                     "kind": "assistant_html",
-                    "text": _render_markup_to_html(full),
+                    "text": _render_markup_to_html(full, final=True),
                 })
         elif event.kind == "assistant_text" and event.text:
             self._broadcast({
                 "kind": "assistant_html",
-                "text": _render_markup_to_html(event.text),
+                "text": _render_markup_to_html(event.text, final=True),
             })
 
 
