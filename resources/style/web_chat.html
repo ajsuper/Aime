@@ -302,7 +302,10 @@
     /* New-conversation welcome: the same centered Aime mark as the empty
        state, plus a caption. Rendered as a real element (so it can carry
        the caption and fade out on the first message) — it fills the log and
-       centers itself, mirroring the #log-inner:empty layout. */
+       centers itself, mirroring the #log-inner:empty layout. The :has rule
+       gives #log-inner the same full height the :empty state has, so the
+       splash lands in the exact spot the first-login wordmark does. */
+    #log-inner:has(.new-session-splash) { height: 100%; }
     .new-session-splash { flex: 1; display: flex; flex-direction: column;
                           align-items: center; justify-content: center;
                           gap: 0.55rem; transition: opacity 0.45s ease;
