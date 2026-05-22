@@ -2158,6 +2158,15 @@ const FILE_CHIP_SVG =
   '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>' +
   '<polyline points="14 2 14 8 20 8"/></svg>';
 
+// Decode base64 image data into a Blob so it can be served via a blob: URL
+// (which browsers will open in a new tab, unlike a data: URL).
+function base64ToBlob(b64, mediaType) {
+  const bin = atob(b64 || "");
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new Blob([bytes], {type: mediaType || "application/octet-stream"});
+}
+
 // Build a single chip for either an image or a text file. Both render
 // identically (small thumbnail/icon + name), and both download/open on click.
 function makeAttachmentChip(att) {
@@ -2172,8 +2181,12 @@ function makeAttachmentChip(att) {
     const im = document.createElement("img");
     im.src = src;
     thumb.appendChild(im);
-    chip.href = src;
-    if (att.name) chip.download = att.name;
+    // Browsers block top-level navigation to data: URLs (clicking a chip
+    // whose href is a data: URL just opens a blank tab), so wrap the image
+    // bytes in a blob: URL instead. Opening that lets the browser show the
+    // image in its own native viewer. No `download` attribute — we want it
+    // to open inline rather than save straight to disk.
+    chip.href = URL.createObjectURL(base64ToBlob(att.data, att.media_type));
   } else {
     thumb.innerHTML = FILE_CHIP_SVG;
     const blob = new Blob([att.contents || ""], {type: "text/plain"});
