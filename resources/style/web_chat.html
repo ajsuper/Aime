@@ -25,6 +25,9 @@
       --rainbow: linear-gradient(90deg,
         #C6E2D0 0 16.66%, #F2E6BA 16.66% 33.33%, #F2D2B8 33.33% 50%,
         #F0CBCB 50% 66.66%, #D6CAE6 66.66% 83.33%, #C2DAEC 83.33% 100%);
+      --rainbow-v: linear-gradient(180deg,
+        #C6E2D0 0 16.66%, #F2E6BA 16.66% 33.33%, #F2D2B8 33.33% 50%,
+        #F0CBCB 50% 66.66%, #D6CAE6 66.66% 83.33%, #C2DAEC 83.33% 100%);
       --warning: #E0AE55;
       --error: #D9817F;
       --success: #6DAE84;
@@ -44,6 +47,9 @@
       --user-bubble-text: #F3E8EC;
       /* Pastel-rainbow accent — hard color stops, never blended. */
       --rainbow: linear-gradient(90deg,
+        #9CC2A9 0 16.66%, #D6C690 16.66% 33.33%, #D6B594 33.33% 50%,
+        #D2A8A8 50% 66.66%, #B4A4C6 66.66% 83.33%, #9EB6CC 83.33% 100%);
+      --rainbow-v: linear-gradient(180deg,
         #9CC2A9 0 16.66%, #D6C690 16.66% 33.33%, #D6B594 33.33% 50%,
         #D2A8A8 50% 66.66%, #B4A4C6 66.66% 83.33%, #9EB6CC 83.33% 100%);
       --warning: #EDC777;
@@ -252,7 +258,8 @@
     .msg.aime::before {
       content: ""; position: absolute; left: 0; top: 0.3rem; bottom: 0.3rem;
       width: 3px; border-radius: 2px;
-      background: linear-gradient(180deg, var(--accent) 0%, var(--accent-hover) 100%);
+      background: var(--rainbow-v,
+        linear-gradient(180deg, var(--accent) 0%, var(--accent-hover) 100%));
     }
     /* Avatar only on the first assistant block of a run — when two aime
        bubbles are adjacent siblings (no tool call / user msg between them),
@@ -352,7 +359,11 @@
     }
     form { display: flex; padding: 1rem; gap: 0.5rem;
            background: var(--bg); border-top: 1px solid var(--border);
-           flex-shrink: 0; }
+           flex-shrink: 0; position: relative; }
+    /* Pastel-rainbow accent along the top of the composer (themes that
+       define --rainbow only; transparent fallback elsewhere). */
+    form::before { content: ""; position: absolute; top: -1px; left: 0;
+                   right: 0; height: 2px; background: var(--rainbow, transparent); }
     /* Small CSS-only tooltip: anchor with `data-tip="..."` and `tip-anchor`.
        A pill appears above the element on hover/focus, after a short delay
        so it doesn't flicker on cursor flyovers. Doesn't fight the browser's
@@ -901,6 +912,10 @@
                    bottom: auto; width: auto; height: auto;
                    flex-direction: row; background: transparent;
                    border-right: 0; padding: 0; gap: 0.5rem; z-index: 70; }
+      /* The rail has no background bar on mobile — drop the top strip so the
+         rainbow doesn't float disconnected. The composer strip and the
+         per-message accent bars carry the theme here instead. */
+      #left-rail::before { display: none; }
       .rail-btn { width: 42px; height: 42px; border-radius: 50%;
                   background: color-mix(in srgb, var(--accent) 28%, transparent);
                   backdrop-filter: blur(14px) saturate(1.4);
