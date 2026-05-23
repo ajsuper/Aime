@@ -563,7 +563,11 @@ class AnthropicMessagesBackend:
                         "data": img.get("data") or "",
                     },
                 })
-            content.append({"type": "text", "text": event.text or ""})
+            # The API rejects empty text blocks, so only append one when the
+            # user actually typed something. Image-only sends are valid as
+            # long as at least one image block is present above.
+            if event.text:
+                content.append({"type": "text", "text": event.text})
             with self._lock:
                 self._messages.append({
                     "role": "user",

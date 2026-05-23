@@ -160,7 +160,11 @@
     const recover = document.querySelector(".recover");
     if (recover && recover.dataset.recoverUsername.trim()) {
       document.querySelector(".tabs").style.display = "none";
-      forms.forEach(f => { f.style.display = "none"; });
+      // Only hide the sign-in / signup forms — the recovery prompt has its
+      // own <form> for the "Yes, recover it" button and must stay visible.
+      forms.forEach(f => {
+        if (f.dataset.form) f.style.display = "none";
+      });
       recover.style.display = "flex";
     }
   </script>

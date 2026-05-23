@@ -1149,8 +1149,11 @@ def index():
 _ALLOWED_IMAGE_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
 
 # The model API rejects images larger than 5 MB; aim under that so the base64
-# overhead the attachment picks up in transit can't push it back over.
+# overhead the attachment picks up in transit can't push it back over. We use
+# the same number as a soft cap for non-image uploads so files and images
+# behave symmetrically from the user's perspective.
 _IMAGE_SIZE_TARGET = int(4.5 * 1024 * 1024)
+_MAX_UPLOAD_BYTES = _IMAGE_SIZE_TARGET
 # Upper bound on how much text we inline from an arbitrary uploaded file, so a
 # huge log or binary blob can't blow up the conversation context.
 _MAX_TEXT_CHARS = 200_000
@@ -1228,11 +1231,17 @@ def upload():
     if not raw:
         return jsonify({"ok": False, "error": "empty_file",
                         "message": "That file is empty."}), 400
+    # Files and images share the same soft cap. We still attach what we can —
+    # `_convert_image` will downsample images to fit, and the text path
+    # truncates well before this — but flag it so the client can show a
+    # friendly notice that part of the file may not make it through.
+    oversized = len(raw) > _MAX_UPLOAD_BYTES
 
     img = _convert_image(raw)
     if img is not None:
         return jsonify({"ok": True, "kind": "image", "name": name,
-                        "media_type": img["media_type"], "data": img["data"]})
+                        "media_type": img["media_type"], "data": img["data"],
+                        "oversized": oversized})
 
     # Not a decodable image — fall back to text. Decode tolerantly so even a
     # binary file yields readable content instead of failing the upload.
@@ -1244,7 +1253,8 @@ def upload():
     if truncated:
         text = text[:_MAX_TEXT_CHARS] + "\n…[truncated]"
     return jsonify({"ok": True, "kind": "file", "name": name,
-                    "text": text, "truncated": truncated})
+                    "text": text, "truncated": truncated,
+                    "oversized": oversized})
 
 
 @app.route("/send", methods=["POST"])

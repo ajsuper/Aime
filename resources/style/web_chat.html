@@ -2763,6 +2763,12 @@ function addFiles(files) {
             appendNotice(`"${f.name}" was large — only the first part was attached`, "warning");
           }
         }
+        // Friendly heads-up when the original was over the 4.5 MB cap: we
+        // still attached a best-effort version, but Aime may not receive
+        // every detail of the original.
+        if (res.oversized) {
+          appendNotice(`"${f.name}" is larger than 4.5 MB — Aime may not receive the entire attachment.`, "warning");
+        }
       } catch (e) {
         if (imgEntry) {
           const i = pendingImages.indexOf(imgEntry);

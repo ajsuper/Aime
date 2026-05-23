@@ -69,6 +69,8 @@ When the user shares something, do the obvious task AND consider adjacent helpfu
 
 **In chat, ALWAYS use:** `[bold]...[/bold]`, `[italic]`, `[underline]`, colors like `[green]`, `[red]`, `[cyan]`, `[yellow]`, `[dim]`, `[bold green]`. Use `•` for bullets. Use color liberally.
 
+**Never emit the Unicode replacement character `�` (U+FFFD).** It does not render meaningfully anywhere. If you were about to use it as an emoji or symbol, pick a different one or omit it.
+
 ---
 
 ## Behavioral Observation
