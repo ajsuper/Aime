@@ -44,6 +44,16 @@ from cryptography.exceptions import InvalidTag
 from . import encryption as _enc
 
 
+# Current at-rest encryption scheme version. Bumped when the wrap layout
+# changes (e.g. moving machine_secret into an OS keychain in the future).
+#   0 = no encryption (very-pre-encryption accounts; never seen on fresh
+#       installs but may exist on early beta databases).
+#   1 = password-derived KEK (Argon2id). Removed; v1 rows are auto-scrubbed
+#       on next verify — see LEGACY MIGRATION AUTH below.
+#   2 = machine-secret-derived KEK (HKDF). Current.
+_ENC_VERSION_CURRENT = 2
+
+
 # ---------------------------------------------------------------------------
 # Public types
 # ---------------------------------------------------------------------------
@@ -110,6 +120,19 @@ class AccountLocked(AuthError):
         self.seconds_remaining = seconds_remaining
 
 
+class BackgroundUnavailable(AuthError):
+    """Raised by `get_dek` when a user's row predates the current encryption
+    scheme and so cannot be unwrapped without their password. Resolved by the
+    user logging in via the web frontend once — that triggers the auto-upgrade
+    to the current scheme. Until then, background services (Midnight) cannot
+    act on the account."""
+
+    def __init__(self, user_id: int):
+        super().__init__(f"user {user_id} has not been upgraded to the "
+                         "current encryption scheme")
+        self.user_id = user_id
+
+
 class AccountDeleted(AuthError):
     """Raised by verify() when the password is correct but the account has
     been soft-deleted. Carries the user id so the caller can offer recovery
@@ -144,8 +167,19 @@ class AuthBackend(Protocol):
     def create(
         self, username: str, password: str, api_access: bool = True
     ) -> tuple[UserRecord, bytes]: ...
-    def verify(self, username: str, password: str) -> tuple[UserRecord, bytes]: ...
+    # `was_reinitialized` is True when verify() upgraded a pre-existing v0/v1
+    # account to the current encryption scheme. The DEK is fresh in that case,
+    # so any conversation files previously on disk are now unreadable garbage
+    # and the caller should wipe them. See LEGACY MIGRATION AUTH in
+    # LocalAuthBackend.verify().
+    def verify(
+        self, username: str, password: str
+    ) -> tuple[UserRecord, bytes, bool]: ...
     def lookup(self, user_id: int) -> UserRecord | None: ...
+    # For background services (Midnight) that need a user's DEK without the
+    # user being present to type a password. Raises BackgroundUnavailable for
+    # accounts that haven't been upgraded yet.
+    def get_dek(self, user_id: int) -> bytes: ...
 
     # ---- account lifecycle ----------------------------------------------
     # Soft delete / restore / permanent purge. scripts/manage_users.py and the
@@ -204,6 +238,13 @@ class LocalAuthBackend:
         # Pre-hash a constant dummy password so unknown-user verifies cost
         # the same as real ones.
         self._dummy_hash = self._hasher.hash(_DUMMY_PASSWORD)
+        # Root of trust for at-rest encryption. Lives next to auth.sql so the
+        # auth backend can find it without callers passing a path. See
+        # `encryption.load_or_create_machine_secret` for the file format and
+        # the threat model.
+        self._machine_secret = _enc.load_or_create_machine_secret(
+            os.path.join(os.path.dirname(db_path) or ".", "machine_secret")
+        )
 
     def _init_schema(self) -> None:
         with self._lock:
@@ -240,10 +281,13 @@ class LocalAuthBackend:
                 );
                 """
             )
-            # LEGACY MIGRATION — pre-encryption databases predate the
+            # LEGACY MIGRATION AUTH — pre-encryption databases predate the
             # salt_kek/wrapped_dek/enc_version columns. ADD COLUMN them in
-            # place so existing installs keep working. Safe to remove once
-            # all live installs have been upgraded past this version.
+            # place so existing installs keep working. salt_kek/wrapped_dek
+            # are also the old (v1) password-derived wrapping; the wrap path
+            # itself is gone, but the columns stay so verify() can detect a
+            # v1 row and trigger the auto-upgrade. Safe to remove once no
+            # rows have enc_version < 2.
             existing_cols = {
                 row[1]
                 for row in self._conn.execute("PRAGMA table_info(users)")
@@ -255,7 +299,17 @@ class LocalAuthBackend:
             ):
                 if col not in existing_cols:
                     self._conn.execute(f"ALTER TABLE users ADD COLUMN {col} {decl}")
-            # END LEGACY MIGRATION
+            # END LEGACY MIGRATION AUTH
+
+            # v2 encryption columns. Populated for every active account on a
+            # fresh install (create() always writes v2) and lazily for legacy
+            # rows on next login (see LEGACY MIGRATION AUTH in verify()).
+            for col, decl in (
+                ("salt_dek",       "BLOB"),
+                ("wrapped_dek_v2", "BLOB"),
+            ):
+                if col not in existing_cols:
+                    self._conn.execute(f"ALTER TABLE users ADD COLUMN {col} {decl}")
 
             # api_access MIGRATION — added with the access-control feature.
             # DEFAULT 1 deliberately grandfathers every account that exists at
@@ -292,22 +346,23 @@ class LocalAuthBackend:
         pw_hash = self._hasher.hash(password)
 
         # Generate this user's per-account data key and wrap it under a KEK
-        # derived from the password. We hand the raw DEK back to the caller
-        # so it can encrypt the new user's first conversation immediately;
-        # only the wrapped form ever touches disk.
-        salt_kek = _enc.generate_salt()
+        # derived from the host's machine secret. The password no longer plays
+        # a role in encryption — it only authenticates. We hand the raw DEK
+        # back to the caller so it can encrypt the new user's first
+        # conversation immediately; only the wrapped form ever touches disk.
+        salt_dek = _enc.generate_salt()
         dek = _enc.generate_dek()
-        kek = _enc.derive_kek(password, salt_kek)
+        kek = _enc.derive_kek(self._machine_secret, salt_dek)
         wrapped = _enc.wrap_dek(kek, dek)
 
         with self._lock:
             try:
                 cur = self._conn.execute(
                     "INSERT INTO users "
-                    "(username, password_hash, salt_kek, wrapped_dek, enc_version, "
-                    "api_access) "
-                    "VALUES (?, ?, ?, ?, 1, ?)",
-                    (username, pw_hash, salt_kek, wrapped, 1 if api_access else 0),
+                    "(username, password_hash, salt_dek, wrapped_dek_v2, "
+                    "enc_version, api_access) "
+                    f"VALUES (?, ?, ?, ?, {_ENC_VERSION_CURRENT}, ?)",
+                    (username, pw_hash, salt_dek, wrapped, 1 if api_access else 0),
                 )
                 self._conn.commit()
             except sqlite3.IntegrityError as e:
@@ -317,14 +372,24 @@ class LocalAuthBackend:
                 dek,
             )
 
-    def verify(self, username: str, password: str) -> tuple[UserRecord, bytes]:
+    def verify(
+        self, username: str, password: str
+    ) -> tuple[UserRecord, bytes, bool]:
+        """Authenticate (username, password) and return the user's DEK.
+
+        The third return value, `was_reinitialized`, is True when the row was
+        a pre-v2 account that we just auto-upgraded — see LEGACY MIGRATION
+        AUTH below. In that case the DEK is fresh, so any conversation files
+        on disk are now unreadable garbage and the caller is responsible for
+        wiping them.
+        """
         # Check lockout up front so a locked account never advances to a
         # hash verify (saves CPU and ensures the error is consistent).
         self._raise_if_locked(username)
 
         with self._lock:
             row = self._conn.execute(
-                "SELECT id, username, password_hash, salt_kek, wrapped_dek, "
+                "SELECT id, username, password_hash, salt_dek, wrapped_dek_v2, "
                 "enc_version, api_access, deleted_at "
                 "FROM users WHERE username = ?",
                 (username,),
@@ -340,7 +405,7 @@ class LocalAuthBackend:
             self._register_failure(username)
             raise InvalidCredentials("invalid username or password")
 
-        (user_id, stored_username, pw_hash, salt_kek, wrapped_dek,
+        (user_id, stored_username, pw_hash, salt_dek, wrapped_dek_v2,
          enc_version, api_access, deleted_at) = row
         try:
             self._hasher.verify(pw_hash, password)
@@ -359,34 +424,31 @@ class LocalAuthBackend:
                 )
                 self._conn.commit()
 
-        # Unwrap (or, for legacy users, mint) this account's DEK.
-        if enc_version == 0 or salt_kek is None or wrapped_dek is None:
-            # LEGACY MIGRATION — account predates encryption. The password
-            # we just verified is the only opportunity to derive a KEK for
-            # this user, so do it now. Safe to remove once no rows have
-            # enc_version = 0.
-            salt_kek = _enc.generate_salt()
-            dek = _enc.generate_dek()
-            kek = _enc.derive_kek(password, salt_kek)
-            wrapped_dek = _enc.wrap_dek(kek, dek)
-            with self._lock:
-                self._conn.execute(
-                    "UPDATE users SET salt_kek = ?, wrapped_dek = ?, enc_version = 1 "
-                    "WHERE id = ?",
-                    (salt_kek, wrapped_dek, user_id),
-                )
-                self._conn.commit()
-            # END LEGACY MIGRATION
+        was_reinitialized = False
+        if (enc_version != _ENC_VERSION_CURRENT
+                or salt_dek is None or wrapped_dek_v2 is None):
+            # LEGACY MIGRATION AUTH — account is on a pre-v2 encryption
+            # scheme (v1 password-derived KEK, or v0 plaintext). Aime is in
+            # early beta and existing conversation files are not worth the
+            # complexity of carrying the old decrypt path forward, so we
+            # mint a fresh v2 DEK and signal the caller to wipe the user's
+            # conversations directory. The auth.sql row (preferences,
+            # api_access, lockout history) is preserved untouched. Safe to
+            # remove once no rows have enc_version < 2.
+            dek, salt_dek, wrapped_dek_v2 = self._mint_v2_keys(user_id)
+            was_reinitialized = True
+            # END LEGACY MIGRATION AUTH
         else:
-            kek = _enc.derive_kek(password, bytes(salt_kek))
+            kek = _enc.derive_kek(self._machine_secret, bytes(salt_dek))
             try:
-                dek = _enc.unwrap_dek(kek, bytes(wrapped_dek))
+                dek = _enc.unwrap_dek(kek, bytes(wrapped_dek_v2))
             except InvalidTag:
-                # Should never happen on a successful password verify — the
-                # KEK was derived from the same password the wrap used. If
-                # we see it, the row is corrupt; treat as auth failure.
-                self._register_failure(username)
-                raise InvalidCredentials("invalid username or password")
+                # The wrap was made with a different machine_secret. Most
+                # commonly: the secret file was deleted/regenerated. We
+                # can't recover the old DEK, so treat this row the same as
+                # a legacy upgrade — mint fresh keys and signal the wipe.
+                dek, salt_dek, wrapped_dek_v2 = self._mint_v2_keys(user_id)
+                was_reinitialized = True
 
         self._clear_failures(username)
 
@@ -405,7 +467,60 @@ class LocalAuthBackend:
                 api_access=bool(api_access),
             ),
             dek,
+            was_reinitialized,
         )
+
+    def get_dek(self, user_id: int) -> bytes:
+        """Unwrap a user's DEK from the machine secret, no password required.
+
+        For background services (Midnight) that need to act on a user's data
+        while the user is offline. Raises `BackgroundUnavailable` for
+        pre-v2 accounts — those don't get unwrapped here on principle, since
+        we'd have no way to wipe their stale conversations without knowing
+        the data directory layout. Such accounts upgrade on next login.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT salt_dek, wrapped_dek_v2, enc_version "
+                "FROM users WHERE id = ? AND deleted_at IS NULL",
+                (user_id,),
+            ).fetchone()
+        if row is None:
+            raise BackgroundUnavailable(user_id)
+        salt_dek, wrapped_dek_v2, enc_version = row
+        if (enc_version != _ENC_VERSION_CURRENT
+                or salt_dek is None or wrapped_dek_v2 is None):
+            raise BackgroundUnavailable(user_id)
+        kek = _enc.derive_kek(self._machine_secret, bytes(salt_dek))
+        try:
+            return _enc.unwrap_dek(kek, bytes(wrapped_dek_v2))
+        except InvalidTag as e:
+            # machine_secret was rotated/regenerated since this row was
+            # written. Same recovery as verify(): the row needs to be
+            # auto-reinitialized at next login. Surface as unavailable.
+            raise BackgroundUnavailable(user_id) from e
+
+    def _mint_v2_keys(
+        self, user_id: int
+    ) -> tuple[bytes, bytes, bytes]:
+        """Generate a fresh v2 DEK for `user_id`, persist the wrap, and bump
+        the row's enc_version. Returns (dek, salt_dek, wrapped_dek_v2). Used
+        by the legacy auto-upgrade path in verify() and by the
+        machine-secret-mismatch recovery."""
+        salt_dek = _enc.generate_salt()
+        dek = _enc.generate_dek()
+        kek = _enc.derive_kek(self._machine_secret, salt_dek)
+        wrapped_dek_v2 = _enc.wrap_dek(kek, dek)
+        with self._lock:
+            self._conn.execute(
+                "UPDATE users SET salt_dek = ?, wrapped_dek_v2 = ?, "
+                "salt_kek = NULL, wrapped_dek = NULL, "
+                f"enc_version = {_ENC_VERSION_CURRENT} "
+                "WHERE id = ?",
+                (salt_dek, wrapped_dek_v2, user_id),
+            )
+            self._conn.commit()
+        return dek, salt_dek, wrapped_dek_v2
 
     def lookup(self, user_id: int) -> UserRecord | None:
         # Soft-deleted accounts are treated as gone here: a session cookie

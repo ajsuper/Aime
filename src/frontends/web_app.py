@@ -87,14 +87,6 @@ _SECRET_KEY = _auth.load_or_create_secret_key(
 _signup_limiter = _auth.IPRateLimiter(limit=5, window_seconds=60 * 60)
 
 
-# In-process cache of unwrapped DEKs, keyed by user_id. Populated by
-# login/signup, dropped on logout. Lives only in process memory by design:
-# a server restart forces re-login, which is the correct property — without
-# the password we can't re-derive the KEK that unwraps the DEK.
-_dek_cache: dict[int, bytes] = {}
-_dek_cache_lock = threading.Lock()
-
-
 def _user_dir(user_id: int) -> str:
     return os.path.join(aime_config.DATABASE_DIR, "users", str(user_id))
 
@@ -146,50 +138,6 @@ _migrate_legacy_shared_conversations()
 # END LEGACY MIGRATION
 
 
-# LEGACY MIGRATION — encrypt any plaintext *.json conversation files in a
-# user's directory, rewriting them as *.json.enc under the user's DEK and
-# removing the originals. Runs once per UserContext construction (i.e. once
-# per login per process). Idempotent: pure-encrypted directories are a no-op.
-# Safe to remove once all live installs have been upgraded past this version.
-def _encrypt_plaintext_conversations(conv_dir: str, dek: bytes) -> None:
-    if not os.path.isdir(conv_dir):
-        return
-    try:
-        names = os.listdir(conv_dir)
-    except OSError:
-        return
-    converted = 0
-    for name in names:
-        if not name.endswith(".json") or name.endswith(".json.enc"):
-            continue
-        session_id = name[: -len(".json")]
-        src = os.path.join(conv_dir, name)
-        dst = os.path.join(conv_dir, session_id + ".json.enc")
-        if os.path.exists(dst):
-            # Encrypted version already present — drop the plaintext.
-            try:
-                os.remove(src)
-            except OSError:
-                pass
-            continue
-        try:
-            with open(src, "rb") as f:
-                plaintext = f.read()
-            blob = _enc.encrypt_blob(dek, plaintext, aad=session_id.encode("utf-8"))
-            tmp = dst + ".tmp"
-            with open(tmp, "wb") as f:
-                f.write(blob)
-            os.replace(tmp, dst)
-            os.remove(src)
-            converted += 1
-        except OSError:
-            continue
-    if converted:
-        print(
-            f"[migration] encrypted {converted} plaintext conversation(s) in {conv_dir}",
-            file=sys.stderr,
-        )
-# END LEGACY MIGRATION
 
 
 # ---------------------------------------------------------------------------
@@ -318,16 +266,15 @@ class UserContext:
     state (conversation history) is expensive to rebuild and personal use
     won't run into pressure."""
 
-    def __init__(self, user_id: int, dek: bytes, username: str | None = None):
+    def __init__(self, user_id: int, username: str | None = None):
         self.user_id = user_id
         self.username = username
 
         conv_dir = _conversations_dir(user_id)
         os.makedirs(conv_dir, exist_ok=True)
-        # LEGACY MIGRATION — rewrite any leftover plaintext *.json files in
-        # this user's directory as encrypted *.json.enc under their DEK.
-        _encrypt_plaintext_conversations(conv_dir, dek)
-        # END LEGACY MIGRATION
+        # The DEK is always derivable from the machine secret, no password
+        # needed. login_required gates everything that reaches here.
+        dek = _auth_backend.get_dek(user_id)
 
         backend = AnthropicMessagesBackend(
             system_prompt=aime_config.load_system_prompt(),
@@ -467,15 +414,7 @@ def _context_for(user_id: int) -> UserContext:
     with _user_contexts_lock:
         ctx = _user_contexts.get(user_id)
         if ctx is None:
-            with _dek_cache_lock:
-                dek = _dek_cache.get(user_id)
-            if dek is None:
-                # Should be unreachable: login_required gates the only paths
-                # that reach _context_for, and it forces re-login when the
-                # DEK is missing. Raise loudly if it ever happens so the
-                # symptom is clear instead of a confusing decrypt failure.
-                raise RuntimeError(f"no cached DEK for user {user_id}")
-            ctx = UserContext(user_id, dek, g.get("username"))
+            ctx = UserContext(user_id, g.get("username"))
             _user_contexts[user_id] = ctx
         return ctx
 
@@ -632,16 +571,6 @@ def login_required(view):
             if _wants_json():
                 return jsonify({"ok": False, "error": "auth required"}), 401
             return redirect(url_for("login_page"))
-        # DEK only lives in process memory; a server restart drops it and
-        # forces re-login. The signed cookie alone never grants access to
-        # encrypted data.
-        with _dek_cache_lock:
-            has_dek = uid in _dek_cache
-        if not has_dek:
-            session.clear()
-            if _wants_json():
-                return jsonify({"ok": False, "error": "auth required"}), 401
-            return redirect(url_for("login_page"))
         g.user_id = user.id
         g.username = user.username
         # api_access gates message sending only; login itself never depends
@@ -685,7 +614,7 @@ def login_submit():
     username = (request.form.get("username") or "").strip()
     password = request.form.get("password") or ""
     try:
-        user, dek = _auth_backend.verify(username, password)
+        user, _dek, was_reinitialized = _auth_backend.verify(username, password)
     except _auth.AccountLocked as e:
         return Response(
             _load_login_page(login_error=str(e)),
@@ -711,8 +640,17 @@ def login_submit():
     session.clear()
     session["user_id"] = user.id
     session.permanent = True
-    with _dek_cache_lock:
-        _dek_cache[user.id] = dek
+    # LEGACY MIGRATION AUTH — verify() auto-upgrades pre-v2 accounts to the
+    # current encryption scheme by minting a fresh DEK, which makes any
+    # existing conversation files on disk unreadable garbage. Wipe them via
+    # the normal delete-all-conversations path. The user database (topics,
+    # calendar, preferences) is untouched. Safe to remove once no rows have
+    # enc_version < 2.
+    if was_reinitialized:
+        g.username = user.username
+        g.user_id = user.id
+        _context_for(user.id).controller.delete_all_sessions()
+    # END LEGACY MIGRATION AUTH
     return redirect("/")
 
 
@@ -745,7 +683,7 @@ def signup_submit():
         # Stamp the new account's send access from the deployment mode:
         # "open" grants it immediately, "keys" withholds it until the user
         # redeems an invite key. See docs/access-control.md.
-        user, dek = _auth_backend.create(
+        user, _dek = _auth_backend.create(
             username, password, api_access=(_ACCESS_MODE == "open")
         )
     except _auth.UsernameTaken:
@@ -766,8 +704,6 @@ def signup_submit():
     session.clear()
     session["user_id"] = user.id
     session.permanent = True
-    with _dek_cache_lock:
-        _dek_cache[user.id] = dek
     return redirect("/")
 
 
@@ -775,11 +711,7 @@ def signup_submit():
 def logout():
     # POST-only so a stray <img src="/logout"> or prefetched link can't
     # silently log the user out. The frontend already POSTs via fetch().
-    uid = session.get("user_id")
     session.clear()
-    if uid is not None:
-        with _dek_cache_lock:
-            _dek_cache.pop(uid, None)
     return redirect(url_for("login_page"))
 
 
@@ -789,9 +721,10 @@ def account_recover():
 
     Reached only from the recovery prompt: login_submit() puts the verified
     user id into the signed session as `recover_user_id`. Restoring just
-    clears the soft-delete flag — we do not log the user in here, because the
-    session needs the password-derived DEK, so they sign in again normally
-    (which rebuilds it).
+    clears the soft-delete flag — we still bounce back to the login page
+    rather than auto-logging-in, so the user goes through the normal
+    password-verify path and any access-control re-stamping (api_access)
+    happens in one place.
     """
     uid = session.get("recover_user_id")
     session.pop("recover_user_id", None)
@@ -981,9 +914,13 @@ def _reload_backend_database(user_id: int) -> None:
 def account_export():
     """Stream the logged-in user's data as an unencrypted zip bundle."""
     user_id = g.user_id
-    with _dek_cache_lock:
-        dek = _dek_cache.get(user_id)
-    if dek is None:
+    try:
+        dek = _auth_backend.get_dek(user_id)
+    except _auth.BackgroundUnavailable:
+        # Pre-v2 account that hasn't been logged in since the encryption
+        # upgrade. login_required got us this far only because the cookie
+        # was valid; force re-login so verify() can auto-upgrade.
+        session.clear()
         return jsonify({"ok": False, "error": "auth required"}), 401
 
     user_dir = _user_dir(user_id)
@@ -1048,9 +985,10 @@ def account_import():
     data is backed up first; conversations are re-encrypted under this
     account's key."""
     user_id = g.user_id
-    with _dek_cache_lock:
-        dek = _dek_cache.get(user_id)
-    if dek is None:
+    try:
+        dek = _auth_backend.get_dek(user_id)
+    except _auth.BackgroundUnavailable:
+        session.clear()
         return jsonify({"ok": False, "error": "auth required"}), 401
 
     upload = request.files.get("bundle")
@@ -1134,12 +1072,10 @@ def account_delete():
     """
     uid = g.user_id
     _auth_backend.soft_delete(uid)
-    # Tear down the in-memory session and drop the cached DEK — the account is
-    # now disabled and the next request must not resolve to it.
+    # Tear down the in-memory session — the account is now disabled and the
+    # next request must not resolve to it.
     _evict_user_context(uid)
     session.clear()
-    with _dek_cache_lock:
-        _dek_cache.pop(uid, None)
     return jsonify({"ok": True})
 
 

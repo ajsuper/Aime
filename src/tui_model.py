@@ -504,11 +504,12 @@ class Aime(App):
         # whether it needs `call_from_thread` to marshal an event onto the UI.
         self._main_tid = threading.get_ident()
 
-        # The TUI is a single-user local interface and has no password to
-        # derive a key from, so we use a key file stored next to the data.
-        # This protects against accidental file leaks (logs, copied backups)
-        # but not an attacker with disk access. The web app uses the
-        # stronger password-derived KEK path in auth.py.
+        # The TUI is a single-user local interface with no accounts database
+        # and so no wrapped-DEK row to look up. We keep its DEK in a plain
+        # key file alongside the data, same machine-bound threat model as
+        # the web app's `machine_secret` (see docs/security.md): anyone who
+        # has the file can decrypt the data. Web users get the wrapped-DEK
+        # path managed by aime.auth instead.
         from aime import encryption as _enc
         tui_user_dir = os.path.join(aime_config.DATABASE_DIR, "users", "1")
         conv_dir = os.path.join(tui_user_dir, "conversations")

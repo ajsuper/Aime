@@ -3658,8 +3658,8 @@ function applyAccessState() {
   const sendBtn = document.querySelector(".send-btn");
   if (input) {
     input.disabled = locked;
-    if (locked) input.placeholder = "Add an invite key in Account settings to send messages";
-    else if (input.placeholder.startsWith("Add an invite key")) input.placeholder = "Message Aime…";
+    if (locked) input.placeholder = "Add invite key in Account settings, or ask admin to unlock access";
+    else if (input.placeholder.startsWith("Add invite key")) input.placeholder = "Message Aime…";
   }
   if (sendBtn) sendBtn.disabled = locked;
 

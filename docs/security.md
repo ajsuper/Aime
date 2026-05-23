@@ -13,20 +13,27 @@ tries to provide:
 
 - **Account isolation.** A logged-in user can only read or modify their own
   conversations, topics, and calendar.
-- **At-rest secrecy of conversation history.** A stolen disk, leaked backup
-  tape, or sysadmin with read access to the data directory cannot read what
-  users said to the assistant.
-- **Password-derived secrets.** The keys that decrypt user data are
-  reproducible only from a correct password — they are not persisted on
-  disk in any form a server compromise could recover.
+- **At-rest secrecy against partial leaks.** A stolen disk image, leaked
+  backup tape, or sysadmin reading the user database in isolation cannot
+  decrypt conversation files without also obtaining the host's
+  `machine_secret` file.
 
 What it deliberately does **not** try to protect against:
 
+- **A full host compromise.** Aime's at-rest encryption is bound to a
+  per-host `machine_secret` that lives on the same disk as the data it
+  protects. An attacker who reads both the user database *and*
+  `machine_secret` can decrypt every user's conversations. This is the
+  correct trade-off for a personal-scale deploy where unattended
+  background services (the midnight agent that sends morning briefs,
+  pre-event reminders, etc.) need to read user data without the user
+  being present. See [`midnight-agent.md`](./midnight-agent.md) for the
+  feature it enables.
 - **An attacker with code execution on the live server.** Per-user data
-  keys live in process memory while a session is active; a memory-reading
-  attacker can extract them. Defense in depth here would require an HSM or
-  a dedicated key-management service, neither of which fit a personal-scale
-  deploy.
+  keys are derived on demand from `machine_secret` and held in process
+  memory while in use; a memory-reading attacker can extract them.
+  Defense in depth here would require an HSM, an OS keychain, or a cloud
+  KMS — see "Future hardening" below.
 - **The model provider seeing the conversation.** Every turn is sent in
   cleartext to whichever model API is configured. This is intrinsic to
   using a hosted model; encryption at rest does not change it.
@@ -90,14 +97,14 @@ active session. See `load_or_create_secret_key()` in `auth.py`.
 ### Sessions and cookies
 
 The session cookie only ever contains `user_id` (an integer). The data key
-used to decrypt user files is held in a separate, **in-process memory
-cache** (`_dek_cache` in `web_app.py`). On a server restart, the cache
-empties; users with valid cookies are forced to re-authenticate. This is
-the correct property — the cookie alone never grants access to encrypted
-data.
+used to decrypt user files is not stored in the cookie or in any in-memory
+cache; it is re-derived on demand from the host's `machine_secret`. A
+server restart does **not** force re-login — that is the property that
+lets background services run after a restart without operator
+intervention.
 
-`HttpOnly` and `SameSite=Lax` are set on the cookie by default; `Secure` is
-set when `AIME_HTTPS=1`.
+`HttpOnly` and `SameSite=Strict` are set on the cookie by default;
+`Secure` is set when `AIME_HTTPS=1`.
 
 ---
 
@@ -106,31 +113,40 @@ set when `AIME_HTTPS=1`.
 ### Two-tier key scheme
 
 ```
-password ──Argon2id(salt_kek)──▶ KEK ──AES-GCM──▶ DEK
+machine_secret ──HKDF-SHA256(salt_dek)──▶ KEK ──AES-GCM──▶ DEK
 DEK ──AES-GCM──▶ conversation files
 ```
 
 - **DEK** (Data Encryption Key) — a random 256-bit key, minted once per
   user at signup. It's what actually encrypts conversation blobs and never
   changes for the lifetime of the account.
-- **KEK** (Key Encryption Key) — derived from the password via Argon2id
-  with its own salt, distinct from the password-verifier salt. Used only
-  to encrypt/decrypt the DEK.
-- **Wrapped DEK** — AES-GCM(KEK, DEK), stored alongside `salt_kek` and the
-  password hash in the `users` table.
+- **KEK** (Key Encryption Key) — derived on demand from the host's
+  `machine_secret` and a per-user salt via HKDF-SHA256. Used only to
+  encrypt/decrypt the DEK.
+- **Wrapped DEK** — AES-GCM(KEK, DEK), stored alongside `salt_dek` in the
+  `users` table.
+- **`machine_secret`** — a 32-byte random file (`machine_secret`, mode
+  0600) generated on first boot. The root of trust for at-rest
+  encryption: anything that can read this file plus the user database can
+  decrypt every user's data.
 
-Why two tiers, instead of using the password as the file key directly:
+Why two tiers, instead of using `machine_secret` as the file key directly:
 
-1. **Password changes are O(1).** Re-derive the KEK from the new password,
-   re-wrap the same DEK, update one row. Existing files don't need
-   rewriting.
-2. **The auth hash and the encryption key are decoupled.** The Argon2 hash
-   used to verify a login (PHC string, salted separately) and the KEK used
-   to unwrap the DEK use independent salts. Leaking one gives no advantage
-   against the other.
+1. **Rotating `machine_secret` is O(users), not O(files).** Re-derive each
+   user's KEK, re-wrap the same DEK, update one row per user. Existing
+   conversation files don't need rewriting.
+2. **The encryption key is decoupled from the password.** The Argon2 hash
+   used to verify a login is purely authentication; it plays no part in
+   encryption. This is what lets background services (the midnight
+   agent) read user data without the user being present to type a
+   password.
 3. **Multiple wrappings of the same DEK become possible.** Adding a
-   recovery key, a backup passphrase, or a second-device key later means
-   adding a row, not re-encrypting files.
+   portable recovery passphrase later means adding a column, not
+   re-encrypting files.
+
+HKDF — not Argon2 — for the KEK derivation: `machine_secret` is 32 bytes
+of OS randomness, not a low-entropy password. Argon2's slow-by-design
+stretching buys nothing here and would cost ~150ms per unwrap.
 
 See [`encryption.py`](../src/aime/encryption.py).
 
@@ -142,6 +158,7 @@ See [`encryption.py`](../src/aime/encryption.py).
 | `users/<id>/database.sql` | ❌ | Owned by the native backend (`serve.cpp`), which does not currently receive the data key. See **Known gaps** below. |
 | `users/<id>/topics/*.md` | ❌ | Same as above. |
 | `auth.sql` | ❌ | Contains password hashes + wrapped DEKs — the wrapped DEK is itself encrypted; the hashes are Argon2id. Treated as integrity-sensitive, not confidentiality-sensitive. |
+| `machine_secret` | ❌ | Root of trust. Mode 0600. Must not be included in backups or copied off the host. |
 | `secret_key` | ❌ | Flask signing key. Treat like a private key — file mode 0600. |
 
 ### AAD binding
@@ -156,18 +173,54 @@ ciphertext is bound to its logical identity.
 1. User submits username + password.
 2. `verify()` checks lockout, performs the Argon2 verify on
    `password_hash`.
-3. On success, derives the KEK from the password + `salt_kek`, unwraps the
-   `wrapped_dek` to recover the DEK.
-4. Returns `(UserRecord, DEK)`. The Flask route stores `user_id` in the
-   session cookie and the DEK in the in-process cache, keyed by `user_id`.
-5. All subsequent requests pass through `login_required`, which checks the
-   cookie's `user_id` is valid **and** that a DEK exists in the cache. If
-   either is missing, the user is forced to re-login.
+3. On success, derives the KEK from `machine_secret + salt_dek` and
+   unwraps `wrapped_dek_v2` to recover the DEK.
+4. Returns `(UserRecord, DEK, was_reinitialized)`. The Flask route stores
+   `user_id` in the session cookie; the DEK is not cached — subsequent
+   requests re-derive it on demand via `auth_backend.get_dek(user_id)`.
+5. All subsequent requests pass through `login_required`, which checks
+   the cookie's `user_id` resolves to a live user.
+
+`was_reinitialized` flags an early-beta account that was on the v1
+password-derived scheme and has just been auto-upgraded to v2 — see
+[Legacy encryption migration](#legacy-encryption-migration) below.
 
 ### Logout flow
 
-`/logout` clears the session cookie and deletes the DEK from the in-process
-cache.
+`/logout` clears the session cookie. There is no in-memory key to wipe.
+
+### Background unwrap
+
+`auth_backend.get_dek(user_id)` returns the user's DEK without a password.
+This is what the midnight agent calls to read a user's events/topics at
+07:00 to write a morning brief. The implication is documented in the
+threat model: a host compromise can decrypt any user's data; this is the
+explicit trade-off for the feature.
+
+### Legacy encryption migration
+
+Aime is in early beta. The v1 scheme used a password-derived KEK
+(`Argon2id(password, salt_kek)` wrapping the DEK); the v2 scheme replaces
+it with the machine-secret-derived KEK described above. Existing v1
+accounts are auto-upgraded on next login:
+
+1. `verify()` authenticates the password as usual.
+2. The row's `enc_version` is detected as `< 2`.
+3. A fresh v2 DEK is generated, wrapped under `machine_secret + new
+   salt_dek`, and persisted; the old `salt_kek` / `wrapped_dek` columns
+   are nulled.
+4. The Flask layer calls `controller.delete_all_sessions()` to wipe the
+   user's `*.json.enc` files — they were encrypted under the old DEK,
+   which is gone, so they're unreadable garbage either way.
+
+The user's database (topics, calendar, preferences) and account state
+(api_access, lockout history) are untouched. Conversation history is
+treated as a nice-to-have for cross-device sync, not as data worth
+preserving across a one-time scheme change.
+
+Search the codebase for `LEGACY MIGRATION AUTH` to find every transitional
+code path; they are paired with `END LEGACY MIGRATION AUTH` markers and
+can be deleted once you have decided all installs have upgraded.
 
 ---
 
@@ -198,33 +251,31 @@ how data is stored locally. Encryption at rest does not change it. For
 fully private operation, the application would need to be reconfigured
 against a self-hosted model.
 
-### 3. A forgotten password means lost data
+### 3. The server can decrypt any user's data
 
-Without the password, the KEK cannot be re-derived, and without the KEK
-the wrapped DEK cannot be unwrapped. There is no password-reset flow. This
-is the honest consequence of "encrypted at rest" — a reset path operable
-by the server administrator would also let that administrator read user
-data without consent.
+This is by design — the v2 encryption scheme binds the DEK to a host-side
+`machine_secret`, not to the user's password, so the assistant can read
+user data while the user is offline. Without this property, the midnight
+agent (morning briefs, pre-event reminders) could not function.
 
-A user-facing recovery flow can be added later without re-encrypting any
-files: at signup, generate a separate recovery key and wrap the same DEK
-under it; display the recovery key to the user once; store only the extra
-wrapped blob server-side. This is a planned enhancement, not a current
-feature.
+Operational consequences:
 
-### 4. The data key lives in process memory during a session
+- A full host compromise (disk + `machine_secret`) decrypts every user's
+  conversations.
+- A forgotten password no longer destroys data — password reset is
+  trivial to add and does not require touching encryption.
+- Backups that include the user database **must not** include
+  `machine_secret`. Restoring to a new host requires bringing the secret
+  across, or accepting that the encrypted conversations are lost (the
+  database — topics, calendar, preferences — survives either way).
 
-An attacker who can execute code on the running server can read the
-in-memory key cache and recover every logged-in user's data key. Avoiding
-this entirely would require an external key-management service or an HSM,
-which is out of scope for the intended deployments.
+### 4. The data key is reachable on the live host
 
-Mitigations in the current design:
-
-- The DEK is never persisted outside of its wrapped-by-KEK form.
-- A server restart drops the entire in-memory cache, forcing every user
-  to re-authenticate (and re-derive their KEK) before any data can be
-  decrypted.
+Anyone with code execution on the running server can read
+`machine_secret`, look up any user's wrapped DEK, and unwrap it. There is
+no in-memory key cache to evict; the DEK is re-derived on demand. The
+hardening path is to move `machine_secret` off the local disk — see
+"Future hardening" below.
 
 ### 5. Login is single-factor
 
@@ -269,12 +320,28 @@ xxd -l 64 $HOME/.local/share/aime-assistant/database/users/<id>/conversations/*.
 # Expect: high-entropy bytes; no recognizable JSON keys like "role" or "content"
 
 sqlite3 $HOME/.local/share/aime-assistant/database/auth.sql \
-    'SELECT id, username, enc_version, length(salt_kek), length(wrapped_dek) FROM users'
-# Expect: enc_version=1, salt_kek=16, wrapped_dek=60 for any user who has logged in
+    'SELECT id, username, enc_version, length(salt_dek), length(wrapped_dek_v2) FROM users'
+# Expect: enc_version=2, salt_dek=16, wrapped_dek_v2=60 for every active user
+
+ls -l $HOME/.local/share/aime-assistant/database/machine_secret
+# Expect: mode 0600, 32 bytes
 ```
 
-Legacy plaintext files from pre-encryption installs are migrated lazily on
-the user's next successful login. Search the codebase for `LEGACY
-MIGRATION` to find every transitional code path; they are paired with
-`END LEGACY MIGRATION` markers and can be deleted once you have decided
-all installs have upgraded.
+---
+
+## Future hardening
+
+The current design is fit for a personal-scale deploy. Two paths exist to
+narrow the "host compromise = full decrypt" surface, both deferred:
+
+1. **OS keychain** for `machine_secret`. On Linux (libsecret), macOS
+   (Keychain), and Windows (DPAPI) the root secret can live outside the
+   filesystem so a disk-only snapshot — even one that includes the user
+   database — cannot decrypt anything.
+2. **Cloud KMS** (AWS KMS, GCP KMS, HashiCorp Vault). The root unwrap
+   becomes a network call; the secret never sits on the host at all.
+   Appropriate for managed deploys where the host is fungible.
+
+Either substitution is a one-function change in
+[`encryption.load_or_create_machine_secret`](../src/aime/encryption.py) —
+the wrap/unwrap logic that depends on the 32-byte result stays the same.
