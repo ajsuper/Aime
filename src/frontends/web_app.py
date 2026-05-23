@@ -798,7 +798,10 @@ def account_recover():
     if not uid:
         # No handoff in the session — nothing to recover. Back to login.
         return redirect(url_for("login_page"))
-    _auth_backend.restore(uid)
+    # Re-stamp api_access using the same logic as signup: open mode grants
+    # immediately, keys mode forces a fresh key redemption. Prevents a
+    # soft-deleted account from skipping the gate on its way back.
+    _auth_backend.restore(uid, api_access=(_ACCESS_MODE == "open"))
     user = _auth_backend.lookup(uid)
     return Response(
         _load_login_page(

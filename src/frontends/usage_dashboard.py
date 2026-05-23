@@ -1242,7 +1242,8 @@ def account_delete():
 def account_restore():
     username = (request.form.get("username") or "").strip()
     if _auth_backend().restore_by_username(username):
-        _flash("ok", f"Restored {username!r}; the account is active again.")
+        _flash("ok", f"Restored {username!r}; the account is active again. "
+                     f"Send access is off — grant it explicitly if needed.")
     else:
         _flash("bad", f"No soft-deleted user named {username!r}.")
     return redirect(url_for("index", tab="accounts"))

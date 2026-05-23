@@ -108,7 +108,9 @@ def cmd_delete(args: argparse.Namespace) -> int:
 
 def cmd_restore(args: argparse.Namespace) -> int:
     if _backend().restore_by_username(args.username):
-        print(f"Restored {args.username!r}; the account is active again.")
+        print(f"Restored {args.username!r}; the account is active again. "
+              f"Send access is off — grant it with: "
+              f"./scripts/access_keys.py grant {args.username}")
         return 0
     print(f"No soft-deleted user named {args.username!r} to restore.",
           file=sys.stderr)

@@ -151,7 +151,7 @@ class AuthBackend(Protocol):
     # Soft delete / restore / permanent purge. scripts/manage_users.py and the
     # web frontend's account routes are thin wrappers over these.
     def soft_delete(self, user_id: int) -> bool: ...
-    def restore(self, user_id: int) -> bool: ...
+    def restore(self, user_id: int, api_access: bool = False) -> bool: ...
     def hard_delete(self, user_id: int) -> bool: ...
     def list_deleted_users(self) -> list[UserRecord]: ...
 
@@ -454,25 +454,30 @@ class LocalAuthBackend:
             self._conn.commit()
         return cur.rowcount > 0
 
-    def restore(self, user_id: int) -> bool:
-        """Clear the soft-delete flag, reactivating the account. Returns False
-        if there is no matching soft-deleted row."""
+    def restore(self, user_id: int, api_access: bool = False) -> bool:
+        """Clear the soft-delete flag, reactivating the account. `api_access`
+        is re-stamped on restore (mirroring create()): callers pass the value
+        appropriate for their deployment mode — True in `open`, False in
+        `keys` (the default, which forces a fresh key redemption). Returns
+        False if there is no matching soft-deleted row."""
         with self._lock:
             cur = self._conn.execute(
-                "UPDATE users SET deleted_at = NULL "
+                "UPDATE users SET deleted_at = NULL, api_access = ? "
                 "WHERE id = ? AND deleted_at IS NOT NULL",
-                (user_id,),
+                (1 if api_access else 0, user_id),
             )
             self._conn.commit()
         return cur.rowcount > 0
 
-    def restore_by_username(self, username: str) -> bool:
-        """Username-keyed restore for admin tooling."""
+    def restore_by_username(self, username: str, api_access: bool = False) -> bool:
+        """Username-keyed restore for admin tooling. Defaults to api_access=False
+        so admin-driven restores behave like keys-mode: an admin can grant
+        access explicitly afterwards via scripts/access_keys.py."""
         with self._lock:
             cur = self._conn.execute(
-                "UPDATE users SET deleted_at = NULL "
+                "UPDATE users SET deleted_at = NULL, api_access = ? "
                 "WHERE username = ? AND deleted_at IS NOT NULL",
-                (username,),
+                (1 if api_access else 0, username),
             )
             self._conn.commit()
         return cur.rowcount > 0

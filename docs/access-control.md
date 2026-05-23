@@ -108,6 +108,13 @@ session; the web frontend turns that into a prompt — *"This account no longer
 exists. Do you want to recover it?"* — and `POST /account/recover` clears the
 flag.
 
+Recovery re-stamps `api_access` using the same rule as signup: `open` mode
+grants it, `keys` mode withholds it (the user must redeem a key again). This
+prevents a soft-deleted account from sidestepping the access gate on its way
+back. Admin restores via `scripts/manage_users.py restore` default to
+`api_access=0` regardless of mode — the admin can grant explicitly via
+`access_keys.py grant` afterwards.
+
 **Verification is the password, and it is cryptographically self-enforcing.**
 The check is only ever raised *after* a correct password verify, so a deleted
 account is indistinguishable from a live one to anyone who does not already
