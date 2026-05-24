@@ -260,6 +260,147 @@ def _aggregate_cache(records):
     return users
 
 
+def _percentile(sorted_values, pct: float):
+    """Linear-interpolated percentile of a pre-sorted list (or None if empty)."""
+    if not sorted_values:
+        return None
+    if len(sorted_values) == 1:
+        return sorted_values[0]
+    k = (pct / 100.0) * (len(sorted_values) - 1)
+    lo = int(k)
+    hi = min(lo + 1, len(sorted_values) - 1)
+    frac = k - lo
+    return sorted_values[lo] + (sorted_values[hi] - sorted_values[lo]) * frac
+
+
+def _aggregate_purpose(records):
+    """Per-purpose totals (turn / title / compaction / ...).
+
+    Purpose tags what an API call was *for* — user-facing turns vs. cheap
+    background Haiku tasks like session-title generation and history
+    compaction. Splitting by purpose lets the admin see how much of the bill
+    is the user actually talking, vs. plumbing they never see.
+    """
+    purposes = {}
+    for rec in records:
+        if rec.get("kind") != "api":
+            continue
+        name = rec.get("purpose") or "(unspecified)"
+        p = purposes.setdefault(name, {
+            "calls": 0, "input": 0, "output": 0, "cost": 0.0, "_lat": [],
+        })
+        p["calls"] += 1
+        p["input"] += rec.get("input_tokens", 0)
+        p["output"] += rec.get("output_tokens", 0)
+        p["cost"] += _report._api_cost(rec)
+        d = rec.get("duration_ms")
+        if d is not None:
+            try:
+                p["_lat"].append(float(d))
+            except (TypeError, ValueError):
+                pass
+    for p in purposes.values():
+        lats = sorted(p.pop("_lat"))
+        p["lat_n"] = len(lats)
+        p["lat_p50"] = _percentile(lats, 50)
+        p["lat_p90"] = _percentile(lats, 90)
+        p["lat_p99"] = _percentile(lats, 99)
+    return purposes
+
+
+def _aggregate_stop_reasons(records):
+    """Counts per stop_reason, plus the total of records that carried one.
+
+    Returns (counts_dict, total_with_reason). end_turn = clean finish,
+    tool_use = handed off to a tool, max_tokens = ran into the output cap.
+    A growing max_tokens share is the usual signal to raise the limit.
+    """
+    counts = {}
+    total = 0
+    for rec in records:
+        if rec.get("kind") != "api":
+            continue
+        r = rec.get("stop_reason")
+        if not r:
+            continue
+        counts[r] = counts.get(r, 0) + 1
+        total += 1
+    return counts, total
+
+
+def _aggregate_hour(records):
+    """API calls bucketed by UTC hour-of-day (0..23)."""
+    hours = [0] * 24
+    for rec in records:
+        if rec.get("kind") != "api":
+            continue
+        try:
+            hours[datetime.datetime.fromisoformat(rec["ts"]).hour] += 1
+        except (ValueError, KeyError):
+            continue
+    return hours
+
+
+def _overall_latency(records):
+    """Sorted list of every api record's duration_ms (those that carry one)."""
+    lats = []
+    for rec in records:
+        if rec.get("kind") != "api":
+            continue
+        d = rec.get("duration_ms")
+        if d is None:
+            continue
+        try:
+            lats.append(float(d))
+        except (TypeError, ValueError):
+            pass
+    lats.sort()
+    return lats
+
+
+def _format_bytes(n: int) -> str:
+    """Human-friendly byte size — KB / MB / GB with one decimal."""
+    if n < 1024:
+        return f"{n} B"
+    for unit in ("KB", "MB", "GB", "TB"):
+        n /= 1024.0
+        if n < 1024:
+            return f"{n:.1f} {unit}"
+    return f"{n:.1f} PB"
+
+
+def _dir_size(path: str) -> int:
+    """Recursive byte size of a directory tree. Missing path → 0. Best-effort:
+    a file that vanishes between stat calls is skipped, never raised."""
+    if not os.path.isdir(path):
+        return 0
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(root, f))
+            except OSError:
+                pass
+    return total
+
+
+def _count_files(path: str, suffix: str | None = None) -> int:
+    """Number of files (optionally only those ending in `suffix`) in a
+    directory. Does NOT read file contents — directory listing only."""
+    if not os.path.isdir(path):
+        return 0
+    try:
+        entries = os.listdir(path)
+    except OSError:
+        return 0
+    if suffix is None:
+        return sum(1 for e in entries if os.path.isfile(os.path.join(path, e)))
+    return sum(
+        1 for e in entries
+        if e.endswith(suffix) and os.path.isfile(os.path.join(path, e))
+    )
+
+
 # ---------------------------------------------------------------------------
 # Auth helpers
 # ---------------------------------------------------------------------------
@@ -331,18 +472,31 @@ _FRAGMENT_OVERVIEW = """<div class="meta">
     with AIME_USAGE_STATS=1.</p>
   {% else %}
 
+  <div class="view-toggle"
+    title="Switch the headline cards between window totals and the per-user average for the {{ user_count }} user(s) active in this window. The 'cache read share' card is a ratio and is unaffected.">
+    <span class="lbl">Show:</span>
+    <a href="?{{ qs_view_total }}" class="{{ 'active' if view == 'total' else '' }}"
+      title="Show totals across every user active in this window.">Total</a>
+    <a href="?{{ qs_view_avg }}" class="{{ 'active' if view == 'avg' else '' }}"
+      title="Divide the cost / call / token figures by the {{ user_count }} user(s) active in this window. The 'cache read share' card is a ratio and is unaffected.">Avg / user</a>
+    <span class="note">({{ user_count }} user{{ '' if user_count == 1 else 's' }} active in this window)</span>
+  </div>
+
   <div class="cards">
-    <div class="card accent-green" title="Total estimated USD cost of every API call in this window: input, output, cache, and web-search charges combined. An estimate from list prices — not your actual invoice.">
-      <div class="num good">${{ "%.4f"|format(grand_cost) }}</div>
-      <div class="lbl">estimated cost</div></div>
-    <div class="card accent-blue" title="Number of requests sent to the Anthropic Messages API in this window.">
-      <div class="num blue">{{ "{:,}".format(total_calls) }}</div>
-      <div class="lbl">API calls</div></div>
-    <div class="card accent-purple" title="Fresh (uncached) input tokens plus output tokens. Excludes cache read/write tokens — see 'cache read share'.">
-      <div class="num purple">{{ "{:,}".format(total_in + total_out) }}</div>
-      <div class="lbl">tokens (in+out)</div></div>
+    <div class="card accent-green"
+      title="{% if view == 'avg' %}Per-user average — total estimated USD cost divided by the {{ user_count }} user(s) active in this window.{% else %}Total estimated USD cost of every API call in this window: input + output + cache + web-search charges combined.{% endif %} An estimate from list prices — not your actual invoice. Larger than the Cache Efficacy tab's 'prompt cost' figures, which isolate prompt-side tokens only.">
+      <div class="num good">${{ "%.4f"|format(card_cost) }}</div>
+      <div class="lbl">{{ 'avg cost / user' if view == 'avg' else 'estimated total cost (all charges)' }}</div></div>
+    <div class="card accent-blue"
+      title="{% if view == 'avg' %}Average requests sent per active user.{% else %}Number of requests sent to the Anthropic Messages API in this window.{% endif %}">
+      <div class="num blue">{{ ('%.1f' % card_calls) if view == 'avg' else '{:,}'.format(card_calls) }}</div>
+      <div class="lbl">{{ 'avg API calls / user' if view == 'avg' else 'API calls' }}</div></div>
+    <div class="card accent-purple"
+      title="{% if view == 'avg' %}Average fresh input + output tokens per active user.{% else %}Fresh (uncached) input tokens plus output tokens.{% endif %} Excludes cache read/write tokens — see 'cache read share'.">
+      <div class="num purple">{{ ('%.0f' % card_tokens) if view == 'avg' else '{:,}'.format(card_tokens) }}</div>
+      <div class="lbl">{{ 'avg tokens / user' if view == 'avg' else 'tokens (in+out)' }}</div></div>
     <div class="card {{ 'accent-green' if cache_hit_pct >= 70 else 'accent-amber' if cache_hit_pct >= 40 else 'accent-red' }}"
-      title="Share of read-side prompt tokens served from cache (cache reads) rather than billed as fresh input. Higher is cheaper. Green at 70%+, amber 40-70%, red below 40%.">
+      title="Share of read-side prompt tokens served from cache (cache reads) rather than billed as fresh input. Higher is cheaper. This is a ratio, identical whether you view totals or per-user averages. Green at 70%+, amber 40-70%, red below 40%.">
       <div class="num {{ 'good' if cache_hit_pct >= 70 else 'warn' if cache_hit_pct >= 40 else 'bad' }}">{{ "%.0f"|format(cache_hit_pct) }}%</div>
       <div class="lbl">cache read share</div></div>
   </div>
@@ -361,7 +515,7 @@ _FRAGMENT_OVERVIEW = """<div class="meta">
         <th title="Local speech-to-text transcription calls.">STT calls</th>
         <th title="Total seconds of audio transcribed by speech-to-text.">Audio (s)</th>
         <th title="Wall-clock seconds of local compute spent on speech-to-text.">Compute (s)</th>
-        <th title="Estimated USD cost for this user: tokens, cache, and web search combined.">Est. cost</th>
+        <th title="Estimated total USD cost for this user: input + output + cache reads/writes + web-search charges combined. This is broader than the Cache Efficacy tab's 'Cost (cache)' column, which only counts the prompt side (fresh input + cache reads + cache writes) and excludes output tokens and web-search charges — so that figure will always be smaller.">Est. total cost</th>
       </tr>
     </thead>
     <tbody>
@@ -464,12 +618,12 @@ _FRAGMENT_CACHE = """<div class="meta">
   {% endif %}
 
   <div class="cards">
-    <div class="card accent-blue" title="Actual prompt-token cost with caching on: fresh input at 1x, cache reads at 0.10x, 5m writes at 1.25x, 1h writes at 2x base input. Output and web-search cost are excluded — they are identical with or without caching.">
+    <div class="card accent-blue" title="Actual prompt-side cost with caching on — counting only fresh input (1x), cache reads (0.10x), 5m writes (1.25x), and 1h writes (2x base input). Excludes output tokens and web-search charges, which are identical with or without caching and would only obscure the comparison. This is smaller than Overview's 'Est. total cost' for the same reason.">
       <div class="num blue">${{ "%.4f"|format(cache_with) }}</div>
-      <div class="lbl">prompt cost, caching on</div></div>
-    <div class="card accent-purple" title="Hypothetical prompt-token cost with caching off: every cache read and cache write token re-billed as plain input at 1x base rate.">
+      <div class="lbl">prompt-side cost, caching on</div></div>
+    <div class="card accent-purple" title="Hypothetical prompt-side cost with caching off: every cache read and cache write token re-billed as plain input at the 1x base rate. Output and web-search charges are excluded for the same reason as the 'caching on' card.">
       <div class="num purple">${{ "%.4f"|format(cache_without) }}</div>
-      <div class="lbl">prompt cost, no caching</div></div>
+      <div class="lbl">prompt-side cost, no caching</div></div>
     <div class="card {{ 'accent-green' if cache_savings >= 0 else 'accent-red' }}"
       title="No-cache cost minus actual cost. Positive (green) means caching saved money; negative (red) means the write premium outran the read discount.">
       <div class="num {{ 'good' if cache_savings >= 0 else 'bad' }}">${{ "%.4f"|format(cache_savings) }}</div>
@@ -505,8 +659,8 @@ _FRAGMENT_CACHE = """<div class="meta">
         <th title="Cache reads divided by cache writes. Above 1x the cache is recouping its write premium; below 1x it is losing money.">Reuse</th>
         <th title="Cache-write tokens not covered by an equal number of reads (writes minus reads, floored at 0). A lower bound on write premium paid for no read discount.">Unread writes</th>
         <th title="Median time between this user's consecutive API requests. Above 5 minutes, a 5m-TTL cache write tends to expire before it is read back (row turns red with a warning sign).">Median gap</th>
-        <th title="Actual prompt-token cost for this user with caching on.">Cost (cache)</th>
-        <th title="Hypothetical prompt-token cost for this user if caching were off.">Cost (no cache)</th>
+        <th title="Actual prompt-side cost for this user with caching on — counting only fresh input + cache reads + cache writes. Excludes output tokens and web-search charges (those are identical with or without caching), so this is smaller than the Overview tab's 'Est. total cost' column.">Prompt cost (cache)</th>
+        <th title="Hypothetical prompt-side cost for this user if caching were off — every cache read/write re-billed as plain input. Also excludes output and web-search charges, for the same apples-to-apples reason.">Prompt cost (no cache)</th>
         <th title="No-cache cost minus actual cost for this user. Positive = caching saved money.">Savings</th>
       </tr>
     </thead>
@@ -541,6 +695,197 @@ _FRAGMENT_CACHE = """<div class="meta">
       </tr>
     </tfoot>
   </table>
+  {% endif %}"""
+
+
+# Activity tab — what the API is being *used* for, beyond the raw cost on
+# Overview: purpose mix (turn vs. background plumbing), stop-reason
+# distribution (truncation / tool-use rates), latency percentiles, and
+# UTC-hour traffic shape. Filters share the form with Overview / Cache.
+_FRAGMENT_ACTIVITY = """<div class="meta">
+    <span title="Filesystem path of the usage.jsonl log being read. Resolved from AIME_DATABASE_DIR, identical to the CLI usage report.">log: {{ log }}</span><br>
+    <span title="Number of log records matching the current filters.">{{ record_count }} records</span>
+    &middot;
+    <span title="Date range currently in view, set by the Since / Until filters above.">window: {{ window }}</span>
+  </div>
+
+  {% for e in errors %}<p class="err">{{ e }}</p>{% endfor %}
+
+  {% if not purpose_rows %}
+    <p class="empty">No API records in this window — nothing to analyse.</p>
+  {% else %}
+
+  <div class="cards">
+    <div class="card accent-blue"
+      title="Median wall-clock latency of an API call (records that carry a duration_ms — newer records do, older ones may not). Half of calls finish faster than this.">
+      <div class="num blue">{{ ('%.0f ms' % lat_p50) if lat_p50 is not none else '—' }}</div>
+      <div class="lbl">latency p50</div></div>
+    <div class="card accent-amber"
+      title="90th-percentile latency. One call in ten takes at least this long. A growing p90 is the usual early sign of a slow tail.">
+      <div class="num warn">{{ ('%.0f ms' % lat_p90) if lat_p90 is not none else '—' }}</div>
+      <div class="lbl">latency p90</div></div>
+    <div class="card accent-red"
+      title="99th-percentile latency. The slowest 1% of calls. Watch this against a service-level target.">
+      <div class="num bad">{{ ('%.0f ms' % lat_p99) if lat_p99 is not none else '—' }}</div>
+      <div class="lbl">latency p99</div></div>
+    <div class="card accent-purple"
+      title="Mean (arithmetic average) of duration_ms across {{ '{:,}'.format(lat_n) }} record(s) that carry a latency. Pulled higher than p50 by the long tail — keep an eye on the percentiles for the real shape.">
+      <div class="num purple">{{ ('%.0f ms' % lat_avg) if lat_avg is not none else '—' }}</div>
+      <div class="lbl">latency avg</div></div>
+  </div>
+
+  <h2 title="API calls split by their `purpose` tag — 'turn' is a user-facing assistant turn, 'title' / 'compaction' are background Haiku jobs the user never sees directly. A high background share means a lot of the bill goes to plumbing.">By purpose</h2>
+  <table>
+    <thead>
+      <tr>
+        <th title="Purpose tag stamped on the record by aime.usage.record_api.">Purpose</th>
+        <th title="Number of API calls with this purpose.">Calls</th>
+        <th title="Fresh input tokens.">Input</th>
+        <th title="Output tokens generated.">Output</th>
+        <th title="Median latency (ms) across calls of this purpose that carry a duration_ms.">p50 (ms)</th>
+        <th title="90th-percentile latency (ms) — one call in ten is at least this slow.">p90 (ms)</th>
+        <th title="99th-percentile latency (ms) — the slow tail.">p99 (ms)</th>
+        <th title="Estimated USD cost attributed to this purpose (all charges, same basis as Overview's 'Est. total cost').">Est. cost</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for name, p in purpose_rows %}
+      <tr>
+        <td>{{ name }}</td>
+        <td>{{ "{:,}".format(p.calls) }}</td>
+        <td>{{ "{:,}".format(p.input) }}</td>
+        <td>{{ "{:,}".format(p.output) }}</td>
+        <td>{{ ('%.0f' % p.lat_p50) if p.lat_p50 is not none else '—' }}</td>
+        <td>{{ ('%.0f' % p.lat_p90) if p.lat_p90 is not none else '—' }}</td>
+        <td>{{ ('%.0f' % p.lat_p99) if p.lat_p99 is not none else '—' }}</td>
+        <td class="cost good">${{ "%.4f"|format(p.cost) }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  <h2 title="Why the model decided to stop a given turn. A growing 'max_tokens' share is the usual signal that the output cap needs raising; 'tool_use' counts handoffs to a tool.">Stop reasons</h2>
+  {% if not stop_rows %}
+    <p class="empty">No stop_reason recorded in this window.</p>
+  {% else %}
+  <table>
+    <thead>
+      <tr>
+        <th title="Stop reason stamped on the record by the Messages API.">Reason</th>
+        <th title="Number of records with this stop reason.">Count</th>
+        <th title="Share of records carrying a stop reason that ended this way.">Share</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for name, c in stop_rows %}
+      <tr>
+        <td>{{ name }}</td>
+        <td>{{ "{:,}".format(c) }}</td>
+        <td>{{ "%.1f"|format(100.0 * c / stop_total) }}%
+          <span class="inline-bar" title="Visual share — {{ '%.1f'|format(100.0 * c / stop_total) }}% of stop reasons in this window."><span class="fill" style="width: {{ (100.0 * c / stop_total)|round(1) }}%"></span></span></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+
+  <h2 title="API calls bucketed by UTC hour-of-day. Tall bars are busy hours. Use this to spot off-hours background traffic, or to size capacity to peak.">Hourly traffic (UTC)</h2>
+  <div class="hour-bars" title="One bar per UTC hour 00..23. Bar height is calls in that hour relative to the busiest hour ({{ '{:,}'.format(hour_max) }} calls).">
+    {% for h in hours %}
+    <div class="bar {{ 'empty' if h == 0 else '' }}"
+      style="height: {{ ((100.0 * h / hour_max)|round(1)) if hour_max else 0 }}%"
+      title="{{ '%02d:00' % loop.index0 }} UTC — {{ '{:,}'.format(h) }} call{{ '' if h == 1 else 's' }}"></div>
+    {% endfor %}
+  </div>
+  <div class="hour-axis">
+    {% for h in hours %}<span>{{ '%02d' % loop.index0 }}</span>{% endfor %}
+  </div>
+
+  {% endif %}"""
+
+
+# System tab — operator-level health. Counts and sizes only; never reads
+# topic, event, or conversation content. The user's data stays opaque.
+_FRAGMENT_SYSTEM = """
+  <div class="cards">
+    <div class="card accent-blue"
+      title="Active accounts in this deployment.">
+      <div class="num blue">{{ n_active }}</div>
+      <div class="lbl">active accounts</div></div>
+    <div class="card accent-green"
+      title="Active accounts whose api_access flag is on — they may send messages through the paid model backend.">
+      <div class="num good">{{ n_with_send_access }}</div>
+      <div class="lbl">with send access</div></div>
+    <div class="card accent-amber"
+      title="Soft-deleted accounts still within their grace period. Data is retained until purge.">
+      <div class="num warn">{{ n_deleted }}</div>
+      <div class="lbl">soft-deleted</div></div>
+    <div class="card accent-purple"
+      title="Total disk used by every per-user data directory plus shared state under AIME_DATABASE_DIR. Includes the usage log, auth.sql, backups, and per-user databases and conversations.">
+      <div class="num purple">{{ db_dir_size_h }}</div>
+      <div class="lbl">database dir size</div></div>
+  </div>
+
+  <div class="cards">
+    <div class="card accent-blue"
+      title="Invite keys minted, redeemed or not.">
+      <div class="num blue">{{ n_keys_total }}</div>
+      <div class="lbl">invite keys total</div></div>
+    <div class="card accent-green"
+      title="Invite keys that have been redeemed and turned into an active account.">
+      <div class="num good">{{ n_keys_redeemed }}</div>
+      <div class="lbl">keys redeemed</div></div>
+    <div class="card accent-amber"
+      title="Invite keys still minted but unused — eligible to be revoked or redeemed.">
+      <div class="num warn">{{ n_keys_unredeemed }}</div>
+      <div class="lbl">keys unredeemed</div></div>
+    <div class="card accent-purple"
+      title="Size on disk of the append-only usage.jsonl log (drives every figure on the Overview / Cache / Activity tabs).">
+      <div class="num purple">{{ log_size_h }}</div>
+      <div class="lbl">usage log size</div></div>
+  </div>
+
+  <p class="note">Database root: <code>{{ db_dir }}</code></p>
+
+  <h2 title="Per-user storage occupancy. Sizes and file counts only — topic, event, and conversation contents are never read by this dashboard.">Storage per user</h2>
+  {% if not per_user %}
+    <p class="empty">No active per-user data directories.</p>
+  {% else %}
+  <table>
+    <thead>
+      <tr>
+        <th title="Internal account id (matches the on-disk users/&lt;id&gt;/ directory).">ID</th>
+        <th title="Account username.">Username</th>
+        <th title="Total bytes under the user's data directory (database.sql, topics/, conversations/, etc.). Recursive sum of file sizes — files are never opened.">Size</th>
+        <th title="Number of .md files in users/&lt;id&gt;/topics/. The dashboard counts entries only; topic contents are not read.">Topics</th>
+        <th title="Number of .json files in users/&lt;id&gt;/conversations/. These are encrypted on disk; the dashboard counts entries only.">Conversations</th>
+        <th title="Whether the per-user data directory currently exists on disk. A 'no' usually means the user has signed up but never created any data.">Dir exists</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for u in per_user %}
+      <tr>
+        <td>#{{ u.id }}</td>
+        <td>{{ u.username }}</td>
+        <td>{{ u.size_h }}</td>
+        <td>{{ "{:,}".format(u.topics) }}</td>
+        <td>{{ "{:,}".format(u.conversations) }}</td>
+        <td class="{{ 'good' if u.exists else 'warn' }}">{{ 'yes' if u.exists else 'no' }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+    <tfoot>
+      <tr>
+        <td colspan="2">Total</td>
+        <td>{{ per_user_size_h }}</td>
+        <td>{{ "{:,}".format(per_user_topics_total) }}</td>
+        <td>{{ "{:,}".format(per_user_conversations_total) }}</td>
+        <td></td>
+      </tr>
+    </tfoot>
+  </table>
+  <p class="note">Sizes and counts are read directly from the filesystem.
+    No topic, event, or conversation content is ever opened by this view.</p>
   {% endif %}"""
 
 
@@ -757,6 +1102,34 @@ _PAGE = """<!doctype html>
     form.filter .quick { display: flex; gap: .3rem; }
     form.filter .quick button { padding: .25rem .55rem; }
 
+    /* Total / avg-per-user toggle on the Overview tab. */
+    .view-toggle { display: flex; gap: .35rem; align-items: center;
+      margin: 0 0 .7rem; font-size: .85rem; flex-wrap: wrap; }
+    .view-toggle .lbl { color: #888; }
+    .view-toggle a { padding: .15rem .6rem; text-decoration: none; color: inherit;
+      border: 1px solid #8884; border-radius: 999px; background: transparent; }
+    .view-toggle a:hover { background: #8881; }
+    .view-toggle a.active { background: #8883; border-color: #8886; font-weight: 600; }
+    .view-toggle .note { color: #888; font-size: .8rem; margin-left: .3rem; }
+
+    /* Hourly activity bars (Activity tab). */
+    .hour-bars { display: grid; grid-template-columns: repeat(24, 1fr);
+      gap: 2px; align-items: end; height: 90px; margin: .4rem 0 .3rem;
+      padding: .4rem; border: 1px solid #8884; border-radius: 6px; }
+    .hour-bars .bar { background: #2f6fd0; border-radius: 2px 2px 0 0;
+      min-height: 1px; position: relative; }
+    .hour-bars .bar.empty { background: #8882; min-height: 1px; }
+    .hour-axis { display: grid; grid-template-columns: repeat(24, 1fr);
+      gap: 2px; padding: 0 .4rem; font-size: .7rem; color: #888;
+      text-align: center; font-variant-numeric: tabular-nums; }
+    .hour-axis span { overflow: hidden; }
+
+    /* Skinny inline bar (used in the stop-reason table for share %). */
+    .inline-bar { display: inline-block; height: .55rem; width: 80px;
+      background: #8882; border-radius: 3px; vertical-align: middle;
+      margin-left: .4rem; position: relative; overflow: hidden; }
+    .inline-bar .fill { display: block; height: 100%; background: #2f6fd0; }
+
     .cards { display: flex; flex-wrap: wrap; gap: .8rem; margin-bottom: 1rem; }
     .card { flex: 1 1 140px; padding: .7rem .9rem; border: 1px solid #8884;
       border-left-width: 4px; border-radius: 6px; }
@@ -832,23 +1205,27 @@ _PAGE = """<!doctype html>
       title="Per-user, per-day and per-model token usage and cost.">Overview</a>
     <a href="?{{ qs_cache }}" class="{{ 'active' if tab == 'cache' else '' }}"
       title="Whether prompt caching is actually saving money — reuse factors, hypothetical no-cache cost, and 5-minute-TTL warnings.">Cache Efficacy</a>
+    <a href="?{{ qs_activity }}" class="{{ 'active' if tab == 'activity' else '' }}"
+      title="What the API is being used for — call purpose, stop-reason mix, latency percentiles, and when of day traffic happens.">Activity</a>
     <a href="?{{ qs_accounts }}" class="{{ 'active' if tab == 'accounts' else '' }}"
       title="List, grant/revoke, soft-delete, restore and purge user accounts.">Accounts</a>
     <a href="?{{ qs_keys }}" class="{{ 'active' if tab == 'keys' else '' }}"
       title="Mint and revoke single-use invite keys.">Keys</a>
+    <a href="?{{ qs_system }}" class="{{ 'active' if tab == 'system' else '' }}"
+      title="Operator-level health: account/key counts, storage per user (sizes and file counts only — never content), usage-log status.">System</a>
   </nav>
 
   {% for f in flashes %}
   <div class="flash {{ f.level }}">{{ f.msg }}</div>
   {% endfor %}
 
-  {% if tab in ('overview', 'cache') %}
+  {% if tab in ('overview', 'cache', 'activity') %}
   <form class="filter" method="get">
     <input type="hidden" name="tab" value="{{ tab }}">
-    <label title="Only include records on or after this date. Accepts YYYY-MM-DD or a full ISO-8601 timestamp. Leave blank for no lower bound.">Since
+    <label title="Only include records on or after this date, interpreted in UTC. Accepts YYYY-MM-DD or a full ISO-8601 timestamp. Leave blank for no lower bound.">Since (UTC)
       <input type="text" name="since" value="{{ since_raw }}" placeholder="YYYY-MM-DD">
     </label>
-    <label title="Only include records on or before this date. A bare YYYY-MM-DD covers the whole day (through 23:59:59). Leave blank for no upper bound.">Until
+    <label title="Only include records on or before this date, interpreted in UTC. A bare YYYY-MM-DD covers the whole UTC day (through 23:59:59 UTC). Leave blank for no upper bound.">Until (UTC)
       <input type="text" name="until" value="{{ until_raw }}" placeholder="YYYY-MM-DD">
     </label>
     <div class="quick-group" title="Quick presets that fill the Since / Until fields and apply immediately."><span>Quick range</span>
@@ -878,6 +1255,7 @@ _PAGE = """<!doctype html>
     <button type="submit" title="Apply the filters above and reload the data.">Apply</button>
     <a href="{{ request.path }}?tab={{ tab }}" title="Clear all filters and return to the all-time view on this tab.">reset</a>
   </form>
+  <p class="note" title="Dates and timestamps throughout the dashboard — the Since/Until filters, the By day grouping, and log timestamps — are all UTC. The dashboard runs in a container with no timezone configured, so it uses UTC by default.">All dates and times shown are <strong>UTC</strong>.</p>
   {% endif %}
 
   <div id="data">{{ fragment|safe }}</div>
@@ -1038,9 +1416,38 @@ def _compute(args):
     denom = total_in + total_cache_r
     cache_hit_pct = (100.0 * total_cache_r / denom) if denom else 0.0
 
+    # `user_count` is the divisor for the avg-per-user view — every distinct
+    # username that actually has a record in this window, including
+    # `(anonymous)` if any records were logged without linkage. Avoids dividing
+    # by an account roster that has never sent a message.
+    user_count = len(users)
+    view = "avg" if args.get("view") == "avg" else "total"
+    if view == "avg" and user_count:
+        card_cost = grand_cost / user_count
+        card_calls = total_calls / user_count
+        card_tokens = (total_in + total_out) / user_count
+    else:
+        card_cost = grand_cost
+        card_calls = total_calls
+        card_tokens = total_in + total_out
+
     by_day = sorted(_aggregate_by_day(records).items(), reverse=True)
     by_model = sorted(_aggregate_by_model(records).items(),
                       key=lambda kv: kv[1]["cost"], reverse=True)
+
+    # --- Activity aggregations ---
+    purposes = _aggregate_purpose(records)
+    purpose_rows = sorted(purposes.items(), key=lambda kv: kv[1]["cost"], reverse=True)
+    stop_counts, stop_total = _aggregate_stop_reasons(records)
+    stop_rows = sorted(stop_counts.items(), key=lambda kv: kv[1], reverse=True)
+    hours = _aggregate_hour(records)
+    hour_max = max(hours) if hours else 0
+    lats = _overall_latency(records)
+    lat_n = len(lats)
+    lat_avg = (sum(lats) / lat_n) if lat_n else None
+    lat_p50 = _percentile(lats, 50)
+    lat_p90 = _percentile(lats, 90)
+    lat_p99 = _percentile(lats, 99)
 
     # --- Cache-efficacy aggregations ---
     cache_users_map = _aggregate_cache(records)
@@ -1078,6 +1485,12 @@ def _compute(args):
         cache_hit_pct=cache_hit_pct,
         by_day=by_day,
         by_model=by_model,
+        # overview view toggle
+        view=view,
+        user_count=user_count,
+        card_cost=card_cost,
+        card_calls=card_calls,
+        card_tokens=card_tokens,
         # cache efficacy
         cache_users=cache_users,
         cache_with=cache_with,
@@ -1086,6 +1499,17 @@ def _compute(args):
         cache_savings_pct=cache_savings_pct,
         cache_reuse=cache_reuse,
         flagged=flagged,
+        # activity
+        purpose_rows=purpose_rows,
+        stop_rows=stop_rows,
+        stop_total=stop_total,
+        hours=hours,
+        hour_max=hour_max,
+        lat_n=lat_n,
+        lat_avg=lat_avg,
+        lat_p50=lat_p50,
+        lat_p90=lat_p90,
+        lat_p99=lat_p99,
     )
 
 
@@ -1107,16 +1531,74 @@ def _keys_context() -> dict:
     return dict(keys=_auth_backend().list_access_keys())
 
 
+def _system_context() -> dict:
+    """Template context for the System tab.
+
+    Counts + sizes only. Topic / event / conversation files are never opened —
+    just directory entries and ``os.path.getsize``. The user's data stays
+    opaque to the admin dashboard, by design.
+    """
+    backend = _auth_backend()
+    active = backend.list_users()
+    deleted = backend.list_deleted_users()
+    keys = backend.list_access_keys()
+
+    db_dir = _config.DATABASE_DIR
+    users_root = os.path.join(db_dir, "users")
+
+    per_user = []
+    for u in active:
+        ud = os.path.join(users_root, str(u.id))
+        per_user.append({
+            "id": u.id,
+            "username": u.username,
+            "size": _dir_size(ud),
+            "size_h": _format_bytes(_dir_size(ud)),
+            "topics": _count_files(os.path.join(ud, "topics"), ".md"),
+            "conversations": _count_files(os.path.join(ud, "conversations"), ".json"),
+            "exists": os.path.isdir(ud),
+        })
+    # Largest user first — that's the one most likely to need attention if
+    # disk pressure ever shows up.
+    per_user.sort(key=lambda r: r["size"], reverse=True)
+
+    per_user_size = sum(u["size"] for u in per_user)
+
+    log_path = _log_path()
+    try:
+        log_size = os.path.getsize(log_path)
+    except OSError:
+        log_size = 0
+
+    return dict(
+        n_active=len(active),
+        n_with_send_access=sum(1 for u in active if u.api_access),
+        n_deleted=len(deleted),
+        n_keys_total=len(keys),
+        n_keys_redeemed=sum(1 for k in keys if k.redeemed),
+        n_keys_unredeemed=sum(1 for k in keys if not k.redeemed),
+        per_user=per_user,
+        per_user_size_h=_format_bytes(per_user_size),
+        per_user_topics_total=sum(u["topics"] for u in per_user),
+        per_user_conversations_total=sum(u["conversations"] for u in per_user),
+        db_dir=db_dir,
+        db_dir_size_h=_format_bytes(_dir_size(db_dir)),
+        log_size_h=_format_bytes(log_size),
+    )
+
+
 def _tab(args) -> str:
     t = args.get("tab")
-    return t if t in ("overview", "cache", "accounts", "keys") else "overview"
+    return t if t in ("overview", "cache", "activity", "accounts", "keys", "system") else "overview"
 
 
 def _render_fragment(ctx, tab) -> str:
     template = {
         "cache": _FRAGMENT_CACHE,
+        "activity": _FRAGMENT_ACTIVITY,
         "accounts": _FRAGMENT_ACCOUNTS,
         "keys": _FRAGMENT_KEYS,
+        "system": _FRAGMENT_SYSTEM,
     }.get(tab, _FRAGMENT_OVERVIEW)
     return render_template_string(template, **ctx)
 
@@ -1175,26 +1657,40 @@ def index():
         ctx["flash_keys"] = flash_keys
         auto = 0
         page_ctx = dict(since_raw="", until_raw="", user_raw="", all_users=[])
+    elif tab == "system":
+        ctx = _system_context()
+        auto = 0
+        page_ctx = dict(since_raw="", until_raw="", user_raw="", all_users=[])
     else:
         ctx = _compute(request.args)
         auto = _refresh_seconds(request.args)
         page_ctx = {k: ctx[k] for k in
                     ("since_raw", "until_raw", "user_raw", "all_users")}
+        # Overview view toggle: preserve filters, flip `view`.
+        if tab == "overview":
+            keep_view = {k: request.args.get(k)
+                         for k in ("since", "until", "user", "auto")
+                         if request.args.get(k)}
+            ctx["qs_view_total"] = urlencode({**keep_view, "tab": "overview", "view": "total"})
+            ctx["qs_view_avg"] = urlencode({**keep_view, "tab": "overview", "view": "avg"})
 
     fragment = _render_fragment(ctx, tab)
 
     # Tab links carry the active usage filter (since/until/user/auto) across.
+    # `view` is overview-only and intentionally NOT carried so switching tabs
+    # doesn't preserve a stale toggle state for tabs that don't have one.
     keep = {k: request.args.get(k) for k in ("since", "until", "user", "auto")
             if request.args.get(k)}
     qs = {t: urlencode({**keep, "tab": t})
-          for t in ("overview", "cache", "accounts", "keys")}
+          for t in ("overview", "cache", "activity", "accounts", "keys", "system")}
 
     return render_template_string(
         _PAGE, fragment=fragment, tab=tab, auto=auto,
         auto_label=_AUTO_LABELS.get(auto, "second"),
         csrf=csrf, flashes=flashes,
         qs_overview=qs["overview"], qs_cache=qs["cache"],
-        qs_accounts=qs["accounts"], qs_keys=qs["keys"], **page_ctx,
+        qs_activity=qs["activity"], qs_accounts=qs["accounts"],
+        qs_keys=qs["keys"], qs_system=qs["system"], **page_ctx,
     )
 
 
