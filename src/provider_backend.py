@@ -613,7 +613,7 @@ class AnthropicMessagesBackend:
                 # `_expected_tool_use_ids` is cleared but a slow tool
                 # already executing on the controller's thread may still
                 # call back here. Without this guard, the late result
-                # would be appended as a fresh user message and trigger
+                # would later be flushed as a user message and trigger
                 # an unwanted next turn.
                 if event.tool_use_id not in self._expected_tool_use_ids:
                     return
@@ -623,16 +623,14 @@ class AnthropicMessagesBackend:
                     "content": content_text,
                 })
                 self._expected_tool_use_ids.discard(event.tool_use_id)
-                ready = not self._expected_tool_use_ids
-                if ready:
-                    self._messages.append({
-                        "role": "user",
-                        "content": self._pending_tool_results,
-                    })
-                    self._pending_tool_results = []
-            if ready:
-                self._persist()
-                self._turn_trigger.set()
+                # Buffer only. The user message holding these tool_results
+                # is appended by `_run_turn` after the assistant stream
+                # finishes. Flushing eagerly here breaks parallel tool
+                # calls: with two tool_use blocks A and B, A's result
+                # arrives (and would flush as a user message) before B
+                # even streams out, which leaves B landing in an assistant
+                # message that already has a following user message — i.e.
+                # an orphan tool_use.
         else:
             raise ValueError(f"submit() does not accept event kind: {event.kind}")
 
@@ -1026,6 +1024,22 @@ class AnthropicMessagesBackend:
                 if self._messages and self._messages[-1].get("content") is assistant_blocks:
                     self._messages.pop()
 
+        # Flush any tool_results buffered by submit() during the stream as
+        # a single user message. Deferred until here so that all tool_use
+        # blocks the model emitted have already landed in assistant_blocks
+        # before we close the assistant turn — flushing eagerly inside
+        # submit() would orphan later tool_use blocks (see comment in
+        # submit()'s tool_send_response branch).
+        flushed = False
+        with self._lock:
+            if self._pending_tool_results:
+                self._messages.append({
+                    "role": "user",
+                    "content": self._pending_tool_results,
+                })
+                self._pending_tool_results = []
+                flushed = True
+
         self._persist()
 
         if stop_reason != "tool_use":
@@ -1035,9 +1049,10 @@ class AnthropicMessagesBackend:
             # hasn't landed yet; once it does, subsequent turns benefit.
             self._spawn_compaction()
             yield BackendEvent(kind="turn_end", stop_reason=stop_reason or "end_turn")
-        # If stop_reason == "tool_use", the outer loop blocks on
-        # _turn_trigger until submit() has gathered every tool_result and
-        # appended them as a user message.
+        elif flushed:
+            # All tool_results are in and appended as one user message —
+            # wake the outer stream() loop so it starts the next turn.
+            self._turn_trigger.set()
 
     def _cacheable_messages(self, messages: list[dict]) -> list[dict]:
         """Return a shallow copy of `messages` with a prompt-cache breakpoint on
