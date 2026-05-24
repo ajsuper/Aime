@@ -2885,17 +2885,20 @@ document.querySelectorAll(".pane-btn").forEach(btn => {
 
 document.getElementById("side-close").addEventListener("click", closeSide);
 
-// Reload whichever pane is currently open. Used by the explicit refresh
-// button in the header, by the auto-refresh hooks below, and by the
-// visibility-change fallback.
-function refreshActivePane() {
-  if (activePaneName === "chats") loadChats();
-  else if (activePaneName === "calendar") renderCalendar();
-  else if (activePaneName === "topics") { loadTopics(); refreshOpenTopic(); }
+// Reload whichever pane is currently open. `silent=true` swaps content in
+// only after the fetch returns (no "loading…" placeholder, no error
+// message on failure) so background refreshes don't flash the pane. Used
+// by the explicit refresh button (loud), the auto-refresh hooks (silent),
+// and the visibility-change fallback (silent).
+function refreshActivePane(silent) {
+  if (activePaneName === "chats") loadChats(silent);
+  else if (activePaneName === "calendar") renderCalendar(silent);
+  else if (activePaneName === "topics") { loadTopics(silent); refreshOpenTopic(); }
 }
 
 // Re-fetch the currently-open topic's contents in place. Skipped when the
-// user is mid-edit so we don't clobber unsaved work.
+// user is mid-edit so we don't clobber unsaved work. Always silent: the
+// existing markdown stays rendered until the new copy is parsed.
 function refreshOpenTopic() {
   if (!selectedTopicId || topicEditing) return;
   fetch("/topics/" + encodeURIComponent(selectedTopicId))
@@ -2921,17 +2924,18 @@ function scheduleActivePaneRefresh() {
   if (paneRefreshTimer != null) clearTimeout(paneRefreshTimer);
   paneRefreshTimer = setTimeout(() => {
     paneRefreshTimer = null;
-    refreshActivePane();
+    refreshActivePane(true);
   }, 250);
 }
 
 // Fallback for the case the user switched tabs while the model was busy —
-// when they come back, immediately pull fresh data.
+// when they come back, pull fresh data without a visible reload flash.
 document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "visible") refreshActivePane();
+  if (document.visibilityState === "visible") refreshActivePane(true);
 });
 
-document.getElementById("side-refresh").addEventListener("click", refreshActivePane);
+document.getElementById("side-refresh").addEventListener("click", () =>
+  refreshActivePane(false));
 
 function activatePane(name) {
   activePaneName = name;
@@ -2983,8 +2987,8 @@ function closeSide() {
 
 const chatsList = document.getElementById("chats-list");
 
-async function loadChats() {
-  chatsList.innerHTML = '<div class="empty">loading…</div>';
+async function loadChats(silent) {
+  if (!silent) chatsList.innerHTML = '<div class="empty">loading…</div>';
   try {
     const r = await fetch("/sessions");
     const data = await r.json();
@@ -3059,7 +3063,9 @@ async function loadChats() {
       chatsList.appendChild(item);
     });
   } catch (e) {
-    chatsList.innerHTML = '<div class="empty">error: ' + e + '</div>';
+    // Keep the prior list visible on a silent refresh failure rather than
+    // flashing an error over content the user is reading.
+    if (!silent) chatsList.innerHTML = '<div class="empty">error: ' + e + '</div>';
   }
 }
 
@@ -3084,25 +3090,27 @@ document.querySelector('[data-action="cal-next"]').addEventListener("click", () 
   calSelectedDay = null;
   renderCalendar();
 });
-async function renderCalendar() {
+async function renderCalendar(silent) {
+  // Header text always reflects the month being shown — not a "loading"
+  // signal — so update it up-front in both modes.
   document.getElementById("cal-title").textContent =
     MONTH_NAMES[calMonth - 1] + " " + calYear;
   const grid = document.getElementById("cal-grid");
-  grid.innerHTML = "";
 
-  ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"].forEach(d => {
-    const el = document.createElement("div");
-    el.className = "dow";
-    el.textContent = d;
-    grid.appendChild(el);
-  });
+  // Loud mode: blank the grid so the user sees the change is being
+  // processed. Silent mode: leave the existing grid in place until the
+  // replacement is ready, then swap it in atomically.
+  if (!silent) grid.innerHTML = "";
 
   let events = [];
   try {
     const r = await fetch(`/calendar/${calYear}/${calMonth}`);
     const data = await r.json();
     events = data.events || [];
-  } catch (e) { /* show empty grid */ }
+  } catch (e) {
+    // Silent refresh failure: leave whatever's already rendered alone.
+    if (silent) return;
+  }
 
   // Bucket events by day-of-month.
   const byDay = {};
@@ -3116,13 +3124,20 @@ async function renderCalendar() {
   const firstDow = new Date(calYear, calMonth - 1, 1).getDay();
   const daysInMonth = new Date(calYear, calMonth, 0).getDate();
 
-  // Leading blanks
+  // Build into a fragment so the swap is one paint, not 40+ appends over a
+  // visibly-clearing grid.
+  const frag = document.createDocumentFragment();
+  ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"].forEach(d => {
+    const el = document.createElement("div");
+    el.className = "dow";
+    el.textContent = d;
+    frag.appendChild(el);
+  });
   for (let i = 0; i < firstDow; i++) {
     const c = document.createElement("div");
     c.className = "cal-cell empty";
-    grid.appendChild(c);
+    frag.appendChild(c);
   }
-
   const isCurrentMonth = (calYear === now.getFullYear() && calMonth === now.getMonth() + 1);
   for (let d = 1; d <= daysInMonth; d++) {
     const cell = document.createElement("div");
@@ -3140,11 +3155,13 @@ async function renderCalendar() {
       cell.appendChild(e);
     });
     cell.addEventListener("click", () => selectDay(d));
-    grid.appendChild(cell);
+    frag.appendChild(cell);
   }
+  grid.innerHTML = "";
+  grid.appendChild(frag);
 
-  if (calSelectedDay !== null) loadDayEvents(calSelectedDay);
-  else document.getElementById("day-detail").innerHTML =
+  if (calSelectedDay !== null) loadDayEvents(calSelectedDay, silent);
+  else if (!silent) document.getElementById("day-detail").innerHTML =
     '<div class="empty">select a day</div>';
 }
 
@@ -3157,9 +3174,9 @@ function selectDay(d) {
   loadDayEvents(d);
 }
 
-async function loadDayEvents(d) {
+async function loadDayEvents(d, silent) {
   const detail = document.getElementById("day-detail");
-  detail.innerHTML = '<div class="empty">loading…</div>';
+  if (!silent) detail.innerHTML = '<div class="empty">loading…</div>';
   try {
     const r = await fetch(`/calendar/${calYear}/${calMonth}/${d}`);
     const data = await r.json();
@@ -3192,7 +3209,7 @@ async function loadDayEvents(d) {
       detail.appendChild(item);
     });
   } catch (e) {
-    detail.innerHTML = '<div class="empty">error: ' + e + '</div>';
+    if (!silent) detail.innerHTML = '<div class="empty">error: ' + e + '</div>';
   }
 }
 
@@ -3216,25 +3233,33 @@ const topicCountEl = document.getElementById("topic-count");
 let selectedTopicId = null;
 let allTopics = [];
 
-async function loadTopics() {
-  // Reopening the pane always lands on the browser, not a stale topic view.
-  sideColEl.classList.remove("topic-open");
-  topicListEl.innerHTML = '<div class="empty">loading…</div>';
+async function loadTopics(silent) {
+  if (!silent) {
+    // Loud mode (user opened the pane or hit refresh): drop any open topic
+    // view, blank the list. Silent mode leaves both alone — the open topic
+    // is refreshed separately by refreshOpenTopic.
+    sideColEl.classList.remove("topic-open");
+    topicListEl.innerHTML = '<div class="empty">loading…</div>';
+  }
   try {
     const r = await fetch("/topics");
     const data = await r.json();
     allTopics = data.topics || [];
     if (!allTopics.length) {
       topicListEl.innerHTML = '<div class="empty">no topics</div>';
-      topicToolbarEl.classList.remove("show");
-      topicBodyEl.innerHTML = '<div class="empty">select a topic</div>';
+      if (!silent) {
+        topicToolbarEl.classList.remove("show");
+        topicBodyEl.innerHTML = '<div class="empty">select a topic</div>';
+      }
       topicCountEl.textContent = "";
       return;
     }
     renderTopicList();
   } catch (e) {
-    topicListEl.innerHTML = '<div class="empty">error: ' + e + '</div>';
-    topicCountEl.textContent = "";
+    if (!silent) {
+      topicListEl.innerHTML = '<div class="empty">error: ' + e + '</div>';
+      topicCountEl.textContent = "";
+    }
   }
 }
 
