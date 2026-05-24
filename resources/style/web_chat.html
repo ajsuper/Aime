@@ -1408,6 +1408,32 @@
               details, and full error text.</p>
           </div>
           <div class="settings-section">
+            <h3>Date & time</h3>
+            <p class="desc">How dates and times are displayed. Doesn't change
+              how Aime stores them internally.</p>
+            <div class="settings-row">
+              <span class="label">Date format</span>
+              <select id="date-format-select">
+                <option value="auto">Automatic (based on your region)</option>
+                <option value="MM/DD/YYYY">MM/DD/YYYY (e.g. 05/23/2026)</option>
+                <option value="DD/MM/YYYY">DD/MM/YYYY (e.g. 23/05/2026)</option>
+                <option value="YYYY-MM-DD">YYYY-MM-DD (e.g. 2026-05-23)</option>
+                <option value="MM/DD/YY">MM/DD/YY (e.g. 05/23/26)</option>
+                <option value="DD/MM/YY">DD/MM/YY (e.g. 23/05/26)</option>
+                <option value="D MMM YYYY">D MMM YYYY (e.g. 23 May 2026)</option>
+                <option value="MMM D, YYYY">MMM D, YYYY (e.g. May 23, 2026)</option>
+              </select>
+            </div>
+            <div class="settings-row">
+              <span class="label">Time format</span>
+              <select id="time-format-select">
+                <option value="auto">Automatic (based on your region)</option>
+                <option value="12">12-hour (e.g. 3:45 PM)</option>
+                <option value="24">24-hour (e.g. 15:45)</option>
+              </select>
+            </div>
+          </div>
+          <div class="settings-section">
             <h3>About</h3>
             <p class="wordmark">Aime</p>
             <p class="desc">Your personal assistant.</p>
@@ -3181,18 +3207,19 @@ async function loadDayEvents(d, silent) {
     const r = await fetch(`/calendar/${calYear}/${calMonth}/${d}`);
     const data = await r.json();
     const events = data.events || [];
+    const dayLabel = formatDateParts(d, calMonth, calYear);
     if (!events.length) {
-      detail.innerHTML = `<div class="empty">no events on ${String(d).padStart(2,"0")}/${String(calMonth).padStart(2,"0")}/${calYear}</div>`;
+      detail.innerHTML = `<div class="empty">no events on ${dayLabel}</div>`;
       return;
     }
-    detail.innerHTML = `<h4>${String(d).padStart(2,"0")}/${String(calMonth).padStart(2,"0")}/${calYear}</h4>`;
+    detail.innerHTML = `<h4>${dayLabel}</h4>`;
     events.forEach(ev => {
       const item = document.createElement("div");
       item.className = "ev-item";
       const head = document.createElement("div");
       head.className = "ev-head";
-      let h = ev.date || "";
-      if (ev.time) h += " " + ev.time;
+      let h = formatBackendDate(ev.date || "");
+      if (ev.time) h += " " + formatBackendTime(ev.time);
       if (ev.category) h += "  #" + ev.category;
       head.textContent = h;
       const title = document.createElement("div");
@@ -3637,6 +3664,111 @@ verbositySelect.value = verbosity;
 verbositySelect.addEventListener("change", () => {
   verbosity = verbositySelect.value;
   localStorage.setItem(VERBOSITY_KEY, verbosity);
+});
+
+// -- Date & time format -------------------------------------------------
+// Display-only preference. Internal storage (DD/MM/YYYY from the backend,
+// HH:MM 24h for event times) is untouched — we just reformat at render
+// time. "auto" derives the regional default from the browser's Intl data.
+
+const DATE_FORMAT_KEY = "aime.dateFormat";
+const TIME_FORMAT_KEY = "aime.timeFormat";
+const dateFormatSelect = document.getElementById("date-format-select");
+const timeFormatSelect = document.getElementById("time-format-select");
+
+let dateFormat = localStorage.getItem(DATE_FORMAT_KEY) || "auto";
+let timeFormat = localStorage.getItem(TIME_FORMAT_KEY) || "auto";
+dateFormatSelect.value = dateFormat;
+timeFormatSelect.value = timeFormat;
+
+const MONTH_ABBR = ["Jan","Feb","Mar","Apr","May","Jun",
+                    "Jul","Aug","Sep","Oct","Nov","Dec"];
+
+// Detect the regional date-component order by inspecting a formatted sample.
+function _autoDatePattern() {
+  try {
+    const sample = new Date(2001, 0, 2);  // Jan 2, 2001 — three distinct parts
+    const parts = new Intl.DateTimeFormat(undefined, { dateStyle: "short" })
+      .formatToParts(sample);
+    const order = parts.filter(p => p.type === "day" || p.type === "month"
+                                 || p.type === "year").map(p => p.type);
+    // Fall back to US short if the locale produced something unexpected.
+    if (order.length !== 3) return "MM/DD/YYYY";
+    const map = { day: "DD", month: "MM", year: "YYYY" };
+    return order.map(t => map[t]).join("/");
+  } catch (e) {
+    return "MM/DD/YYYY";
+  }
+}
+
+function _autoUse24h() {
+  try {
+    return Intl.DateTimeFormat(undefined, { hour: "numeric" })
+                 .resolvedOptions().hour12 === false;
+  } catch (e) {
+    return false;
+  }
+}
+
+// Format a date given its (day, month, year) integers.
+function formatDateParts(d, m, y) {
+  const pattern = dateFormat === "auto" ? _autoDatePattern() : dateFormat;
+  const dd = String(d).padStart(2, "0");
+  const mm = String(m).padStart(2, "0");
+  const yyyy = String(y);
+  const yy = yyyy.slice(-2);
+  const mon = MONTH_ABBR[(m - 1 + 12) % 12] || "";
+  switch (pattern) {
+    case "MM/DD/YYYY": return `${mm}/${dd}/${yyyy}`;
+    case "DD/MM/YYYY": return `${dd}/${mm}/${yyyy}`;
+    case "YYYY-MM-DD": return `${yyyy}-${mm}-${dd}`;
+    case "MM/DD/YY":   return `${mm}/${dd}/${yy}`;
+    case "DD/MM/YY":   return `${dd}/${mm}/${yy}`;
+    case "D MMM YYYY": return `${d} ${mon} ${yyyy}`;
+    case "MMM D, YYYY":return `${mon} ${d}, ${yyyy}`;
+    default:           return `${mm}/${dd}/${yyyy}`;
+  }
+}
+
+// Backend ev.date is "DD/MM/YYYY". Reformat without touching invalid input.
+function formatBackendDate(ddmmyyyy) {
+  if (!ddmmyyyy) return "";
+  const parts = ddmmyyyy.split("/");
+  if (parts.length !== 3) return ddmmyyyy;
+  const d = parseInt(parts[0], 10);
+  const m = parseInt(parts[1], 10);
+  const y = parseInt(parts[2], 10);
+  if (Number.isNaN(d) || Number.isNaN(m) || Number.isNaN(y)) return ddmmyyyy;
+  return formatDateParts(d, m, y);
+}
+
+// Backend ev.time is "HH:MM" 24-hour.
+function formatBackendTime(hhmm) {
+  if (!hhmm) return "";
+  const parts = hhmm.split(":");
+  if (parts.length < 2) return hhmm;
+  let h = parseInt(parts[0], 10);
+  const m = parseInt(parts[1], 10);
+  if (Number.isNaN(h) || Number.isNaN(m)) return hhmm;
+  const use24 = timeFormat === "auto" ? _autoUse24h() : timeFormat === "24";
+  const mm = String(m).padStart(2, "0");
+  if (use24) return `${String(h).padStart(2, "0")}:${mm}`;
+  const suffix = h >= 12 ? "PM" : "AM";
+  h = h % 12;
+  if (h === 0) h = 12;
+  return `${h}:${mm} ${suffix}`;
+}
+
+dateFormatSelect.addEventListener("change", () => {
+  dateFormat = dateFormatSelect.value;
+  localStorage.setItem(DATE_FORMAT_KEY, dateFormat);
+  if (calSelectedDay !== null) loadDayEvents(calSelectedDay, /*silent=*/true);
+});
+
+timeFormatSelect.addEventListener("change", () => {
+  timeFormat = timeFormatSelect.value;
+  localStorage.setItem(TIME_FORMAT_KEY, timeFormat);
+  if (calSelectedDay !== null) loadDayEvents(calSelectedDay, /*silent=*/true);
 });
 
 // -- Settings modal -----------------------------------------------------
