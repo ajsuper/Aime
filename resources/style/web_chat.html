@@ -2101,6 +2101,30 @@ function appendNewSessionSplash(text) {
   return wrap;
 }
 
+// Map a tool_name (agent-side name) to a short human-readable action label
+// for Standard verbosity notices.
+function toolLabel(toolName, toolDetails) {
+  switch (toolName) {
+    case "FilterUsersEvents":    return "Filtering events…";
+    case "FilterTopics":         return "Filtering topics…";
+    case "CreateEvent":          return "Creating event…";
+    case "EditEvent":            return "Editing event…";
+    case "CreateTopic":          return "Creating topic…";
+    case "ReplaceTopic":         return "Updating topic…";
+    case "GetTopicContents":     return "Reading topic…";
+    case "ReplaceTopicContents": return "Updating topic…";
+    case "EditTopicContents":    return "Editing topic…";
+    case "web_search": {
+      const m = toolDetails && toolDetails.match(/^query="(.+)"$/);
+      return m ? "Searching the web for '" + m[1] + "'…" : "Searching the web…";
+    }
+    default:
+      return toolName
+        ? toolName.replace(/([A-Z])/g, " $1").trim() + "…"
+        : "Working…";
+  }
+}
+
 // Minimal-verbosity status line: a single reusable "Working…" notice shown
 // while tools run, instead of one notice per call. `showWorkingIndicator`
 // moves it to the end of the log so it stays as the latest line.
@@ -2113,6 +2137,11 @@ function showWorkingIndicator() {
   }
   logInner.appendChild(workingIndicator);  // append, or move existing to end
   scrollToBottom();
+}
+// Leave the "Working…" line visible in the transcript but stop tracking it
+// so future tool calls create a fresh one. Used by turn_end in minimal mode.
+function freezeWorkingIndicator() {
+  workingIndicator = null;
 }
 function clearWorkingIndicator() {
   if (workingIndicator) {
@@ -2338,7 +2367,7 @@ es.onmessage = (ev) => {
         appendNotice("· tool: " + e.tool_name +
                      (e.tool_details ? " — " + e.tool_details : ""), "info");
       } else if (verbosity === "standard") {
-        appendNotice("Filtering events…", "info");
+        appendNotice(toolLabel(e.tool_name, e.tool_details), "info");
       } else {  // minimal — a single shared status line
         showWorkingIndicator();
       }
@@ -2351,7 +2380,8 @@ es.onmessage = (ev) => {
       }
       break;
     case "turn_end":
-      clearWorkingIndicator();
+      if (verbosity === "minimal") freezeWorkingIndicator();
+      else clearWorkingIndicator();
       if (e.stop_reason === "end_turn") currentAssistant = null;
       if (e.stop_reason === "end_turn" || e.stop_reason === "interrupted") {
         modelBusy = false;
