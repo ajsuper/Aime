@@ -2378,10 +2378,15 @@ es.onmessage = (ev) => {
                      (e.tool_result_summary ? " — " + e.tool_result_summary : ""),
                      "info");
       }
+      scheduleActivePaneRefresh();
       break;
     case "turn_end":
       if (verbosity === "minimal") freezeWorkingIndicator();
       else clearWorkingIndicator();
+      // Catches title-refresh, which runs in a background Haiku thread on
+      // turn end and isn't tied to any tool call — scheduleActivePaneRefresh
+      // alone wouldn't see it.
+      scheduleActivePaneRefresh();
       if (e.stop_reason === "end_turn") currentAssistant = null;
       if (e.stop_reason === "end_turn" || e.stop_reason === "interrupted") {
         modelBusy = false;
@@ -2880,12 +2885,53 @@ document.querySelectorAll(".pane-btn").forEach(btn => {
 
 document.getElementById("side-close").addEventListener("click", closeSide);
 
-// One refresh button in the shared header — reloads whichever pane is open.
-document.getElementById("side-refresh").addEventListener("click", () => {
+// Reload whichever pane is currently open. Used by the explicit refresh
+// button in the header, by the auto-refresh hooks below, and by the
+// visibility-change fallback.
+function refreshActivePane() {
   if (activePaneName === "chats") loadChats();
   else if (activePaneName === "calendar") renderCalendar();
-  else if (activePaneName === "topics") loadTopics();
+  else if (activePaneName === "topics") { loadTopics(); refreshOpenTopic(); }
+}
+
+// Re-fetch the currently-open topic's contents in place. Skipped when the
+// user is mid-edit so we don't clobber unsaved work.
+function refreshOpenTopic() {
+  if (!selectedTopicId || topicEditing) return;
+  fetch("/topics/" + encodeURIComponent(selectedTopicId))
+    .then(r => r.json())
+    .then(data => {
+      const md = data.contents || "";
+      currentTopicMarkdown = md;
+      if (!md.trim()) topicBodyEl.innerHTML = '<div class="empty">(empty)</div>';
+      else renderTopicMarkdown(md);
+    })
+    .catch(() => {});
+}
+
+// Debounced auto-refresh of the active pane. Tool results often arrive in
+// bursts (filter, then edit, then re-filter); collapse them into one
+// refresh at the tail of the burst so we make at most one fetch per pane
+// per turn regardless of how many tools the model ran. The cost of a
+// "wasted" refresh after a read-only tool is one cheap JSON fetch, only
+// when a pane is open — well worth not maintaining a tool→pane map.
+let paneRefreshTimer = null;
+function scheduleActivePaneRefresh() {
+  if (!activePaneName) return;
+  if (paneRefreshTimer != null) clearTimeout(paneRefreshTimer);
+  paneRefreshTimer = setTimeout(() => {
+    paneRefreshTimer = null;
+    refreshActivePane();
+  }, 250);
+}
+
+// Fallback for the case the user switched tabs while the model was busy —
+// when they come back, immediately pull fresh data.
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") refreshActivePane();
 });
+
+document.getElementById("side-refresh").addEventListener("click", refreshActivePane);
 
 function activatePane(name) {
   activePaneName = name;
