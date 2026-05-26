@@ -41,7 +41,7 @@ class CalendarService:
     def __init__(self, gateway: ToolGateway):
         self._gw = gateway
 
-    def events_for_month(self, year: int, month: int) -> list[dict]:
+    def events_for_month(self, year: int, month: int, *, include_archived: bool = False) -> list[dict]:
         """Every event with a date in the given month/year. Uses a wide-day
         range so events on day 31 still come back regardless of how the
         backend interprets day boundaries."""
@@ -52,10 +52,11 @@ class CalendarService:
             filter_by_date=True,
             start_date=f"00/{mm}/{year}",
             end_date=f"40/{mm}/{year}",
+            archived="all" if include_archived else "active_only",
         )
         return _events_from(data)
 
-    def events_for_day(self, year: int, month: int, day: int) -> list[dict]:
+    def events_for_day(self, year: int, month: int, day: int, *, include_archived: bool = False) -> list[dict]:
         day_str = f"{day:02d}/{month:02d}/{year}"
         data = self._gw.call(
             "get_events",
@@ -63,6 +64,7 @@ class CalendarService:
             filter_by_date=True,
             start_date=day_str,
             end_date=day_str,
+            archived="all" if include_archived else "active_only",
         )
         return _events_from(data)
 

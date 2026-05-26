@@ -23,8 +23,8 @@
             --r-sm: 10px;
             --r-md: 14px;
             --r-lg: 20px; }
-    /* Default theme — Creativity (light). Retro-Apple offwhite with pastel-rainbow accents. */
-    :root, :root[data-theme="creativity"] {
+    /* Creativity (light). Retro-Apple offwhite with pastel-rainbow accents. */
+    :root[data-theme="creativity"] {
       color-scheme: light;
       --bg: #F4F0E6;
       --bg-elev: #FBF8F0;
@@ -56,8 +56,8 @@
       --error: #D9817F;
       --success: #6DAE84;
     }
-    /* Creativity (dark) — same pastel-rainbow language on a warm near-black. */
-    :root[data-theme="creativity-dark"] {
+    /* Default theme — Creativity (dark). Same pastel-rainbow language on a warm near-black. */
+    :root, :root[data-theme="creativity-dark"] {
       color-scheme: dark;
       --bg: #1E1C18;
       --bg-elev: #28251F;
@@ -1130,6 +1130,21 @@
     /* Schedule and pill events should look interactive. */
     .cal-sched .ev-block, .cal-sched .ev-pill,
     .cal-cell .ev { cursor: pointer; }
+
+    /* Archived events stay visible so users see their history, but are
+       desaturated and dimmed so active events read first. Strike-through on
+       the title makes the archived state unambiguous up close. */
+    .cal-cell .ev.archived,
+    .cal-sched .ev-pill.archived,
+    .cal-sched .ev-block.archived {
+      opacity: 0.45;
+      filter: grayscale(0.7);
+      text-decoration: line-through;
+      text-decoration-thickness: 1px;
+    }
+    .cal-sched .ev-block.archived:hover,
+    .cal-sched .ev-pill.archived:hover,
+    .cal-cell .ev.archived:hover { opacity: 0.75; }
 
     /* Settings modal: floating panel over a blurred chat backdrop. */
     #settings-backdrop {
@@ -3656,7 +3671,7 @@ async function renderMonthView(silent) {
     cell.appendChild(num);
     (byDay[d] || []).slice(0, 3).forEach(ev => {
       const e = document.createElement("div");
-      e.className = "ev";
+      e.className = "ev" + (ev.archived ? " archived" : "");
       e.textContent = "• " + (ev.title || ev.name || "(untitled)");
       cell.appendChild(e);
     });
@@ -3890,7 +3905,7 @@ function buildDayColumn(date, events, sched, allDayCol, hourPx, startHour, endHo
       // All-day: render a pill in the strip rather than a positioned block.
       if (allDayCol) {
         const pill = document.createElement("div");
-        pill.className = "ev-pill";
+        pill.className = "ev-pill" + (ev.archived ? " archived" : "");
         pill.textContent = ev.title || ev.name || "(untitled)";
         pill.addEventListener("click", (e) => {
           e.stopPropagation();
@@ -3901,7 +3916,7 @@ function buildDayColumn(date, events, sched, allDayCol, hourPx, startHour, endHo
       return;
     }
     const block = document.createElement("div");
-    block.className = "ev-block";
+    block.className = "ev-block" + (ev.archived ? " archived" : "");
     block.style.top = ((start - startMin) / 60 * hourPx) + "px";
     block.style.height = Math.max(18, DEFAULT_EV_MIN / 60 * hourPx) + "px";
     const t = document.createElement("div");
@@ -4681,7 +4696,7 @@ document.getElementById("menu-btn").addEventListener("click", openSettings);
 // -- Theme picker -------------------------------------------------------
 
 const THEME_KEY = "aime.theme";
-const DEFAULT_THEME = "creativity";
+const DEFAULT_THEME = "creativity-dark";
 const themeSelect = document.getElementById("theme-select");
 
 function applyTheme(name) {

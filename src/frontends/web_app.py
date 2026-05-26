@@ -1320,7 +1320,7 @@ def delete_all_sessions():
 @login_required
 def calendar_month(year: int, month: int):
     try:
-        events = _context_for(g.user_id).calendar_service.events_for_month(year, month)
+        events = _context_for(g.user_id).calendar_service.events_for_month(year, month, include_archived=True)
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 500
     return jsonify({"events": events})
@@ -1331,7 +1331,7 @@ def calendar_month(year: int, month: int):
 def calendar_day(year: int, month: int, day: int):
     try:
         events = sort_events_by_date(
-            _context_for(g.user_id).calendar_service.events_for_day(year, month, day)
+            _context_for(g.user_id).calendar_service.events_for_day(year, month, day, include_archived=True)
         )
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 500
