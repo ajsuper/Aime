@@ -1338,6 +1338,35 @@ def calendar_day(year: int, month: int, day: int):
     return jsonify({"events": events})
 
 
+@app.route("/calendar/events/<int:event_id>", methods=["PUT"])
+@login_required
+def calendar_event_update(event_id: int):
+    """Replace an event's fields (and/or toggle archived). The frontend
+    sends the full record back, which matches the backend tool's contract."""
+    data = request.get_json(silent=True) or {}
+    title = data.get("title")
+    summary = data.get("summary")
+    category = data.get("category")
+    date = data.get("date")
+    time_ = data.get("time", "")
+    archived = data.get("archived", False)
+    if not isinstance(title, str) or not isinstance(date, str):
+        return jsonify({"ok": False, "error": "title and date are required"}), 400
+    try:
+        result = _context_for(g.user_id).calendar_service.replace_event(
+            event_id,
+            title=title,
+            summary=summary if isinstance(summary, str) else "",
+            category=category if isinstance(category, str) else "",
+            date=date,
+            time=time_ if isinstance(time_, str) else "",
+            archived=bool(archived),
+        )
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    return jsonify({"ok": True, "result": result})
+
+
 @app.route("/stt/models", methods=["GET"])
 @login_required
 def stt_models():

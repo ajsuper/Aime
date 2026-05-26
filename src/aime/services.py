@@ -66,6 +66,24 @@ class CalendarService:
         )
         return _events_from(data)
 
+    def replace_event(
+        self, event_id: int, *, title: str, summary: str, category: str,
+        date: str, time: str, archived: bool,
+    ) -> dict:
+        """Edit / archive an existing event. Mirrors the backend's
+        `replace_event` tool — caller supplies the full record so a partial
+        edit always sends the unchanged fields too."""
+        return self._gw.call(
+            "replace_event",
+            id=event_id,
+            title=title,
+            summary=summary,
+            category=category,
+            date=date,
+            time=time,
+            archived=archived,
+        )
+
 
 class TopicService:
     """Query helpers for the topics store."""

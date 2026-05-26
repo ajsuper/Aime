@@ -848,6 +848,10 @@
                                                 font-size: 1rem; color: var(--text);
                                                 font-weight: 600; }
     .cal-sched .sched-head .day-head.today .dow-num { color: var(--accent); }
+    .cal-sched .sched-head .day-head .dow-rel { display: block; margin-top: 2px;
+                                                font-size: 0.7rem; color: var(--muted);
+                                                font-weight: 500; letter-spacing: 0; }
+    .cal-sched .sched-head .day-head.today .dow-rel { color: var(--accent); }
     .cal-sched .sched-head .day-head.today {
         background: color-mix(in srgb, var(--accent) 14%, transparent); }
 
@@ -918,8 +922,16 @@
                                        border-right: 1px solid var(--border); }
     .cal-sched .allday .allday-col { padding: 4px; min-height: 22px;
                                      border-right: 1px solid var(--border);
-                                     display: flex; flex-wrap: wrap; gap: 3px;
+                                     display: flex; flex-direction: column;
+                                     align-items: stretch;
+                                     justify-content: flex-start;
+                                     gap: 3px;
                                      min-width: 0; overflow: hidden; }
+    /* Each pill is one row tall regardless of how many its sibling
+       columns have. Without explicit sizing, flex stretches a lone pill
+       vertically to fill the column when another column in the same grid
+       row is taller. */
+    .cal-sched .allday .ev-pill { flex: 0 0 auto; }
     .cal-sched .allday .allday-col:last-child { border-right: none; }
     .cal-sched .allday .ev-pill { background: rgba(124, 140, 255, 0.18);
                                   color: var(--text); padding: 1px 8px;
@@ -1045,6 +1057,79 @@
 
     /* Tab bar is gone — left rail controls which pane is open. */
     #tabbar { display: none; }
+
+    /* Generic modal styling — reused by the event detail modal so we don't
+       fork the settings-only ruleset. */
+    .modal-backdrop { position: fixed; inset: 0; z-index: 210;
+                      background: rgba(15, 12, 10, 0.45);
+                      backdrop-filter: blur(8px);
+                      -webkit-backdrop-filter: blur(8px);
+                      display: flex; align-items: center; justify-content: center;
+                      padding: 2rem; animation: settings-fade 0.15s ease-out; }
+    .modal-backdrop[hidden] { display: none; }
+    .modal-card { background: var(--bg-elev); border: 1px solid var(--border);
+                  border-radius: var(--r-md); width: 100%; max-width: 480px;
+                  max-height: 100%; display: flex; flex-direction: column;
+                  box-shadow: var(--shadow-2, 0 20px 60px rgba(0,0,0,0.55));
+                  animation: settings-rise 0.18s ease-out; }
+    .modal-head { display: flex; align-items: center; gap: 0.5rem;
+                  padding: 0.85rem 1rem 0.85rem 1.25rem;
+                  border-bottom: 1px solid var(--border); flex-shrink: 0; }
+    .modal-head .title { flex: 1; font-weight: 600; font-size: 1.05rem;
+                         font-family: var(--font-display); }
+    .modal-close { background: transparent; border: 0; color: var(--muted);
+                   width: 32px; height: 32px; border-radius: 6px; cursor: pointer;
+                   display: flex; align-items: center; justify-content: center;
+                   padding: 0; transition: color 0.15s, background 0.15s; }
+    .modal-close:hover { color: var(--text); background: rgba(255,255,255,0.06); }
+    .modal-close svg { width: 16px; height: 16px; }
+    .modal-body { overflow-y: auto; padding: 1.1rem 1.25rem;
+                  display: flex; flex-direction: column; gap: 0.85rem; }
+    .modal-foot { display: flex; gap: 0.5rem; align-items: center;
+                  padding: 0.75rem 1rem; border-top: 1px solid var(--border); }
+    .modal-foot .spacer { flex: 1; }
+    .modal-foot button { background: transparent; color: var(--text);
+                         border: 1px solid var(--border); border-radius: 6px;
+                         padding: 0.4rem 0.9rem; cursor: pointer; font: inherit;
+                         font-size: 0.85rem; transition: background 0.15s, border-color 0.15s; }
+    .modal-foot button:hover { border-color: var(--accent); }
+    .modal-foot button.primary { background: var(--accent); border-color: var(--accent);
+                                 color: white; }
+    .modal-foot button.primary:hover { background: var(--accent-hover);
+                                       border-color: var(--accent-hover); }
+    .modal-foot button.danger { color: var(--warning, #e29a4a);
+                                border-color: color-mix(in srgb,
+                                  var(--warning, #e29a4a) 60%, var(--border)); }
+    .modal-foot button.danger:hover { background:
+        color-mix(in srgb, var(--warning, #e29a4a) 15%, transparent); }
+
+    /* Event modal field rows */
+    .ev-field { display: flex; flex-direction: column; gap: 0.3rem; flex: 1;
+                min-width: 0; }
+    .ev-field .lbl { font-size: 0.72rem; color: var(--muted);
+                     text-transform: uppercase; letter-spacing: 0.08em;
+                     font-weight: 600; }
+    .ev-field input, .ev-field textarea {
+        background: var(--bg-input); color: var(--text);
+        border: 1px solid var(--border); border-radius: 6px;
+        padding: 0.45rem 0.6rem; font: inherit; font-size: 0.9rem;
+        transition: border-color 0.15s, box-shadow 0.15s;
+        font-family: inherit; }
+    .ev-field textarea { resize: vertical; min-height: 4em;
+                         font-family: inherit; }
+    .ev-field input:focus, .ev-field textarea:focus {
+        outline: none; border-color: var(--accent);
+        box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 30%, transparent); }
+    .ev-field input:disabled, .ev-field textarea:disabled {
+        background: transparent; border-color: transparent;
+        color: var(--text); cursor: default;
+        padding-left: 0; padding-right: 0; }
+    .ev-row { display: flex; gap: 0.85rem; }
+    .ev-modal-error { color: var(--warning, #e29a4a); font-size: 0.8rem;
+                      margin: 0; }
+    /* Schedule and pill events should look interactive. */
+    .cal-sched .ev-block, .cal-sched .ev-pill,
+    .cal-cell .ev { cursor: pointer; }
 
     /* Settings modal: floating panel over a blurred chat backdrop. */
     #settings-backdrop {
@@ -1553,6 +1638,58 @@
   </div>
   <div id="drop-overlay">Drop files to attach</div>
   <div id="voice-toast" role="status" aria-live="polite"></div>
+
+  <!-- Event detail / edit modal. Opened by clicking an event block or
+       all-day pill in any calendar view. Stores the active event id in
+       a data-attribute so save/archive know which record to PUT. -->
+  <div id="event-backdrop" class="modal-backdrop" role="dialog"
+       aria-modal="true" aria-labelledby="event-modal-title" hidden>
+    <div id="event-modal" class="modal-card">
+      <div class="modal-head">
+        <span class="title" id="event-modal-title">Event</span>
+        <button class="modal-close" id="event-close" title="Close"
+                aria-label="Close">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M6 6l12 12M18 6L6 18"/>
+          </svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <label class="ev-field">
+          <span class="lbl">Title</span>
+          <input type="text" id="ev-f-title" disabled>
+        </label>
+        <div class="ev-row">
+          <label class="ev-field">
+            <span class="lbl">Date</span>
+            <input type="date" id="ev-f-date" disabled>
+          </label>
+          <label class="ev-field ev-time-field">
+            <span class="lbl">Time</span>
+            <input type="time" id="ev-f-time" disabled>
+          </label>
+        </div>
+        <label class="ev-field">
+          <span class="lbl">Category</span>
+          <input type="text" id="ev-f-category" disabled>
+        </label>
+        <label class="ev-field">
+          <span class="lbl">Summary</span>
+          <textarea id="ev-f-summary" rows="4" disabled></textarea>
+        </label>
+        <p class="ev-modal-error" id="ev-modal-error" hidden></p>
+      </div>
+      <div class="modal-foot">
+        <button id="ev-archive-btn" class="danger">Archive</button>
+        <span class="spacer"></span>
+        <button id="ev-cancel-btn" hidden>Cancel</button>
+        <button id="ev-edit-btn">Edit</button>
+        <button id="ev-save-btn" class="primary" hidden>Save</button>
+      </div>
+    </div>
+  </div>
+
   <div id="settings-backdrop" role="dialog" aria-modal="true" aria-labelledby="settings-title">
     <div id="settings-modal">
       <div class="settings-header">
@@ -3326,6 +3463,34 @@ function sameYMD(a, b) {
       && a.getDate() === b.getDate();
 }
 
+// "Today", "Tomorrow", "Yesterday", "In N days", "N days ago", etc. Past
+// a couple of weeks we switch to weeks/months/years so the label stays
+// readable instead of becoming "In 47 days".
+function relativeDayLabel(date) {
+  const a = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+  const b = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const diffDays = Math.round((a - b) / 86400000);
+  if (diffDays === 0) return "Today";
+  if (diffDays === 1) return "Tomorrow";
+  if (diffDays === -1) return "Yesterday";
+  const abs = Math.abs(diffDays);
+  const future = diffDays > 0;
+  if (abs < 14) {
+    return future ? `In ${abs} days` : `${abs} days ago`;
+  }
+  if (abs < 60) {
+    const w = Math.round(abs / 7);
+    return future ? `In ${w} weeks` : `${w} weeks ago`;
+  }
+  if (abs < 365) {
+    const m = Math.round(abs / 30);
+    return future ? `In ${m} months` : `${m} months ago`;
+  }
+  const y = Math.round(abs / 365);
+  return future ? `In ${y} year${y === 1 ? "" : "s"}`
+                : `${y} year${y === 1 ? "" : "s"} ago`;
+}
+
 document.querySelector('[data-action="cal-prev"]').addEventListener("click",
   () => moveCalCursor(-1));
 document.querySelector('[data-action="cal-next"]').addEventListener("click",
@@ -3564,6 +3729,148 @@ function buildHourGutter(hourPx, startHour, endHour) {
   return g;
 }
 
+// -- Event modal --------------------------------------------------------
+// Holds the event currently being displayed so save/archive know what to
+// PUT. Stores the original record so cancel can revert without re-fetching.
+let activeEventRecord = null;
+const eventBackdrop = document.getElementById("event-backdrop");
+const evFTitle = document.getElementById("ev-f-title");
+const evFDate = document.getElementById("ev-f-date");
+const evFTime = document.getElementById("ev-f-time");
+const evFCategory = document.getElementById("ev-f-category");
+const evFSummary = document.getElementById("ev-f-summary");
+const evEditBtn = document.getElementById("ev-edit-btn");
+const evSaveBtn = document.getElementById("ev-save-btn");
+const evCancelBtn = document.getElementById("ev-cancel-btn");
+const evArchiveBtn = document.getElementById("ev-archive-btn");
+const evCloseBtn = document.getElementById("ev-close");
+const evModalError = document.getElementById("ev-modal-error");
+
+function backendDateToInput(d) {
+  const m = /^(\d{2})\/(\d{2})\/(\d{4})/.exec(d || "");
+  return m ? `${m[3]}-${m[2]}-${m[1]}` : "";
+}
+function inputDateToBackend(d) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(d || "");
+  return m ? `${m[3]}/${m[2]}/${m[1]}` : "";
+}
+
+function openEventModal(ev) {
+  activeEventRecord = { ...ev };
+  evModalError.hidden = true;
+  evFTitle.value = ev.title || ev.name || "";
+  evFDate.value = backendDateToInput(ev.date || "");
+  evFTime.value = (ev.time || "").trim();
+  evFCategory.value = ev.category || "";
+  evFSummary.value = ev.summary || "";
+  setEventEditMode(false);
+  eventBackdrop.hidden = false;
+  // Defer focus until after the open animation so the input doesn't briefly
+  // show its focus ring on the wrong side of the transform.
+  setTimeout(() => evFTitle.focus({ preventScroll: true }), 0);
+}
+
+function closeEventModal() {
+  eventBackdrop.hidden = true;
+  activeEventRecord = null;
+}
+
+function setEventEditMode(on) {
+  [evFTitle, evFDate, evFTime, evFCategory, evFSummary].forEach(el => {
+    el.disabled = !on;
+  });
+  evEditBtn.hidden = on;
+  evArchiveBtn.hidden = on;
+  evSaveBtn.hidden = !on;
+  evCancelBtn.hidden = !on;
+}
+
+async function saveActiveEvent() {
+  if (!activeEventRecord || activeEventRecord.id == null) return;
+  evModalError.hidden = true;
+  const payload = {
+    title: evFTitle.value.trim(),
+    summary: evFSummary.value,
+    category: evFCategory.value.trim(),
+    date: inputDateToBackend(evFDate.value),
+    time: evFTime.value || "",
+    archived: !!activeEventRecord.archived,
+  };
+  if (!payload.title) {
+    evModalError.textContent = "Title can't be empty.";
+    evModalError.hidden = false;
+    return;
+  }
+  if (!payload.date) {
+    evModalError.textContent = "Pick a date.";
+    evModalError.hidden = false;
+    return;
+  }
+  try {
+    const r = await fetch(
+      "/calendar/events/" + encodeURIComponent(activeEventRecord.id),
+      { method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload) }
+    );
+    const j = await r.json();
+    if (!r.ok || !j.ok) {
+      evModalError.textContent = (j && j.error) || "Couldn't save.";
+      evModalError.hidden = false;
+      return;
+    }
+    closeEventModal();
+    renderCalendar();
+  } catch (err) {
+    evModalError.textContent = "Couldn't save: " + err;
+    evModalError.hidden = false;
+  }
+}
+
+async function archiveActiveEvent() {
+  if (!activeEventRecord || activeEventRecord.id == null) return;
+  const payload = {
+    title: activeEventRecord.title || "",
+    summary: activeEventRecord.summary || "",
+    category: activeEventRecord.category || "",
+    date: activeEventRecord.date || "",
+    time: activeEventRecord.time || "",
+    archived: true,
+  };
+  try {
+    const r = await fetch(
+      "/calendar/events/" + encodeURIComponent(activeEventRecord.id),
+      { method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload) }
+    );
+    const j = await r.json();
+    if (!r.ok || !j.ok) {
+      evModalError.textContent = (j && j.error) || "Couldn't archive.";
+      evModalError.hidden = false;
+      return;
+    }
+    closeEventModal();
+    renderCalendar();
+  } catch (err) {
+    evModalError.textContent = "Couldn't archive: " + err;
+    evModalError.hidden = false;
+  }
+}
+
+evEditBtn.addEventListener("click", () => setEventEditMode(true));
+evCancelBtn.addEventListener("click", () => {
+  // Re-populate from the original record so unsaved edits are dropped.
+  if (activeEventRecord) openEventModal(activeEventRecord);
+});
+evSaveBtn.addEventListener("click", saveActiveEvent);
+evArchiveBtn.addEventListener("click", archiveActiveEvent);
+evCloseBtn.addEventListener("click", closeEventModal);
+eventBackdrop.addEventListener("click", (e) => {
+  if (e.target === eventBackdrop) closeEventModal();
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !eventBackdrop.hidden) closeEventModal();
+});
+
 function buildDayColumn(date, events, sched, allDayCol, hourPx, startHour, endHour) {
   const col = document.createElement("div");
   col.className = "day-col";
@@ -3585,6 +3892,10 @@ function buildDayColumn(date, events, sched, allDayCol, hourPx, startHour, endHo
         const pill = document.createElement("div");
         pill.className = "ev-pill";
         pill.textContent = ev.title || ev.name || "(untitled)";
+        pill.addEventListener("click", (e) => {
+          e.stopPropagation();
+          openEventModal(ev);
+        });
         allDayCol.appendChild(pill);
       }
       return;
@@ -3601,6 +3912,10 @@ function buildDayColumn(date, events, sched, allDayCol, hourPx, startHour, endHo
     title.textContent = ev.title || ev.name || "(untitled)";
     block.appendChild(t);
     block.appendChild(title);
+    block.addEventListener("click", (e) => {
+      e.stopPropagation();
+      openEventModal(ev);
+    });
     col.appendChild(block);
   });
   // Now-line drawn only on today's column, and only if "now" falls in the
@@ -3745,8 +4060,12 @@ async function renderDaySchedule(silent) {
   const num = document.createElement("span");
   num.className = "dow-num";
   num.textContent = `${SHORT_MONTHS[d.getMonth()]} ${d.getDate()}`;
+  const rel = document.createElement("span");
+  rel.className = "dow-rel";
+  rel.textContent = relativeDayLabel(d);
   dh.appendChild(lbl);
   dh.appendChild(num);
+  dh.appendChild(rel);
   head.appendChild(dh);
 
   const hasAllDay = events.some(ev => parseEventMinutes(ev) === null);
