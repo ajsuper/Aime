@@ -822,8 +822,13 @@
                  margin: 0.5rem 0.75rem;
                  border: 1px solid var(--border); border-radius: 10px;
                  overflow: hidden; background: var(--bg);
-                 flex: 0 0 auto; height: var(--cal-body-h); }
+                 flex: 0 0 auto; min-height: var(--cal-body-h); }
     .cal-sched.show { display: flex; flex-direction: column; }
+    /* Day view places the all-day strip at the bottom (below the hour
+       ladder) — gives it a footer feel rather than competing with the
+       header. Flex order on the strip is enough since head/body sit at
+       default order:0 and follow DOM order. */
+    .cal-sched.day .allday { order: 1; }
     .cal-sched .sched-head { display: grid;
                              grid-template-columns: 56px minmax(0, 1fr);
                              background: var(--bg-elev);
@@ -848,11 +853,11 @@
 
     .cal-sched .sched-body { display: grid;
                              grid-template-columns: 56px minmax(0, 1fr);
-                             overflow-y: auto; overscroll-behavior: contain;
                              flex: 1 1 auto; position: relative; }
-    /* Day view sizes the hour ladder to fit the viewport exactly, so no
-       internal scrolling is needed (or wanted — it intercepts page scroll). */
-    .cal-sched.day .sched-body { overflow: hidden; }
+    /* No internal scrolling on the schedule itself — the calendar pane is
+       already scrollable, so let the schedule grow to fit its hours and
+       page-scroll if needed. Avoids two scroll surfaces fighting on the
+       same wheel event. */
     .cal-sched.week .sched-body {
         grid-template-columns: 56px repeat(7, minmax(0, 1fr)); }
     .cal-sched .hour-gutter { display: flex; flex-direction: column;
@@ -922,8 +927,16 @@
                                   max-width: 100%; overflow: hidden;
                                   text-overflow: ellipsis; white-space: nowrap; }
 
-    .day-detail { flex: 0 0 auto; padding: 0.75rem 1rem;
+    .day-detail { flex: 0 0 auto; padding: 0.75rem 0;
                   border-top: 1px solid var(--border); min-height: 80px; }
+    .day-detail[hidden] { display: none; }
+    /* The schedule we drop into the day-detail panel is the same component
+       as the main day view, but with a thinner top margin so it feels like
+       a continuation of the surface above, not a second card. */
+    .day-detail .cal-sched { margin-top: 0; }
+    .cal-sched .sched-head .day-head.selected {
+        box-shadow: inset 0 -2px 0 var(--accent); }
+    .cal-sched.week .sched-head .day-head { cursor: pointer; }
     .day-detail h4 { margin: 0 0 0.5rem; font-size: 0.85rem; color: var(--muted);
                      font-weight: 600; text-transform: uppercase;
                      letter-spacing: 0.05em; }
@@ -3293,7 +3306,8 @@ const calCursor = new Date(now.getFullYear(), now.getMonth(), now.getDate());
 let calView = "month";              // "month" | "week" | "day"
 let calYear = calCursor.getFullYear();
 let calMonth = calCursor.getMonth() + 1;
-let calSelectedDay = null;
+let calSelectedDay = null;          // 1..31, kept in sync for month-cell highlighting
+let calSelectedDate = null;         // Date | null; drives the day-detail panel below
 
 function syncCalAliases() {
   calYear = calCursor.getFullYear();
@@ -3319,6 +3333,7 @@ document.querySelector('[data-action="cal-next"]').addEventListener("click",
 document.getElementById("cal-view").addEventListener("change", (e) => {
   calView = e.target.value;
   calSelectedDay = null;
+  calSelectedDate = null;
   renderCalendar();
 });
 
@@ -3328,8 +3343,10 @@ function moveCalCursor(delta) {
     calCursor.setDate(1);
     calCursor.setMonth(calCursor.getMonth() + delta);
     calSelectedDay = null;
+    calSelectedDate = null;
   } else if (calView === "week") {
     calCursor.setDate(calCursor.getDate() + 7 * delta);
+    calSelectedDate = null;
   } else {
     calCursor.setDate(calCursor.getDate() + delta);
   }
@@ -3370,6 +3387,7 @@ async function fetchEventsInRange(start, end) {
 // scrolling. Both views show a "default day" of 7 AM → 11 PM, expanded on
 // either side to fit any events outside that window.
 const HOUR_PX_WEEK = 44;
+const HOUR_PX_DAY = 48;          // a touch roomier than the week view since one column has the slack
 const DEFAULT_EV_MIN = 50;       // events have no end time — give them a sensible slot
 const DEFAULT_DAY_START = 7;     // earliest hour visible if no events run earlier
 const DEFAULT_DAY_END = 23;      // latest hour boundary visible if no events run later
@@ -3399,16 +3417,25 @@ async function renderCalendar(silent) {
   if (calView === "month") {
     grid.hidden = false;
     sched.classList.remove("show", "week", "day");
-    dayDetail.hidden = false;
-    return renderMonthView(silent);
+  } else {
+    grid.hidden = true;
+    grid.innerHTML = "";
+    sched.classList.add("show");
+    sched.classList.toggle("week", calView === "week");
+    sched.classList.toggle("day", calView === "day");
   }
-  // Day/week share the schedule surface; hide the month-only chrome.
-  grid.hidden = true;
-  grid.innerHTML = "";
-  dayDetail.hidden = true;
-  sched.classList.add("show");
-  sched.classList.toggle("week", calView === "week");
-  sched.classList.toggle("day", calView === "day");
+  // Day-detail (the schedule-style panel below the main view) is hidden in
+  // day view (redundant — the whole pane already shows that day) and in
+  // month/week when nothing's selected. Re-render its schedule whenever a
+  // selection survives a re-render so it stays in sync with edits.
+  if (calView === "day" || !calSelectedDate) {
+    dayDetail.hidden = true;
+    dayDetail.innerHTML = "";
+  } else {
+    dayDetail.hidden = false;
+    showDayDetailSchedule(calSelectedDate);
+  }
+  if (calView === "month") return renderMonthView(silent);
   if (calView === "week") return renderWeekSchedule(silent);
   return renderDaySchedule(silent);
 }
@@ -3468,15 +3495,13 @@ async function renderMonthView(silent) {
       e.textContent = "• " + (ev.title || ev.name || "(untitled)");
       cell.appendChild(e);
     });
-    cell.addEventListener("click", () => selectDay(d));
+    cell.addEventListener("click", () => selectDayCell(
+      new Date(calYear, calMonth - 1, d)
+    ));
     frag.appendChild(cell);
   }
   grid.innerHTML = "";
   grid.appendChild(frag);
-
-  if (calSelectedDay !== null) loadDayEvents(calSelectedDay, silent);
-  else if (!silent) document.getElementById("day-detail").innerHTML =
-    '<div class="empty">select a day</div>';
 }
 
 function formatWeekTitle(start, end) {
@@ -3640,6 +3665,14 @@ async function renderWeekSchedule(silent) {
     num.textContent = date.getDate();
     dh.appendChild(lbl);
     dh.appendChild(num);
+    if (calSelectedDate && sameYMD(date, calSelectedDate)) {
+      dh.classList.add("selected");
+    }
+    // Click reveals the schedule-style day-detail below the week — does
+    // NOT switch the whole pane into day view.
+    dh.addEventListener("click", () => selectDayCell(new Date(
+      date.getFullYear(), date.getMonth(), date.getDate()
+    )));
     head.appendChild(dh);
   }
 
@@ -3731,81 +3764,103 @@ async function renderDaySchedule(silent) {
   }
 
   body.innerHTML = "";
-  // Day view: derive the window from this day's events, then size each
-  // hour to fill the available viewport height so the whole window is
-  // visible without scrolling. Falls back to a generous minimum so very
-  // short windows (one event) don't render as a comically tall single hour.
   const { startHour, endHour } = computeHourWindow(events);
-  const hoursShown = endHour - startHour;
-  // Body height ≈ container height minus header (~48 px) and (when shown)
-  // the all-day strip (~32 px). We don't measure the live layout because
-  // we're building the body in this same call — but the constants are
-  // tied to the schedule CSS above.
-  const bodyHeight = (16 * 36)    // --cal-body-h ≈ 36rem (assuming 16 px root)
-                   - 48
-                   - (hasAllDay ? 32 : 0);
-  const hourPx = Math.max(28, Math.floor(bodyHeight / hoursShown));
-  body.appendChild(buildHourGutter(hourPx, startHour, endHour));
-  body.appendChild(buildDayColumn(d, byKey, "day", allDayCol, hourPx,
+  body.appendChild(buildHourGutter(HOUR_PX_DAY, startHour, endHour));
+  body.appendChild(buildDayColumn(d, byKey, "day", allDayCol, HOUR_PX_DAY,
                                   startHour, endHour));
 }
 
-function selectDay(d) {
-  calSelectedDay = d;
-  document.querySelectorAll(".cal-cell").forEach(c => c.classList.remove("selected"));
-  const cells = document.querySelectorAll("#cal-grid .cal-cell:not(.empty)");
-  if (cells[d - 1]) cells[d - 1].classList.add("selected");
-  loadDayEvents(d);
-}
-
-function loadDayEventsForDate(date, silent) {
-  return loadDayEventsFor(
-    date.getFullYear(), date.getMonth() + 1, date.getDate(), silent
-  );
-}
-
-function loadDayEvents(d, silent) {
-  return loadDayEventsFor(calYear, calMonth, d, silent);
-}
-
-async function loadDayEventsFor(year, month, d, silent) {
-  const detail = document.getElementById("day-detail");
-  if (!silent) detail.innerHTML = '<div class="empty">loading…</div>';
-  try {
-    const r = await fetch(`/calendar/${year}/${month}/${d}`);
-    const data = await r.json();
-    const events = data.events || [];
-    const dayLabel = formatDateParts(d, month, year);
-    if (!events.length) {
-      detail.innerHTML = `<div class="empty">no events on ${dayLabel}</div>`;
-      return;
-    }
-    detail.innerHTML = `<h4>${dayLabel}</h4>`;
-    events.forEach(ev => {
-      const item = document.createElement("div");
-      item.className = "ev-item";
-      const head = document.createElement("div");
-      head.className = "ev-head";
-      let h = formatBackendDate(ev.date || "");
-      if (ev.time) h += " " + formatBackendTime(ev.time);
-      if (ev.category) h += "  #" + ev.category;
-      head.textContent = h;
-      const title = document.createElement("div");
-      title.className = "ev-title";
-      title.textContent = ev.title || ev.name || "(untitled)";
-      item.appendChild(head);
-      item.appendChild(title);
-      if (ev.summary) {
-        const s = document.createElement("div");
-        s.className = "ev-summary";
-        s.textContent = ev.summary;
-        item.appendChild(s);
-      }
-      detail.appendChild(item);
-    });
-  } catch (e) {
-    if (!silent) detail.innerHTML = '<div class="empty">error: ' + e + '</div>';
+// Drives selection from month or week views — sets calSelectedDate, updates
+// the local "selected" highlight, and reveals the day-detail schedule below.
+function selectDayCell(date) {
+  calSelectedDate = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+  if (calView === "month") {
+    calSelectedDay = date.getDate();
+    document.querySelectorAll("#cal-grid .cal-cell").forEach(c =>
+      c.classList.remove("selected"));
+    const cells = document.querySelectorAll("#cal-grid .cal-cell:not(.empty)");
+    if (cells[date.getDate() - 1]) cells[date.getDate() - 1].classList.add("selected");
+  } else if (calView === "week") {
+    document.querySelectorAll("#cal-sched-head .day-head").forEach(c =>
+      c.classList.remove("selected"));
+    const weekStart = startOfWeek(calCursor);
+    const idx = Math.round(
+      (calSelectedDate - weekStart) / 86400000
+    );
+    const heads = document.querySelectorAll("#cal-sched-head .day-head");
+    if (heads[idx]) heads[idx].classList.add("selected");
   }
+  const detail = document.getElementById("day-detail");
+  detail.hidden = false;
+  showDayDetailSchedule(calSelectedDate);
+}
+
+// Renders a schedule-style mini view of `date` into #day-detail. Same hour
+// ladder + all-day strip used by the main day view, just nested.
+async function showDayDetailSchedule(date) {
+  const dayDetail = document.getElementById("day-detail");
+  dayDetail.hidden = false;
+  if (!dayDetail.firstChild) {
+    dayDetail.innerHTML = '<div class="empty">loading…</div>';
+  }
+  const events = await fetchEventsInRange(date, date);
+  const byKey = {};
+  events.forEach(ev => {
+    const [dd, mm, yy] = (ev.date || "").split("/");
+    const k = `${yy}-${mm}-${dd}`;
+    (byKey[k] = byKey[k] || []).push(ev);
+  });
+  dayDetail.innerHTML = "";
+  const wrap = document.createElement("div");
+  wrap.className = "cal-sched show day";
+
+  // Header: weekday + date.
+  const head = document.createElement("div");
+  head.className = "sched-head";
+  const corner = document.createElement("div");
+  corner.className = "corner";
+  head.appendChild(corner);
+  const dh = document.createElement("div");
+  dh.className = "day-head" + (sameYMD(date, now) ? " today" : "");
+  const lbl = document.createElement("span");
+  lbl.className = "dow-letters";
+  lbl.textContent = ["SUNDAY","MONDAY","TUESDAY","WEDNESDAY",
+                     "THURSDAY","FRIDAY","SATURDAY"][date.getDay()];
+  const num = document.createElement("span");
+  num.className = "dow-num";
+  num.textContent = `${SHORT_MONTHS[date.getMonth()]} ${date.getDate()}`;
+  dh.appendChild(lbl);
+  dh.appendChild(num);
+  head.appendChild(dh);
+  wrap.appendChild(head);
+
+  // All-day strip — created up front but appended after the body so flex
+  // order puts it at the bottom (matches main day view).
+  const allDay = document.createElement("div");
+  allDay.className = "allday";
+  const hasAllDay = events.some(ev => parseEventMinutes(ev) === null);
+  allDay.hidden = !hasAllDay;
+  let allDayCol = null;
+  if (hasAllDay) {
+    const lab = document.createElement("div");
+    lab.className = "allday-label";
+    lab.textContent = "all-day";
+    allDay.appendChild(lab);
+    allDayCol = document.createElement("div");
+    allDayCol.className = "allday-col";
+    allDay.appendChild(allDayCol);
+  }
+
+  const body = document.createElement("div");
+  body.className = "sched-body";
+  const { startHour, endHour } = computeHourWindow(events);
+  body.appendChild(buildHourGutter(HOUR_PX_DAY, startHour, endHour));
+  body.appendChild(buildDayColumn(date, byKey, "day", allDayCol, HOUR_PX_DAY,
+                                  startHour, endHour));
+
+  wrap.appendChild(body);
+  wrap.appendChild(allDay);
+  dayDetail.appendChild(wrap);
 }
 
 // -- Topics -------------------------------------------------------------
@@ -4435,13 +4490,13 @@ function formatBackendTime(hhmm) {
 dateFormatSelect.addEventListener("change", () => {
   dateFormat = dateFormatSelect.value;
   localStorage.setItem(DATE_FORMAT_KEY, dateFormat);
-  if (calSelectedDay !== null) loadDayEvents(calSelectedDay, /*silent=*/true);
+  if (calSelectedDate) showDayDetailSchedule(calSelectedDate);
 });
 
 timeFormatSelect.addEventListener("change", () => {
   timeFormat = timeFormatSelect.value;
   localStorage.setItem(TIME_FORMAT_KEY, timeFormat);
-  if (calSelectedDay !== null) loadDayEvents(calSelectedDay, /*silent=*/true);
+  if (calSelectedDate) showDayDetailSchedule(calSelectedDate);
 });
 
 // -- Settings modal -----------------------------------------------------
