@@ -2359,7 +2359,11 @@ es.onmessage = (ev) => {
       break;
     case "assistant_html_partial": {
       const bubble = ensureAssistant();
-      typewriterUpdate(bubble, e.text, /*finalize=*/false);
+      if (liveMode) {
+        typewriterUpdate(bubble, e.text, /*finalize=*/false);
+      } else {
+        bubble._content.innerHTML = e.text;
+      }
       break;
     }
     case "assistant_html": {
