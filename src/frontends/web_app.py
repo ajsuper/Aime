@@ -67,6 +67,7 @@ from aime.services import sort_events_by_date
 from aime import auth as _auth
 from aime import encryption as _enc
 from aime import backup as _backup
+from aime import email_send as _email_send
 
 from . import stt as _stt
 
@@ -496,6 +497,14 @@ _LOGIN_PAGE_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "resources", "style", "login.html",
 )
+_VERIFY_PAGE_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "resources", "style", "verify_code.html",
+)
+_ADD_EMAIL_PAGE_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "resources", "style", "add_email.html",
+)
 
 
 def _load_page() -> str:
@@ -531,13 +540,16 @@ def _load_login_page(
     notice: str = "",
     recover_username: str = "",
     login_username: str = "",
+    signup_username: str = "",
+    signup_email: str = "",
 ) -> str:
     """Render the login page.
 
     `notice` shows an informational line above the sign-in form (e.g. after a
     recovery). `recover_username`, when set, switches the page into its
     account-recovery prompt for that account. `login_username` pre-fills the
-    sign-in username field.
+    sign-in username field; `signup_username` / `signup_email` pre-fill the
+    signup form after a validation error so the user doesn't retype them.
     """
     with open(_LOGIN_PAGE_PATH) as f:
         html = f.read()
@@ -548,8 +560,54 @@ def _load_login_page(
         .replace("__LOGIN_NOTICE__", _h(notice))
         .replace("__RECOVER_USERNAME__", _h(recover_username))
         .replace("__LOGIN_USERNAME__", _h(login_username))
+        .replace("__SIGNUP_USERNAME__", _h(signup_username))
+        .replace("__SIGNUP_EMAIL__", _h(signup_email))
         .replace("__SIGNUP_DISABLED_STYLE__", "" if _ALLOW_SIGNUP else _SIGNUP_DISABLED_STYLE)
     )
+
+
+def _mask_email(email: str) -> str:
+    """Show enough of an email to confirm "yes that's the one I gave you"
+    without putting the full address on a page that might be over the user's
+    shoulder. Falls back to the raw value if it doesn't look like an email."""
+    if not email or "@" not in email:
+        return email or ""
+    local, _, domain = email.partition("@")
+    if len(local) <= 2:
+        masked_local = local[:1] + "•"
+    else:
+        masked_local = local[0] + "•" * (len(local) - 2) + local[-1]
+    return f"{masked_local}@{domain}"
+
+
+def _load_verify_page(
+    *,
+    email: str,
+    verify_action: str,
+    resend_action: str,
+    cancel_href: str,
+    purpose_phrase: str,
+    error: str = "",
+    notice: str = "",
+) -> str:
+    with open(_VERIFY_PAGE_PATH) as f:
+        html = f.read()
+    return (
+        html
+        .replace("__EMAIL__", _h(_mask_email(email)))
+        .replace("__VERIFY_ACTION__", _h(verify_action))
+        .replace("__RESEND_ACTION__", _h(resend_action))
+        .replace("__CANCEL_HREF__", _h(cancel_href))
+        .replace("__PURPOSE_PHRASE__", _h(purpose_phrase))
+        .replace("__ERROR__", _h(error))
+        .replace("__NOTICE__", _h(notice))
+    )
+
+
+def _load_add_email_page(error: str = "") -> str:
+    with open(_ADD_EMAIL_PAGE_PATH) as f:
+        html = f.read()
+    return html.replace("__ERROR__", _h(error))
 
 
 def _h(s: str) -> str:
@@ -626,8 +684,18 @@ def login_page():
     if session.get("user_id"):
         return redirect("/")
     # Drop any stale recovery handoff (e.g. the user navigated back here, or
-    # chose "No" on the recovery prompt, which links to /login).
+    # chose "No" on the recovery prompt, which links to /login). Same for any
+    # half-finished email verification — visiting /login is an explicit
+    # restart of the auth flow.
     session.pop("recover_user_id", None)
+    stale_signup = session.pop("pending_signup_token", None)
+    if stale_signup:
+        _auth_backend.cancel_verification(stale_signup)
+    stale_email = session.pop("pending_email_token", None)
+    if stale_email:
+        _auth_backend.cancel_verification(stale_email)
+    session.pop("pending_email_user_id", None)
+    session.pop("pending_email_was_reinitialized", None)
     return Response(_load_login_page(), mimetype="text/html")
 
 
@@ -660,6 +728,19 @@ def login_submit():
         )
     # Prevent session fixation: drop any prior session contents on login.
     session.clear()
+    # If the account predates email 2FA and has no email on file yet, gate the
+    # login on collecting and verifying one. We hold the verified user_id in a
+    # *separate* session key (pending_email_user_id) so request handlers that
+    # check session['user_id'] don't treat them as logged in until the email
+    # step completes.
+    needs_email = not (user.email or "").strip()
+    if needs_email:
+        session["pending_email_user_id"] = user.id
+        # Carry the legacy-reinit flag through to the add-email step so we
+        # can still wipe stale conversations on the way in.
+        if was_reinitialized:
+            session["pending_email_was_reinitialized"] = True
+        return redirect(url_for("add_email_page"))
     session["user_id"] = user.id
     session.permanent = True
     # LEGACY MIGRATION AUTH — verify() auto-upgrades pre-v2 accounts to the
@@ -674,6 +755,169 @@ def login_submit():
         _context_for(user.id).controller.delete_all_sessions()
     # END LEGACY MIGRATION AUTH
     return redirect("/")
+
+
+# ---------------------------------------------------------------------------
+# Add-email-to-existing-account flow (post-login gate for legacy accounts)
+# ---------------------------------------------------------------------------
+
+
+def _finalize_pending_email_login() -> None:
+    """Promote the pending_email_* session state into a full login, wiping
+    any one-shot flags. Called once the email verification succeeds."""
+    uid = session.pop("pending_email_user_id", None)
+    was_reinit = session.pop("pending_email_was_reinitialized", False)
+    session.pop("pending_email_token", None)
+    if uid is None:
+        return
+    session["user_id"] = uid
+    session.permanent = True
+    if was_reinit:
+        # Same wipe as the standard login path — the freshly minted DEK left
+        # the user's stored conversations unreadable.
+        user = _auth_backend.lookup(uid)
+        if user is not None:
+            g.username = user.username
+            g.user_id = user.id
+            _context_for(uid).controller.delete_all_sessions()
+
+
+@app.route("/add-email", methods=["GET"])
+def add_email_page():
+    if not session.get("pending_email_user_id"):
+        return redirect(url_for("login_page"))
+    return Response(_load_add_email_page(), mimetype="text/html")
+
+
+@app.route("/add-email/start", methods=["POST"])
+def add_email_start():
+    uid = session.get("pending_email_user_id")
+    if not uid:
+        return redirect(url_for("login_page"))
+    email = (request.form.get("email") or "").strip()
+    try:
+        token, code, _norm = _auth_backend.start_add_email_verification(uid, email)
+    except _auth.InvalidEmail as e:
+        return Response(
+            _load_add_email_page(error=str(e)),
+            mimetype="text/html", status=400,
+        )
+    try:
+        _email_send.send_verification_code(email, code)
+    except _email_send.EmailSendError as e:
+        _auth_backend.cancel_verification(token)
+        return Response(
+            _load_add_email_page(error=str(e)),
+            mimetype="text/html", status=502,
+        )
+    session["pending_email_token"] = token
+    return redirect(url_for("add_email_verify_page"))
+
+
+@app.route("/add-email/verify", methods=["GET"])
+def add_email_verify_page():
+    uid = session.get("pending_email_user_id")
+    token = session.get("pending_email_token")
+    if not uid or not token:
+        return redirect(url_for("login_page"))
+    email = _auth_backend.verification_email(token)
+    if email is None:
+        session.pop("pending_email_token", None)
+        return redirect(url_for("add_email_page"))
+    return Response(
+        _load_verify_page(
+            email=email,
+            verify_action=url_for("add_email_verify_submit"),
+            resend_action=url_for("add_email_verify_resend"),
+            cancel_href=url_for("add_email_verify_cancel"),
+            purpose_phrase="finish signing in",
+        ),
+        mimetype="text/html",
+    )
+
+
+@app.route("/add-email/verify", methods=["POST"])
+def add_email_verify_submit():
+    uid = session.get("pending_email_user_id")
+    token = session.get("pending_email_token")
+    if not uid or not token:
+        return redirect(url_for("login_page"))
+    code = (request.form.get("code") or "").strip()
+    try:
+        _auth_backend.complete_add_email_verification(token, code)
+    except _auth.VerificationError as e:
+        email = _auth_backend.verification_email(token)
+        if email is None:
+            # Attempts exhausted or expired — go back to email entry.
+            session.pop("pending_email_token", None)
+            return Response(
+                _load_add_email_page(
+                    error="That code expired or was used up. Please try again.",
+                ),
+                mimetype="text/html", status=400,
+            )
+        return Response(
+            _load_verify_page(
+                email=email,
+                verify_action=url_for("add_email_verify_submit"),
+                resend_action=url_for("add_email_verify_resend"),
+                cancel_href=url_for("add_email_verify_cancel"),
+                purpose_phrase="finish signing in",
+                error=str(e),
+            ),
+            mimetype="text/html", status=400,
+        )
+    _finalize_pending_email_login()
+    return redirect("/")
+
+
+@app.route("/add-email/verify/resend", methods=["POST"])
+def add_email_verify_resend():
+    if not session.get("pending_email_user_id"):
+        return redirect(url_for("login_page"))
+    token = session.get("pending_email_token")
+    if not token:
+        return redirect(url_for("add_email_page"))
+    fresh = _auth_backend.resend_verification_code(token)
+    if fresh is None:
+        session.pop("pending_email_token", None)
+        return redirect(url_for("add_email_page"))
+    code, email = fresh
+    try:
+        _email_send.send_verification_code(email, code)
+    except _email_send.EmailSendError as e:
+        return Response(
+            _load_verify_page(
+                email=email,
+                verify_action=url_for("add_email_verify_submit"),
+                resend_action=url_for("add_email_verify_resend"),
+                cancel_href=url_for("add_email_verify_cancel"),
+                purpose_phrase="finish signing in",
+                error=str(e),
+            ),
+            mimetype="text/html", status=502,
+        )
+    return Response(
+        _load_verify_page(
+            email=email,
+            verify_action=url_for("add_email_verify_submit"),
+            resend_action=url_for("add_email_verify_resend"),
+            cancel_href=url_for("add_email_verify_cancel"),
+            purpose_phrase="finish signing in",
+            notice="We sent a fresh code.",
+        ),
+        mimetype="text/html",
+    )
+
+
+@app.route("/add-email/verify/cancel", methods=["GET"])
+def add_email_verify_cancel():
+    token = session.pop("pending_email_token", None)
+    session.pop("pending_email_user_id", None)
+    session.pop("pending_email_was_reinitialized", None)
+    if token:
+        _auth_backend.cancel_verification(token)
+    return redirect(url_for("login_page"))
 
 
 @app.route("/signup", methods=["POST"])
@@ -694,39 +938,167 @@ def signup_submit():
             mimetype="text/html", status=429,
         )
     username = (request.form.get("username") or "").strip()
+    email = (request.form.get("email") or "").strip()
     password = request.form.get("password") or ""
     password2 = request.form.get("password2") or ""
-    if password != password2:
+
+    def _signup_err(msg: str, status: int = 400):
         return Response(
-            _load_login_page(signup_error="Passwords do not match."),
-            mimetype="text/html", status=400,
+            _load_login_page(
+                signup_error=msg,
+                signup_username=username,
+                signup_email=email,
+            ),
+            mimetype="text/html", status=status,
         )
+
+    if password != password2:
+        return _signup_err("Passwords do not match.")
     try:
-        # Stamp the new account's send access from the deployment mode:
-        # "open" grants it immediately, "keys" withholds it until the user
-        # redeems an invite key. See docs/access-control.md.
-        user, _dek = _auth_backend.create(
-            username, password, api_access=(_ACCESS_MODE == "open")
+        token, code, _email_norm = _auth_backend.start_signup_verification(
+            username, password, email,
+            api_access=(_ACCESS_MODE == "open"),
         )
     except _auth.UsernameTaken:
+        return _signup_err("That username is already taken.", status=409)
+    except _auth.InvalidUsername as e:
+        return _signup_err(str(e))
+    except _auth.WeakPassword as e:
+        return _signup_err(str(e))
+    except _auth.InvalidEmail as e:
+        return _signup_err(str(e))
+
+    try:
+        _email_send.send_verification_code(email, code)
+    except _email_send.EmailSendError as e:
+        # Drop the pending row — we never managed to deliver its code, and
+        # leaving it would block a retry on the same username/email.
+        _auth_backend.cancel_verification(token)
+        return _signup_err(str(e), status=502)
+
+    # Stash only the token in the signed session. Everything else lives in
+    # the verifications table and is reached via the token.
+    session.clear()
+    session["pending_signup_token"] = token
+    session.permanent = False
+    return redirect(url_for("signup_verify_page"))
+
+
+@app.route("/signup/verify", methods=["GET"])
+def signup_verify_page():
+    token = session.get("pending_signup_token")
+    if not token:
+        return redirect(url_for("login_page"))
+    email = _auth_backend.verification_email(token)
+    if email is None:
+        # Token expired or vanished — clean the session and bounce to login.
+        session.pop("pending_signup_token", None)
+        return redirect(url_for("login_page"))
+    return Response(
+        _load_verify_page(
+            email=email,
+            verify_action=url_for("signup_verify_submit"),
+            resend_action=url_for("signup_verify_resend"),
+            cancel_href=url_for("signup_verify_cancel"),
+            purpose_phrase="finish creating your account",
+        ),
+        mimetype="text/html",
+    )
+
+
+@app.route("/signup/verify", methods=["POST"])
+def signup_verify_submit():
+    token = session.get("pending_signup_token")
+    if not token:
+        return redirect(url_for("login_page"))
+    code = (request.form.get("code") or "").strip()
+    try:
+        user, _dek = _auth_backend.complete_signup_verification(token, code)
+    except _auth.VerificationError as e:
+        # The backend deletes the row itself once the attempt cap is hit; in
+        # that case the token still in the session is now meaningless.
+        email = _auth_backend.verification_email(token)
+        if email is None:
+            session.pop("pending_signup_token", None)
+            return Response(
+                _load_login_page(
+                    signup_error="That verification expired — please sign up again.",
+                ),
+                mimetype="text/html", status=400,
+            )
         return Response(
-            _load_login_page(signup_error="That username is already taken."),
+            _load_verify_page(
+                email=email,
+                verify_action=url_for("signup_verify_submit"),
+                resend_action=url_for("signup_verify_resend"),
+                cancel_href=url_for("signup_verify_cancel"),
+                purpose_phrase="finish creating your account",
+                error=str(e),
+            ),
+            mimetype="text/html", status=400,
+        )
+    except _auth.UsernameTaken:
+        # A different signup completed for this username while the code was
+        # outstanding — extremely unlikely, but recoverable: bounce back to
+        # signup so they can pick another name.
+        session.pop("pending_signup_token", None)
+        return Response(
+            _load_login_page(
+                signup_error="That username was just taken — please pick another.",
+            ),
             mimetype="text/html", status=409,
         )
-    except _auth.InvalidUsername as e:
-        return Response(
-            _load_login_page(signup_error=str(e)),
-            mimetype="text/html", status=400,
-        )
-    except _auth.WeakPassword as e:
-        return Response(
-            _load_login_page(signup_error=str(e)),
-            mimetype="text/html", status=400,
-        )
+
+    # Promote: clear the pending state, log the new account in.
     session.clear()
     session["user_id"] = user.id
     session.permanent = True
     return redirect("/")
+
+
+@app.route("/signup/verify/resend", methods=["POST"])
+def signup_verify_resend():
+    token = session.get("pending_signup_token")
+    if not token:
+        return redirect(url_for("login_page"))
+    fresh = _auth_backend.resend_verification_code(token)
+    if fresh is None:
+        session.pop("pending_signup_token", None)
+        return redirect(url_for("login_page"))
+    code, email = fresh
+    try:
+        _email_send.send_verification_code(email, code)
+    except _email_send.EmailSendError as e:
+        return Response(
+            _load_verify_page(
+                email=email,
+                verify_action=url_for("signup_verify_submit"),
+                resend_action=url_for("signup_verify_resend"),
+                cancel_href=url_for("signup_verify_cancel"),
+                purpose_phrase="finish creating your account",
+                error=str(e),
+            ),
+            mimetype="text/html", status=502,
+        )
+    return Response(
+        _load_verify_page(
+            email=email,
+            verify_action=url_for("signup_verify_submit"),
+            resend_action=url_for("signup_verify_resend"),
+            cancel_href=url_for("signup_verify_cancel"),
+            purpose_phrase="finish creating your account",
+            notice="We sent a fresh code.",
+        ),
+        mimetype="text/html",
+    )
+
+
+@app.route("/signup/verify/cancel", methods=["GET"])
+def signup_verify_cancel():
+    token = session.pop("pending_signup_token", None)
+    if token:
+        _auth_backend.cancel_verification(token)
+    return redirect(url_for("login_page"))
 
 
 @app.route("/logout", methods=["POST"])

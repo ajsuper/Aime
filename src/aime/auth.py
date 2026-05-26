@@ -97,6 +97,7 @@ class UserRecord:
     username: str
     api_access: bool = True
     deleted_at: str | None = None
+    email: str | None = None
 
 
 class AuthError(Exception):
@@ -151,6 +152,16 @@ class WeakPassword(AuthError):
 
 class InvalidUsername(AuthError):
     pass
+
+
+class InvalidEmail(AuthError):
+    pass
+
+
+class VerificationError(AuthError):
+    """Wrong / expired / used-up verification code, or unknown token. Kept
+    deliberately generic so the UI doesn't differentiate between "wrong code"
+    and "code expired" in a way that helps an attacker probe state."""
 
 
 @runtime_checkable
@@ -331,6 +342,44 @@ class LocalAuthBackend:
                     "ALTER TABLE users ADD COLUMN deleted_at TEXT"
                 )
             # END soft-delete MIGRATION
+
+            # email MIGRATION — added with the email 2FA feature. NULL means
+            # "not yet collected" so pre-existing accounts are prompted for an
+            # email + verification code on next login.
+            if "email" not in existing_cols:
+                self._conn.execute(
+                    "ALTER TABLE users ADD COLUMN email TEXT"
+                )
+            # END email MIGRATION
+
+            # Pending email-verification rows. Used for two flows:
+            #   purpose='signup'    — username/password are being held until
+            #                         the 6-digit code mailed to `email` is
+            #                         confirmed; on confirm the row's data is
+            #                         promoted into a real users row.
+            #   purpose='add_email' — an existing user is attaching an email
+            #                         to their account; on confirm the email
+            #                         is written onto users.email.
+            # `token` is a 256-bit random secret kept in the user's signed
+            # session — it's how a request proves it owns this pending row
+            # without having to retype the username/email.
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS email_verifications (
+                    token         TEXT    PRIMARY KEY,
+                    purpose       TEXT    NOT NULL,
+                    user_id       INTEGER,
+                    username      TEXT    COLLATE NOCASE,
+                    password_hash TEXT,
+                    email         TEXT    NOT NULL,
+                    code_hash     TEXT    NOT NULL,
+                    api_access    INTEGER NOT NULL DEFAULT 0,
+                    created_at    INTEGER NOT NULL,
+                    expires_at    INTEGER NOT NULL,
+                    attempts      INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
             self._conn.commit()
 
     # ---- AuthBackend interface --------------------------------------------
@@ -390,7 +439,7 @@ class LocalAuthBackend:
         with self._lock:
             row = self._conn.execute(
                 "SELECT id, username, password_hash, salt_dek, wrapped_dek_v2, "
-                "enc_version, api_access, deleted_at "
+                "enc_version, api_access, deleted_at, email "
                 "FROM users WHERE username = ?",
                 (username,),
             ).fetchone()
@@ -406,7 +455,7 @@ class LocalAuthBackend:
             raise InvalidCredentials("invalid username or password")
 
         (user_id, stored_username, pw_hash, salt_dek, wrapped_dek_v2,
-         enc_version, api_access, deleted_at) = row
+         enc_version, api_access, deleted_at, email) = row
         try:
             self._hasher.verify(pw_hash, password)
         except (VerifyMismatchError, InvalidHashError):
@@ -465,6 +514,7 @@ class LocalAuthBackend:
                 id=user_id,
                 username=stored_username,
                 api_access=bool(api_access),
+                email=email,
             ),
             dek,
             was_reinitialized,
@@ -528,13 +578,16 @@ class LocalAuthBackend:
         # to login (where recovery is offered).
         with self._lock:
             row = self._conn.execute(
-                "SELECT id, username, api_access FROM users "
+                "SELECT id, username, api_access, email FROM users "
                 "WHERE id = ? AND deleted_at IS NULL",
                 (user_id,),
             ).fetchone()
         if row is None:
             return None
-        return UserRecord(id=row[0], username=row[1], api_access=bool(row[2]))
+        return UserRecord(
+            id=row[0], username=row[1],
+            api_access=bool(row[2]), email=row[3],
+        )
 
     # ---- Account lifecycle ------------------------------------------------
     #
@@ -782,6 +835,312 @@ class LocalAuthBackend:
             raise WeakPassword(
                 f"password must be at least {_MIN_PASSWORD_LEN} characters"
             )
+
+    @staticmethod
+    def _validate_email(email: str) -> None:
+        if not isinstance(email, str):
+            raise InvalidEmail("please enter your email address")
+        # Loose practical check — bare-bones "looks like an email". Real
+        # validation comes from the user receiving the code we mail to it.
+        if "@" not in email or "." not in email.split("@", 1)[-1] or " " in email:
+            raise InvalidEmail("that doesn't look like an email address")
+        if len(email) > 254:
+            raise InvalidEmail("that email address is too long")
+
+    # ---- Email verification (signup 2FA + add-email-to-existing-user) -----
+    #
+    # Two flows live in the email_verifications table:
+    #   * 'signup' — username/password are *held*, not yet a real account,
+    #     until the user proves they own the email. complete_signup_verification
+    #     promotes the row into a real users row.
+    #   * 'add_email' — an existing logged-in user attaches an email to their
+    #     account; complete_add_email_verification writes users.email.
+    #
+    # The raw 6-digit code is mailed to the user; only its sha256 is stored.
+    # The `token` is a fresh 256-bit secret kept in the user's signed session
+    # cookie — it identifies which pending row the request is acting on,
+    # without re-trusting client-supplied user_id/username/email.
+
+    _VERIFICATION_TTL_SECONDS = 10 * 60
+    _VERIFICATION_MAX_ATTEMPTS = 5
+
+    @staticmethod
+    def _generate_code() -> str:
+        # secrets.randbelow gives unbiased 6-digit codes including leading
+        # zeros. 10^6 = 1M space; brute force is bounded by max-attempts.
+        return f"{secrets.randbelow(1_000_000):06d}"
+
+    @staticmethod
+    def _hash_code(code: str) -> str:
+        return hashlib.sha256(code.strip().encode("utf-8")).hexdigest()
+
+    def _purge_expired_verifications(self) -> None:
+        now = int(time.time())
+        self._conn.execute(
+            "DELETE FROM email_verifications WHERE expires_at < ?",
+            (now,),
+        )
+
+    def email_in_use(self, email: str) -> bool:
+        """True if some active account already has this email. Case-insensitive."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM users "
+                "WHERE LOWER(email) = LOWER(?) AND deleted_at IS NULL",
+                (email.strip(),),
+            ).fetchone()
+        return row is not None
+
+    def start_signup_verification(
+        self, username: str, password: str, email: str, api_access: bool = True
+    ) -> tuple[str, str, str]:
+        """Begin a signup. Validates everything, stashes a pending row, and
+        returns (token, code, normalized_email). The caller mails the code;
+        the token goes in the user's signed session.
+
+        Raises UsernameTaken, WeakPassword, InvalidUsername, InvalidEmail at
+        the same points create() would, so the UI can surface the same errors
+        on the signup form before we ever send mail.
+        """
+        self._validate_username(username)
+        self._validate_password(password)
+        self._validate_email(email)
+        email_norm = email.strip()
+
+        # Pre-hash the password so the plaintext never sits in the DB.
+        pw_hash = self._hasher.hash(password)
+        token = secrets.token_urlsafe(32)
+        code = self._generate_code()
+        code_hash = self._hash_code(code)
+        now = int(time.time())
+        expires_at = now + self._VERIFICATION_TTL_SECONDS
+
+        with self._lock:
+            # Block obvious duplicates up front so a UsernameTaken doesn't
+            # surface only after the user retrieves the code from email.
+            taken = self._conn.execute(
+                "SELECT 1 FROM users WHERE username = ? AND deleted_at IS NULL",
+                (username,),
+            ).fetchone()
+            if taken is not None:
+                raise UsernameTaken(f"username already taken: {username!r}")
+            # Inlined email-uniqueness check — calling email_in_use() here
+            # would re-enter the (non-reentrant) lock and deadlock.
+            dup_email = self._conn.execute(
+                "SELECT 1 FROM users "
+                "WHERE LOWER(email) = LOWER(?) AND deleted_at IS NULL",
+                (email_norm,),
+            ).fetchone()
+            if dup_email is not None:
+                raise InvalidEmail("an account with that email already exists")
+            self._purge_expired_verifications()
+            self._conn.execute(
+                "INSERT INTO email_verifications "
+                "(token, purpose, username, password_hash, email, code_hash, "
+                "api_access, created_at, expires_at) "
+                "VALUES (?, 'signup', ?, ?, ?, ?, ?, ?, ?)",
+                (token, username, pw_hash, email_norm, code_hash,
+                 1 if api_access else 0, now, expires_at),
+            )
+            self._conn.commit()
+        return token, code, email_norm
+
+    def start_add_email_verification(
+        self, user_id: int, email: str
+    ) -> tuple[str, str, str]:
+        """Begin attaching an email to an existing account. Same return shape
+        as start_signup_verification."""
+        self._validate_email(email)
+        email_norm = email.strip()
+        token = secrets.token_urlsafe(32)
+        code = self._generate_code()
+        code_hash = self._hash_code(code)
+        now = int(time.time())
+        expires_at = now + self._VERIFICATION_TTL_SECONDS
+        with self._lock:
+            dup_email = self._conn.execute(
+                "SELECT 1 FROM users "
+                "WHERE LOWER(email) = LOWER(?) AND deleted_at IS NULL",
+                (email_norm,),
+            ).fetchone()
+            if dup_email is not None:
+                raise InvalidEmail("an account with that email already exists")
+            self._purge_expired_verifications()
+            self._conn.execute(
+                "INSERT INTO email_verifications "
+                "(token, purpose, user_id, email, code_hash, "
+                "created_at, expires_at) "
+                "VALUES (?, 'add_email', ?, ?, ?, ?, ?)",
+                (token, user_id, email_norm, code_hash, now, expires_at),
+            )
+            self._conn.commit()
+        return token, code, email_norm
+
+    def resend_verification_code(self, token: str) -> tuple[str, str] | None:
+        """Rotate the code on an existing pending row and reset its expiry.
+        Returns (code, email) for the caller to remail, or None if the token
+        is unknown."""
+        now = int(time.time())
+        code = self._generate_code()
+        code_hash = self._hash_code(code)
+        expires_at = now + self._VERIFICATION_TTL_SECONDS
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT email FROM email_verifications WHERE token = ?",
+                (token,),
+            ).fetchone()
+            if row is None:
+                return None
+            self._conn.execute(
+                "UPDATE email_verifications "
+                "SET code_hash = ?, expires_at = ?, attempts = 0 "
+                "WHERE token = ?",
+                (code_hash, expires_at, token),
+            )
+            self._conn.commit()
+        return code, row[0]
+
+    def cancel_verification(self, token: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM email_verifications WHERE token = ?", (token,)
+            )
+            self._conn.commit()
+
+    def _consume_verification(
+        self, token: str, code: str, expected_purpose: str
+    ) -> tuple:
+        """Validate the (token, code) pair and atomically delete the row.
+        Returns the row tuple on success; raises VerificationError otherwise.
+
+        The row is *only* deleted when the code is correct, so a wrong guess
+        consumes an attempt but lets the user try again. After the max number
+        of wrong attempts the row is deleted and the user has to start over.
+        """
+        code_hash = self._hash_code(code)
+        now = int(time.time())
+        with self._lock:
+            self._purge_expired_verifications()
+            row = self._conn.execute(
+                "SELECT token, purpose, user_id, username, password_hash, "
+                "email, code_hash, api_access, attempts, expires_at "
+                "FROM email_verifications WHERE token = ?",
+                (token,),
+            ).fetchone()
+            if row is None:
+                raise VerificationError(
+                    "this verification has expired — please start over"
+                )
+            (_t, purpose, _uid, _user, _pwh, _email, stored_hash,
+             _api, attempts, expires_at) = row
+            if purpose != expected_purpose or expires_at < now:
+                self._conn.execute(
+                    "DELETE FROM email_verifications WHERE token = ?", (token,)
+                )
+                self._conn.commit()
+                raise VerificationError(
+                    "this verification has expired — please start over"
+                )
+            # secrets.compare_digest avoids a timing oracle on the stored hash.
+            if not secrets.compare_digest(stored_hash, code_hash):
+                new_attempts = attempts + 1
+                if new_attempts >= self._VERIFICATION_MAX_ATTEMPTS:
+                    self._conn.execute(
+                        "DELETE FROM email_verifications WHERE token = ?",
+                        (token,),
+                    )
+                    self._conn.commit()
+                    raise VerificationError(
+                        "too many wrong codes — please start over"
+                    )
+                self._conn.execute(
+                    "UPDATE email_verifications SET attempts = ? "
+                    "WHERE token = ?",
+                    (new_attempts, token),
+                )
+                self._conn.commit()
+                raise VerificationError("that code isn't right — try again")
+            # Correct — consume the row and hand its data back to the caller.
+            self._conn.execute(
+                "DELETE FROM email_verifications WHERE token = ?", (token,)
+            )
+            self._conn.commit()
+        return row
+
+    def complete_signup_verification(
+        self, token: str, code: str
+    ) -> tuple[UserRecord, bytes]:
+        """Finalize a 'signup' verification: validate the code, then create
+        the real users row with the held password hash and email. Returns
+        (UserRecord, dek) identical to create()."""
+        row = self._consume_verification(token, code, expected_purpose="signup")
+        (_t, _purpose, _uid, username, pw_hash, email, _code_hash,
+         api_access, _attempts, _exp) = row
+
+        # Re-check uniqueness right before the INSERT — a different signup may
+        # have completed for the same username in the interval the code was
+        # outstanding.
+        salt_dek = _enc.generate_salt()
+        dek = _enc.generate_dek()
+        kek = _enc.derive_kek(self._machine_secret, salt_dek)
+        wrapped = _enc.wrap_dek(kek, dek)
+        with self._lock:
+            try:
+                cur = self._conn.execute(
+                    "INSERT INTO users "
+                    "(username, password_hash, email, salt_dek, wrapped_dek_v2, "
+                    "enc_version, api_access) "
+                    f"VALUES (?, ?, ?, ?, ?, {_ENC_VERSION_CURRENT}, ?)",
+                    (username, pw_hash, email, salt_dek, wrapped,
+                     int(api_access)),
+                )
+                self._conn.commit()
+            except sqlite3.IntegrityError as e:
+                raise UsernameTaken(
+                    f"username already taken: {username!r}"
+                ) from e
+        return (
+            UserRecord(
+                id=cur.lastrowid, username=username,
+                api_access=bool(api_access), email=email,
+            ),
+            dek,
+        )
+
+    def complete_add_email_verification(
+        self, token: str, code: str
+    ) -> UserRecord:
+        """Finalize an 'add_email' verification: validate the code, then write
+        the new email onto the existing user row. Returns the updated record."""
+        row = self._consume_verification(token, code, expected_purpose="add_email")
+        (_t, _purpose, user_id, _username, _pwh, email, _code_hash,
+         _api, _attempts, _exp) = row
+        with self._lock:
+            self._conn.execute(
+                "UPDATE users SET email = ? WHERE id = ?",
+                (email, user_id),
+            )
+            self._conn.commit()
+        record = self.lookup(user_id)
+        if record is None:
+            # Should be impossible: the row existed when verification began,
+            # and add_email never touches deleted_at. But surface it cleanly
+            # rather than crashing if the account was deleted in the meantime.
+            raise VerificationError("this account no longer exists")
+        return record
+
+    def verification_email(self, token: str) -> str | None:
+        """The email a pending verification will deliver to, for display
+        on the code-entry page (e.g. "we sent a code to a@b.com")."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT email, expires_at FROM email_verifications "
+                "WHERE token = ?",
+                (token,),
+            ).fetchone()
+        if row is None or row[1] < int(time.time()):
+            return None
+        return row[0]
 
     # ---- Lockout bookkeeping ---------------------------------------------
 

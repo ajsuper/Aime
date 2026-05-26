@@ -93,8 +93,12 @@
     <form data-form="signup" method="post" action="/signup" autocomplete="on">
       <label for="signup-username">Username</label>
       <input id="signup-username" name="username" type="text" autocomplete="username"
-             autocapitalize="off" autocorrect="off" required>
+             autocapitalize="off" autocorrect="off" value="__SIGNUP_USERNAME__" required>
       <p class="hint">3–32 characters: letters, digits, dot, underscore, dash.</p>
+      <label for="signup-email">Email</label>
+      <input id="signup-email" name="email" type="email" autocomplete="email"
+             autocapitalize="off" autocorrect="off" value="__SIGNUP_EMAIL__" required>
+      <p class="hint">We'll send a 6-digit code to verify it.</p>
       <label for="signup-password">Password</label>
       <input id="signup-password" name="password" type="password"
              autocomplete="new-password" minlength="8" required>
