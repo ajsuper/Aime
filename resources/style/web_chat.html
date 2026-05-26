@@ -3479,6 +3479,49 @@ async function selectTopic(tid, item) {
   }
 }
 
+// Copies from #topic-body / #day-detail used to paste as light text on a
+// black background because the browser serializes the rendered element's
+// computed CSS (dark theme) into the clipboard's text/html payload. We
+// intercept the copy and rewrite both payloads: plain text from the
+// selection, and an HTML fragment with every color/background style
+// stripped so the paste inherits the destination document's theme.
+const COPY_SANITIZE_ROOTS = ["#topic-body", "#day-detail", ".topic-content"];
+
+function stripThemeStyles(node) {
+  if (node.nodeType !== 1) return;
+  const el = node;
+  const s = el.style;
+  if (s) {
+    s.removeProperty("color");
+    s.removeProperty("background");
+    s.removeProperty("background-color");
+    s.removeProperty("background-image");
+    if (!s.length) el.removeAttribute("style");
+  }
+  for (let i = 0; i < el.children.length; i++) stripThemeStyles(el.children[i]);
+}
+
+document.addEventListener("copy", (e) => {
+  const sel = window.getSelection();
+  if (!sel || sel.isCollapsed) return;
+  const anchor = sel.anchorNode && (sel.anchorNode.nodeType === 1
+    ? sel.anchorNode : sel.anchorNode.parentElement);
+  if (!anchor) return;
+  const inViewer = COPY_SANITIZE_ROOTS.some(root => anchor.closest(root));
+  if (!inViewer) return;
+  const range = sel.getRangeAt(0);
+  const frag = range.cloneContents();
+  const wrap = document.createElement("div");
+  wrap.appendChild(frag);
+  for (let i = 0; i < wrap.children.length; i++) stripThemeStyles(wrap.children[i]);
+  // Top-level neutralizer: anything the destination would otherwise inherit
+  // from a stray parent style gets reset here.
+  wrap.setAttribute("style", "color:inherit;background:transparent");
+  e.clipboardData.setData("text/html", wrap.outerHTML);
+  e.clipboardData.setData("text/plain", sel.toString());
+  e.preventDefault();
+});
+
 function renderTopicMarkdown(md) {
   if (window.marked) {
     // Sanitize parsed markdown — topics are authored by the agent and the
