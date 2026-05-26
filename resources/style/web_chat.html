@@ -842,6 +842,25 @@
     .topic-toolbar .spacer { flex: 1; }
     .topic-toolbar .icon { font-weight: 700; min-width: 1.6em; text-align: center; }
     .topic-toolbar .icon-i { font-style: italic; font-family: serif; }
+    /* Download menu — small popover under the download icon. The wrap is
+       just an anchor for the absolutely-positioned menu so it overlays the
+       topic body instead of pushing it. */
+    .topic-download-wrap { position: relative; display: inline-flex; }
+    #topic-download-btn { display: inline-flex; align-items: center;
+                          padding: 0.25rem 0.45rem; }
+    #topic-download-btn svg { display: block; }
+    .topic-download-menu { position: absolute; top: calc(100% + 4px); left: 0;
+                           min-width: 11rem; background: var(--bg-elev);
+                           border: 1px solid var(--border); border-radius: 8px;
+                           box-shadow: 0 6px 20px rgba(0,0,0,0.25);
+                           padding: 0.25rem; display: flex; flex-direction: column;
+                           gap: 1px; z-index: 20; }
+    .topic-download-menu[hidden] { display: none; }
+    .topic-download-menu button { width: 100%; text-align: left;
+                                  border: 1px solid transparent !important;
+                                  padding: 0.4rem 0.6rem !important;
+                                  border-radius: 4px; color: var(--text) !important; }
+    .topic-download-menu button:hover { background: var(--bg) !important; }
     #topic-body { padding: 1rem 1.25rem; }
     #topic-editor { width: 100%; min-height: calc(100vh - 200px);
                     box-sizing: border-box; background: var(--bg-input); color: var(--text);
@@ -1212,14 +1231,6 @@
     <div id="side-col" tabindex="-1">
       <div class="side-header">
         <span class="title" id="side-title">Conversations</span>
-        <button class="side-close" id="side-refresh" title="Refresh" aria-label="Refresh">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
-               stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <polyline points="23 4 23 10 17 10"/>
-            <polyline points="1 20 1 14 7 14"/>
-            <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
-          </svg>
-        </button>
         <button class="side-close topic-back-btn" id="topic-back-btn"
                 title="Back to topics" aria-label="Back to topics">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
@@ -1270,6 +1281,30 @@
           <div class="topic-content scroll" id="topic-content">
             <div class="topic-toolbar" id="topic-toolbar">
               <button id="topic-edit-btn" title="Edit topic">Edit</button>
+              <div class="topic-download-wrap" id="topic-download-wrap">
+                <button id="topic-download-btn" title="Download topic"
+                        aria-label="Download topic" aria-haspopup="menu"
+                        aria-expanded="false">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                       stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+                       width="16" height="16">
+                    <path d="M12 3v12"/>
+                    <polyline points="7 10 12 15 17 10"/>
+                    <path d="M5 21h14"/>
+                  </svg>
+                </button>
+                <div class="topic-download-menu" id="topic-download-menu"
+                     role="menu" hidden>
+                  <button role="menuitem" data-format="pdf">PDF</button>
+                  <button role="menuitem" data-format="docx">Word (.docx)</button>
+                  <button role="menuitem" data-format="odt">OpenDocument (.odt)</button>
+                  <button role="menuitem" data-format="html">HTML</button>
+                  <button role="menuitem" data-format="md">Markdown</button>
+                  <button role="menuitem" data-format="epub">EPUB</button>
+                  <button role="menuitem" data-format="rtf">Rich Text (.rtf)</button>
+                  <button role="menuitem" data-format="txt">Plain text</button>
+                </div>
+              </div>
               <button id="topic-bold-btn" class="icon" title="Bold (Ctrl+B)" hidden><b>B</b></button>
               <button id="topic-italic-btn" class="icon icon-i" title="Italic (Ctrl+I)" hidden>I</button>
               <span class="spacer"></span>
@@ -2964,9 +2999,6 @@ document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") refreshActivePane(true);
 });
 
-document.getElementById("side-refresh").addEventListener("click", () =>
-  refreshActivePane(false));
-
 function activatePane(name) {
   activePaneName = name;
   // Switching panes always leaves any open topic detail — clears the
@@ -3259,8 +3291,70 @@ const topicBoldBtn = document.getElementById("topic-bold-btn");
 const topicItalicBtn = document.getElementById("topic-italic-btn");
 const topicSaveBtn = document.getElementById("topic-save-btn");
 const topicCancelBtn = document.getElementById("topic-cancel-btn");
+const topicDownloadBtn = document.getElementById("topic-download-btn");
+const topicDownloadMenu = document.getElementById("topic-download-menu");
 const topicSearchEl = document.getElementById("topic-search");
 const topicCountEl = document.getElementById("topic-count");
+
+function closeDownloadMenu() {
+  topicDownloadMenu.hidden = true;
+  topicDownloadBtn.setAttribute("aria-expanded", "false");
+}
+topicDownloadBtn.addEventListener("click", (e) => {
+  e.stopPropagation();
+  if (!selectedTopicId) return;
+  const opening = topicDownloadMenu.hidden;
+  topicDownloadMenu.hidden = !opening;
+  topicDownloadBtn.setAttribute("aria-expanded", opening ? "true" : "false");
+});
+topicDownloadMenu.addEventListener("click", async (e) => {
+  const btn = e.target.closest("button[data-format]");
+  if (!btn) return;
+  e.stopPropagation();
+  const fmt = btn.dataset.format;
+  closeDownloadMenu();
+  if (!selectedTopicId) return;
+  try {
+    const r = await fetch(
+      "/topics/" + encodeURIComponent(selectedTopicId)
+      + "/export?format=" + encodeURIComponent(fmt)
+    );
+    if (!r.ok) {
+      let msg = "Couldn't export this topic.";
+      try {
+        const j = await r.json();
+        if (j && j.error) msg = j.error;
+      } catch (_) {}
+      appendNotice(msg, "error");
+      return;
+    }
+    const blob = await r.blob();
+    // Filename comes back in Content-Disposition; parse it if present, else
+    // build one from the topic title we already have on screen.
+    let filename = "topic." + fmt;
+    const cd = r.headers.get("Content-Disposition") || "";
+    const m = /filename="([^"]+)"/.exec(cd);
+    if (m) filename = m[1];
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (err) {
+    appendNotice("Download failed: " + err, "error");
+  }
+});
+// Click outside / Escape to close.
+document.addEventListener("click", (e) => {
+  if (topicDownloadMenu.hidden) return;
+  if (!e.target.closest("#topic-download-wrap")) closeDownloadMenu();
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !topicDownloadMenu.hidden) closeDownloadMenu();
+});
 let selectedTopicId = null;
 let allTopics = [];
 

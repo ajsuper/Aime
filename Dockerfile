@@ -32,10 +32,20 @@ RUN g++ -std=c++17 -O2 src/serve.cpp -lsqlite3 -o serve.o
 # ---------------------------------------------------------------------------
 FROM python:3.13-slim AS runtime
 
-# Runtime libs: sqlite3 shared lib for the backend, certs for HTTPS/API calls.
+# Runtime libs: sqlite3 shared lib for the backend, certs for HTTPS/API calls,
+# and the native libraries WeasyPrint needs to render the topic-export PDFs
+# (pango + cairo + harfbuzz + their font/freetype stack).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libsqlite3-0 \
         ca-certificates \
+        libpango-1.0-0 \
+        libpangoft2-1.0-0 \
+        libharfbuzz0b \
+        libcairo2 \
+        libffi8 \
+        libfreetype6 \
+        fonts-dejavu-core \
+        shared-mime-info \
     && rm -rf /var/lib/apt/lists/*
 
 # uv, the same installer scripts/install.sh uses on the host.

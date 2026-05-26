@@ -70,6 +70,17 @@ from aime import backup as _backup
 
 from . import stt as _stt
 
+# pypandoc converts markdown → PDF/DOCX/HTML/etc. for topic exports. The
+# pypandoc_binary wheel bundles a pandoc binary so it works without any
+# system-level install. If the import fails (e.g. wheel unavailable on a
+# given platform), the /topics/<id>/export route falls back to markdown-only.
+try:
+    import pypandoc as _pypandoc
+    _PANDOC_AVAILABLE = True
+except Exception:  # noqa: BLE001 - export is best-effort
+    _pypandoc = None
+    _PANDOC_AVAILABLE = False
+
 
 # ---------------------------------------------------------------------------
 # Auth wiring (Phase 1: per-route gating, single shared controller still)
@@ -1381,6 +1392,139 @@ def topic_contents(topic_id: str):
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 500
     return jsonify({"contents": contents})
+
+
+_EXPORT_FORMATS = {
+    # ui-name -> (pandoc target, file extension, mime type)
+    "md":   (None,    "md",   "text/markdown"),
+    "html": ("html5", "html", "text/html"),
+    "docx": ("docx",  "docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+    "odt":  ("odt",   "odt",  "application/vnd.oasis.opendocument.text"),
+    "pdf":  ("pdf",   "pdf",  "application/pdf"),
+    "epub": ("epub",  "epub", "application/epub+zip"),
+    "rtf":  ("rtf",   "rtf",  "application/rtf"),
+    "txt":  ("plain", "txt",  "text/plain"),
+}
+
+
+def _safe_filename(name: str, fallback: str) -> str:
+    # Strip path separators and control chars; keep it readable across OSes.
+    cleaned = re.sub(r"[^\w\-. ]+", "", (name or "").strip())
+    cleaned = cleaned.strip(" .")[:80]
+    return cleaned or fallback
+
+
+@app.route("/topics/<topic_id>/export")
+@login_required
+def topic_export(topic_id: str):
+    if not topic_id.isdigit():
+        return jsonify({"ok": False, "error": "invalid topic id"}), 400
+    fmt = (request.args.get("format") or "md").lower()
+    if fmt not in _EXPORT_FORMATS:
+        return jsonify({"ok": False, "error": "unsupported format"}), 400
+    target, ext, mime = _EXPORT_FORMATS[fmt]
+    ctx = _context_for(g.user_id)
+    try:
+        markdown = ctx.topic_service.get_topic_contents(int(topic_id))
+        # Title comes from the topics list — get_topic_contents only returns
+        # the body, not metadata. A small list scan is fine (topics are tens,
+        # not thousands) and keeps this route independent of how the gateway
+        # exposes single-topic metadata.
+        title = ""
+        for t in ctx.topic_service.list_topics():
+            if str(t.get("id") or t.get("topic_id") or "") == topic_id:
+                title = t.get("title") or t.get("name") or ""
+                break
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+    filename = f"{_safe_filename(title, f'topic-{topic_id}')}.{ext}"
+    if target is None:
+        # Raw markdown — no pandoc needed.
+        data = markdown.encode("utf-8")
+    else:
+        if not _PANDOC_AVAILABLE:
+            return jsonify({
+                "ok": False,
+                "error": "export to this format is unavailable on the server",
+            }), 503
+        try:
+            if target == "pdf":
+                # pandoc needs an external engine to render PDFs. Try the
+                # common engines in order — whichever the user has installed
+                # wins. If none are present, surface a clear message.
+                with tempfile.NamedTemporaryFile(
+                    suffix=".pdf", delete=False
+                ) as tf:
+                    tmp_path = tf.name
+                last_err = None
+                produced = False
+                try:
+                    for engine in ("weasyprint", "wkhtmltopdf", "xelatex",
+                                   "pdflatex", "context"):
+                        try:
+                            _pypandoc.convert_text(
+                                markdown, "pdf", format="md",
+                                outputfile=tmp_path,
+                                extra_args=[f"--pdf-engine={engine}"],
+                            )
+                            produced = True
+                            break
+                        except Exception as exc:  # noqa: BLE001
+                            last_err = exc
+                    if not produced:
+                        raise RuntimeError(
+                            "no PDF engine available — install weasyprint, "
+                            "wkhtmltopdf, or a LaTeX distribution "
+                            f"(last error: {last_err})"
+                        )
+                    with open(tmp_path, "rb") as f:
+                        data = f.read()
+                finally:
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+            elif target in ("docx", "odt", "epub"):
+                with tempfile.NamedTemporaryFile(
+                    suffix=f".{ext}", delete=False
+                ) as tf:
+                    tmp_path = tf.name
+                try:
+                    _pypandoc.convert_text(
+                        markdown, target, format="md", outputfile=tmp_path,
+                    )
+                    with open(tmp_path, "rb") as f:
+                        data = f.read()
+                finally:
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+            else:
+                text = _pypandoc.convert_text(markdown, target, format="md")
+                data = text.encode("utf-8")
+        except OSError as exc:
+            # Missing PDF engine is the common one — surface a clean message
+            # instead of a stack trace.
+            return jsonify({
+                "ok": False,
+                "error": f"conversion failed: {exc}",
+            }), 500
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({
+                "ok": False,
+                "error": f"conversion failed: {exc}",
+            }), 500
+
+    return Response(
+        data,
+        mimetype=mime,
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store",
+        },
+    )
 
 
 @app.route("/topics/<topic_id>", methods=["PUT"])
