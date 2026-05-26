@@ -757,8 +757,19 @@
                           padding: 0.25rem 0.55rem; cursor: pointer; font: inherit;
                           font-size: 0.85rem; }
     .cal-toolbar button:hover { border-color: var(--accent); }
-    .cal-toolbar .title { flex: 1; text-align: center; font-weight: 600;
-                          font-size: 0.95rem; }
+    /* Group the prev/title/next together so the nav is one visual unit and
+       doesn't stretch across the whole toolbar — leaves room for the view
+       picker (and anything we want to add later) on the right. */
+    .cal-toolbar .cal-nav { display: inline-flex; align-items: center;
+                            gap: 0.4rem; }
+    .cal-toolbar .cal-nav .title { font-weight: 600; font-size: 0.95rem;
+                                   min-width: 9rem; text-align: center; }
+    .cal-toolbar .cal-spacer { flex: 1; }
+    .cal-toolbar .cal-view { background: var(--bg-input); color: var(--text);
+                             border: 1px solid var(--border); border-radius: 6px;
+                             padding: 0.25rem 0.4rem; font: inherit;
+                             font-size: 0.85rem; cursor: pointer; }
+    .cal-toolbar .cal-view:hover { border-color: var(--accent); }
     /* Calendar pane scrolls as a single column: the month grid and the
        day's event list share one scroll, so the event list can use the
        full window height and the last week's events are never clipped
@@ -1256,9 +1267,17 @@
       <!-- Calendar pane -->
       <div class="pane" data-pane="calendar">
         <div class="cal-toolbar">
-          <button data-action="cal-prev">‹</button>
-          <span class="title" id="cal-title">—</span>
-          <button data-action="cal-next">›</button>
+          <div class="cal-nav">
+            <button data-action="cal-prev" aria-label="Previous">‹</button>
+            <span class="title" id="cal-title">—</span>
+            <button data-action="cal-next" aria-label="Next">›</button>
+          </div>
+          <span class="cal-spacer"></span>
+          <select id="cal-view" class="cal-view" aria-label="Calendar view">
+            <option value="month" selected>Month</option>
+            <option value="week">Week</option>
+            <option value="day">Day</option>
+          </select>
         </div>
         <div class="cal-grid" id="cal-grid"></div>
         <div class="day-detail" id="day-detail">
@@ -3135,33 +3154,99 @@ async function loadChats(silent) {
 
 const MONTH_NAMES = ["January","February","March","April","May","June",
                      "July","August","September","October","November","December"];
+const SHORT_MONTHS = ["Jan","Feb","Mar","Apr","May","Jun",
+                      "Jul","Aug","Sep","Oct","Nov","Dec"];
 const now = new Date();
-let calYear = now.getFullYear();
-let calMonth = now.getMonth() + 1;  // 1-indexed
+// Anchor date drives all three views. We keep the legacy calYear / calMonth /
+// calSelectedDay aliases in sync so existing fetch URLs and refresh hooks
+// keep working — they were already month-indexed.
+const calCursor = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+let calView = "month";              // "month" | "week" | "day"
+let calYear = calCursor.getFullYear();
+let calMonth = calCursor.getMonth() + 1;
 let calSelectedDay = null;
 
-document.querySelector('[data-action="cal-prev"]').addEventListener("click", () => {
-  calMonth -= 1;
-  if (calMonth < 1) { calMonth = 12; calYear -= 1; }
+function syncCalAliases() {
+  calYear = calCursor.getFullYear();
+  calMonth = calCursor.getMonth() + 1;
+}
+
+function startOfWeek(d) {
+  const x = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  x.setDate(x.getDate() - x.getDay()); // Sunday-based, matches DOW header
+  return x;
+}
+
+function sameYMD(a, b) {
+  return a.getFullYear() === b.getFullYear()
+      && a.getMonth() === b.getMonth()
+      && a.getDate() === b.getDate();
+}
+
+document.querySelector('[data-action="cal-prev"]').addEventListener("click",
+  () => moveCalCursor(-1));
+document.querySelector('[data-action="cal-next"]').addEventListener("click",
+  () => moveCalCursor(1));
+document.getElementById("cal-view").addEventListener("change", (e) => {
+  calView = e.target.value;
   calSelectedDay = null;
   renderCalendar();
 });
-document.querySelector('[data-action="cal-next"]').addEventListener("click", () => {
-  calMonth += 1;
-  if (calMonth > 12) { calMonth = 1; calYear += 1; }
-  calSelectedDay = null;
+
+function moveCalCursor(delta) {
+  if (calView === "month") {
+    // Snap to day 1 first so e.g. Mar 31 → Apr 30 instead of overflowing.
+    calCursor.setDate(1);
+    calCursor.setMonth(calCursor.getMonth() + delta);
+    calSelectedDay = null;
+  } else if (calView === "week") {
+    calCursor.setDate(calCursor.getDate() + 7 * delta);
+  } else {
+    calCursor.setDate(calCursor.getDate() + delta);
+  }
+  syncCalAliases();
   renderCalendar();
-});
+}
+
+// Fetch every event whose date intersects [start, end] (both inclusive).
+// /calendar/<y>/<m> already returns a full month; we union the months the
+// range touches so week views spanning a month boundary stay correct.
+async function fetchEventsInRange(start, end) {
+  const months = new Set();
+  const cursor = new Date(start.getFullYear(), start.getMonth(), 1);
+  while (cursor <= end) {
+    months.add(`${cursor.getFullYear()}/${cursor.getMonth() + 1}`);
+    cursor.setMonth(cursor.getMonth() + 1);
+  }
+  const all = [];
+  for (const key of months) {
+    try {
+      const r = await fetch(`/calendar/${key}`);
+      const data = await r.json();
+      (data.events || []).forEach(ev => all.push(ev));
+    } catch (_) { /* silent: partial is better than nothing */ }
+  }
+  return all.filter(ev => {
+    const [dd, mm, yy] = (ev.date || "").split("/");
+    if (!dd) return false;
+    const d = new Date(parseInt(yy, 10), parseInt(mm, 10) - 1, parseInt(dd, 10));
+    return d >= new Date(start.getFullYear(), start.getMonth(), start.getDate())
+        && d <= new Date(end.getFullYear(), end.getMonth(), end.getDate());
+  });
+}
+
 async function renderCalendar(silent) {
-  // Header text always reflects the month being shown — not a "loading"
-  // signal — so update it up-front in both modes.
+  syncCalAliases();
+  if (calView === "week") return renderWeekView(silent);
+  if (calView === "day") return renderDayView(silent);
+  return renderMonthView(silent);
+}
+
+async function renderMonthView(silent) {
   document.getElementById("cal-title").textContent =
     MONTH_NAMES[calMonth - 1] + " " + calYear;
   const grid = document.getElementById("cal-grid");
-
-  // Loud mode: blank the grid so the user sees the change is being
-  // processed. Silent mode: leave the existing grid in place until the
-  // replacement is ready, then swap it in atomically.
+  grid.hidden = false;
   if (!silent) grid.innerHTML = "";
 
   let events = [];
@@ -3170,11 +3255,9 @@ async function renderCalendar(silent) {
     const data = await r.json();
     events = data.events || [];
   } catch (e) {
-    // Silent refresh failure: leave whatever's already rendered alone.
     if (silent) return;
   }
 
-  // Bucket events by day-of-month.
   const byDay = {};
   events.forEach(ev => {
     const d = (ev.date || "").split("/")[0];
@@ -3182,12 +3265,9 @@ async function renderCalendar(silent) {
     if (!Number.isNaN(n)) (byDay[n] = byDay[n] || []).push(ev);
   });
 
-  // First weekday of month (0=Sun … 6=Sat) — JS getDay() matches our header.
   const firstDow = new Date(calYear, calMonth - 1, 1).getDay();
   const daysInMonth = new Date(calYear, calMonth, 0).getDate();
 
-  // Build into a fragment so the swap is one paint, not 40+ appends over a
-  // visibly-clearing grid.
   const frag = document.createDocumentFragment();
   ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"].forEach(d => {
     const el = document.createElement("div");
@@ -3200,7 +3280,8 @@ async function renderCalendar(silent) {
     c.className = "cal-cell empty";
     frag.appendChild(c);
   }
-  const isCurrentMonth = (calYear === now.getFullYear() && calMonth === now.getMonth() + 1);
+  const isCurrentMonth =
+    (calYear === now.getFullYear() && calMonth === now.getMonth() + 1);
   for (let d = 1; d <= daysInMonth; d++) {
     const cell = document.createElement("div");
     cell.className = "cal-cell";
@@ -3227,23 +3308,119 @@ async function renderCalendar(silent) {
     '<div class="empty">select a day</div>';
 }
 
+async function renderWeekView(silent) {
+  const start = startOfWeek(calCursor);
+  const end = new Date(start);
+  end.setDate(end.getDate() + 6);
+  // Title spans months/years when the week crosses a boundary.
+  const sameMonth = start.getMonth() === end.getMonth()
+                 && start.getFullYear() === end.getFullYear();
+  const sameYear = start.getFullYear() === end.getFullYear();
+  let title;
+  if (sameMonth) {
+    title = `${SHORT_MONTHS[start.getMonth()]} ${start.getDate()}–`
+          + `${end.getDate()}, ${end.getFullYear()}`;
+  } else if (sameYear) {
+    title = `${SHORT_MONTHS[start.getMonth()]} ${start.getDate()} – `
+          + `${SHORT_MONTHS[end.getMonth()]} ${end.getDate()}, `
+          + `${end.getFullYear()}`;
+  } else {
+    title = `${SHORT_MONTHS[start.getMonth()]} ${start.getDate()}, `
+          + `${start.getFullYear()} – ${SHORT_MONTHS[end.getMonth()]} `
+          + `${end.getDate()}, ${end.getFullYear()}`;
+  }
+  document.getElementById("cal-title").textContent = title;
+
+  const grid = document.getElementById("cal-grid");
+  grid.hidden = false;
+  if (!silent) grid.innerHTML = "";
+
+  const events = await fetchEventsInRange(start, end);
+  const byKey = {};
+  events.forEach(ev => {
+    const [dd, mm, yy] = (ev.date || "").split("/");
+    const k = `${yy}-${mm}-${dd}`;
+    (byKey[k] = byKey[k] || []).push(ev);
+  });
+
+  const frag = document.createDocumentFragment();
+  ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"].forEach(d => {
+    const el = document.createElement("div");
+    el.className = "dow";
+    el.textContent = d;
+    frag.appendChild(el);
+  });
+  for (let i = 0; i < 7; i++) {
+    const date = new Date(start);
+    date.setDate(start.getDate() + i);
+    const cell = document.createElement("div");
+    cell.className = "cal-cell";
+    if (sameYMD(date, now)) cell.classList.add("today");
+    if (sameYMD(date, calCursor)) cell.classList.add("selected");
+    const num = document.createElement("div");
+    num.className = "daynum";
+    num.textContent = `${SHORT_MONTHS[date.getMonth()]} ${date.getDate()}`;
+    cell.appendChild(num);
+    const key = `${date.getFullYear()}-`
+              + `${String(date.getMonth() + 1).padStart(2, "0")}-`
+              + `${String(date.getDate()).padStart(2, "0")}`;
+    (byKey[key] || []).slice(0, 4).forEach(ev => {
+      const e = document.createElement("div");
+      e.className = "ev";
+      e.textContent = "• " + (ev.title || ev.name || "(untitled)");
+      cell.appendChild(e);
+    });
+    cell.addEventListener("click", () => {
+      calCursor.setFullYear(date.getFullYear(),
+                            date.getMonth(), date.getDate());
+      syncCalAliases();
+      renderWeekView();
+    });
+    frag.appendChild(cell);
+  }
+  grid.innerHTML = "";
+  grid.appendChild(frag);
+
+  loadDayEventsForDate(calCursor, silent);
+}
+
+async function renderDayView(silent) {
+  const d = calCursor;
+  const title = `${MONTH_NAMES[d.getMonth()]} ${d.getDate()}, ${d.getFullYear()}`;
+  document.getElementById("cal-title").textContent = title;
+  const grid = document.getElementById("cal-grid");
+  // Day view is just the detail panel — the grid is meaningless here.
+  grid.hidden = true;
+  grid.innerHTML = "";
+  loadDayEventsForDate(d, silent);
+}
+
 function selectDay(d) {
   calSelectedDay = d;
   document.querySelectorAll(".cal-cell").forEach(c => c.classList.remove("selected"));
-  // Find this cell — daynum order in grid corresponds to day index.
   const cells = document.querySelectorAll("#cal-grid .cal-cell:not(.empty)");
   if (cells[d - 1]) cells[d - 1].classList.add("selected");
   loadDayEvents(d);
 }
 
-async function loadDayEvents(d, silent) {
+function loadDayEventsForDate(date, silent) {
+  return loadDayEventsFor(
+    date.getFullYear(), date.getMonth() + 1, date.getDate(), silent
+  );
+}
+
+function loadDayEvents(d, silent) {
+  return loadDayEventsFor(calYear, calMonth, d, silent);
+}
+
+async function loadDayEventsFor(year, month, d, silent) {
   const detail = document.getElementById("day-detail");
   if (!silent) detail.innerHTML = '<div class="empty">loading…</div>';
   try {
-    const r = await fetch(`/calendar/${calYear}/${calMonth}/${d}`);
+    const r = await fetch(`/calendar/${year}/${month}/${d}`);
     const data = await r.json();
     const events = data.events || [];
-    const dayLabel = formatDateParts(d, calMonth, calYear);
+    const dayLabel = formatDateParts(d, month, year);
     if (!events.length) {
       detail.innerHTML = `<div class="empty">no events on ${dayLabel}</div>`;
       return;
