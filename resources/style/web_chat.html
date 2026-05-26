@@ -787,6 +787,10 @@
                 border-radius: 10px; overflow: hidden;
                 margin: 0.5rem 0.75rem; min-height: var(--cal-body-h);
                 flex: 0 0 auto; }
+    /* `display: grid` above outruns the UA stylesheet's `[hidden]` rule —
+       without this, switching to week/day view leaves the empty month grid
+       as a tall gray box above the schedule. */
+    .cal-grid[hidden] { display: none; }
     .cal-grid .dow { background: var(--bg-elev); padding: 0.35rem;
                      text-align: center; font-size: 0.68rem;
                      color: var(--muted); font-weight: 600;
@@ -846,6 +850,9 @@
                              grid-template-columns: 56px minmax(0, 1fr);
                              overflow-y: auto; overscroll-behavior: contain;
                              flex: 1 1 auto; position: relative; }
+    /* Day view sizes the hour ladder to fit the viewport exactly, so no
+       internal scrolling is needed (or wanted — it intercepts page scroll). */
+    .cal-sched.day .sched-body { overflow: hidden; }
     .cal-sched.week .sched-body {
         grid-template-columns: 56px repeat(7, minmax(0, 1fr)); }
     .cal-sched .hour-gutter { display: flex; flex-direction: column;
@@ -3357,10 +3364,32 @@ async function fetchEventsInRange(start, end) {
   });
 }
 
-// Schedule geometry. HOUR_PX × 24 sets total scroll height; the outer
-// .cal-sched is capped at --cal-body-h so the view matches the month grid.
-const HOUR_PX = 44;
-const DEFAULT_EV_MIN = 50;  // events have no end time — give them a sensible slot
+// Schedule geometry. Week view uses a fixed hour height (scrolls when the
+// active window exceeds the viewport). Day view derives hour height from
+// the visible window so the whole shown range fills --cal-body-h without
+// scrolling. Both views show a "default day" of 7 AM → 11 PM, expanded on
+// either side to fit any events outside that window.
+const HOUR_PX_WEEK = 44;
+const DEFAULT_EV_MIN = 50;       // events have no end time — give them a sensible slot
+const DEFAULT_DAY_START = 7;     // earliest hour visible if no events run earlier
+const DEFAULT_DAY_END = 23;      // latest hour boundary visible if no events run later
+
+function computeHourWindow(events) {
+  let startHour = DEFAULT_DAY_START;
+  let endHour = DEFAULT_DAY_END;
+  events.forEach(ev => {
+    const m = parseEventMinutes(ev);
+    if (m === null) return;       // all-day events live in the strip, not the ladder
+    const h = Math.floor(m / 60);
+    if (h < startHour) startHour = h;
+    const tail = Math.ceil((m + DEFAULT_EV_MIN) / 60);
+    if (tail > endHour) endHour = tail;
+  });
+  startHour = Math.max(0, startHour);
+  endHour = Math.min(24, endHour);
+  if (endHour <= startHour) endHour = startHour + 1;
+  return { startHour, endHour };
+}
 
 async function renderCalendar(silent) {
   syncCalAliases();
@@ -3487,27 +3516,41 @@ function eventKey(date) {
        + `${String(date.getDate()).padStart(2, "0")}`;
 }
 
-function buildHourGutter() {
+function hourLabel(h) {
+  if (h === 0 || h === 24) return "12 AM";
+  if (h < 12) return `${h} AM`;
+  if (h === 12) return "12 PM";
+  return `${h - 12} PM`;
+}
+
+function buildHourGutter(hourPx, startHour, endHour) {
   const g = document.createElement("div");
   g.className = "hour-gutter";
-  // Skip 0 so midnight doesn't look like an event boundary.
-  for (let h = 0; h < 24; h++) {
+  for (let h = startHour; h < endHour; h++) {
     const el = document.createElement("div");
     el.className = "hour-label";
-    if (h === 0) el.textContent = "";
-    else if (h < 12) el.textContent = `${h} AM`;
-    else if (h === 12) el.textContent = "12 PM";
-    else el.textContent = `${h - 12} PM`;
+    el.style.height = hourPx + "px";
+    // Drop the very first label when it lines up with the column's top edge
+    // (no gridline above it to anchor against). Every later hour still gets
+    // labeled.
+    el.textContent = h === startHour ? "" : hourLabel(h);
     g.appendChild(el);
   }
   return g;
 }
 
-function buildDayColumn(date, events, sched, allDayCol) {
+function buildDayColumn(date, events, sched, allDayCol, hourPx, startHour, endHour) {
   const col = document.createElement("div");
   col.className = "day-col";
   if (sameYMD(date, now)) col.classList.add("today");
-  col.style.height = (HOUR_PX * 24) + "px";
+  const hoursShown = endHour - startHour;
+  col.style.height = (hourPx * hoursShown) + "px";
+  // Repaint the hour grid stripes to match this view's row height.
+  col.style.background =
+    `repeating-linear-gradient(to bottom, transparent 0, `
+    + `transparent ${hourPx - 1}px, var(--border) ${hourPx - 1}px, `
+    + `var(--border) ${hourPx}px)`;
+  const startMin = startHour * 60;
   const dayEvents = (events[eventKey(date)] || []);
   dayEvents.forEach(ev => {
     const start = parseEventMinutes(ev);
@@ -3523,8 +3566,8 @@ function buildDayColumn(date, events, sched, allDayCol) {
     }
     const block = document.createElement("div");
     block.className = "ev-block";
-    block.style.top = (start / 60 * HOUR_PX) + "px";
-    block.style.height = (DEFAULT_EV_MIN / 60 * HOUR_PX) + "px";
+    block.style.top = ((start - startMin) / 60 * hourPx) + "px";
+    block.style.height = Math.max(18, DEFAULT_EV_MIN / 60 * hourPx) + "px";
     const t = document.createElement("div");
     t.className = "ev-block-time";
     t.textContent = formatBackendTime(ev.time);
@@ -3535,32 +3578,29 @@ function buildDayColumn(date, events, sched, allDayCol) {
     block.appendChild(title);
     col.appendChild(block);
   });
-  // Now-line drawn only on today's column.
+  // Now-line drawn only on today's column, and only if "now" falls in the
+  // shown window (no point pointing at an hour we've cropped out).
   if (sameYMD(date, now)) {
-    const line = document.createElement("div");
-    line.className = "now-line";
     const mins = now.getHours() * 60 + now.getMinutes();
-    line.style.top = (mins / 60 * HOUR_PX) + "px";
-    col.appendChild(line);
+    if (mins >= startMin && mins <= endHour * 60) {
+      const line = document.createElement("div");
+      line.className = "now-line";
+      line.style.top = ((mins - startMin) / 60 * hourPx) + "px";
+      col.appendChild(line);
+    }
   }
   return col;
 }
 
-function scrollScheduleToInteresting(body, date, events) {
-  // Prefer the first event of the (focused) day; fall back to the current
-  // hour if we're looking at today; otherwise 8 AM so the viewport starts
-  // at a humane time instead of midnight.
-  const dayEvents = events[eventKey(date)] || [];
-  const first = dayEvents
-    .map(parseEventMinutes)
-    .filter(m => m !== null)
-    .sort((a, b) => a - b)[0];
-  let mins;
-  if (first !== undefined) mins = first;
-  else if (sameYMD(date, now)) mins = now.getHours() * 60 + now.getMinutes();
-  else mins = 8 * 60;
-  // A little padding above so the target line isn't glued to the top edge.
-  body.scrollTop = Math.max(0, (mins / 60 * HOUR_PX) - HOUR_PX);
+function scrollScheduleToInteresting(body, date, events, hourPx, startHour) {
+  // Window starts at startHour now, so most days no scrolling is needed —
+  // the first event is already on-screen. Only scroll when "now" is later
+  // in the visible window than the natural top edge.
+  if (!sameYMD(date, now)) { body.scrollTop = 0; return; }
+  const mins = now.getHours() * 60 + now.getMinutes();
+  const startMin = startHour * 60;
+  if (mins <= startMin) { body.scrollTop = 0; return; }
+  body.scrollTop = Math.max(0, ((mins - startMin) / 60 * hourPx) - hourPx);
 }
 
 async function renderWeekSchedule(silent) {
@@ -3623,14 +3663,19 @@ async function renderWeekSchedule(silent) {
 
   // Body: gutter + 7 day columns.
   body.innerHTML = "";
-  body.appendChild(buildHourGutter());
+  // One window for the whole week — keeps columns visually aligned and
+  // gives every day equal vertical real estate even when only one day has
+  // an early/late outlier.
+  const { startHour, endHour } = computeHourWindow(events);
+  body.appendChild(buildHourGutter(HOUR_PX_WEEK, startHour, endHour));
   for (let i = 0; i < 7; i++) {
     const date = new Date(start);
     date.setDate(start.getDate() + i);
     body.appendChild(buildDayColumn(date, byKey, "week",
-                                    hasAllDay ? allDayCols[i] : null));
+                                    hasAllDay ? allDayCols[i] : null,
+                                    HOUR_PX_WEEK, startHour, endHour));
   }
-  scrollScheduleToInteresting(body, calCursor, byKey);
+  scrollScheduleToInteresting(body, calCursor, byKey, HOUR_PX_WEEK, startHour);
 }
 
 async function renderDaySchedule(silent) {
@@ -3686,10 +3731,23 @@ async function renderDaySchedule(silent) {
   }
 
   body.innerHTML = "";
-  body.appendChild(buildHourGutter());
-  body.appendChild(buildDayColumn(d, byKey, "day", allDayCol));
-
-  scrollScheduleToInteresting(body, d, byKey);
+  // Day view: derive the window from this day's events, then size each
+  // hour to fill the available viewport height so the whole window is
+  // visible without scrolling. Falls back to a generous minimum so very
+  // short windows (one event) don't render as a comically tall single hour.
+  const { startHour, endHour } = computeHourWindow(events);
+  const hoursShown = endHour - startHour;
+  // Body height ≈ container height minus header (~48 px) and (when shown)
+  // the all-day strip (~32 px). We don't measure the live layout because
+  // we're building the body in this same call — but the constants are
+  // tied to the schedule CSS above.
+  const bodyHeight = (16 * 36)    // --cal-body-h ≈ 36rem (assuming 16 px root)
+                   - 48
+                   - (hasAllDay ? 32 : 0);
+  const hourPx = Math.max(28, Math.floor(bodyHeight / hoursShown));
+  body.appendChild(buildHourGutter(hourPx, startHour, endHour));
+  body.appendChild(buildDayColumn(d, byKey, "day", allDayCol, hourPx,
+                                  startHour, endHour));
 }
 
 function selectDay(d) {
