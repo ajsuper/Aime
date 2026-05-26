@@ -1795,6 +1795,10 @@
               <span class="label">Username</span>
               <span class="value" id="account-username">—</span>
             </div>
+            <div class="settings-row">
+              <span class="label">Email</span>
+              <span class="value" id="account-email">—</span>
+            </div>
           </div>
           <div class="settings-section" id="account-access-section" style="display:none">
             <h3>Aime access</h3>
@@ -4931,6 +4935,7 @@ document.addEventListener("keydown", (e) => {
 // -- Account (a tab in the settings modal) ------------------------------
 
 const accountUsernameEl = document.getElementById("account-username");
+const accountEmailEl = document.getElementById("account-email");
 
 // Access state (see docs/access-control.md). Optimistic defaults until the
 // first /me resolves; the server-side /send gate is the real guard.
@@ -4976,10 +4981,12 @@ async function refreshMe() {
     const r = await fetch("/me", {credentials: "same-origin"});
     const data = await r.json();
     accountUsernameEl.textContent = data.username || "—";
+    accountEmailEl.textContent = data.email || "—";
     __accessMode = data.access_mode || "open";
     __apiAccess = !!data.api_access;
   } catch {
     accountUsernameEl.textContent = "—";
+    accountEmailEl.textContent = "—";
   }
   applyAccessState();
 }

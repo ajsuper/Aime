@@ -526,10 +526,34 @@ _ACCESS_MODE = os.environ.get("AIME_ACCESS_MODE", "keys").strip().lower()
 if _ACCESS_MODE not in ("keys", "open"):
     _ACCESS_MODE = "keys"
 
+# Toggle for the email 2FA flow. Off by default so a fresh install behaves
+# like it did before the feature shipped — handy for dev, demos, and anyone
+# who hasn't configured EMAIL_ADDRESS / EMAIL_PASSWORD yet. When off:
+#   * the Email field on the signup form is hidden,
+#   * /signup creates the account directly (no code mailed),
+#   * existing accounts without an email are NOT gated on next login.
+def _env_bool(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).strip() not in ("", "0", "false", "False", "no")
+
+
+_DO_EMAIL_VERIFICATION = _env_bool("DO_EMAIL_VERIFICATION", "0")
+
 # When signup is disabled, hide the "Create account" tab and form on the login
 # page so visitors aren't offered something the server will reject.
 _SIGNUP_DISABLED_STYLE = (
     '<style>[data-tab="signup"],form[data-form="signup"]{display:none!important}</style>'
+)
+
+# When email verification is off, also hide the Email input + its label + its
+# helper hint on the signup form. The field stays in the DOM (so the POST still
+# carries an empty value, which the server ignores in that mode) but is
+# visually removed so the form matches the pre-2FA layout.
+_EMAIL_VERIFICATION_DISABLED_STYLE = (
+    '<style>'
+    'label[for="signup-email"],#signup-email,'
+    'label[for="signup-email"] + #signup-email + .hint'
+    '{display:none!important}'
+    '</style>'
 )
 
 
@@ -563,6 +587,9 @@ def _load_login_page(
         .replace("__SIGNUP_USERNAME__", _h(signup_username))
         .replace("__SIGNUP_EMAIL__", _h(signup_email))
         .replace("__SIGNUP_DISABLED_STYLE__", "" if _ALLOW_SIGNUP else _SIGNUP_DISABLED_STYLE)
+        .replace("__EMAIL_VERIFICATION_DISABLED_STYLE__",
+                 "" if _DO_EMAIL_VERIFICATION else _EMAIL_VERIFICATION_DISABLED_STYLE)
+        .replace("__EMAIL_REQUIRED__", "required" if _DO_EMAIL_VERIFICATION else "")
     )
 
 
@@ -733,7 +760,7 @@ def login_submit():
     # *separate* session key (pending_email_user_id) so request handlers that
     # check session['user_id'] don't treat them as logged in until the email
     # step completes.
-    needs_email = not (user.email or "").strip()
+    needs_email = _DO_EMAIL_VERIFICATION and not (user.email or "").strip()
     if needs_email:
         session["pending_email_user_id"] = user.id
         # Carry the legacy-reinit flag through to the add-email step so we
@@ -954,6 +981,27 @@ def signup_submit():
 
     if password != password2:
         return _signup_err("Passwords do not match.")
+
+    # When email verification is off, behave like the pre-2FA signup: create
+    # the account directly and log the user in. The Email field is hidden on
+    # the form (via _EMAIL_VERIFICATION_DISABLED_STYLE), so any value submitted
+    # is ignored.
+    if not _DO_EMAIL_VERIFICATION:
+        try:
+            user, _dek = _auth_backend.create(
+                username, password, api_access=(_ACCESS_MODE == "open")
+            )
+        except _auth.UsernameTaken:
+            return _signup_err("That username is already taken.", status=409)
+        except _auth.InvalidUsername as e:
+            return _signup_err(str(e))
+        except _auth.WeakPassword as e:
+            return _signup_err(str(e))
+        session.clear()
+        session["user_id"] = user.id
+        session.permanent = True
+        return redirect("/")
+
     try:
         token, code, _email_norm = _auth_backend.start_signup_verification(
             username, password, email,
@@ -1144,9 +1192,11 @@ def account_recover():
 def me():
     # access_mode + api_access let the frontend show the invite-key field in
     # profile settings and disable the composer when sending is gated.
+    user = _auth_backend.lookup(g.user_id)
     return jsonify({
         "id": g.user_id,
         "username": g.username,
+        "email": user.email if user else None,
         "access_mode": _ACCESS_MODE,
         "api_access": g.api_access,
     })

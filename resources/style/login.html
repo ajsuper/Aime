@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Sign in — Aime</title>
   __SIGNUP_DISABLED_STYLE__
+  __EMAIL_VERIFICATION_DISABLED_STYLE__
   <style>
     :root {
       --bg: #1a1815; --bg-elev: #25221e; --bg-input: #1f1c19;
@@ -97,7 +98,8 @@
       <p class="hint">3–32 characters: letters, digits, dot, underscore, dash.</p>
       <label for="signup-email">Email</label>
       <input id="signup-email" name="email" type="email" autocomplete="email"
-             autocapitalize="off" autocorrect="off" value="__SIGNUP_EMAIL__" required>
+             autocapitalize="off" autocorrect="off" value="__SIGNUP_EMAIL__"
+             __EMAIL_REQUIRED__>
       <p class="hint">We'll send a 6-digit code to verify it.</p>
       <label for="signup-password">Password</label>
       <input id="signup-password" name="password" type="password"
