@@ -6,71 +6,108 @@
   <title>Sign in — Aime</title>
   __SIGNUP_DISABLED_STYLE__
   __EMAIL_VERIFICATION_DISABLED_STYLE__
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=Hanken+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
   <style>
     :root {
-      --bg: #1a1815; --bg-elev: #25221e; --bg-input: #1f1c19;
-      --text: #f0ebe5; --muted: #9a8f80; --border: #3a342d;
-      --accent: #c89968; --accent-hover: #d6a978; --error: #e5484d;
+      color-scheme: dark;
+      --font-body: "Hanken Grotesk", ui-sans-serif, system-ui, -apple-system, sans-serif;
+      --font-display: "Fraunces", Georgia, "Times New Roman", serif;
+      --r-xs: 6px; --r-sm: 10px; --r-md: 14px; --r-lg: 20px;
+      --bg: #1E1C18;
+      --bg-elev: #28251F;
+      --bg-input: #302C25;
+      --border: #3B362D;
+      --text: #EDE8DD;
+      --muted: #998F7E;
+      --accent: #E0AAB4;
+      --accent-hover: #E8BAC3;
+      --cta: #DC6076;
+      --cta-hover: #E67288;
+      --error: #EC9090;
+      --shadow-1: 0 1px 2px rgba(0,0,0,0.35), 0 4px 14px rgba(0,0,0,0.32);
+      --shadow-2: 0 8px 24px rgba(0,0,0,0.5), 0 28px 60px rgba(0,0,0,0.6);
+      --edge-light: rgba(255,255,255,0.07);
+      --rainbow: linear-gradient(90deg,
+        #8CC09C 0 16.66%, #DBCA7C 16.66% 33.33%, #DEB07E 33.33% 50%,
+        #DA9898 50% 66.66%, #A992CE 66.66% 83.33%, #8EAFD6 83.33% 100%);
     }
     * { box-sizing: border-box; }
     html, body { height: 100%; margin: 0; }
     body { background: var(--bg); color: var(--text);
-           font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+           font-family: var(--font-body);
            display: flex; align-items: center; justify-content: center;
-           padding: 1.5rem; }
-    .card { background: var(--bg-elev); border: 1px solid var(--border);
-            border-radius: 16px; width: 100%; max-width: 380px;
-            padding: 1.75rem 1.75rem 1.5rem;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.45); }
-    h1 { margin: 0 0 0.25rem; font-size: 1.4rem; font-weight: 600; }
-    .subtitle { color: var(--muted); font-size: 0.88rem; margin: 0 0 1.25rem; }
+           padding: 1.5rem;
+           -webkit-font-smoothing: antialiased; }
+    .card { position: relative; background: var(--bg-elev);
+            border: 1px solid var(--border); border-radius: var(--r-lg);
+            width: 100%; max-width: 400px;
+            padding: 1.9rem 1.9rem 1.6rem;
+            box-shadow: var(--shadow-2); }
+    /* Faint top edge highlight — the "lit from above" cue used across the app. */
+    .card::before { content: ""; position: absolute; inset: 0;
+                    border-radius: inherit; pointer-events: none;
+                    box-shadow: inset 0 1px 0 var(--edge-light); }
+    /* Wordmark — display face + hard-stop pastel-rainbow underline. */
+    .wordmark { font-family: var(--font-display); font-weight: 600;
+                font-size: 2.4rem; line-height: 1.1; color: var(--text);
+                width: fit-content; margin: 0.1rem auto 0.2rem;
+                letter-spacing: -0.01em; }
+    .wordmark::after { content: ""; display: block; height: 3px;
+                       margin-top: 0.3rem; border-radius: 2px;
+                       background: var(--rainbow); }
+    .subtitle { font-family: var(--font-display); color: var(--muted);
+                font-size: 0.95rem; text-align: center;
+                margin: 0 0 1.25rem; font-style: italic; font-weight: 400; }
     .tabs { display: flex; gap: 0.25rem; margin-bottom: 1rem;
             border-bottom: 1px solid var(--border); }
     .tab { background: transparent; border: 0; color: var(--muted);
-           font: inherit; font-size: 0.92rem; padding: 0.5rem 0.8rem;
+           font-family: var(--font-display); font-weight: 500;
+           font-size: 0.95rem; padding: 0.55rem 0.85rem;
            cursor: pointer; border-bottom: 2px solid transparent;
-           margin-bottom: -1px; transition: color 0.15s, border-color 0.15s; }
+           margin-bottom: -1px;
+           transition: color 0.15s, border-color 0.15s; }
     .tab:hover { color: var(--text); }
-    .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
-    form { display: none; flex-direction: column; gap: 0.75rem; }
+    .tab.active { color: var(--text); border-bottom-color: var(--cta); }
+    form { display: none; flex-direction: column; gap: 0.7rem; }
     form.active { display: flex; }
-    label { font-size: 0.82rem; color: var(--muted); }
+    label { font-family: var(--font-display); font-weight: 500;
+            font-size: 0.85rem; color: var(--muted); }
     input { background: var(--bg-input); color: var(--text);
-            border: 1px solid var(--border); border-radius: 8px;
-            padding: 0.55rem 0.7rem; font: inherit; font-size: 0.95rem;
+            border: 1px solid var(--border); border-radius: var(--r-sm);
+            padding: 0.6rem 0.75rem; font: inherit; font-size: 0.95rem;
             outline: none;
             transition: border-color 0.15s, box-shadow 0.15s; }
     input:focus { border-color: var(--accent);
-                  box-shadow: 0 0 0 3px rgba(200, 153, 104, 0.18); }
-    button.submit { background: var(--accent); color: #2a1c0c; border: 0;
-                    border-radius: 8px; padding: 0.65rem 0.7rem;
-                    font: inherit; font-size: 0.95rem; font-weight: 600;
-                    cursor: pointer; margin-top: 0.4rem;
-                    transition: background 0.15s; }
-    button.submit:hover { background: var(--accent-hover); }
+                  box-shadow: 0 0 0 3px rgba(224, 170, 180, 0.18); }
+    button.submit { background: var(--cta); color: #fff; border: 0;
+                    border-radius: var(--r-sm); padding: 0.7rem 0.8rem;
+                    font-family: var(--font-display); font-weight: 600;
+                    font-size: 0.98rem; cursor: pointer; margin-top: 0.55rem;
+                    box-shadow: var(--shadow-1);
+                    transition: background 0.15s, transform 0.05s; }
+    button.submit:hover { background: var(--cta-hover); }
+    button.submit:active { transform: translateY(1px); }
     button.submit:disabled { opacity: 0.6; cursor: default; }
-    .hint { color: var(--muted); font-size: 0.75rem; margin: -0.2rem 0 0; }
+    .hint { color: var(--muted); font-size: 0.78rem; margin: -0.2rem 0 0; }
     .error { color: var(--error); font-size: 0.85rem; margin: 0;
              min-height: 1.1rem; }
-    /* Informational line above the sign-in form (e.g. after a recovery).
-       Hidden entirely when the server interpolates nothing into it. */
-    .notice { color: var(--accent); font-size: 0.85rem;
+    .notice { color: var(--accent); font-size: 0.88rem;
               margin: 0 0 1rem; line-height: 1.4; }
     .notice:empty { display: none; }
-    /* Account-recovery prompt — shown in place of the sign-in/signup UI when
-       the user logs into a soft-deleted account. Toggled on by the script
-       below when the server fills in the account name. */
     .recover { display: none; flex-direction: column; gap: 0.9rem; }
-    .recover-msg { margin: 0; font-size: 0.92rem; line-height: 1.5; }
+    .recover-msg { margin: 0; font-size: 0.95rem; line-height: 1.5; }
     .recover-actions { display: flex; flex-direction: column; gap: 0.6rem; }
     .recover-no { text-align: center; color: var(--muted);
-                  font-size: 0.88rem; text-decoration: none; }
+                  font-family: var(--font-display); font-size: 0.9rem;
+                  text-decoration: none; }
     .recover-no:hover { color: var(--text); }
   </style>
 </head>
 <body>
   <div class="card">
-    <h1>Aime</h1>
+    <div class="wordmark">Aime</div>
     <p class="subtitle">Your personal assistant.</p>
     <p class="notice" data-notice>__LOGIN_NOTICE__</p>
 
@@ -138,7 +175,6 @@
         forms.forEach(f => f.classList.toggle("active", f.dataset.form === target));
       });
     });
-    // Client-side check: passwords must match before submitting signup.
     const signupForm = document.querySelector('form[data-form="signup"]');
     signupForm.addEventListener("submit", (e) => {
       const pw = signupForm.querySelector('input[name="password"]').value;
@@ -149,8 +185,6 @@
         err.textContent = "Passwords do not match.";
       }
     });
-
-    // If the server rendered an error into one of the panels, switch to it.
     const errs = document.querySelectorAll(".error");
     for (const e of errs) {
       if (e.textContent.trim()) {
@@ -159,15 +193,9 @@
         break;
       }
     }
-
-    // Account recovery: when the server marked this account as soft-deleted,
-    // it fills in the account name. Show the recovery prompt in place of the
-    // sign-in / signup UI so the choice is unambiguous.
     const recover = document.querySelector(".recover");
     if (recover && recover.dataset.recoverUsername.trim()) {
       document.querySelector(".tabs").style.display = "none";
-      // Only hide the sign-in / signup forms — the recovery prompt has its
-      // own <form> for the "Yes, recover it" button and must stay visible.
       forms.forEach(f => {
         if (f.dataset.form) f.style.display = "none";
       });
