@@ -2359,7 +2359,7 @@ es.onmessage = (ev) => {
       break;
     case "assistant_html_partial": {
       const bubble = ensureAssistant();
-      if (liveMode) {
+      if (liveMode && !e.from_replay) {
         typewriterUpdate(bubble, e.text, /*finalize=*/false);
       } else {
         bubble._content.innerHTML = e.text;
@@ -2371,7 +2371,7 @@ es.onmessage = (ev) => {
       // one and skip the typewriter entirely (replay should appear instantly).
       let target = pendingHtmlTarget || currentAssistant;
       if (!target) target = appendMessage("aime", "aime", "");
-      if (liveMode) {
+      if (liveMode && !e.from_replay) {
         typewriterUpdate(target, e.text, /*finalize=*/true);
       } else {
         target._content.innerHTML = e.text;

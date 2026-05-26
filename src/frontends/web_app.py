@@ -396,6 +396,7 @@ class UserContext:
             self._broadcast({
                 "kind": "assistant_html",
                 "text": _render_markup_to_html(event.text, final=True),
+                "from_replay": event.from_replay,
             })
 
 
