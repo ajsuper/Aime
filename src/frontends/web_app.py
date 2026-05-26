@@ -81,6 +81,16 @@ except Exception:  # noqa: BLE001 - export is best-effort
     _pypandoc = None
     _PANDOC_AVAILABLE = False
 
+# WeasyPrint handles HTML → PDF as a pure Python library. Importing it eagerly
+# at startup means the (slow) Pango/Cairo initialisation cost is paid once,
+# not on the first export request.
+try:
+    from weasyprint import HTML as _WeasyHTML
+    _WEASY_AVAILABLE = True
+except Exception:  # noqa: BLE001 - PDF export is best-effort
+    _WeasyHTML = None
+    _WEASY_AVAILABLE = False
+
 
 # ---------------------------------------------------------------------------
 # Auth wiring (Phase 1: per-route gating, single shared controller still)
@@ -1450,41 +1460,20 @@ def topic_export(topic_id: str):
             }), 503
         try:
             if target == "pdf":
-                # pandoc needs an external engine to render PDFs. Try the
-                # common engines in order — whichever the user has installed
-                # wins. If none are present, surface a clear message.
-                with tempfile.NamedTemporaryFile(
-                    suffix=".pdf", delete=False
-                ) as tf:
-                    tmp_path = tf.name
-                last_err = None
-                produced = False
-                try:
-                    for engine in ("weasyprint", "wkhtmltopdf", "xelatex",
-                                   "pdflatex", "context"):
-                        try:
-                            _pypandoc.convert_text(
-                                markdown, "pdf", format="md",
-                                outputfile=tmp_path,
-                                extra_args=[f"--pdf-engine={engine}"],
-                            )
-                            produced = True
-                            break
-                        except Exception as exc:  # noqa: BLE001
-                            last_err = exc
-                    if not produced:
-                        raise RuntimeError(
-                            "no PDF engine available — install weasyprint, "
-                            "wkhtmltopdf, or a LaTeX distribution "
-                            f"(last error: {last_err})"
-                        )
-                    with open(tmp_path, "rb") as f:
-                        data = f.read()
-                finally:
-                    try:
-                        os.unlink(tmp_path)
-                    except OSError:
-                        pass
+                # Skip pandoc's --pdf-engine machinery (which depends on
+                # external binaries on PATH and has finicky engine/format
+                # compatibility rules). Render to HTML with pandoc, then
+                # rasterize with WeasyPrint as an in-process Python call.
+                if not _WEASY_AVAILABLE:
+                    raise RuntimeError(
+                        "PDF export needs WeasyPrint, which isn't installed "
+                        "on the server"
+                    )
+                html = _pypandoc.convert_text(
+                    markdown, "html5", format="md",
+                    extra_args=["--standalone"],
+                )
+                data = _WeasyHTML(string=html).write_pdf()
             elif target in ("docx", "odt", "epub"):
                 with tempfile.NamedTemporaryFile(
                     suffix=f".{ext}", delete=False
