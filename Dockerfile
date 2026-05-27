@@ -67,26 +67,44 @@ COPY --from=backend-build /build/serve.o ./build/serve.o
 # dashboard process crashes on import.
 COPY scripts/usage_report.py ./scripts/usage_report.py
 
-# Pre-download the practical, commonly-used Whisper STT models (tiny / base /
-# small, ~700MB total) so voice input is instant out of the box. The heavier
-# models (medium, large-v3, large-v3-turbo) still work — faster-whisper just
-# fetches them on first use into the mounted models volume.
-#
-# frontends/stt.py resolves the model dir as <repo>/models/whisper, which is
-# /app/models/whisper here, and reads the default UI choice from .selected.
-ARG WHISPER_MODEL=small.en
+# Pre-download Whisper STT models so voice input is instant out of the box.
+# Which models get baked in is controlled by DOWNLOAD_TINY / DOWNLOAD_BASE /
+# DOWNLOAD_SMALL (see .env.example) — only "1" downloads. Tiny is on by
+# default. Heavier models (medium, large-v3, large-v3-turbo) still work —
+# faster-whisper just fetches them on first use into the mounted models
+# volume. frontends/stt.py resolves the model dir as <repo>/models/whisper
+# (i.e. /app/models/whisper here) and only exposes downloaded models in the
+# UI dropdown.
+ARG DOWNLOAD_TINY=1
+ARG DOWNLOAD_BASE=0
+ARG DOWNLOAD_SMALL=0
 RUN mkdir -p /app/models/whisper && \
+    DOWNLOAD_TINY="$DOWNLOAD_TINY" \
+    DOWNLOAD_BASE="$DOWNLOAD_BASE" \
+    DOWNLOAD_SMALL="$DOWNLOAD_SMALL" \
     python - /app/models/whisper <<'PY'
+import os
 import sys
 from faster_whisper import WhisperModel
 cache = sys.argv[1]
-for name in ["tiny.en", "base.en", "small.en"]:
+wanted = []
+if os.environ.get("DOWNLOAD_TINY") == "1":
+    wanted.append("tiny.en")
+if os.environ.get("DOWNLOAD_BASE") == "1":
+    wanted.append("base.en")
+if os.environ.get("DOWNLOAD_SMALL") == "1":
+    wanted.append("small.en")
+if not wanted:
+    # Always ship with at least one model so voice input works out of the box.
+    wanted.append("tiny.en")
+for name in wanted:
     print(f"Downloading Whisper model {name!r} ...", flush=True)
     WhisperModel(name, device="cpu", compute_type="int8", download_root=cache)
-print(f"Whisper models cached under {cache}")
+# Default the UI to the smallest (fastest) downloaded model.
+with open(os.path.join(cache, ".selected"), "w") as f:
+    f.write(wanted[0])
+print(f"Whisper models cached under {cache}: {', '.join(wanted)}")
 PY
-
-RUN echo "$WHISPER_MODEL" > /app/models/whisper/.selected
 
 # HOME drives every data path: aime/config.py derives DATABASE_DIR, the
 # conversations dir, and CONFIG_PATH from it. Point it at /data so a single

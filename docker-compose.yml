@@ -11,6 +11,13 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      # Pick which Whisper STT models get baked into the image. Defaults match
+      # .env.example: just tiny.en. Set DOWNLOAD_BASE / DOWNLOAD_SMALL to 1 in
+      # .env to include the larger ones.
+      args:
+        DOWNLOAD_TINY: "${DOWNLOAD_TINY:-1}"
+        DOWNLOAD_BASE: "${DOWNLOAD_BASE:-0}"
+        DOWNLOAD_SMALL: "${DOWNLOAD_SMALL:-0}"
     image: aime
     ports:
       - "5000:5000"

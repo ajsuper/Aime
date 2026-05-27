@@ -37,6 +37,26 @@ _AVAILABLE_MODELS = [
     "large-v3-turbo",
 ]
 
+# Hugging Face repo each size resolves to. Used to detect which sizes are
+# already cached on disk so the UI only offers downloaded models.
+_MODEL_REPOS = {
+    "tiny.en": "Systran/faster-whisper-tiny.en",
+    "base.en": "Systran/faster-whisper-base.en",
+    "small.en": "Systran/faster-whisper-small.en",
+    "medium.en": "Systran/faster-whisper-medium.en",
+    "large-v3": "Systran/faster-whisper-large-v3",
+    "large-v3-turbo": "mobiuslabsgmbh/faster-whisper-large-v3-turbo",
+}
+
+
+def _is_downloaded(name: str) -> bool:
+    repo = _MODEL_REPOS.get(name)
+    if not repo:
+        return False
+    # huggingface_hub caches a repo "org/name" as "models--org--name/".
+    dirname = "models--" + repo.replace("/", "--")
+    return os.path.isdir(os.path.join(_DEFAULT_MODEL_DIR, dirname))
+
 _model_lock = threading.Lock()
 _model = None  # type: ignore[var-annotated]
 _model_name_loaded: str | None = None
@@ -55,11 +75,16 @@ def _read_selection() -> str | None:
 
 
 def list_models() -> dict:
-    """Return available model sizes plus selection state."""
+    """Return available model sizes plus selection state.
+
+    Only models that are already cached on disk are returned, so the UI
+    dropdown never offers a size that hasn't been downloaded yet.
+    """
     selected = _read_selection()
     env = os.environ.get("WHISPER_MODEL")
+    downloaded = [name for name in _AVAILABLE_MODELS if _is_downloaded(name)]
     return {
-        "models": list(_AVAILABLE_MODELS),
+        "models": downloaded,
         "selected": selected,
         "env_override": env or None,
     }
