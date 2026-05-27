@@ -20,7 +20,11 @@ services:
         DOWNLOAD_SMALL: "${DOWNLOAD_SMALL:-0}"
     image: aime
     ports:
-      - "5000:5000"
+      # Bound to 127.0.0.1 on the host so the app is only reachable from the
+      # box itself. On a server, put a reverse proxy (Caddy, nginx) in front
+      # to terminate TLS for your real domain and forward to 127.0.0.1:5000.
+      # For LAN access without a proxy, change this to "5000:5000".
+      - "127.0.0.1:5000:5000"
       # Usage dashboard. Only reachable when AIME_USAGE_DASHBOARD=1; it can
       # expose usernames, so keep this bound to localhost on the host side.
       - "127.0.0.1:5050:5050"
