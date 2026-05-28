@@ -884,15 +884,21 @@
     .cal-sched .day-col.today { background-color:
         color-mix(in srgb, var(--accent) 8%, transparent); }
     .cal-sched .ev-block { position: absolute; left: 4px; right: 4px;
-                           padding: 4px 8px; border-radius: 6px;
+                           padding: 3px 8px; border-radius: 6px;
                            background: var(--accent); color: white;
-                           font-size: 0.72rem; line-height: 1.25;
+                           font-size: 0.72rem; line-height: 1.2;
                            overflow: hidden; cursor: pointer;
                            box-shadow: 0 1px 2px rgba(0,0,0,0.18);
-                           transition: transform 0.1s; }
-    .cal-sched .ev-block:hover { transform: translateY(-1px); }
-    .cal-sched .ev-block .ev-block-time { opacity: 0.85; font-size: 0.65rem;
-                                          margin-bottom: 1px; }
+                           transition: transform 0.1s, box-shadow 0.1s;
+                           box-sizing: border-box; }
+    .cal-sched .ev-block:hover { transform: translateY(-1px);
+                                 box-shadow: 0 3px 8px rgba(0,0,0,0.22);
+                                 z-index: 3; }
+    /* When events overlap they're laid out into N side-by-side columns
+       within the same time-slot; a hairline separates neighbors so they
+       don't visually merge. */
+    .cal-sched .ev-block.is-overlap { border: 1px solid
+        color-mix(in srgb, var(--bg) 55%, transparent); }
     .cal-sched .ev-block .ev-block-title { font-weight: 600;
                                            overflow: hidden;
                                            text-overflow: ellipsis;
@@ -1103,19 +1109,23 @@
     .modal-foot button.danger:hover { background:
         color-mix(in srgb, var(--warning, #e29a4a) 15%, transparent); }
 
-    /* Event modal field rows */
-    .ev-field { display: flex; flex-direction: column; gap: 0.3rem; flex: 1;
+    /* Event modal field rows — compact, inline label + control on one
+       line so the modal isn't dominated by uppercase tags. */
+    .ev-field { display: flex; align-items: center; gap: 0.6rem; flex: 1;
                 min-width: 0; }
+    .ev-field.stack { flex-direction: column; align-items: stretch;
+                      gap: 0.3rem; }
     .ev-field .lbl { font-size: 0.72rem; color: var(--muted);
                      text-transform: uppercase; letter-spacing: 0.08em;
-                     font-weight: 600; }
+                     font-weight: 600; flex: 0 0 4.2rem; }
+    .ev-field.stack .lbl { flex: 0 0 auto; }
     .ev-field input, .ev-field textarea {
         background: var(--bg-input); color: var(--text);
         border: 1px solid var(--border); border-radius: 6px;
-        padding: 0.45rem 0.6rem; font: inherit; font-size: 0.9rem;
+        padding: 0.35rem 0.55rem; font: inherit; font-size: 0.88rem;
         transition: border-color 0.15s, box-shadow 0.15s;
-        font-family: inherit; }
-    .ev-field textarea { resize: vertical; min-height: 4em;
+        font-family: inherit; flex: 1; min-width: 0; }
+    .ev-field textarea { resize: vertical; min-height: 3.2em;
                          font-family: inherit; }
     .ev-field input:focus, .ev-field textarea:focus {
         outline: none; border-color: var(--accent);
@@ -1125,6 +1135,8 @@
         color: var(--text); cursor: default;
         padding-left: 0; padding-right: 0; }
     .ev-row { display: flex; gap: 0.85rem; }
+    /* Tighter vertical rhythm inside the event modal specifically. */
+    #event-modal .modal-body { gap: 0.55rem; padding: 0.9rem 1.1rem; }
     .ev-modal-error { color: var(--warning, #e29a4a); font-size: 0.8rem;
                       margin: 0; }
     /* Schedule and pill events should look interactive. */
@@ -1689,9 +1701,9 @@
           <span class="lbl">Category</span>
           <input type="text" id="ev-f-category" disabled>
         </label>
-        <label class="ev-field">
+        <label class="ev-field stack">
           <span class="lbl">Summary</span>
-          <textarea id="ev-f-summary" rows="4" disabled></textarea>
+          <textarea id="ev-f-summary" rows="3" disabled></textarea>
         </label>
         <p class="ev-modal-error" id="ev-modal-error" hidden></p>
       </div>
@@ -3893,6 +3905,34 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && !eventBackdrop.hidden) closeEventModal();
 });
 
+// Greedy column packing for overlapping events. `items` is pre-sorted by
+// start. Returns one entry per item with its column index and the cluster's
+// total column count, so all siblings in a cluster render at the same width.
+function layoutOverlaps(items) {
+  const out = [];
+  let cluster = [];
+  let clusterEnd = -Infinity;
+  const flush = () => {
+    const cols = cluster.reduce((m, p) => Math.max(m, p.colIdx + 1), 0);
+    cluster.forEach(p => { p.colCount = cols; out.push(p); });
+    cluster = [];
+  };
+  items.forEach(it => {
+    if (it.start >= clusterEnd) flush();
+    // Find lowest free column (one whose last event has already ended).
+    const colEnds = [];
+    cluster.forEach(p => {
+      colEnds[p.colIdx] = Math.max(colEnds[p.colIdx] || 0, p.end);
+    });
+    let colIdx = 0;
+    while (colEnds[colIdx] !== undefined && colEnds[colIdx] > it.start) colIdx++;
+    cluster.push({ ev: it.ev, start: it.start, end: it.end, colIdx });
+    clusterEnd = Math.max(clusterEnd, it.end);
+  });
+  flush();
+  return out;
+}
+
 function buildDayColumn(date, events, sched, allDayCol, hourPx, startHour, endHour) {
   const col = document.createElement("div");
   col.className = "day-col";
@@ -3906,10 +3946,13 @@ function buildDayColumn(date, events, sched, allDayCol, hourPx, startHour, endHo
     + `var(--border) ${hourPx}px)`;
   const startMin = startHour * 60;
   const dayEvents = (events[eventKey(date)] || []);
+
+  // Split into timed vs all-day. All-day events go to the strip above;
+  // timed events get laid out below with overlap-aware column assignment.
+  const timed = [];
   dayEvents.forEach(ev => {
     const start = parseEventMinutes(ev);
     if (start === null) {
-      // All-day: render a pill in the strip rather than a positioned block.
       if (allDayCol) {
         const pill = document.createElement("div");
         pill.className = "ev-pill" + (ev.archived ? " archived" : "");
@@ -3922,17 +3965,33 @@ function buildDayColumn(date, events, sched, allDayCol, hourPx, startHour, endHo
       }
       return;
     }
+    timed.push({ ev, start, end: start + DEFAULT_EV_MIN });
+  });
+
+  // Overlap layout: sort by start, then walk forward grouping into clusters
+  // of mutually-overlapping events. Within a cluster, greedily place each
+  // event in the lowest-numbered column whose previous occupant has ended.
+  // Every event in a cluster is rendered with the same column count so all
+  // siblings share width — keeps the layout calm.
+  timed.sort((a, b) => a.start - b.start || a.end - b.end);
+  const placements = layoutOverlaps(timed);
+
+  placements.forEach(({ ev, start, colIdx, colCount }) => {
     const block = document.createElement("div");
-    block.className = "ev-block" + (ev.archived ? " archived" : "");
+    block.className = "ev-block" + (ev.archived ? " archived" : "")
+                    + (colCount > 1 ? " is-overlap" : "");
     block.style.top = ((start - startMin) / 60 * hourPx) + "px";
     block.style.height = Math.max(18, DEFAULT_EV_MIN / 60 * hourPx) + "px";
-    const t = document.createElement("div");
-    t.className = "ev-block-time";
-    t.textContent = formatBackendTime(ev.time);
+    if (colCount > 1) {
+      // 4px inset on each side of the column, 2px gap between siblings.
+      block.style.left = `calc(4px + (100% - 8px) * ${colIdx} / ${colCount}`
+                       + ` + ${colIdx > 0 ? 1 : 0}px)`;
+      block.style.right = "auto";
+      block.style.width = `calc((100% - 8px) / ${colCount} - 2px)`;
+    }
     const title = document.createElement("div");
     title.className = "ev-block-title";
     title.textContent = ev.title || ev.name || "(untitled)";
-    block.appendChild(t);
     block.appendChild(title);
     block.addEventListener("click", (e) => {
       e.stopPropagation();
