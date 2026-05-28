@@ -18,6 +18,10 @@
     "category": {
       "type": "string",
       "description": "A category to help organize and identify topics. Please attempt to use categories that are already being used by other topics and only use a new category if you think it is needed."
+    },
+    "folder": {
+      "type": "string",
+      "description": "Optional folder name this topic belongs to. Omit to leave the topic's current folder unchanged. Pass an empty string to move it back to the root. To rename a folder across many topics at once, use RenameFolder instead."
     }
   }
 }

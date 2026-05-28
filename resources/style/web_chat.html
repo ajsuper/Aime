@@ -987,6 +987,26 @@
     .topic-item:hover { background: rgba(124, 140, 255, 0.08); }
     .topic-item.active { background: rgba(124, 140, 255, 0.18); color: var(--accent); }
     .topic-item .cat { color: var(--muted); font-size: 0.7rem; margin-top: 0.1rem; }
+    .topic-item.in-folder { padding-left: 1.6rem; }
+    /* Folder header — a clickable row that toggles its child topics. The
+       chevron rotates rather than swapping glyphs so the transition feels
+       smooth and the row width doesn't jitter. */
+    .topic-folder-header { display: flex; align-items: center; gap: 0.4rem;
+                           padding: 0.5rem 0.8rem; cursor: pointer;
+                           font-size: 0.8rem; color: var(--muted);
+                           background: var(--bg-elev);
+                           border-bottom: 1px solid var(--border);
+                           user-select: none;
+                           text-transform: uppercase; letter-spacing: 0.04em; }
+    .topic-folder-header:hover { color: var(--text); }
+    .topic-folder-header .chev { display: inline-block; width: 0.8em;
+                                 transition: transform 0.15s; }
+    .topic-folder-header.collapsed .chev { transform: rotate(-90deg); }
+    .topic-folder-header .name { flex: 1; overflow: hidden;
+                                 text-overflow: ellipsis; white-space: nowrap; }
+    .topic-folder-header .count { font-size: 0.7rem; color: var(--muted);
+                                  opacity: 0.7; }
+    .topic-folder-group.collapsed .topic-item { display: none; }
     .topic-content { flex: 1; overflow-y: auto; min-width: 0; }
     .topic-toolbar { position: sticky; top: 0; z-index: 5;
                      background: var(--bg); border-bottom: 1px solid var(--border);
@@ -4375,6 +4395,39 @@ async function loadTopics(silent) {
   }
 }
 
+// Folder expand/collapse state persists across reloads. Stored as
+// { "<folder name>": true } where true == collapsed. Folders default to
+// expanded (key absent), and an active search query overrides the saved
+// state so the user can see every match in context.
+const FOLDER_STATE_KEY = "aime.topicFolderCollapsed";
+let folderCollapsed = {};
+try {
+  folderCollapsed = JSON.parse(localStorage.getItem(FOLDER_STATE_KEY) || "{}") || {};
+} catch { folderCollapsed = {}; }
+
+function saveFolderState() {
+  try { localStorage.setItem(FOLDER_STATE_KEY, JSON.stringify(folderCollapsed)); }
+  catch {}
+}
+
+function buildTopicItem(t) {
+  const item = document.createElement("div");
+  item.className = "topic-item";
+  const tid = t.id || t.topic_id || t.name || t.title;
+  if (tid === selectedTopicId) item.classList.add("active");
+  const title = document.createElement("div");
+  title.textContent = t.title || t.name || "(untitled)";
+  item.appendChild(title);
+  if (t.category) {
+    const c = document.createElement("div");
+    c.className = "cat";
+    c.textContent = "#" + t.category;
+    item.appendChild(c);
+  }
+  item.addEventListener("click", () => selectTopic(tid, item));
+  return item;
+}
+
 function renderTopicList() {
   const q = (topicSearchEl.value || "").trim().toLowerCase();
   const filtered = q
@@ -4382,7 +4435,9 @@ function renderTopicList() {
         const title = (t.title || t.name || "").toLowerCase();
         const summary = (t.summary || t.description || "").toLowerCase();
         const category = (t.category || "").toLowerCase();
-        return title.includes(q) || summary.includes(q) || category.includes(q);
+        const folder = (t.folder || "").toLowerCase();
+        return title.includes(q) || summary.includes(q)
+            || category.includes(q) || folder.includes(q);
       })
     : allTopics;
 
@@ -4394,23 +4449,63 @@ function renderTopicList() {
     topicListEl.innerHTML = '<div class="empty">no matches</div>';
     return;
   }
-  topicListEl.innerHTML = "";
+
+  // Group by folder. "" (or missing) means root — those topics render at the
+  // top with no folder header. Folder iteration order follows first-seen so
+  // the backend's natural ordering is preserved.
+  const root = [];
+  const folders = new Map();
   filtered.forEach(t => {
-    const item = document.createElement("div");
-    item.className = "topic-item";
-    const tid = t.id || t.topic_id || t.name || t.title;
-    if (tid === selectedTopicId) item.classList.add("active");
-    const title = document.createElement("div");
-    title.textContent = t.title || t.name || "(untitled)";
-    item.appendChild(title);
-    if (t.category) {
-      const c = document.createElement("div");
-      c.className = "cat";
-      c.textContent = "#" + t.category;
-      item.appendChild(c);
-    }
-    item.addEventListener("click", () => selectTopic(tid, item));
-    topicListEl.appendChild(item);
+    const folder = (t.folder || "").trim();
+    if (!folder) { root.push(t); return; }
+    if (!folders.has(folder)) folders.set(folder, []);
+    folders.get(folder).push(t);
+  });
+
+  topicListEl.innerHTML = "";
+  root.forEach(t => topicListEl.appendChild(buildTopicItem(t)));
+
+  folders.forEach((topics, folderName) => {
+    const group = document.createElement("div");
+    group.className = "topic-folder-group";
+    // Search overrides saved state — searcher should see all matches.
+    const collapsed = !q && folderCollapsed[folderName] === true;
+    if (collapsed) group.classList.add("collapsed");
+
+    const header = document.createElement("div");
+    header.className = "topic-folder-header" + (collapsed ? " collapsed" : "");
+    const chev = document.createElement("span");
+    chev.className = "chev";
+    chev.textContent = "▾";
+    const name = document.createElement("span");
+    name.className = "name";
+    name.textContent = folderName;
+    const count = document.createElement("span");
+    count.className = "count";
+    count.textContent = topics.length;
+    header.appendChild(chev);
+    header.appendChild(name);
+    header.appendChild(count);
+    header.addEventListener("click", () => {
+      const nowCollapsed = !group.classList.contains("collapsed");
+      group.classList.toggle("collapsed", nowCollapsed);
+      header.classList.toggle("collapsed", nowCollapsed);
+      // Only persist when no search query is active so a transient
+      // search-driven expand doesn't overwrite the user's saved preference.
+      if (!q) {
+        if (nowCollapsed) folderCollapsed[folderName] = true;
+        else delete folderCollapsed[folderName];
+        saveFolderState();
+      }
+    });
+    group.appendChild(header);
+
+    topics.forEach(t => {
+      const item = buildTopicItem(t);
+      item.classList.add("in-folder");
+      group.appendChild(item);
+    });
+    topicListEl.appendChild(group);
   });
 }
 

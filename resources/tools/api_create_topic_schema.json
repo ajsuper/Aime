@@ -17,6 +17,10 @@
     "category": {
       "type": "string",
       "description": "A category to help organize and identify topics. Please attempt to use categories that are already being used by other topics and only use a new category if you think it is needed."
+    },
+    "folder": {
+      "type": "string",
+      "description": "Optional folder name this topic belongs to (e.g. 'Work', 'Health'). Folders exist implicitly — using a name that no other topic uses creates that folder. Reuse existing folder names exactly (case-sensitive) instead of inventing variants. Omit or pass an empty string to place the topic at the root. Whitespace-only values are treated as empty."
     }
   }
 }

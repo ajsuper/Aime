@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "FilterTopics",
-  "description": "Request body for POST /api. All fields are optional; omitted fields use their defaults. The tool gets a list of topics based on the filters.",
+  "description": "Request body for POST /api. All fields are optional; omitted fields use their defaults. The tool gets a list of topics based on the filters. Each returned topic includes its 'folder' name (empty string = root); folder is NOT a filter dimension — fetch all topics and group by folder client-side if needed.",
   "type": "object",
   "additionalProperties": false,
   "properties": {
