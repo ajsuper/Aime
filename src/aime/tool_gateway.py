@@ -7,10 +7,26 @@ the rest of the codebase never imports `requests` and never references
 `API_URL` directly.
 """
 
+from typing import Callable
+
 import requests
 
 from .tool_formatting import TOOL_NAME_MAP
 from .config import API_URL
+
+
+# Backend tool-name prefixes that only read state. Anything not matching is
+# treated as a mutation so that newly added mutating tools auto-trigger a
+# cross-session refresh without anyone remembering to wire it up.
+_READONLY_PREFIXES = ("get_", "list_")
+# Specific read-only backend tools that don't match the prefix rule.
+_READONLY_TOOLS = frozenset({"reload_database"})
+
+
+def _is_mutation(backend_tool_name: str) -> bool:
+    if backend_tool_name in _READONLY_TOOLS:
+        return False
+    return not backend_tool_name.startswith(_READONLY_PREFIXES)
 
 
 class ToolGateway:
@@ -19,14 +35,21 @@ class ToolGateway:
         api_url: str = API_URL,
         timeout: float = 10.0,
         user_id: int | None = None,
+        on_mutation: Callable[[str], None] | None = None,
     ):
         """`user_id` is forwarded with every backend call so the C++ side can
         route each request to that user's database. None preserves the legacy
         single-DB behavior the backend still uses today; the field is just
-        absent in that case."""
+        absent in that case.
+
+        `on_mutation` fires after any successful call whose tool name isn't
+        read-only — used to broadcast a refresh signal to other sessions of
+        the same user. Hooking it here (rather than at each endpoint) means a
+        future mutating tool ships sync support automatically."""
         self._url = api_url
         self._timeout = timeout
         self._user_id = user_id
+        self._on_mutation = on_mutation
 
     def _post(self, body: dict) -> dict:
         if self._user_id is not None:
@@ -38,9 +61,19 @@ class ToolGateway:
         if not response.ok:
             return {"error": response.text}
         try:
-            return response.json()
+            result = response.json()
         except ValueError as exc:
             return {"error": f"invalid JSON from tool server: {exc}"}
+        if (
+            self._on_mutation
+            and not (isinstance(result, dict) and "error" in result)
+            and _is_mutation(body.get("tool_name", ""))
+        ):
+            try:
+                self._on_mutation(body.get("tool_name", ""))
+            except Exception:
+                pass
+        return result
 
     def execute(self, agent_tool_name: str | None, tool_input: dict) -> dict:
         """Run a tool by its agent-side name (translated to the backend name

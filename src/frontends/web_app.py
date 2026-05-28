@@ -308,7 +308,25 @@ class UserContext:
         )
         backend.new_session()
 
-        gateway = ToolGateway(api_url=aime_config.API_URL, user_id=user_id)
+        # SSE plumbing: one queue per connected client, plus a replayable
+        # history for refreshes. Locks are per-user so concurrent users don't
+        # serialize against each other. Built before the gateway so the
+        # on_mutation callback always has somewhere to broadcast to.
+        self._subscribers_lock = threading.Lock()
+        self._client_queues: list[queue.Queue] = []
+        self._history_lock = threading.Lock()
+        self._history: list[dict] = []
+
+        # Streaming assistant text accumulator. Rich-markup tags can span
+        # delta boundaries; we render to HTML once a block ends.
+        self._assistant_buf: list[str] = []
+        self._assistant_buf_lock = threading.Lock()
+
+        gateway = ToolGateway(
+            api_url=aime_config.API_URL,
+            user_id=user_id,
+            on_mutation=self._on_backend_mutation,
+        )
         self.gateway = gateway
         self.calendar_service = CalendarService(gateway)
         self.topic_service = TopicService(gateway)
@@ -323,19 +341,6 @@ class UserContext:
             tool_gateway=gateway,
             worker_spawner=spawn_worker,
         )
-
-        # SSE plumbing: one queue per connected client, plus a replayable
-        # history for refreshes. Locks are per-user so concurrent users don't
-        # serialize against each other.
-        self._subscribers_lock = threading.Lock()
-        self._client_queues: list[queue.Queue] = []
-        self._history_lock = threading.Lock()
-        self._history: list[dict] = []
-
-        # Streaming assistant text accumulator. Rich-markup tags can span
-        # delta boundaries; we render to HTML once a block ends.
-        self._assistant_buf: list[str] = []
-        self._assistant_buf_lock = threading.Lock()
 
         self.controller.subscribe(self._fanout)
         self.controller.start()
@@ -364,9 +369,12 @@ class UserContext:
                 self._history.clear()
             # Streaming text deltas and presentational events don't replay —
             # the assistant_html that follows is the final rendered form.
+            # `remote_edit` is a transient refresh ping; replaying it on
+            # reconnect would just trigger redundant refetches.
             if payload.get("kind") not in (
                 "assistant_text_delta", "assistant_text_end",
                 "assistant_html_partial", "turn_end", "ready",
+                "remote_edit",
             ):
                 self._history.append(payload)
         with self._subscribers_lock:
@@ -376,6 +384,20 @@ class UserContext:
                 q.put_nowait(payload)
             except queue.Full:
                 pass
+
+    def notify_remote_edit(self, source: str) -> None:
+        """Tell every connected session of this user to re-fetch their
+        topic/calendar views. This is the single refresh-fanout entry point:
+        anything that mutates user-visible state (agent tool call via the
+        gateway, direct UI endpoint, future background job, etc.) should
+        funnel through here so the frontend only needs one handler to wire
+        up. `source` is for debugging — it shows up in the SSE payload."""
+        self._broadcast({"kind": "remote_edit", "source": source})
+
+    def _on_backend_mutation(self, tool_name: str) -> None:
+        # Fired by ToolGateway after any successful non-read tool call,
+        # covering both AI tool calls and direct UI service calls.
+        self.notify_remote_edit(tool_name)
 
     def _fanout(self, event: CoreEvent) -> None:
         partial_full: str | None = None

@@ -2921,6 +2921,18 @@ es.onmessage = (ev) => {
                      (e.tool_result_summary ? " — " + e.tool_result_summary : ""),
                      "info");
       }
+      // Pane refresh is driven by `remote_edit` (fired for every backend
+      // mutation regardless of origin — AI tool call or direct UI edit on
+      // any session of this user). Keeping it off `tool_result` avoids
+      // refetching after read-only tool calls.
+      break;
+    case "remote_edit":
+      // Single unified refresh signal. Anything that mutates user-visible
+      // state on the server fans out as one of these so every open session
+      // re-fetches. If a future feature needs to trigger a refresh from a
+      // path that doesn't go through the tool gateway, have it call
+      // UserContext.notify_remote_edit on the server and it will land here
+      // with no frontend changes needed.
       scheduleActivePaneRefresh();
       break;
     case "turn_end":
