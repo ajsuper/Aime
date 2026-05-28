@@ -20,6 +20,8 @@ TOOL_NAME_MAP = {
     "GetTopicContents": "get_topic_contents",
     "ReplaceTopicContents": "replace_topic_contents",
     "EditTopicContents": "edit_topic_contents",
+    "RenameFolder": "rename_folder",
+    "ListFolders": "list_folders",
 }
 
 
@@ -74,10 +76,20 @@ def format_tool_details(name: str, inp: dict) -> str:
         parts.append(f"\"{_truncate_for_log(inp.get('title'), 40) or '?'}\"")
         if inp.get("category"):
             parts.append(f"#{inp['category']}")
+        if inp.get("folder"):
+            parts.append(f"folder={_truncate_for_log(inp['folder'], 30)}")
     elif name == "ReplaceTopic":
         parts.append(f"id={inp.get('id', '?')}")
         if inp.get("title"):
             parts.append(f"title={_truncate_for_log(inp['title'], 30)}")
+        if "folder" in inp:
+            folder = inp.get("folder") or ""
+            parts.append(f"folder={_truncate_for_log(folder, 30) or '(root)'}")
+    elif name == "RenameFolder":
+        parts.append(
+            f"\"{_truncate_for_log(inp.get('old_name'), 30) or '?'}\""
+            f" → \"{_truncate_for_log(inp.get('new_name'), 30) or '?'}\""
+        )
     elif name == "GetTopicContents":
         parts.append(f"id={inp.get('id', '?')}")
     elif name == "ReplaceTopicContents":
@@ -110,6 +122,16 @@ def format_tool_response(name: str, result) -> str:
 
     parts: list[str] = []
 
+    if name == "ListFolders":
+        if isinstance(result, dict):
+            folders = result.get("folders") or []
+            parts.append(f"{len(folders)} folder{'s' if len(folders) != 1 else ''}")
+            for f in folders[:5]:
+                if isinstance(f, dict):
+                    parts.append(f"{f.get('name', '?')}({f.get('count', '?')})")
+            if len(folders) > 5:
+                parts.append(f"+{len(folders) - 5} more")
+        return ", ".join(parts)
     if name in ("FilterUsersEvents", "FilterTopics"):
         if isinstance(result, list):
             items = result
@@ -131,7 +153,7 @@ def format_tool_response(name: str, result) -> str:
         if len(items) > 3:
             parts.append(f"+{len(items) - 3} more")
     elif name in ("CreateEvent", "EditEvent", "CreateTopic", "ReplaceTopic",
-                  "ReplaceTopicContents", "EditTopicContents"):
+                  "ReplaceTopicContents", "EditTopicContents", "RenameFolder"):
         if isinstance(result, dict):
             for key in ("id", "status", "ok", "success"):
                 if key in result:

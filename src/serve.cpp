@@ -101,6 +101,7 @@ struct Topic {
     std::string topicTitle;
     std::string topicSummary;
     std::string topicCategory;
+    std::string topicFolder; // "" = root (no folder)
 };
 
 struct EditPatch {
@@ -153,7 +154,8 @@ void createTopics(sqlite3* database) {
         "ID INTEGER PRIMARY KEY AUTOINCREMENT,"
         "TOPIC_TITLE TEXT NOT NULL,"
         "TOPIC_SUMMARY TEXT NOT NULL,"
-        "TOPIC_CATEGORY TEXT NOT NULL"
+        "TOPIC_CATEGORY TEXT NOT NULL,"
+        "TOPIC_FOLDER TEXT NOT NULL DEFAULT ''"
         ")"; // Topics will be storn as .md file in database/topics/, topic title will be id__topic_name_no_special_char.md
 
     int result = sqlite3_exec(database, sqlCommand.c_str(), NULL, 0, &errMsg);
@@ -161,6 +163,32 @@ void createTopics(sqlite3* database) {
         std::cout << "Note: createTopics — " << errMsg << std::endl;
     } else {
         std::cout << "Created topics!" << std::endl;
+    }
+
+    // Migration: older databases pre-date TOPIC_FOLDER. Add it if missing so
+    // existing user data keeps working without a manual migration step.
+    sqlite3_stmt* stmt;
+    bool hasFolder = false;
+    if (sqlite3_prepare_v2(database, "PRAGMA table_info(TOPIC)", -1, &stmt, nullptr) == SQLITE_OK) {
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            const unsigned char* col = sqlite3_column_text(stmt, 1);
+            if (col && std::string(reinterpret_cast<const char*>(col)) == "TOPIC_FOLDER") {
+                hasFolder = true;
+                break;
+            }
+        }
+        sqlite3_finalize(stmt);
+    }
+    if (!hasFolder) {
+        char* alterErr = nullptr;
+        if (sqlite3_exec(database,
+                "ALTER TABLE TOPIC ADD COLUMN TOPIC_FOLDER TEXT NOT NULL DEFAULT ''",
+                NULL, 0, &alterErr) == SQLITE_OK) {
+            std::cout << "Added TOPIC_FOLDER column to existing TOPIC table." << std::endl;
+        } else if (alterErr) {
+            std::cout << "Note: TOPIC_FOLDER migration — " << alterErr << std::endl;
+            sqlite3_free(alterErr);
+        }
     }
 }
 
@@ -483,6 +511,8 @@ Topic rowToTopic(sqlite3_stmt* stmt) {
     topic.topicTitle = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
     topic.topicSummary = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
     topic.topicCategory = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
+    const unsigned char* folder = sqlite3_column_text(stmt, 4);
+    topic.topicFolder = folder ? reinterpret_cast<const char*>(folder) : "";
     return topic;
 }
 
@@ -490,8 +520,8 @@ Topic rowToTopic(sqlite3_stmt* stmt) {
 void addTopic(sqlite3* database, int user_id, Topic& topic) {
     sqlite3_stmt* stmt;
     const std::string sql =
-        "INSERT INTO TOPIC(TOPIC_TITLE, TOPIC_SUMMARY, TOPIC_CATEGORY)"
-        " VALUES(?, ?, ?)";
+        "INSERT INTO TOPIC(TOPIC_TITLE, TOPIC_SUMMARY, TOPIC_CATEGORY, TOPIC_FOLDER)"
+        " VALUES(?, ?, ?, ?)";
 
     if (sqlite3_prepare_v2(database, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
         std::cout << "addTopic prepare failed: " << sqlite3_errmsg(database) << std::endl;
@@ -501,6 +531,7 @@ void addTopic(sqlite3* database, int user_id, Topic& topic) {
     sqlite3_bind_text(stmt, 1, topic.topicTitle.c_str(),    -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt, 2, topic.topicSummary.c_str(),  -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt, 3, topic.topicCategory.c_str(), -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 4, topic.topicFolder.c_str(),   -1, SQLITE_STATIC);
 
     if (sqlite3_step(stmt) != SQLITE_DONE) {
         std::cout << "addTopic failed: " << sqlite3_errmsg(database) << std::endl;
@@ -531,7 +562,7 @@ void addTopic(sqlite3* database, int user_id, Topic& topic) {
 void updateTopic(sqlite3* database, const Topic& topic) {
     sqlite3_stmt* stmt;
     const std::string sql =
-        "UPDATE TOPIC SET TOPIC_SUMMARY=?, TOPIC_CATEGORY=? WHERE ID=?";
+        "UPDATE TOPIC SET TOPIC_SUMMARY=?, TOPIC_CATEGORY=?, TOPIC_FOLDER=? WHERE ID=?";
 
     if (sqlite3_prepare_v2(database, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
         std::cout << "updateTopic prepare failed: " << sqlite3_errmsg(database) << std::endl;
@@ -540,7 +571,8 @@ void updateTopic(sqlite3* database, const Topic& topic) {
 
     sqlite3_bind_text(stmt, 1, topic.topicSummary.c_str(),  -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt, 2, topic.topicCategory.c_str(), -1, SQLITE_STATIC);
-    sqlite3_bind_int (stmt, 3, topic.id);
+    sqlite3_bind_text(stmt, 3, topic.topicFolder.c_str(),   -1, SQLITE_STATIC);
+    sqlite3_bind_int (stmt, 4, topic.id);
 
     if (sqlite3_step(stmt) != SQLITE_DONE) {
         std::cout << "updateTopic failed: " << sqlite3_errmsg(database) << std::endl;
@@ -806,6 +838,7 @@ static crow::json::wvalue topicToJson(const Topic& t) {
     j["title"]    = t.topicTitle;
     j["summary"]  = t.topicSummary;
     j["category"] = t.topicCategory;
+    j["folder"]   = t.topicFolder;
     return j;
 }
 
@@ -892,7 +925,93 @@ static Topic parseEditTopic(const crow::json::rvalue& j) {
     if (j.has("title"))    topic.topicTitle    = std::string(j["title"].s());
     if (j.has("summary"))  topic.topicSummary  = std::string(j["summary"].s());
     if (j.has("category")) topic.topicCategory = std::string(j["category"].s());
+    if (j.has("folder"))   topic.topicFolder   = std::string(j["folder"].s());
     return topic;
+}
+
+// Trim leading/trailing whitespace. Used to validate folder names so callers
+// can't sneak an effectively-empty name like "  " past the non-empty check.
+static std::string trimWhitespace(const std::string& s) {
+    size_t start = 0;
+    while (start < s.size() && std::isspace(static_cast<unsigned char>(s[start]))) ++start;
+    size_t end = s.size();
+    while (end > start && std::isspace(static_cast<unsigned char>(s[end - 1]))) --end;
+    return s.substr(start, end - start);
+}
+
+// Folder names are user-facing labels — keep them short and printable. Returns
+// "" on success, or a human-readable error reason otherwise. Empty input is
+// considered valid here (callers decide whether "" means "root" or is itself
+// an error — rename_folder rejects empty, create/replace allow it).
+static const size_t FOLDER_NAME_MAX_BYTES = 32;
+static std::string validateFolderName(const std::string& name) {
+    if (name.empty()) return "";
+    if (name.size() > FOLDER_NAME_MAX_BYTES) {
+        return "Folder name is too long (max " +
+               std::to_string(FOLDER_NAME_MAX_BYTES) + " bytes).";
+    }
+    // Reject control chars (incl. tab/newline) and the UTF-8 encoding of the
+    // Unicode replacement character U+FFFD (EF BF BD) which signals upstream
+    // encoding corruption — storing it cements the corruption.
+    for (size_t i = 0; i < name.size(); ++i) {
+        unsigned char c = static_cast<unsigned char>(name[i]);
+        if (c < 0x20 || c == 0x7F) {
+            return "Folder name contains a control character.";
+        }
+        if (c == 0xEF && i + 2 < name.size() &&
+            static_cast<unsigned char>(name[i + 1]) == 0xBF &&
+            static_cast<unsigned char>(name[i + 2]) == 0xBD) {
+            return "Folder name contains the Unicode replacement character (U+FFFD).";
+        }
+    }
+    return "";
+}
+
+// Look up the canonical (first-seen) casing for a folder name by scanning
+// TOPIC_FOLDER values case-insensitively. If any topic already uses a
+// case-variant of `name`, that variant is returned so a second caller passing
+// "testfolder" doesn't fork from an existing "TestFolder". If no match, the
+// input is returned unchanged so the first user of a new folder defines its
+// casing.
+static std::string canonicalFolderName(sqlite3* database, const std::string& name) {
+    if (name.empty()) return name;
+    sqlite3_stmt* stmt;
+    const std::string sql =
+        "SELECT TOPIC_FOLDER FROM TOPIC "
+        "WHERE LOWER(TOPIC_FOLDER) = LOWER(?) AND TOPIC_FOLDER != '' "
+        "LIMIT 1";
+    if (sqlite3_prepare_v2(database, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
+        return name;
+    }
+    sqlite3_bind_text(stmt, 1, name.c_str(), -1, SQLITE_STATIC);
+    std::string canonical = name;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const unsigned char* col = sqlite3_column_text(stmt, 0);
+        if (col) canonical = reinterpret_cast<const char*>(col);
+    }
+    sqlite3_finalize(stmt);
+    return canonical;
+}
+
+// Bulk-rename TOPIC_FOLDER values. Returns number of rows updated, or -1 on
+// SQL error. The replace_topic flow handles the single-topic case.
+int renameFolder(sqlite3* database, const std::string& oldName, const std::string& newName) {
+    sqlite3_stmt* stmt;
+    // Match case-insensitively on the old name so "TestFolder" and
+    // "testfolder" rename together — callers no longer need to know the
+    // exact casing stored on disk.
+    const std::string sql =
+        "UPDATE TOPIC SET TOPIC_FOLDER=? WHERE LOWER(TOPIC_FOLDER)=LOWER(?)";
+    if (sqlite3_prepare_v2(database, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
+        std::cout << "renameFolder prepare failed: " << sqlite3_errmsg(database) << std::endl;
+        return -1;
+    }
+    sqlite3_bind_text(stmt, 1, newName.c_str(), -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, oldName.c_str(), -1, SQLITE_STATIC);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) return -1;
+    return sqlite3_changes(database);
 }
 
 static TopicFilterOptions parseTopicFilterOptions(const crow::json::rvalue& j) {
@@ -1124,6 +1243,17 @@ int main(int argc, char* argv[]) {
 
             Topic topic = parseEditTopic(jsonData);
             topic.id = -1;
+            topic.topicFolder = trimWhitespace(topic.topicFolder);
+            {
+                std::string err = validateFolderName(topic.topicFolder);
+                if (!err.empty()) {
+                    crow::json::wvalue response;
+                    response["ok"] = false;
+                    response["error"] = err;
+                    return crow::response(400, response);
+                }
+            }
+            topic.topicFolder = canonicalFolderName(database, topic.topicFolder);
 
             addTopic(database, user_id, topic);
 
@@ -1149,6 +1279,25 @@ int main(int argc, char* argv[]) {
 
             // Preserve the title — title changes would require renaming the .md file.
             topic.topicTitle = existing.topicTitle;
+            // If the caller didn't include a folder field, keep the existing one
+            // so an edit that only changes summary/category doesn't drop the
+            // topic back to the root by accident.
+            if (!jsonData.has("folder")) {
+                topic.topicFolder = existing.topicFolder;
+            } else {
+                // To clear a folder, callers send an empty string, so we
+                // trim and accept that as "root". A whitespace-only string
+                // is treated as empty.
+                topic.topicFolder = trimWhitespace(topic.topicFolder);
+                std::string err = validateFolderName(topic.topicFolder);
+                if (!err.empty()) {
+                    crow::json::wvalue response;
+                    response["ok"] = false;
+                    response["error"] = err;
+                    return crow::response(400, response);
+                }
+                topic.topicFolder = canonicalFolderName(database, topic.topicFolder);
+            }
             updateTopic(database, topic);
 
             crow::json::wvalue response;
@@ -1180,6 +1329,65 @@ int main(int argc, char* argv[]) {
             crow::json::wvalue response;
             response["ok"] = true;
             response["id"] = topicID;
+            return crow::response(200, response);
+        } else if (jsonData["tool_name"] == "list_folders") {
+            sqlite3_stmt* stmt;
+            const std::string sql =
+                "SELECT TOPIC_FOLDER, COUNT(*) FROM TOPIC "
+                "WHERE TOPIC_FOLDER != '' "
+                "GROUP BY TOPIC_FOLDER ORDER BY TOPIC_FOLDER";
+            crow::json::wvalue response;
+            if (sqlite3_prepare_v2(database, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
+                response["ok"] = false;
+                response["error"] = "list_folders prepare failed.";
+                return crow::response(500, response);
+            }
+            int i = 0;
+            while (sqlite3_step(stmt) == SQLITE_ROW) {
+                const unsigned char* nameRaw = sqlite3_column_text(stmt, 0);
+                std::string name = nameRaw ? reinterpret_cast<const char*>(nameRaw) : "";
+                int cnt = sqlite3_column_int(stmt, 1);
+                response["folders"][i]["name"]  = name;
+                response["folders"][i]["count"] = cnt;
+                ++i;
+            }
+            sqlite3_finalize(stmt);
+            response["count"] = i;
+            return crow::response(200, response);
+        } else if (jsonData["tool_name"] == "rename_folder") {
+            if (!jsonData.has("old_name") || !jsonData.has("new_name")) {
+                return crow::response(400, "rename_folder missing required fields: old_name, new_name");
+            }
+            std::string oldName = trimWhitespace(std::string(jsonData["old_name"].s()));
+            std::string newName = trimWhitespace(std::string(jsonData["new_name"].s()));
+            if (oldName.empty() || newName.empty()) {
+                crow::json::wvalue response;
+                response["ok"] = false;
+                response["error"] = "Folder names must be non-empty.";
+                return crow::response(400, response);
+            }
+            {
+                std::string err = validateFolderName(newName);
+                if (!err.empty()) {
+                    crow::json::wvalue response;
+                    response["ok"] = false;
+                    response["error"] = err;
+                    return crow::response(400, response);
+                }
+            }
+            // If the new name is just a case-variant of an existing folder,
+            // align to that folder's canonical casing so the rename merges
+            // cleanly instead of creating yet another near-duplicate.
+            newName = canonicalFolderName(database, newName);
+            int updated = renameFolder(database, oldName, newName);
+            crow::json::wvalue response;
+            if (updated < 0) {
+                response["ok"] = false;
+                response["error"] = "rename_folder failed.";
+                return crow::response(500, response);
+            }
+            response["ok"] = true;
+            response["updated"] = updated;
             return crow::response(200, response);
         } else if (jsonData["tool_name"] == "edit_topic_contents") {
             if (!jsonData.has("id") || !jsonData.has("patches")) {

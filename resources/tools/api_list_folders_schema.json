@@ -1,0 +1,8 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ListFolders",
+  "description": "Return every folder that currently has at least one topic, with a count of topics per folder. Use this before creating or moving a topic into a folder so you reuse existing folder names exactly (case-sensitive) instead of inventing variants. Cheap — returns only folder names and counts, not topic contents.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {}
+}

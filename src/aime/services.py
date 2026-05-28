@@ -105,7 +105,22 @@ class TopicService:
     def replace_topic_contents(self, topic_id, contents: str):
         return self._gw.call("replace_topic_contents", id=topic_id, contents=contents)
 
-    def create_topic(self, title: str, summary: str, category: str) -> dict:
+    def create_topic(
+        self, title: str, summary: str, category: str, folder: str = ""
+    ) -> dict:
         return self._gw.call(
-            "create_topic", title=title, summary=summary, category=category
+            "create_topic",
+            title=title,
+            summary=summary,
+            category=category,
+            folder=folder,
         )
+
+    def rename_folder(self, old_name: str, new_name: str) -> dict:
+        return self._gw.call("rename_folder", old_name=old_name, new_name=new_name)
+
+    def list_folders(self) -> list[dict]:
+        resp = self._gw.call("list_folders")
+        if isinstance(resp, dict):
+            return resp.get("folders", []) or []
+        return []

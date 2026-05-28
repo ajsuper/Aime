@@ -1206,13 +1206,16 @@ class AnthropicMessagesBackend:
                 resp = self._client.messages.create(
                     model=self.COMPACT_MODEL,
                     system=(
-                        "Write a single short sentence describing what the user is "
-                        "asking for, for use as a conversation title. You may be "
-                        "given the first few user messages; summarize the overall "
-                        "request. Ignore any bracketed [System info] or "
-                        "auto-injected context. Return only the sentence, no "
-                        "quotes. It should be a direct summary of the user's request."
-                        "Do NOT answer the users request. If the user asks, why is the sky blue? you should title User asks why the sky is blue."
+                        "Generate a short title for this conversation based on the "
+                        "user's message(s). Rules:\n"
+                        "- 2-5 words maximum\n"
+                        "- Noun phrase only — no \"User wants\", \"User asks\", or similar\n"
+                        "- Capture the core subject, not the action\n"
+                        "- Be specific, not generic (\"Flowers for Joanna\" not \"Date Planning\")\n"
+                        "- If it's a test or trivial message, just say \"Test\"\n"
+                        "- Ignore any bracketed [System info] or auto-injected context\n"
+                        "- Do NOT answer the user's request — only title it\n"
+                        "Return only the title, no punctuation, no quotes."
                     ),
                     messages=[{"role": "user", "content": "[Start users messages to ASSISTANT, NOT to you] " + prompt_text + "[End users messages to ASSISTANT, NOT to you]"}],
                     max_tokens=64,
@@ -1251,13 +1254,17 @@ class AnthropicMessagesBackend:
             resp = self._client.messages.create(
                 model=self.COMPACT_MODEL,
                 system=(
-                    "You maintain a one-sentence description of a conversation. "
-                    "Given the current description and the user's most recent "
-                    "messages, return an updated one-sentence description that "
-                    "reflects what the conversation is *currently* about, or "
-                    "the original unchanged if it is still accurate. Ignore any "
-                    "bracketed [System info] or auto-injected context. Return "
-                    "only the sentence, no quotes."
+                    "You maintain a short title (2-5 words, noun phrase only) for "
+                    "a conversation. Given the current title and the user's most "
+                    "recent messages, return an updated title that reflects what "
+                    "the conversation is *currently* about, or the original "
+                    "unchanged if it is still accurate. Rules:\n"
+                    "- 2-5 words maximum\n"
+                    "- Noun phrase only — no \"User wants\", \"User asks\", or similar\n"
+                    "- Capture the core subject, not the action\n"
+                    "- Be specific, not generic\n"
+                    "- Ignore any bracketed [System info] or auto-injected context\n"
+                    "Return only the title, no punctuation, no quotes."
                 ),
                 messages=[{
                     "role": "user",
@@ -1285,13 +1292,26 @@ class AnthropicMessagesBackend:
         merging `prev_summary` if a prior compaction left one. Raises on API
         failure (the caller treats that as "skip compaction this turn")."""
         instructions = (
-            "You are compacting a conversation between a user and a "
-            "mind assistant. Produce a dense factual summary that "
-            "preserves: decisions made, every created or edited event/topic "
-            "ID, open or unresolved threads, and stated user preferences. "
-            "Omit pleasantries and superseded intermediate steps. Write prose"
-            "Complete sentences are not required, be as dense as possible while"
-            "conveying necessary information."
+            "You are a conversation summarizer for AiMe, a personal assistant app.\n\n"
+            "Your job is to compress the conversation history into a compact summary "
+            "that preserves everything a future AI session would need to continue "
+            "seamlessly.\n\n"
+            "Include:\n"
+            "- Decisions made\n"
+            "- Actions taken (events created/edited/archived, topics updated — include IDs)\n"
+            "- New information shared by the user\n"
+            "- Unresolved threads or open questions from the conversation\n"
+            "- Any instructions or preferences the user expressed\n\n"
+            "Do NOT include:\n"
+            "- The contents of the \"About Me\" or \"Pending\" topics — these are "
+            "automatically injected at the start of every session fresh from the "
+            "database. Summarizing them here is redundant and wastes context.\n"
+            "- General background about the user that belongs in a topic — only "
+            "include it if it was newly shared this conversation and may not yet "
+            "be saved.\n\n"
+            "Keep the summary dense and factual. Use bullet points and headers. "
+            "Aim for brevity — only include what a future session couldn't recover "
+            "from topics and events alone."
         )
         parts = []
         if prev_summary:

@@ -402,6 +402,666 @@ def _count_files(path: str, suffix: str | None = None) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Extended aggregations (chart-shaped)
+# ---------------------------------------------------------------------------
+
+
+def _day_keys_in_range(records):
+    """Sorted list of UTC dates covered by `records`, gap-free.
+
+    Returns ``[]`` for empty input. The result is dense — every calendar date
+    between the earliest and latest record appears, even if no traffic
+    happened on it — so a line/area chart draws an honest zero, not a
+    visually-misleading skip.
+    """
+    days = set()
+    for rec in records:
+        d = str(rec.get("ts", ""))[:10]
+        if d:
+            days.add(d)
+    if not days:
+        return []
+    lo = datetime.date.fromisoformat(min(days))
+    hi = datetime.date.fromisoformat(max(days))
+    out = []
+    cur = lo
+    while cur <= hi:
+        out.append(cur.isoformat())
+        cur += datetime.timedelta(days=1)
+    return out
+
+
+def _aggregate_by_day_model(records, day_keys):
+    """Per-day, per-model USD cost — shape: { model: [cost_per_day, ...] }.
+
+    Daily costs are returned in the same order as ``day_keys`` (which is the
+    dense day axis from ``_day_keys_in_range``). Models are returned ordered
+    by total cost descending — handy for the stacked bar's z-order.
+    """
+    idx = {d: i for i, d in enumerate(day_keys)}
+    series = {}
+    for rec in records:
+        if rec.get("kind") != "api":
+            continue
+        day = str(rec.get("ts", ""))[:10]
+        if day not in idx:
+            continue
+        model = rec.get("model") or "(unknown)"
+        row = series.setdefault(model, [0.0] * len(day_keys))
+        row[idx[day]] += _report._api_cost(rec)
+    # Order by total cost so the largest contributor draws at the base.
+    return sorted(series.items(), key=lambda kv: sum(kv[1]), reverse=True)
+
+
+def _aggregate_active_users_per_day(records, day_keys):
+    """Distinct users per UTC day, aligned to ``day_keys``."""
+    idx = {d: i for i, d in enumerate(day_keys)}
+    buckets = [set() for _ in day_keys]
+    for rec in records:
+        if rec.get("kind") != "api":
+            continue
+        day = str(rec.get("ts", ""))[:10]
+        if day not in idx:
+            continue
+        buckets[idx[day]].add(rec.get("user") or "(anonymous)")
+    return [len(b) for b in buckets]
+
+
+def _aggregate_calls_per_day(records, day_keys):
+    """API call count per day, aligned to ``day_keys``."""
+    idx = {d: i for i, d in enumerate(day_keys)}
+    out = [0] * len(day_keys)
+    for rec in records:
+        if rec.get("kind") != "api":
+            continue
+        day = str(rec.get("ts", ""))[:10]
+        if day in idx:
+            out[idx[day]] += 1
+    return out
+
+
+def _aggregate_cost_per_day(records, day_keys):
+    """Daily total USD cost (all charges), aligned to ``day_keys``."""
+    idx = {d: i for i, d in enumerate(day_keys)}
+    out = [0.0] * len(day_keys)
+    for rec in records:
+        if rec.get("kind") != "api":
+            continue
+        day = str(rec.get("ts", ""))[:10]
+        if day in idx:
+            out[idx[day]] += _report._api_cost(rec)
+    return out
+
+
+def _aggregate_cache_savings_per_day(records, day_keys):
+    """Per-day prompt-side cache savings (no-cache cost − actual cost)."""
+    idx = {d: i for i, d in enumerate(day_keys)}
+    out = [0.0] * len(day_keys)
+    for rec in records:
+        if rec.get("kind") != "api":
+            continue
+        day = str(rec.get("ts", ""))[:10]
+        if day not in idx:
+            continue
+        wc, nc = _prompt_costs(rec)
+        out[idx[day]] += (nc - wc)
+    return out
+
+
+def _aggregate_purpose_per_day(records, day_keys):
+    """Per-day call count per purpose. Same shape as _aggregate_by_day_model."""
+    idx = {d: i for i, d in enumerate(day_keys)}
+    series = {}
+    for rec in records:
+        if rec.get("kind") != "api":
+            continue
+        day = str(rec.get("ts", ""))[:10]
+        if day not in idx:
+            continue
+        purpose = rec.get("purpose") or "(unspecified)"
+        row = series.setdefault(purpose, [0] * len(day_keys))
+        row[idx[day]] += 1
+    return sorted(series.items(), key=lambda kv: sum(kv[1]), reverse=True)
+
+
+def _latency_per_day(records, day_keys):
+    """Per-day p50/p90 latency in ms (None where no records carry duration_ms)."""
+    idx = {d: i for i, d in enumerate(day_keys)}
+    buckets = [[] for _ in day_keys]
+    for rec in records:
+        if rec.get("kind") != "api":
+            continue
+        day = str(rec.get("ts", ""))[:10]
+        if day not in idx:
+            continue
+        d = rec.get("duration_ms")
+        if d is None:
+            continue
+        try:
+            buckets[idx[day]].append(float(d))
+        except (TypeError, ValueError):
+            pass
+    p50 = []
+    p90 = []
+    for b in buckets:
+        if not b:
+            p50.append(None)
+            p90.append(None)
+        else:
+            b.sort()
+            p50.append(_percentile(b, 50))
+            p90.append(_percentile(b, 90))
+    return p50, p90
+
+
+def _top_calls(records, n=15):
+    """The N most expensive single API calls in the window — for the Trends
+    'biggest turns' table. Each row is a (cost, record) pair."""
+    scored = []
+    for rec in records:
+        if rec.get("kind") != "api":
+            continue
+        scored.append((_report._api_cost(rec), rec))
+    scored.sort(key=lambda kv: kv[0], reverse=True)
+    return scored[:n]
+
+
+def _per_user_sparkline_data(records, day_keys):
+    """Per-user daily cost — { user: [cost_per_day, ...] } aligned to day_keys.
+
+    Used to draw a sparkline alongside the Overview by-user table so the admin
+    can spot which users are trending up without leaving the page.
+    """
+    idx = {d: i for i, d in enumerate(day_keys)}
+    out = {}
+    for rec in records:
+        if rec.get("kind") != "api":
+            continue
+        day = str(rec.get("ts", ""))[:10]
+        if day not in idx:
+            continue
+        user = rec.get("user") or "(anonymous)"
+        row = out.setdefault(user, [0.0] * len(day_keys))
+        row[idx[day]] += _report._api_cost(rec)
+    return out
+
+
+def _per_model_sparkline_data(records, day_keys):
+    """Per-model daily cost (same shape as the per-user one)."""
+    idx = {d: i for i, d in enumerate(day_keys)}
+    out = {}
+    for rec in records:
+        if rec.get("kind") != "api":
+            continue
+        day = str(rec.get("ts", ""))[:10]
+        if day not in idx:
+            continue
+        model = rec.get("model") or "(unknown)"
+        row = out.setdefault(model, [0.0] * len(day_keys))
+        row[idx[day]] += _report._api_cost(rec)
+    return out
+
+
+def _compare_periods(all_records, since, until):
+    """Headline figures for the current window and the immediately-preceding
+    equal-length window — for the Trends tab's period-over-period KPI cards.
+
+    Returns ``(current, previous)`` where each is a dict of ``cost / calls /
+    tokens / users``. When ``since`` / ``until`` is unset the comparison falls
+    back to the last 30 days vs the 30 days before that, so the panel never
+    needs to render as "no comparison available" simply because the admin did
+    not type a date.
+    """
+    # Naive UTC to match how every other timestamp in the log is parsed
+    # (datetime.fromisoformat on the stored 'ts' returns naive datetimes).
+    now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+    end = until or now
+    if since:
+        start = since
+    else:
+        start = end - datetime.timedelta(days=30)
+    span = end - start
+    prev_end = start
+    prev_start = start - span
+
+    def _sum(records, lo, hi):
+        cost = 0.0
+        calls = 0
+        tokens = 0
+        users = set()
+        for rec in records:
+            if rec.get("kind") != "api":
+                continue
+            try:
+                ts = datetime.datetime.fromisoformat(rec["ts"])
+            except (ValueError, KeyError):
+                continue
+            if ts < lo or ts > hi:
+                continue
+            cost += _report._api_cost(rec)
+            calls += 1
+            tokens += rec.get("input_tokens", 0) + rec.get("output_tokens", 0)
+            users.add(rec.get("user") or "(anonymous)")
+        return {"cost": cost, "calls": calls, "tokens": tokens, "users": len(users)}
+
+    return (
+        _sum(all_records, start, end),
+        _sum(all_records, prev_start, prev_end),
+        (start, end, prev_start, prev_end),
+    )
+
+
+def _delta_pct(curr, prev):
+    """Percent change from prev → curr, clamped for display. None when prev=0."""
+    if not prev:
+        return None
+    return 100.0 * (curr - prev) / prev
+
+
+def _anomaly_days(daily_cost, day_keys):
+    """Days whose cost exceeds mean + 2*stddev — naive outlier flag.
+
+    Returns ``[(day, cost, z), ...]`` ordered by date. A real anomaly system
+    would seasonal-decompose first; for an admin glance the 2σ rule is fine
+    and stays interpretable. Requires at least 4 days of data; otherwise the
+    standard deviation is too noisy to be useful and the function returns ``[]``.
+    """
+    if len(daily_cost) < 4:
+        return []
+    n = len(daily_cost)
+    mean = sum(daily_cost) / n
+    var = sum((x - mean) ** 2 for x in daily_cost) / n
+    sd = var ** 0.5
+    if sd == 0:
+        return []
+    out = []
+    for day, cost in zip(day_keys, daily_cost):
+        z = (cost - mean) / sd
+        if z >= 2.0:
+            out.append((day, cost, z))
+    return out
+
+
+def _new_users_per_day(backend, day_keys):
+    """Per-day count of newly-created accounts, aligned to ``day_keys``.
+
+    Best-effort: if the backend doesn't expose creation timestamps the function
+    returns an all-zero series, so the chart degrades to a flat baseline
+    rather than a crash.
+    """
+    idx = {d: i for i, d in enumerate(day_keys)}
+    out = [0] * len(day_keys)
+    try:
+        users = backend.list_users() + backend.list_deleted_users()
+    except Exception:
+        return out
+    for u in users:
+        created = getattr(u, "created_at", None) or getattr(u, "created", None)
+        if not created:
+            continue
+        day = str(created)[:10]
+        if day in idx:
+            out[idx[day]] += 1
+    return out
+
+
+def _recent_records(records, n=25, user=None):
+    """The N most-recent API records, optionally filtered to one user."""
+    out = []
+    for rec in records:
+        if rec.get("kind") != "api":
+            continue
+        if user is not None and (rec.get("user") or "(anonymous)") != user:
+            continue
+        out.append(rec)
+    out.sort(key=lambda r: r.get("ts", ""), reverse=True)
+    return out[:n]
+
+
+# ---------------------------------------------------------------------------
+# SVG chart helpers
+#
+# All charts are server-rendered inline SVG — no client-side JS or external
+# libraries. Each helper returns a string that the templates drop in with
+# ``{{ ... |safe }}``. Polylines / rects are sized to the requested viewBox
+# and scaled to the data's own min/max so a low-traffic day on a quiet log
+# still draws a chart that fills the box.
+# ---------------------------------------------------------------------------
+
+
+def _svg_sparkline(values, width=120, height=28, color="#2f6fd0"):
+    """Tiny line with no axes — meant to live inside a table cell.
+
+    Empty / all-zero input returns a dim flat line so the table column keeps
+    its visual alignment instead of collapsing to nothing.
+    """
+    if not values:
+        return (f'<svg class="sparkline" width="{width}" height="{height}" '
+                f'viewBox="0 0 {width} {height}"></svg>')
+    hi = max(values)
+    lo = min(values)
+    span = (hi - lo) or 1.0
+    n = len(values)
+    if n == 1:
+        x = width / 2
+        y = height / 2
+        return (f'<svg class="sparkline" width="{width}" height="{height}" '
+                f'viewBox="0 0 {width} {height}">'
+                f'<circle cx="{x:.1f}" cy="{y:.1f}" r="2" fill="{color}"/></svg>')
+    pts = []
+    for i, v in enumerate(values):
+        x = (i / (n - 1)) * width
+        y = height - ((v - lo) / span) * (height - 2) - 1
+        pts.append(f"{x:.1f},{y:.1f}")
+    fill_pts = pts + [f"{width:.1f},{height:.1f}", f"0,{height:.1f}"]
+    return (
+        f'<svg class="sparkline" width="{width}" height="{height}" '
+        f'viewBox="0 0 {width} {height}">'
+        f'<polygon points="{" ".join(fill_pts)}" fill="{color}" opacity="0.15"/>'
+        f'<polyline points="{" ".join(pts)}" fill="none" stroke="{color}" '
+        f'stroke-width="1.4"/>'
+        f"</svg>"
+    )
+
+
+def _svg_line_chart(day_keys, series, *, width=720, height=220, y_label="",
+                    money=False, colors=None):
+    """Multi-series line chart with axes, gridlines, and a small legend.
+
+    ``series`` is a list of ``(name, values_aligned_to_day_keys)`` — each
+    series can carry ``None`` to leave that day disconnected. The y axis is
+    auto-scaled to the data; the x axis labels the first, middle, and last
+    day_keys (more would overlap in a normal-width admin viewport).
+    """
+    colors = colors or ["#2f6fd0", "#2e9e4f", "#8a4fd0", "#c8860a", "#d23",
+                        "#4d8bd6", "#6fbf85", "#a978d8", "#dca345", "#e36d6d"]
+    if not day_keys or not series:
+        return (f'<svg class="chart" width="{width}" height="{height}" '
+                f'viewBox="0 0 {width} {height}"></svg>')
+
+    pad_l, pad_r, pad_t, pad_b = 50, 12, 14, 30
+    plot_w = width - pad_l - pad_r
+    plot_h = height - pad_t - pad_b
+
+    flat = [v for _name, vs in series for v in vs if v is not None]
+    if not flat:
+        flat = [0.0]
+    hi = max(flat)
+    lo = min(0.0, min(flat))
+    if hi == lo:
+        hi = lo + 1.0
+    span = hi - lo
+
+    def _x(i, n):
+        return pad_l + (i / max(1, n - 1)) * plot_w
+
+    def _y(v):
+        return pad_t + plot_h - ((v - lo) / span) * plot_h
+
+    n = len(day_keys)
+
+    # Gridlines + y labels.
+    grid = []
+    for frac in (0, 0.25, 0.5, 0.75, 1.0):
+        y_val = lo + frac * span
+        y = pad_t + plot_h - frac * plot_h
+        label = f"${y_val:,.2f}" if money else f"{y_val:,.0f}"
+        grid.append(
+            f'<line x1="{pad_l}" y1="{y:.1f}" x2="{width - pad_r}" '
+            f'y2="{y:.1f}" stroke="#8884" stroke-width="0.5"/>'
+            f'<text x="{pad_l - 6}" y="{y + 3:.1f}" font-size="10" '
+            f'text-anchor="end" fill="#888">{label}</text>'
+        )
+
+    # X labels: first, middle, last (avoids overlap at chart widths around 700).
+    x_labels = []
+    label_idxs = (
+        {0} if n == 1 else {0, n // 2, n - 1}
+    )
+    for i in sorted(label_idxs):
+        x_labels.append(
+            f'<text x="{_x(i, n):.1f}" y="{height - 8}" font-size="10" '
+            f'text-anchor="middle" fill="#888">{day_keys[i][5:]}</text>'
+        )
+
+    # Polylines per series, skipping None gaps as separate segments.
+    polylines = []
+    legend = []
+    for s_i, (name, values) in enumerate(series):
+        col = colors[s_i % len(colors)]
+        segs = []
+        current = []
+        for i, v in enumerate(values):
+            if v is None:
+                if current:
+                    segs.append(current)
+                    current = []
+            else:
+                current.append((i, v))
+        if current:
+            segs.append(current)
+        for seg in segs:
+            if len(seg) == 1:
+                i, v = seg[0]
+                polylines.append(
+                    f'<circle cx="{_x(i, n):.1f}" cy="{_y(v):.1f}" r="2" '
+                    f'fill="{col}"/>'
+                )
+            else:
+                pts = " ".join(f"{_x(i, n):.1f},{_y(v):.1f}" for i, v in seg)
+                polylines.append(
+                    f'<polyline points="{pts}" fill="none" stroke="{col}" '
+                    f'stroke-width="1.6"/>'
+                )
+        legend.append(
+            f'<span class="lk"><span class="sw" style="background:{col}"></span>{name}</span>'
+        )
+
+    title = (
+        f'<text x="{pad_l}" y="10" font-size="10" fill="#888">{y_label}</text>'
+        if y_label else ""
+    )
+
+    svg = (
+        f'<svg class="chart" width="{width}" height="{height}" '
+        f'viewBox="0 0 {width} {height}">'
+        + title + "".join(grid) + "".join(x_labels) + "".join(polylines)
+        + "</svg>"
+    )
+    return (
+        f'<div class="chart-wrap">{svg}'
+        f'<div class="legend">{"".join(legend)}</div></div>'
+    )
+
+
+def _svg_stacked_bars(day_keys, series, *, width=720, height=220, money=False):
+    """Stacked vertical bars — one stack per day, ordered top-down by series.
+
+    The first ``series`` entry is drawn at the bottom of each stack, matching
+    "biggest contributor at the base". Returns an empty svg shell for empty
+    input so the layout doesn't collapse.
+    """
+    colors = ["#2f6fd0", "#2e9e4f", "#8a4fd0", "#c8860a", "#d23",
+              "#4d8bd6", "#6fbf85", "#a978d8", "#dca345", "#e36d6d"]
+    if not day_keys or not series:
+        return (f'<svg class="chart" width="{width}" height="{height}" '
+                f'viewBox="0 0 {width} {height}"></svg>')
+
+    pad_l, pad_r, pad_t, pad_b = 50, 12, 14, 30
+    plot_w = width - pad_l - pad_r
+    plot_h = height - pad_t - pad_b
+    n = len(day_keys)
+    totals = [0.0] * n
+    for _name, vs in series:
+        for i, v in enumerate(vs):
+            totals[i] += v
+    hi = max(totals) if totals else 1.0
+    if hi == 0:
+        hi = 1.0
+
+    bar_w = (plot_w / n) * 0.78
+    gap = (plot_w / n) - bar_w
+
+    def _x_left(i):
+        return pad_l + i * (bar_w + gap) + gap / 2
+
+    def _h(v):
+        return (v / hi) * plot_h
+
+    grid = []
+    for frac in (0, 0.5, 1.0):
+        y_val = frac * hi
+        y = pad_t + plot_h - frac * plot_h
+        label = f"${y_val:,.2f}" if money else f"{y_val:,.0f}"
+        grid.append(
+            f'<line x1="{pad_l}" y1="{y:.1f}" x2="{width - pad_r}" '
+            f'y2="{y:.1f}" stroke="#8884" stroke-width="0.5"/>'
+            f'<text x="{pad_l - 6}" y="{y + 3:.1f}" font-size="10" '
+            f'text-anchor="end" fill="#888">{label}</text>'
+        )
+
+    bars = []
+    base = [pad_t + plot_h] * n
+    legend = []
+    for s_i, (name, vs) in enumerate(series):
+        col = colors[s_i % len(colors)]
+        for i, v in enumerate(vs):
+            h = _h(v)
+            if h <= 0:
+                continue
+            y = base[i] - h
+            bars.append(
+                f'<rect x="{_x_left(i):.1f}" y="{y:.1f}" width="{bar_w:.1f}" '
+                f'height="{h:.1f}" fill="{col}"><title>{day_keys[i]} {name}: '
+                f'{("$" + format(v, ",.4f")) if money else format(v, ",.0f")}</title></rect>'
+            )
+            base[i] -= h
+        legend.append(
+            f'<span class="lk"><span class="sw" style="background:{col}"></span>{name}</span>'
+        )
+
+    label_idxs = {0} if n == 1 else {0, n // 2, n - 1}
+    x_labels = []
+    for i in sorted(label_idxs):
+        x_labels.append(
+            f'<text x="{(_x_left(i) + bar_w / 2):.1f}" y="{height - 8}" '
+            f'font-size="10" text-anchor="middle" fill="#888">{day_keys[i][5:]}</text>'
+        )
+
+    svg = (
+        f'<svg class="chart" width="{width}" height="{height}" '
+        f'viewBox="0 0 {width} {height}">'
+        + "".join(grid) + "".join(bars) + "".join(x_labels) + "</svg>"
+    )
+    return (
+        f'<div class="chart-wrap">{svg}'
+        f'<div class="legend">{"".join(legend)}</div></div>'
+    )
+
+
+def _svg_hour_bars(hours, *, width=720, height=120):
+    """A wider, labelled replacement for the inline-CSS hourly bar block."""
+    if not hours:
+        return ""
+    pad_l, pad_r, pad_t, pad_b = 30, 12, 6, 22
+    plot_w = width - pad_l - pad_r
+    plot_h = height - pad_t - pad_b
+    hi = max(hours) or 1
+    bar_w = (plot_w / 24) * 0.78
+    gap = (plot_w / 24) - bar_w
+
+    rects = []
+    for i, c in enumerate(hours):
+        h = (c / hi) * plot_h
+        x = pad_l + i * (bar_w + gap) + gap / 2
+        y = pad_t + plot_h - h
+        col = "#2f6fd0" if c else "#8882"
+        rects.append(
+            f'<rect x="{x:.1f}" y="{y:.1f}" width="{bar_w:.1f}" '
+            f'height="{max(1, h):.1f}" fill="{col}" rx="1"><title>'
+            f'{i:02d}:00 UTC — {c:,} call{"s" if c != 1 else ""}</title></rect>'
+        )
+
+    labels = []
+    for i in range(0, 24, 3):
+        x = pad_l + i * (bar_w + gap) + gap / 2 + bar_w / 2
+        labels.append(
+            f'<text x="{x:.1f}" y="{height - 6}" font-size="10" '
+            f'text-anchor="middle" fill="#888">{i:02d}</text>'
+        )
+
+    return (
+        f'<svg class="chart" width="{width}" height="{height}" '
+        f'viewBox="0 0 {width} {height}">'
+        + "".join(rects) + "".join(labels) + "</svg>"
+    )
+
+
+def _svg_donut(slices, *, size=160, inner=0.55):
+    """Donut chart for a categorical mix (e.g., per-model cost share).
+
+    ``slices`` is ``[(name, value, color), ...]``. Slices below ~2% of the
+    total are still drawn but skip their label to avoid overlap. Returns an
+    inline ``<svg>`` plus a sibling legend.
+    """
+    if not slices or sum(s[1] for s in slices) <= 0:
+        return f'<div class="donut-wrap"><svg width="{size}" height="{size}"></svg></div>'
+    total = sum(s[1] for s in slices)
+    cx, cy = size / 2, size / 2
+    r_o = size / 2 - 2
+    r_i = r_o * inner
+
+    import math
+    paths = []
+    angle = -math.pi / 2
+    for name, value, color in slices:
+        if value <= 0:
+            continue
+        frac = value / total
+        end = angle + frac * 2 * math.pi
+        large = 1 if frac > 0.5 else 0
+        x1 = cx + r_o * math.cos(angle)
+        y1 = cy + r_o * math.sin(angle)
+        x2 = cx + r_o * math.cos(end)
+        y2 = cy + r_o * math.sin(end)
+        x3 = cx + r_i * math.cos(end)
+        y3 = cy + r_i * math.sin(end)
+        x4 = cx + r_i * math.cos(angle)
+        y4 = cy + r_i * math.sin(angle)
+        d = (
+            f"M {x1:.2f} {y1:.2f} "
+            f"A {r_o:.2f} {r_o:.2f} 0 {large} 1 {x2:.2f} {y2:.2f} "
+            f"L {x3:.2f} {y3:.2f} "
+            f"A {r_i:.2f} {r_i:.2f} 0 {large} 0 {x4:.2f} {y4:.2f} Z"
+        )
+        paths.append(
+            f'<path d="{d}" fill="{color}"><title>{name}: '
+            f'{100*frac:.1f}%</title></path>'
+        )
+        angle = end
+
+    legend = "".join(
+        f'<div class="lk"><span class="sw" style="background:{c}"></span>'
+        f'{n} <span class="note">({100*v/total:.1f}%)</span></div>'
+        for n, v, c in slices if v > 0
+    )
+    svg = (
+        f'<svg width="{size}" height="{size}" viewBox="0 0 {size} {size}">'
+        + "".join(paths) + "</svg>"
+    )
+    return f'<div class="donut-wrap">{svg}<div class="legend col">{legend}</div></div>'
+
+
+_PALETTE = ("#2f6fd0", "#2e9e4f", "#8a4fd0", "#c8860a", "#d23",
+            "#4d8bd6", "#6fbf85", "#a978d8", "#dca345", "#e36d6d")
+
+
+def _color_for(i):
+    """Stable colour from the palette for stable indexing in templates."""
+    return _PALETTE[i % len(_PALETTE)]
+
+
+# ---------------------------------------------------------------------------
 # Auth helpers
 # ---------------------------------------------------------------------------
 
@@ -475,9 +1135,9 @@ _FRAGMENT_OVERVIEW = """<div class="meta">
   <div class="view-toggle"
     title="Switch the headline cards between window totals and the per-user average for the {{ user_count }} user(s) active in this window. The 'cache read share' card is a ratio and is unaffected.">
     <span class="lbl">Show:</span>
-    <a href="?{{ qs_view_total }}" class="{{ 'active' if view == 'total' else '' }}"
+    <a href="/?{{ qs_view_total }}" class="{{ 'active' if view == 'total' else '' }}"
       title="Show totals across every user active in this window.">Total</a>
-    <a href="?{{ qs_view_avg }}" class="{{ 'active' if view == 'avg' else '' }}"
+    <a href="/?{{ qs_view_avg }}" class="{{ 'active' if view == 'avg' else '' }}"
       title="Divide the cost / call / token figures by the {{ user_count }} user(s) active in this window. The 'cache read share' card is a ratio and is unaffected.">Avg / user</a>
     <span class="note">({{ user_count }} user{{ '' if user_count == 1 else 's' }} active in this window)</span>
   </div>
@@ -501,11 +1161,29 @@ _FRAGMENT_OVERVIEW = """<div class="meta">
       <div class="lbl">cache read share</div></div>
   </div>
 
-  <h2 title="One row per user, totalling every API and speech-to-text record in the window.">By user</h2>
+  <h2 title="Estimated USD cost charged per UTC day in this window. Gives the headline trend at a glance — a sudden spike usually means a runaway loop or a new heavy user.">Cost over time</h2>
+  {{ chart_daily_cost|safe }}
+
+  <h2 title="Daily cost split by model id, stacked. The widest band is the model carrying the most spend.">Cost by model (daily)</h2>
+  {{ chart_model_stack|safe }}
+
+  <div class="two-col">
+    <div>
+      <h2 title="API request volume and the number of distinct users active per UTC day.">Activity volume</h2>
+      {{ chart_daily_calls|safe }}
+    </div>
+    <div>
+      <h2 title="Share of spend per model across the whole window.">Model mix</h2>
+      {{ chart_model_donut|safe }}
+    </div>
+  </div>
+
+  <h2 title="One row per user, totalling every API and speech-to-text record in the window. Click a username to open that user's drill-down.">By user</h2>
   <table>
     <thead>
       <tr>
-        <th title="Username the record was logged under. (anonymous) covers records with no username (AIME_USAGE_LINK_USERS=0).">User</th>
+        <th title="Username the record was logged under. Click to open the per-user drill-down. (anonymous) covers records with no username (AIME_USAGE_LINK_USERS=0).">User</th>
+        <th title="Per-day cost trend for this user across the visible window.">Trend</th>
         <th title="Requests sent to the Anthropic Messages API.">API calls</th>
         <th title="Fresh, uncached input tokens — billed at the model's base input rate.">Input</th>
         <th title="Tokens generated by the model — billed at the base output rate.">Output</th>
@@ -521,7 +1199,9 @@ _FRAGMENT_OVERVIEW = """<div class="meta">
     <tbody>
       {% for name, u in users %}
       <tr>
-        <td>{{ name }}</td>
+        <td><a href="/user/{{ name|urlencode }}" class="userlink"
+              title="Open the per-user drill-down for {{ name }} — daily cost, model mix, recent activity, cache health.">{{ name }}</a></td>
+        <td class="spark">{{ user_sparklines.get(name, '')|safe }}</td>
         <td>{{ "{:,}".format(u.api_calls) }}</td>
         <td>{{ "{:,}".format(u.input) }}</td>
         <td>{{ "{:,}".format(u.output) }}</td>
@@ -538,7 +1218,7 @@ _FRAGMENT_OVERVIEW = """<div class="meta">
     <tfoot>
       <tr>
         <td>Total</td>
-        <td colspan="9"></td>
+        <td colspan="10"></td>
         <td class="cost good">${{ "%.4f"|format(grand_cost) }}</td>
       </tr>
     </tfoot>
@@ -573,6 +1253,7 @@ _FRAGMENT_OVERVIEW = """<div class="meta">
     <thead>
       <tr>
         <th title="Model id the API stamped on the record (e.g. claude-sonnet-4-6). (unknown) means the record carried no model.">Model</th>
+        <th title="Per-day cost trend for this model across the visible window.">Trend</th>
         <th title="Requests served by this model.">API calls</th>
         <th title="Fresh, uncached input tokens sent to this model.">Input</th>
         <th title="Tokens generated by this model.">Output</th>
@@ -583,6 +1264,7 @@ _FRAGMENT_OVERVIEW = """<div class="meta">
       {% for name, m in by_model %}
       <tr>
         <td>{{ name }}</td>
+        <td class="spark">{{ model_sparklines.get(name, '')|safe }}</td>
         <td>{{ "{:,}".format(m.api_calls) }}</td>
         <td>{{ "{:,}".format(m.input) }}</td>
         <td>{{ "{:,}".format(m.output) }}</td>
@@ -633,6 +1315,9 @@ _FRAGMENT_CACHE = """<div class="meta">
       <div class="num {{ 'good' if cache_reuse >= 3 else 'warn' if cache_reuse >= 1 else 'bad' }}">{{ "%.2f"|format(cache_reuse) }}&times;</div>
       <div class="lbl">cache reuse factor</div></div>
   </div>
+
+  <h2 title="Daily prompt-side cache savings (no-cache cost minus actual cost) in USD. Positive bars are days where caching paid for itself; negative bars are days where the write premium outran the read discount.">Cache savings over time</h2>
+  {{ chart_cache_savings|safe }}
 
   {% if flagged %}
   <div class="banner warn">5-minute-TTL warning: {{ flagged|join(', ') }}
@@ -789,17 +1474,261 @@ _FRAGMENT_ACTIVITY = """<div class="meta">
   </table>
   {% endif %}
 
-  <h2 title="API calls bucketed by UTC hour-of-day. Tall bars are busy hours. Use this to spot off-hours background traffic, or to size capacity to peak.">Hourly traffic (UTC)</h2>
-  <div class="hour-bars" title="One bar per UTC hour 00..23. Bar height is calls in that hour relative to the busiest hour ({{ '{:,}'.format(hour_max) }} calls).">
-    {% for h in hours %}
-    <div class="bar {{ 'empty' if h == 0 else '' }}"
-      style="height: {{ ((100.0 * h / hour_max)|round(1)) if hour_max else 0 }}%"
-      title="{{ '%02d:00' % loop.index0 }} UTC — {{ '{:,}'.format(h) }} call{{ '' if h == 1 else 's' }}"></div>
-    {% endfor %}
+  <h2 title="API calls bucketed by UTC hour-of-day across the visible window. Tall bars are busy hours. Use this to spot off-hours background traffic, or to size capacity to peak.">Hourly traffic (UTC)</h2>
+  {{ chart_hours|safe }}
+
+  <h2 title="p50 and p90 latency per UTC day. Diverging lines mean a long tail is opening up — usually a slower model, larger prompts, or contention with a tool call.">Latency over time</h2>
+  {{ chart_latency_day|safe }}
+
+  <h2 title="Daily API call counts split by purpose. Watch for background plumbing (title / compaction) growing faster than user-facing turns.">Purpose mix (daily)</h2>
+  {{ chart_purpose_stack|safe }}
+
+  {% endif %}"""
+
+
+# Trends tab — period-over-period deltas, anomaly highlights, and a top-N
+# table for the single most expensive turns in the window. Designed for a
+# weekly-glance "did anything weird happen" read, not deep forensics.
+_FRAGMENT_TRENDS = """<div class="meta">
+    <span title="Filesystem path of the usage.jsonl log being read.">log: {{ log }}</span><br>
+    <span title="Records matching the current filters.">{{ record_count }} records</span>
+    &middot;
+    <span title="Date range currently in view.">window: {{ window }}</span>
+    &middot;
+    <span title="The previous window of equal length that the cards compare against.">vs prior {{ prev_window }}</span>
   </div>
-  <div class="hour-axis">
-    {% for h in hours %}<span>{{ '%02d' % loop.index0 }}</span>{% endfor %}
+
+  {% for e in errors %}<p class="err">{{ e }}</p>{% endfor %}
+
+  <div class="cards">
+    <div class="card accent-green"
+      title="Total estimated USD cost in the current window vs the previous same-length window. A red 'up' arrow flags growing spend; green 'down' flags savings.">
+      <div class="num good">${{ "%.4f"|format(curr.cost) }}</div>
+      <div class="lbl">cost</div>
+      {% if delta.cost is none %}
+        <div class="delta flat">no prior baseline</div>
+      {% else %}
+        <div class="delta {{ 'up' if delta.cost > 0 else 'down' if delta.cost < 0 else 'flat' }}">
+          {{ "%+.1f"|format(delta.cost) }}% vs prior
+          (${{ "%.4f"|format(prev.cost) }})</div>
+      {% endif %}
+    </div>
+    <div class="card accent-blue"
+      title="API call count, current vs prior period.">
+      <div class="num blue">{{ "{:,}".format(curr.calls) }}</div>
+      <div class="lbl">API calls</div>
+      {% if delta.calls is none %}
+        <div class="delta flat">no prior baseline</div>
+      {% else %}
+        <div class="delta {{ 'up' if delta.calls > 0 else 'down' if delta.calls < 0 else 'flat' }}">
+          {{ "%+.1f"|format(delta.calls) }}% vs prior
+          ({{ "{:,}".format(prev.calls) }})</div>
+      {% endif %}
+    </div>
+    <div class="card accent-purple"
+      title="Fresh-input + output tokens, current vs prior period.">
+      <div class="num purple">{{ "{:,}".format(curr.tokens) }}</div>
+      <div class="lbl">tokens</div>
+      {% if delta.tokens is none %}
+        <div class="delta flat">no prior baseline</div>
+      {% else %}
+        <div class="delta {{ 'up' if delta.tokens > 0 else 'down' if delta.tokens < 0 else 'flat' }}">
+          {{ "%+.1f"|format(delta.tokens) }}% vs prior
+          ({{ "{:,}".format(prev.tokens) }})</div>
+      {% endif %}
+    </div>
+    <div class="card accent-amber"
+      title="Distinct active users in the current vs prior period. Up is usually good (more engagement); down often precedes a cost dip.">
+      <div class="num warn">{{ curr.users }}</div>
+      <div class="lbl">active users</div>
+      {% if delta.users is none %}
+        <div class="delta flat">no prior baseline</div>
+      {% else %}
+        <div class="delta {{ 'up' if delta.users > 0 else 'down' if delta.users < 0 else 'flat' }}">
+          {{ "%+.1f"|format(delta.users) }}% vs prior
+          ({{ prev.users }})</div>
+      {% endif %}
+    </div>
   </div>
+
+  <h2 title="Daily total cost trend across the visible window.">Daily cost</h2>
+  {{ chart_daily_cost|safe }}
+
+  <h2 title="Active users per UTC day — distinct usernames that logged at least one API call.">Active users per day</h2>
+  {{ chart_active_users|safe }}
+
+  {% if anomalies %}
+  <h2 title="Days whose cost exceeded the window mean by more than 2 standard deviations. A naive outlier flag — useful for spotting runaway loops or one-off heavy turns.">Anomaly days</h2>
+  <table>
+    <thead>
+      <tr>
+        <th title="UTC date.">Date</th>
+        <th title="Total cost on that day.">Cost</th>
+        <th title="Standard deviations above the window mean.">z-score</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for d, c, z in anomalies %}
+      <tr>
+        <td>{{ d }}</td>
+        <td class="cost bad">${{ "%.4f"|format(c) }}</td>
+        <td class="bad">{{ "%.2f"|format(z) }}&sigma;</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+
+  <h2 title="The single most expensive API calls in this window. Each row is one record from usage.jsonl.">Most expensive turns</h2>
+  {% if not top_calls %}
+    <p class="empty">No API records in this window.</p>
+  {% else %}
+  <table>
+    <thead>
+      <tr>
+        <th title="UTC timestamp of the request.">When</th>
+        <th title="User the request was logged under.">User</th>
+        <th title="Model that served the request.">Model</th>
+        <th title="Purpose tag stamped on the record.">Purpose</th>
+        <th title="Fresh input tokens.">Input</th>
+        <th title="Output tokens.">Output</th>
+        <th title="Wall-clock latency.">Latency</th>
+        <th title="Estimated USD cost for this single call.">Cost</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for cost, rec in top_calls %}
+      <tr>
+        <td>{{ rec.ts|truncate(19, true, '') }}</td>
+        <td><a href="/user/{{ (rec.user or '(anonymous)')|urlencode }}" class="userlink">{{ rec.user or '(anonymous)' }}</a></td>
+        <td>{{ rec.model or '(unknown)' }}</td>
+        <td>{{ rec.purpose or '(unspecified)' }}</td>
+        <td>{{ "{:,}".format(rec.input_tokens or 0) }}</td>
+        <td>{{ "{:,}".format(rec.output_tokens or 0) }}</td>
+        <td>{{ ("%.0f ms" % rec.duration_ms) if rec.duration_ms is not none else '—' }}</td>
+        <td class="cost bad">${{ "%.4f"|format(cost) }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+
+  <h2 title="Cost share by user across the window — heaviest first.">Top users by spend</h2>
+  {% if not top_users %}
+    <p class="empty">No API records in this window.</p>
+  {% else %}
+  <table>
+    <thead>
+      <tr>
+        <th>User</th>
+        <th>Calls</th>
+        <th>Cost</th>
+        <th title="Share of total window cost.">Share</th>
+        <th title="Per-day trend.">Trend</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for name, u in top_users %}
+      <tr>
+        <td><a href="/user/{{ name|urlencode }}" class="userlink">{{ name }}</a></td>
+        <td>{{ "{:,}".format(u.api_calls) }}</td>
+        <td class="cost good">${{ "%.4f"|format(u.cost) }}</td>
+        <td>{{ "%.1f"|format(100.0 * u.cost / grand_cost if grand_cost else 0) }}%</td>
+        <td class="spark">{{ user_sparklines.get(name, '')|safe }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}"""
+
+
+# Per-user drill-down — KPI cards, daily cost line, model & purpose donuts,
+# recent activity table. Linked from the Overview "By user" table.
+_FRAGMENT_USER = """<div class="meta">
+    <span title="Username being inspected.">user: <strong>{{ username }}</strong></span><br>
+    <span title="All-time figures, unfiltered. Use the back link to return to the filtered Overview.">{{ record_count }} records</span>
+  </div>
+
+  <p><a href="/?tab=overview">&larr; back to overview</a></p>
+
+  {% if not has_data %}
+    <p class="empty">No API records found for this user.</p>
+  {% else %}
+
+  <div class="cards">
+    <div class="card accent-green"
+      title="All-time estimated USD cost for this user.">
+      <div class="num good">${{ "%.4f"|format(u.cost) }}</div>
+      <div class="lbl">total cost</div></div>
+    <div class="card accent-blue"
+      title="All-time API request count for this user.">
+      <div class="num blue">{{ "{:,}".format(u.api_calls) }}</div>
+      <div class="lbl">API calls</div></div>
+    <div class="card accent-purple"
+      title="Fresh input + output tokens (excludes cache).">
+      <div class="num purple">{{ "{:,}".format(u.input + u.output) }}</div>
+      <div class="lbl">tokens</div></div>
+    <div class="card {{ 'accent-green' if cache_hit_pct >= 70 else 'accent-amber' if cache_hit_pct >= 40 else 'accent-red' }}"
+      title="Share of read-side prompt tokens served from cache rather than billed fresh. Higher is cheaper.">
+      <div class="num {{ 'good' if cache_hit_pct >= 70 else 'warn' if cache_hit_pct >= 40 else 'bad' }}">{{ "%.0f"|format(cache_hit_pct) }}%</div>
+      <div class="lbl">cache read share</div></div>
+    <div class="card accent-amber"
+      title="Mean cost per API call — a quick read on how heavy this user's typical turn is.">
+      <div class="num warn">${{ "%.5f"|format(u.cost / u.api_calls if u.api_calls else 0) }}</div>
+      <div class="lbl">cost / call</div></div>
+    <div class="card accent-blue"
+      title="Median wall-clock latency across calls that carry duration_ms.">
+      <div class="num blue">{{ ('%.0f ms' % lat_p50) if lat_p50 is not none else '—' }}</div>
+      <div class="lbl">latency p50</div></div>
+  </div>
+
+  <h2 title="Cost charged to this user per UTC day, across their full history.">Cost over time</h2>
+  {{ chart_daily_cost|safe }}
+
+  <div class="two-col">
+    <div>
+      <h2 title="Model mix — share of this user's spend per model.">Model mix</h2>
+      {{ chart_model_donut|safe }}
+    </div>
+    <div>
+      <h2 title="Purpose mix — what fraction of calls were user turns vs background plumbing.">Purpose mix</h2>
+      {{ chart_purpose_donut|safe }}
+    </div>
+  </div>
+
+  <h2 title="The 25 most recent API records for this user.">Recent activity</h2>
+  {% if not recent %}
+    <p class="empty">No recent activity.</p>
+  {% else %}
+  <table>
+    <thead>
+      <tr>
+        <th>When (UTC)</th>
+        <th>Model</th>
+        <th>Purpose</th>
+        <th>Input</th>
+        <th>Output</th>
+        <th title="Whether the model finished cleanly, ran out of tokens, or handed off to a tool.">Stop</th>
+        <th>Latency</th>
+        <th>Cost</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for rec in recent %}
+      <tr>
+        <td>{{ rec.ts|truncate(19, true, '') }}</td>
+        <td>{{ rec.model or '(unknown)' }}</td>
+        <td>{{ rec.purpose or '(unspecified)' }}</td>
+        <td>{{ "{:,}".format(rec.input_tokens or 0) }}</td>
+        <td>{{ "{:,}".format(rec.output_tokens or 0) }}</td>
+        <td>{{ rec.stop_reason or '—' }}</td>
+        <td>{{ ("%.0f ms" % rec.duration_ms) if rec.duration_ms is not none else '—' }}</td>
+        <td class="cost good">${{ "%.5f"|format(_costs[loop.index0]) }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
 
   {% endif %}"""
 
@@ -1056,7 +1985,7 @@ _PAGE = """<!doctype html>
   <title>Aime admin</title>
   <style>
     :root { color-scheme: light dark; }
-    body { font: 15px/1.5 system-ui, sans-serif; margin: 2rem auto; max-width: 1000px; padding: 0 1rem; }
+    body { font: 15px/1.5 system-ui, sans-serif; margin: 2rem auto; max-width: 1240px; padding: 0 1rem; }
     h1 { margin-bottom: .4rem; }
     h2 { margin: 2rem 0 .5rem; font-size: 1.1rem; }
     .meta { color: #888; margin-bottom: 1rem; }
@@ -1141,6 +2070,36 @@ _PAGE = """<!doctype html>
     .accent-amber  { border-left-color: #c8860a; }
     .accent-red    { border-left-color: #d23; }
 
+    /* Charts (server-rendered SVG, no JS libraries). */
+    .chart-wrap { border: 1px solid #8884; border-radius: 6px;
+      padding: .5rem; margin-bottom: 1rem; overflow-x: auto; }
+    .chart { display: block; width: 100%; height: auto; max-width: 100%; }
+    .legend { display: flex; flex-wrap: wrap; gap: .8rem;
+      font-size: .8rem; margin-top: .4rem; color: #888; }
+    .legend.col { flex-direction: column; gap: .25rem; align-items: flex-start; }
+    .legend .lk { display: inline-flex; align-items: center; gap: .35rem; }
+    .legend .sw { display: inline-block; width: 10px; height: 10px;
+      border-radius: 2px; }
+
+    .sparkline { vertical-align: middle; }
+    td.spark { padding: 0 .3rem; min-width: 130px; }
+    .userlink { color: #2f6fd0; text-decoration: none; border-bottom: 1px dotted #2f6fd066; }
+    .userlink:hover { border-bottom-style: solid; }
+
+    .two-col { display: grid; grid-template-columns: 2fr 1fr; gap: 1.2rem;
+      align-items: start; }
+    @media (max-width: 800px) { .two-col { grid-template-columns: 1fr; } }
+    .donut-wrap { display: flex; gap: 1rem; align-items: center;
+      border: 1px solid #8884; border-radius: 6px; padding: .6rem;
+      margin-bottom: 1rem; }
+    .donut-wrap svg { flex-shrink: 0; }
+
+    /* Period-over-period KPI cards (Trends tab). */
+    .delta { font-size: .8rem; margin-top: .2rem; }
+    .delta.up   { color: #d23; }
+    .delta.down { color: #2e9e4f; }
+    .delta.flat { color: #888; }
+
     .banner { padding: .6rem .9rem; border-radius: 6px; margin-bottom: 1rem; }
     .banner.good { background: #2e9e4f22; border: 1px solid #2e9e4f88; }
     .banner.warn { background: #c8860a22; border: 1px solid #c8860a88; }
@@ -1201,17 +2160,19 @@ _PAGE = """<!doctype html>
   </div>
 
   <nav class="tabs">
-    <a href="?{{ qs_overview }}" class="{{ 'active' if tab == 'overview' else '' }}"
+    <a href="/?{{ qs_overview }}" class="{{ 'active' if tab == 'overview' else '' }}"
       title="Per-user, per-day and per-model token usage and cost.">Overview</a>
-    <a href="?{{ qs_cache }}" class="{{ 'active' if tab == 'cache' else '' }}"
+    <a href="/?{{ qs_cache }}" class="{{ 'active' if tab == 'cache' else '' }}"
       title="Whether prompt caching is actually saving money — reuse factors, hypothetical no-cache cost, and 5-minute-TTL warnings.">Cache Efficacy</a>
-    <a href="?{{ qs_activity }}" class="{{ 'active' if tab == 'activity' else '' }}"
+    <a href="/?{{ qs_activity }}" class="{{ 'active' if tab == 'activity' else '' }}"
       title="What the API is being used for — call purpose, stop-reason mix, latency percentiles, and when of day traffic happens.">Activity</a>
-    <a href="?{{ qs_accounts }}" class="{{ 'active' if tab == 'accounts' else '' }}"
+    <a href="/?{{ qs_trends }}" class="{{ 'active' if tab == 'trends' else '' }}"
+      title="Period-over-period deltas, anomaly day flags, top-N most expensive turns and top spenders.">Trends</a>
+    <a href="/?{{ qs_accounts }}" class="{{ 'active' if tab == 'accounts' else '' }}"
       title="List, grant/revoke, soft-delete, restore and purge user accounts.">Accounts</a>
-    <a href="?{{ qs_keys }}" class="{{ 'active' if tab == 'keys' else '' }}"
+    <a href="/?{{ qs_keys }}" class="{{ 'active' if tab == 'keys' else '' }}"
       title="Mint and revoke single-use invite keys.">Keys</a>
-    <a href="?{{ qs_system }}" class="{{ 'active' if tab == 'system' else '' }}"
+    <a href="/?{{ qs_system }}" class="{{ 'active' if tab == 'system' else '' }}"
       title="Operator-level health: account/key counts, storage per user (sizes and file counts only — never content), usage-log status.">System</a>
   </nav>
 
@@ -1219,7 +2180,7 @@ _PAGE = """<!doctype html>
   <div class="flash {{ f.level }}">{{ f.msg }}</div>
   {% endfor %}
 
-  {% if tab in ('overview', 'cache', 'activity') %}
+  {% if tab in ('overview', 'cache', 'activity', 'trends') %}
   <form class="filter" method="get">
     <input type="hidden" name="tab" value="{{ tab }}">
     <label title="Only include records on or after this date, interpreted in UTC. Accepts YYYY-MM-DD or a full ISO-8601 timestamp. Leave blank for no lower bound.">Since (UTC)
@@ -1233,6 +2194,8 @@ _PAGE = """<!doctype html>
         <button type="button" title="Today only." onclick="quickRange(0)">Today</button>
         <button type="button" title="Today and the previous 6 days." onclick="quickRange(7)">7d</button>
         <button type="button" title="Today and the previous 29 days." onclick="quickRange(30)">30d</button>
+        <button type="button" title="Month-to-date — from the first of this UTC month through today." onclick="quickRangeMTD()">MTD</button>
+        <button type="button" title="Year-to-date — from January 1 through today." onclick="quickRangeYTD()">YTD</button>
         <button type="button" title="Clear both date bounds — all-time view." onclick="quickRange(null)">All</button>
       </span>
     </div>
@@ -1241,6 +2204,22 @@ _PAGE = """<!doctype html>
         <option value="">(all users)</option>
         {% for name in all_users %}
         <option value="{{ name }}" {{ 'selected' if name == user_raw else '' }}>{{ name }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label title="Restrict every table to a single model id (as stamped on the record, e.g. claude-sonnet-4-6). (unknown) covers records with no model.">Model
+      <select name="model">
+        <option value="">(all models)</option>
+        {% for name in all_models %}
+        <option value="{{ name }}" {{ 'selected' if name == model_raw else '' }}>{{ name }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label title="Restrict every table to a single call purpose (turn / title / compaction / ...). (unspecified) covers records that pre-date the tag.">Purpose
+      <select name="purpose">
+        <option value="">(all purposes)</option>
+        {% for name in all_purposes %}
+        <option value="{{ name }}" {{ 'selected' if name == purpose_raw else '' }}>{{ name }}</option>
         {% endfor %}
       </select>
     </label>
@@ -1296,6 +2275,32 @@ _PAGE = """<!doctype html>
         since.value = fmt(start);
         until.value = fmt(end);
       }
+      form.submit();
+    }
+    function quickRangeMTD() {
+      var form = document.querySelector("form.filter");
+      var d = new Date();
+      var fmt = function (x) {
+        return x.getFullYear() + "-" +
+          String(x.getMonth() + 1).padStart(2, "0") + "-" +
+          String(x.getDate()).padStart(2, "0");
+      };
+      var first = new Date(d.getFullYear(), d.getMonth(), 1);
+      form.elements["since"].value = fmt(first);
+      form.elements["until"].value = fmt(d);
+      form.submit();
+    }
+    function quickRangeYTD() {
+      var form = document.querySelector("form.filter");
+      var d = new Date();
+      var fmt = function (x) {
+        return x.getFullYear() + "-" +
+          String(x.getMonth() + 1).padStart(2, "0") + "-" +
+          String(x.getDate()).padStart(2, "0");
+      };
+      var first = new Date(d.getFullYear(), 0, 1);
+      form.elements["since"].value = fmt(first);
+      form.elements["until"].value = fmt(d);
       form.submit();
     }
   </script>
@@ -1376,19 +2381,27 @@ def _compute(args):
     since_raw = args.get("since", "").strip()
     until_raw = args.get("until", "").strip()
     user_raw = args.get("user", "").strip()
+    model_raw = args.get("model", "").strip()
+    purpose_raw = args.get("purpose", "").strip()
 
     since, since_err = _parse_bound(since_raw, end=False)
     until, until_err = _parse_bound(until_raw, end=True)
     errors = [e for e in (since_err, until_err) if e]
 
-    # Load the whole log once so the user dropdown lists everyone, even when
-    # the current filter would hide them. A bad date is treated as "no bound".
+    # Load the whole log once so the dropdowns can list every user / model /
+    # purpose ever seen, not just those that the current filter would keep. A
+    # bad date is treated as "no bound".
     all_records = []
     if os.path.exists(path):
         all_records = list(_report.load_records(path, None, None, None))
     all_users = sorted({r.get("user") or "(anonymous)" for r in all_records})
+    all_models = sorted({r.get("model") or "(unknown)"
+                         for r in all_records if r.get("kind") == "api"})
+    all_purposes = sorted({r.get("purpose") or "(unspecified)"
+                           for r in all_records if r.get("kind") == "api"})
 
-    # Apply the window / user filter in Python against the already-loaded set.
+    # Apply the window / user / model / purpose filter in Python against the
+    # already-loaded set.
     def _keep(rec):
         try:
             ts = datetime.datetime.fromisoformat(rec["ts"])
@@ -1399,6 +2412,10 @@ def _compute(args):
         if until and ts > until:
             return False
         if user_raw and (rec.get("user") or "(anonymous)") != user_raw:
+            return False
+        if model_raw and (rec.get("model") or "(unknown)") != model_raw:
+            return False
+        if purpose_raw and (rec.get("purpose") or "(unspecified)") != purpose_raw:
             return False
         return True
 
@@ -1467,6 +2484,75 @@ def _compute(args):
     if since_raw or until_raw:
         window = f"{since_raw or 'start'} → {until_raw or 'now'}"
 
+    # --- Chart-shaped series, all aligned to the same dense day axis ---
+    day_keys = _day_keys_in_range(records)
+    daily_cost = _aggregate_cost_per_day(records, day_keys)
+    daily_calls = _aggregate_calls_per_day(records, day_keys)
+    daily_active = _aggregate_active_users_per_day(records, day_keys)
+    daily_savings = _aggregate_cache_savings_per_day(records, day_keys)
+    by_day_model = _aggregate_by_day_model(records, day_keys)
+    by_day_purpose = _aggregate_purpose_per_day(records, day_keys)
+    lat_p50_day, lat_p90_day = _latency_per_day(records, day_keys)
+
+    # Cap visible series to the top 6; lump the rest as "other" so the legend
+    # stays readable on a wide log with dozens of obscure models.
+    def _top_n_series(series, n=6):
+        if len(series) <= n:
+            return series
+        top = series[:n]
+        rest = series[n:]
+        if not rest:
+            return top
+        other = [0.0] * len(day_keys)
+        for _name, vs in rest:
+            for i, v in enumerate(vs):
+                other[i] += v
+        return top + [("other", other)]
+
+    by_day_model_top = _top_n_series(by_day_model)
+    by_day_purpose_top = _top_n_series(by_day_purpose)
+
+    user_spark = _per_user_sparkline_data(records, day_keys)
+    model_spark = _per_model_sparkline_data(records, day_keys)
+
+    # Render the SVG strings server-side so the templates stay simple.
+    chart_daily_cost = _svg_line_chart(
+        day_keys, [("daily cost", daily_cost)],
+        y_label="USD", money=True,
+    )
+    chart_daily_calls = _svg_line_chart(
+        day_keys,
+        [("API calls", daily_calls), ("active users", daily_active)],
+        y_label="count",
+    )
+    chart_model_stack = _svg_stacked_bars(
+        day_keys, by_day_model_top, money=True,
+    )
+    chart_purpose_stack = _svg_stacked_bars(
+        day_keys, by_day_purpose_top,
+    )
+    chart_cache_savings = _svg_line_chart(
+        day_keys, [("cache savings", daily_savings)],
+        y_label="USD", money=True,
+        colors=["#2e9e4f"],
+    )
+    chart_latency_day = _svg_line_chart(
+        day_keys, [("p50", lat_p50_day), ("p90", lat_p90_day)],
+        y_label="ms",
+    )
+    chart_hours = _svg_hour_bars(hours)
+
+    # Donut: cost share by model in this window.
+    model_total = [
+        (name, m["cost"], _color_for(i))
+        for i, (name, m) in enumerate(by_model)
+    ]
+    chart_model_donut = _svg_donut(model_total[:8])
+
+    # Sparkline strings keyed by user / model — used by table templates.
+    user_sparklines = {n: _svg_sparkline(vs) for n, vs in user_spark.items()}
+    model_sparklines = {n: _svg_sparkline(vs) for n, vs in model_spark.items()}
+
     return dict(
         log=path,
         record_count=len(records),
@@ -1474,7 +2560,11 @@ def _compute(args):
         since_raw=since_raw,
         until_raw=until_raw,
         user_raw=user_raw,
+        model_raw=model_raw,
+        purpose_raw=purpose_raw,
         all_users=all_users,
+        all_models=all_models,
+        all_purposes=all_purposes,
         errors=errors,
         # overview
         users=sorted(users.items()),
@@ -1510,6 +2600,27 @@ def _compute(args):
         lat_p50=lat_p50,
         lat_p90=lat_p90,
         lat_p99=lat_p99,
+        # chart strings + supporting series
+        day_keys=day_keys,
+        daily_cost=daily_cost,
+        daily_calls=daily_calls,
+        daily_active=daily_active,
+        daily_savings=daily_savings,
+        chart_daily_cost=chart_daily_cost,
+        chart_daily_calls=chart_daily_calls,
+        chart_model_stack=chart_model_stack,
+        chart_purpose_stack=chart_purpose_stack,
+        chart_cache_savings=chart_cache_savings,
+        chart_latency_day=chart_latency_day,
+        chart_hours=chart_hours,
+        chart_model_donut=chart_model_donut,
+        user_sparklines=user_sparklines,
+        model_sparklines=model_sparklines,
+        # records carried for Trends-tab post-processing
+        _records=records,
+        _all_records=all_records,
+        _since=since,
+        _until=until,
     )
 
 
@@ -1587,15 +2698,131 @@ def _system_context() -> dict:
     )
 
 
+def _trends_context(compute_ctx):
+    """Compute period-over-period figures and the anomaly / top-N tables.
+
+    Folds the chart and KPI extras on top of the regular ``_compute`` context —
+    the Trends tab shares filters with Overview, so we reuse the same record
+    set and aggregations to avoid loading the log twice.
+    """
+    records = compute_ctx.pop("_records")
+    all_records = compute_ctx.pop("_all_records")
+    since = compute_ctx.pop("_since")
+    until = compute_ctx.pop("_until")
+    day_keys = compute_ctx["day_keys"]
+    daily_cost = compute_ctx["daily_cost"]
+    daily_active = compute_ctx["daily_active"]
+
+    curr, prev, (cs, ce, ps, pe) = _compare_periods(all_records, since, until)
+    delta = {
+        "cost":   _delta_pct(curr["cost"],   prev["cost"]),
+        "calls":  _delta_pct(curr["calls"],  prev["calls"]),
+        "tokens": _delta_pct(curr["tokens"], prev["tokens"]),
+        "users":  _delta_pct(curr["users"],  prev["users"]),
+    }
+    prev_window = f"{ps.date()} → {pe.date()}"
+
+    anomalies = _anomaly_days(daily_cost, day_keys)
+    top_calls = _top_calls(records, n=15)
+
+    # Top users by cost across the visible window.
+    users_agg = _report.aggregate(records)
+    top_users = sorted(users_agg.items(), key=lambda kv: kv[1]["cost"],
+                       reverse=True)[:10]
+    grand_cost = sum(u["cost"] for u in users_agg.values())
+
+    chart_active_users = _svg_line_chart(
+        day_keys, [("active users", daily_active)],
+        y_label="users",
+        colors=["#c8860a"],
+    )
+
+    compute_ctx.update(
+        curr=curr,
+        prev=prev,
+        delta=delta,
+        prev_window=prev_window,
+        anomalies=anomalies,
+        top_calls=top_calls,
+        top_users=top_users,
+        grand_cost=grand_cost,
+        chart_active_users=chart_active_users,
+    )
+    return compute_ctx
+
+
+def _user_context(username: str):
+    """All-time drill-down for a single user."""
+    path = _log_path()
+    all_records = []
+    if os.path.exists(path):
+        all_records = list(_report.load_records(path, None, None, None))
+    records = [r for r in all_records
+               if (r.get("user") or "(anonymous)") == username]
+
+    api_records = [r for r in records if r.get("kind") == "api"]
+    users_agg = _report.aggregate(records)
+    u = users_agg.get(username, {
+        "api_calls": 0, "input": 0, "output": 0, "cost": 0.0,
+        "cache_r": 0, "cache_w_5m": 0, "cache_w_1h": 0,
+        "web_searches": 0, "stt_calls": 0, "audio_seconds": 0.0, "compute_ms": 0,
+    })
+
+    cache_denom = u["input"] + u["cache_r"]
+    cache_hit_pct = (100.0 * u["cache_r"] / cache_denom) if cache_denom else 0.0
+
+    lats = sorted(float(r["duration_ms"]) for r in api_records
+                  if r.get("duration_ms") is not None)
+    lat_p50 = _percentile(lats, 50) if lats else None
+
+    day_keys = _day_keys_in_range(api_records)
+    daily_cost = _aggregate_cost_per_day(api_records, day_keys)
+    chart_daily_cost = _svg_line_chart(
+        day_keys, [(username, daily_cost)],
+        y_label="USD", money=True,
+    )
+
+    by_model = sorted(_aggregate_by_model(api_records).items(),
+                      key=lambda kv: kv[1]["cost"], reverse=True)
+    model_slices = [(name, m["cost"], _color_for(i))
+                    for i, (name, m) in enumerate(by_model[:8])]
+    chart_model_donut = _svg_donut(model_slices)
+
+    by_purpose = sorted(_aggregate_purpose(api_records).items(),
+                        key=lambda kv: kv[1]["cost"], reverse=True)
+    purpose_slices = [(name, p["cost"], _color_for(i))
+                      for i, (name, p) in enumerate(by_purpose[:8])]
+    chart_purpose_donut = _svg_donut(purpose_slices)
+
+    recent = _recent_records(records, n=25)
+    recent_costs = [_report._api_cost(r) for r in recent]
+
+    return dict(
+        username=username,
+        record_count=len(records),
+        has_data=bool(api_records),
+        u=u,
+        cache_hit_pct=cache_hit_pct,
+        lat_p50=lat_p50,
+        chart_daily_cost=chart_daily_cost,
+        chart_model_donut=chart_model_donut,
+        chart_purpose_donut=chart_purpose_donut,
+        recent=recent,
+        _costs=recent_costs,
+    )
+
+
 def _tab(args) -> str:
     t = args.get("tab")
-    return t if t in ("overview", "cache", "activity", "accounts", "keys", "system") else "overview"
+    return t if t in ("overview", "cache", "activity", "trends",
+                      "accounts", "keys", "system") else "overview"
 
 
 def _render_fragment(ctx, tab) -> str:
     template = {
         "cache": _FRAGMENT_CACHE,
         "activity": _FRAGMENT_ACTIVITY,
+        "trends": _FRAGMENT_TRENDS,
         "accounts": _FRAGMENT_ACCOUNTS,
         "keys": _FRAGMENT_KEYS,
         "system": _FRAGMENT_SYSTEM,
@@ -1646,51 +2873,68 @@ def index():
     flashes = session.pop("flash", [])
     flash_keys = session.pop("flash_keys", [])
 
+    empty_page_ctx = dict(since_raw="", until_raw="", user_raw="",
+                          model_raw="", purpose_raw="",
+                          all_users=[], all_models=[], all_purposes=[])
+
     if tab == "accounts":
         ctx = _accounts_context()
         ctx["csrf"] = csrf
         auto = 0
-        page_ctx = dict(since_raw="", until_raw="", user_raw="", all_users=[])
+        page_ctx = empty_page_ctx
     elif tab == "keys":
         ctx = _keys_context()
         ctx["csrf"] = csrf
         ctx["flash_keys"] = flash_keys
         auto = 0
-        page_ctx = dict(since_raw="", until_raw="", user_raw="", all_users=[])
+        page_ctx = empty_page_ctx
     elif tab == "system":
         ctx = _system_context()
         auto = 0
-        page_ctx = dict(since_raw="", until_raw="", user_raw="", all_users=[])
+        page_ctx = empty_page_ctx
     else:
         ctx = _compute(request.args)
         auto = _refresh_seconds(request.args)
         page_ctx = {k: ctx[k] for k in
-                    ("since_raw", "until_raw", "user_raw", "all_users")}
+                    ("since_raw", "until_raw", "user_raw",
+                     "model_raw", "purpose_raw",
+                     "all_users", "all_models", "all_purposes")}
         # Overview view toggle: preserve filters, flip `view`.
         if tab == "overview":
             keep_view = {k: request.args.get(k)
-                         for k in ("since", "until", "user", "auto")
+                         for k in ("since", "until", "user", "model",
+                                   "purpose", "auto")
                          if request.args.get(k)}
             ctx["qs_view_total"] = urlencode({**keep_view, "tab": "overview", "view": "total"})
             ctx["qs_view_avg"] = urlencode({**keep_view, "tab": "overview", "view": "avg"})
+        if tab == "trends":
+            ctx = _trends_context(ctx)
+        else:
+            # Drop transient keys carried for the Trends post-process so they
+            # don't leak into other fragment renders.
+            for k in ("_records", "_all_records", "_since", "_until"):
+                ctx.pop(k, None)
 
     fragment = _render_fragment(ctx, tab)
 
-    # Tab links carry the active usage filter (since/until/user/auto) across.
+    # Tab links carry the active usage filter (since/until/user/model/purpose/auto).
     # `view` is overview-only and intentionally NOT carried so switching tabs
     # doesn't preserve a stale toggle state for tabs that don't have one.
-    keep = {k: request.args.get(k) for k in ("since", "until", "user", "auto")
+    keep = {k: request.args.get(k)
+            for k in ("since", "until", "user", "model", "purpose", "auto")
             if request.args.get(k)}
     qs = {t: urlencode({**keep, "tab": t})
-          for t in ("overview", "cache", "activity", "accounts", "keys", "system")}
+          for t in ("overview", "cache", "activity", "trends",
+                    "accounts", "keys", "system")}
 
     return render_template_string(
         _PAGE, fragment=fragment, tab=tab, auto=auto,
         auto_label=_AUTO_LABELS.get(auto, "second"),
         csrf=csrf, flashes=flashes,
         qs_overview=qs["overview"], qs_cache=qs["cache"],
-        qs_activity=qs["activity"], qs_accounts=qs["accounts"],
-        qs_keys=qs["keys"], qs_system=qs["system"], **page_ctx,
+        qs_activity=qs["activity"], qs_trends=qs["trends"],
+        qs_accounts=qs["accounts"], qs_keys=qs["keys"],
+        qs_system=qs["system"], **page_ctx,
     )
 
 
@@ -1698,9 +2942,47 @@ def index():
 @admin_required
 def fragment():
     """The data region only — polled on the refresh interval by the usage
-    tabs. Admin tabs do not poll, so only overview/cache reach here."""
+    tabs. Admin tabs do not poll, so only overview/cache/activity/trends
+    reach here."""
+    tab = _tab(request.args)
     ctx = _compute(request.args)
-    return _render_fragment(ctx, _tab(request.args))
+    if tab == "trends":
+        ctx = _trends_context(ctx)
+    else:
+        for k in ("_records", "_all_records", "_since", "_until"):
+            ctx.pop(k, None)
+    return _render_fragment(ctx, tab)
+
+
+@app.route("/user/<path:username>")
+@admin_required
+def user_drilldown(username):
+    """Per-user drill-down — KPI cards, daily-cost trend, model & purpose
+    mix, recent activity. Always shows all-time figures; the visible Overview
+    filter set is intentionally not applied so the page is a coherent
+    snapshot of the user, not a slice of one."""
+    csrf = _csrf_token()
+    flashes = session.pop("flash", [])
+    ctx = _user_context(username)
+    fragment = render_template_string(_FRAGMENT_USER, **ctx)
+
+    # No filter form on the user page; pass the empty page-ctx + qs so the
+    # tab nav still renders.
+    empty_page_ctx = dict(since_raw="", until_raw="", user_raw="",
+                          model_raw="", purpose_raw="",
+                          all_users=[], all_models=[], all_purposes=[])
+    qs = {t: urlencode({"tab": t})
+          for t in ("overview", "cache", "activity", "trends",
+                    "accounts", "keys", "system")}
+    return render_template_string(
+        _PAGE, fragment=fragment, tab="user", auto=0,
+        auto_label="second",
+        csrf=csrf, flashes=flashes,
+        qs_overview=qs["overview"], qs_cache=qs["cache"],
+        qs_activity=qs["activity"], qs_trends=qs["trends"],
+        qs_accounts=qs["accounts"], qs_keys=qs["keys"],
+        qs_system=qs["system"], **empty_page_ctx,
+    )
 
 
 # ---------------------------------------------------------------------------
