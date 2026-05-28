@@ -1007,9 +1007,12 @@
     .cal-sched.day .allday .allday-col { padding: 6px 8px 8px;
                                          gap: 4px; }
 
-    /* Month-cell to-do rows: match the chip footprint but include the
-       checkbox. The cell click still selects the day. */
+    /* Month-cell to-do rows: match the chip footprint. In the month grid
+       these render `.static` (no checkbox) so the cell click selects the
+       day without offering an easy mis-tap that would archive the item. */
     .cal-cell .ev-todo { margin-bottom: 2px; }
+    .todo-item.static { cursor: pointer; }
+    .todo-item.static .todo-label { cursor: inherit; }
 
     .day-detail { flex: 0 0 auto; padding: 0.75rem 0;
                   border-top: 1px solid var(--border); min-height: 80px; }
@@ -1594,6 +1597,48 @@
       /* Calendar single-scroll layout is now the default (see .cal-grid);
          phones just get shorter cells so more weeks fit before a scroll. */
       .pane[data-pane="calendar"] .cal-grid { grid-auto-rows: minmax(66px, auto); }
+
+      /* Mobile calendar: claw back horizontal space. The desktop layout
+         spends ~24px on outer margins, 8–12px on cell padding, and 56px
+         on the schedule's hour-gutter — on a 360–390px phone that leaves
+         the seven day-columns of the week view ~40px each. Tighten
+         everything that's per-column so titles and times actually fit. */
+      .cal-toolbar { padding: 0.5rem 0.5rem; }
+      .pane[data-pane="calendar"] .cal-grid,
+      .pane[data-pane="calendar"] .cal-sched { margin: 0.4rem 0.25rem; }
+      .pane[data-pane="calendar"] .cal-cell { padding: 0.25rem 0.3rem;
+                                              font-size: 0.72rem; }
+      .pane[data-pane="calendar"] .cal-cell .ev,
+      .pane[data-pane="calendar"] .cal-cell .ev-todo,
+      .pane[data-pane="calendar"] .cal-cell .todo-label {
+          font-size: 0.66rem; padding-left: 4px; padding-right: 4px; }
+      .pane[data-pane="calendar"] .cal-cell .daynum { font-size: 0.72rem;
+                                                      margin-bottom: 0.1rem; }
+      /* Shrink the time-axis gutter so day columns get the saved width.
+         All three grids that reference 56px need to match. */
+      .pane[data-pane="calendar"] .cal-sched .sched-head,
+      .pane[data-pane="calendar"] .cal-sched .sched-body,
+      .pane[data-pane="calendar"] .cal-sched .allday {
+          grid-template-columns: 28px minmax(0, 1fr); }
+      .pane[data-pane="calendar"] .cal-sched.week .sched-head,
+      .pane[data-pane="calendar"] .cal-sched.week .sched-body,
+      .pane[data-pane="calendar"] .cal-sched.week .allday {
+          grid-template-columns: 28px repeat(7, minmax(0, 1fr)); }
+      .pane[data-pane="calendar"] .cal-sched .hour-gutter .hour-label {
+          padding-right: 3px; font-size: 0.6rem; }
+      .pane[data-pane="calendar"] .cal-sched .allday .allday-label {
+          padding: 4px 3px 4px 0; font-size: 0.55rem; letter-spacing: 0.04em; }
+      .pane[data-pane="calendar"] .cal-sched .sched-head .day-head {
+          padding: 0.35rem 0.15rem; font-size: 0.65rem; letter-spacing: 0.02em; }
+      .pane[data-pane="calendar"] .cal-sched .sched-head .day-head .dow-num {
+          font-size: 0.9rem; }
+      .pane[data-pane="calendar"] .cal-sched .ev-block { left: 1px; right: 1px;
+                                                         padding: 2px 4px;
+                                                         font-size: 0.66rem; }
+      .pane[data-pane="calendar"] .cal-sched .allday .allday-col {
+          padding: 3px 2px; }
+      .pane[data-pane="calendar"] .cal-sched .allday .ev-pill {
+          padding: 1px 5px; font-size: 0.62rem; }
 
       /* Topics pane: the list fills the pane; selecting a topic slides its
          content in over the full window (see `.topic-open` below). */
@@ -3881,7 +3926,10 @@ async function renderMonthView(silent) {
       if (parseEventMinutes(ev) === null) {
         // All-day events render as compact to-do rows so a quick check
         // toggles done state without leaving the month grid.
-        const todo = buildTodoItem(ev, { compact: true });
+        // Month view: render all-day items as static rows — they keep the
+        // to-do styling/category color but the checkbox is omitted so a
+        // stray tap in the dense grid can't accidentally archive an item.
+        const todo = buildTodoItem(ev, { compact: true, interactive: false });
         todo.classList.add("ev", "ev-todo");
         cell.appendChild(todo);
       } else {
@@ -4167,44 +4215,49 @@ async function setEventArchived(ev, archived) {
 
 // Render an all-day event as a to-do row: checkbox toggles archived
 // (= done); clicking the label opens the event modal as before.
-function buildTodoItem(ev, { compact = false } = {}) {
+function buildTodoItem(ev, { compact = false, interactive = true } = {}) {
   const item = document.createElement("div");
   item.className = "todo-item" + (compact ? " compact" : "")
-                 + (ev.archived ? " done" : "");
+                 + (ev.archived ? " done" : "")
+                 + (interactive ? "" : " static");
   applyCategoryColor(item, ev.category);
 
-  const box = document.createElement("button");
-  box.type = "button";
-  box.className = "todo-check";
-  box.setAttribute("role", "checkbox");
-  box.setAttribute("aria-checked", ev.archived ? "true" : "false");
-  box.setAttribute("aria-label",
-    ev.archived ? "Mark not done" : "Mark done");
-  box.innerHTML =
-    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" '
-    + 'stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round">'
-    + '<path d="M5 12l5 5L20 7"/></svg>';
-  box.addEventListener("click", async (e) => {
-    e.stopPropagation();
-    const next = !ev.archived;
-    item.classList.toggle("done", next);
-    box.setAttribute("aria-checked", next ? "true" : "false");
-    const ok = await setEventArchived(ev, next);
-    if (!ok) {
-      // Roll back the optimistic flip so state stays truthful.
-      item.classList.toggle("done", !next);
-      box.setAttribute("aria-checked", !next ? "true" : "false");
-    }
-  });
-  item.appendChild(box);
+  if (interactive) {
+    const box = document.createElement("button");
+    box.type = "button";
+    box.className = "todo-check";
+    box.setAttribute("role", "checkbox");
+    box.setAttribute("aria-checked", ev.archived ? "true" : "false");
+    box.setAttribute("aria-label",
+      ev.archived ? "Mark not done" : "Mark done");
+    box.innerHTML =
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" '
+      + 'stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round">'
+      + '<path d="M5 12l5 5L20 7"/></svg>';
+    box.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      const next = !ev.archived;
+      item.classList.toggle("done", next);
+      box.setAttribute("aria-checked", next ? "true" : "false");
+      const ok = await setEventArchived(ev, next);
+      if (!ok) {
+        // Roll back the optimistic flip so state stays truthful.
+        item.classList.toggle("done", !next);
+        box.setAttribute("aria-checked", !next ? "true" : "false");
+      }
+    });
+    item.appendChild(box);
+  }
 
   const label = document.createElement("span");
   label.className = "todo-label";
   label.textContent = ev.title || ev.name || "(untitled)";
-  label.addEventListener("click", (e) => {
-    e.stopPropagation();
-    openEventModal(ev);
-  });
+  if (interactive) {
+    label.addEventListener("click", (e) => {
+      e.stopPropagation();
+      openEventModal(ev);
+    });
+  }
   item.appendChild(label);
   return item;
 }
