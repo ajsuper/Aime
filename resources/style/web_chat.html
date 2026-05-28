@@ -22,7 +22,17 @@
             --r-xs: 6px;
             --r-sm: 10px;
             --r-md: 14px;
-            --r-lg: 20px; }
+            --r-lg: 20px;
+            /* Category coloring — every category string maps to its own
+               hue, derived deterministically from the text. The element
+               gets `--cat-h: <degrees>` inline; the theme picks the
+               saturation/lightness so the resulting pastel sits inside
+               the theme's palette instead of shouting over it. Same
+               category text always lands on the same hue, so a "work"
+               topic and a "work" event read as kin without us hard-coding
+               anything. Dark-theme defaults below; light themes override. */
+            --cat-s: 40%;
+            --cat-l: 64%; }
     /* Creativity (light). Retro-Apple offwhite with pastel-rainbow accents. */
     :root[data-theme="creativity"] {
       color-scheme: light;
@@ -55,6 +65,8 @@
       --warning: #E0AE55;
       --error: #D9817F;
       --success: #6DAE84;
+      --cat-s: 55%;
+      --cat-l: 78%;
     }
     /* Default theme — Creativity (dark). Same pastel-rainbow language on a warm near-black. */
     :root, :root[data-theme="creativity-dark"] {
@@ -193,6 +205,8 @@
       --warning: #C58B1D;
       --error: #B14333;
       --success: #4F8253;
+      --cat-s: 45%;
+      --cat-l: 60%;
     }
     * { box-sizing: border-box; }
     html, body { height: 100%; }
@@ -1181,6 +1195,36 @@
     /* Schedule and pill events should look interactive. */
     .cal-sched .ev-block, .cal-sched .ev-pill,
     .cal-cell .ev { cursor: pointer; }
+
+    /* Category coloring — the renderers set `--cat-h` to a hue derived
+       from the category text. Theme provides --cat-s / --cat-l, so the
+       resulting pastel sits inside the active palette. A 3px left bar is
+       the universal carrier across topic rows, month chips, all-day
+       pills and schedule blocks — same shape, same colour per category,
+       across surfaces. Elements without --cat-h fall through cleanly. */
+    [style*="--cat-h"] {
+      --cat-color: hsl(var(--cat-h) var(--cat-s, 40%) var(--cat-l, 64%));
+    }
+    .topic-item[style*="--cat-h"] {
+      box-shadow: inset 3px 0 0 var(--cat-color);
+    }
+    .cal-cell .ev[style*="--cat-h"] {
+      background: color-mix(in srgb, var(--cat-color) 28%, transparent);
+      box-shadow: inset 3px 0 0 var(--cat-color);
+      padding-left: 8px;
+    }
+    .cal-sched .ev-pill[style*="--cat-h"] {
+      background: color-mix(in srgb, var(--cat-color) 32%, transparent);
+      box-shadow: inset 3px 0 0 var(--cat-color);
+      padding-left: 10px;
+    }
+    .cal-sched .ev-block[style*="--cat-h"] {
+      background: color-mix(in srgb, var(--cat-color) 78%,
+                            color-mix(in srgb, var(--bg) 50%, transparent));
+      color: var(--text);
+      box-shadow: inset 3px 0 0 var(--cat-color),
+                  0 1px 2px rgba(0,0,0,0.18);
+    }
 
     /* Archived events stay visible so users see their history, but are
        desaturated and dimmed so active events read first. Strike-through on
@@ -3533,6 +3577,26 @@ function sameYMD(a, b) {
       && a.getDate() === b.getDate();
 }
 
+// Deterministic category → hue. FNV-1a over the lowercased trimmed text;
+// the same string always lands on the same hue, so a "work" topic and a
+// "work" event read as the same category across surfaces. The theme picks
+// saturation/lightness, so we never hard-code colours per category.
+function categoryHue(category) {
+  if (!category) return null;
+  const s = String(category).trim().toLowerCase();
+  if (!s) return null;
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return ((h >>> 0) % 360);
+}
+function applyCategoryColor(el, category) {
+  const h = categoryHue(category);
+  if (h !== null) el.style.setProperty("--cat-h", h);
+}
+
 // "Today", "Tomorrow", "Yesterday", "In N days", "N days ago", etc. Past
 // a couple of weeks we switch to weeks/months/years so the label stays
 // readable instead of becoming "In 47 days".
@@ -3728,6 +3792,7 @@ async function renderMonthView(silent) {
       const e = document.createElement("div");
       e.className = "ev" + (ev.archived ? " archived" : "");
       e.textContent = "• " + (ev.title || ev.name || "(untitled)");
+      applyCategoryColor(e, ev.category);
       cell.appendChild(e);
     });
     cell.addEventListener("click", () => selectDayCell(
@@ -3996,6 +4061,7 @@ function buildDayColumn(date, events, sched, allDayCol, hourPx, startHour, endHo
         const pill = document.createElement("div");
         pill.className = "ev-pill" + (ev.archived ? " archived" : "");
         pill.textContent = ev.title || ev.name || "(untitled)";
+        applyCategoryColor(pill, ev.category);
         pill.addEventListener("click", (e) => {
           e.stopPropagation();
           openEventModal(ev);
@@ -4028,6 +4094,7 @@ function buildDayColumn(date, events, sched, allDayCol, hourPx, startHour, endHo
       block.style.right = "auto";
       block.style.width = `calc((100% - 8px) / ${colCount} - 2px)`;
     }
+    applyCategoryColor(block, ev.category);
     const title = document.createElement("div");
     title.className = "ev-block-title";
     title.textContent = ev.title || ev.name || "(untitled)";
@@ -4435,6 +4502,7 @@ function buildTopicItem(t) {
   item.className = "topic-item";
   const tid = t.id || t.topic_id || t.name || t.title;
   if (tid === selectedTopicId) item.classList.add("active");
+  applyCategoryColor(item, t.category);
   const title = document.createElement("div");
   title.textContent = t.title || t.name || "(untitled)";
   item.appendChild(title);
