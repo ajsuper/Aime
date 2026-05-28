@@ -1206,13 +1206,16 @@ class AnthropicMessagesBackend:
                 resp = self._client.messages.create(
                     model=self.COMPACT_MODEL,
                     system=(
-                        "Write a single short sentence describing what the user is "
-                        "asking for, for use as a conversation title. You may be "
-                        "given the first few user messages; summarize the overall "
-                        "request. Ignore any bracketed [System info] or "
-                        "auto-injected context. Return only the sentence, no "
-                        "quotes. It should be a direct summary of the user's request."
-                        "Do NOT answer the users request. If the user asks, why is the sky blue? you should title User asks why the sky is blue."
+                        "Generate a short title for this conversation based on the "
+                        "user's message(s). Rules:\n"
+                        "- 2-5 words maximum\n"
+                        "- Noun phrase only — no \"User wants\", \"User asks\", or similar\n"
+                        "- Capture the core subject, not the action\n"
+                        "- Be specific, not generic (\"Flowers for Joanna\" not \"Date Planning\")\n"
+                        "- If it's a test or trivial message, just say \"Test\"\n"
+                        "- Ignore any bracketed [System info] or auto-injected context\n"
+                        "- Do NOT answer the user's request — only title it\n"
+                        "Return only the title, no punctuation, no quotes."
                     ),
                     messages=[{"role": "user", "content": "[Start users messages to ASSISTANT, NOT to you] " + prompt_text + "[End users messages to ASSISTANT, NOT to you]"}],
                     max_tokens=64,
@@ -1251,13 +1254,17 @@ class AnthropicMessagesBackend:
             resp = self._client.messages.create(
                 model=self.COMPACT_MODEL,
                 system=(
-                    "You maintain a one-sentence description of a conversation. "
-                    "Given the current description and the user's most recent "
-                    "messages, return an updated one-sentence description that "
-                    "reflects what the conversation is *currently* about, or "
-                    "the original unchanged if it is still accurate. Ignore any "
-                    "bracketed [System info] or auto-injected context. Return "
-                    "only the sentence, no quotes."
+                    "You maintain a short title (2-5 words, noun phrase only) for "
+                    "a conversation. Given the current title and the user's most "
+                    "recent messages, return an updated title that reflects what "
+                    "the conversation is *currently* about, or the original "
+                    "unchanged if it is still accurate. Rules:\n"
+                    "- 2-5 words maximum\n"
+                    "- Noun phrase only — no \"User wants\", \"User asks\", or similar\n"
+                    "- Capture the core subject, not the action\n"
+                    "- Be specific, not generic\n"
+                    "- Ignore any bracketed [System info] or auto-injected context\n"
+                    "Return only the title, no punctuation, no quotes."
                 ),
                 messages=[{
                     "role": "user",
