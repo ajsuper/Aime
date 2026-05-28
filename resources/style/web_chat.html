@@ -4415,17 +4415,18 @@ async function loadTopics(silent) {
 }
 
 // Folder expand/collapse state persists across reloads. Stored as
-// { "<folder name>": true } where true == collapsed. Folders default to
-// expanded (key absent), and an active search query overrides the saved
-// state so the user can see every match in context.
-const FOLDER_STATE_KEY = "aime.topicFolderCollapsed";
-let folderCollapsed = {};
+// { "<folder name>": true } where true == EXPANDED. Folders default to
+// collapsed (key absent), so brand-new folders, renamed folders, and a
+// fresh app load all start closed. An active search query overrides the
+// saved state so the user can see every match in context.
+const FOLDER_STATE_KEY = "aime.topicFolderExpanded";
+let folderExpanded = {};
 try {
-  folderCollapsed = JSON.parse(localStorage.getItem(FOLDER_STATE_KEY) || "{}") || {};
-} catch { folderCollapsed = {}; }
+  folderExpanded = JSON.parse(localStorage.getItem(FOLDER_STATE_KEY) || "{}") || {};
+} catch { folderExpanded = {}; }
 
 function saveFolderState() {
-  try { localStorage.setItem(FOLDER_STATE_KEY, JSON.stringify(folderCollapsed)); }
+  try { localStorage.setItem(FOLDER_STATE_KEY, JSON.stringify(folderExpanded)); }
   catch {}
 }
 
@@ -4496,8 +4497,10 @@ function renderTopicList() {
   folders.forEach((topics, folderName) => {
     const group = document.createElement("div");
     group.className = "topic-folder-group";
-    // Search overrides saved state — searcher should see all matches.
-    const collapsed = !q && folderCollapsed[folderName] === true;
+    // Search overrides saved state — searcher should see all matches. With
+    // no query, folders default to collapsed unless the user has explicitly
+    // opened this one before.
+    const collapsed = !q && folderExpanded[folderName] !== true;
     if (collapsed) group.classList.add("collapsed");
 
     const header = document.createElement("div");
@@ -4521,8 +4524,8 @@ function renderTopicList() {
       // Only persist when no search query is active so a transient
       // search-driven expand doesn't overwrite the user's saved preference.
       if (!q) {
-        if (nowCollapsed) folderCollapsed[folderName] = true;
-        else delete folderCollapsed[folderName];
+        if (nowCollapsed) delete folderExpanded[folderName];
+        else folderExpanded[folderName] = true;
         saveFolderState();
       }
     });
