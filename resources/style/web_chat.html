@@ -1300,15 +1300,12 @@
     }
 
     /* Archived events stay visible so users see their history, but are
-       desaturated and dimmed so active events read first. Strike-through on
-       the title makes the archived state unambiguous up close. */
+       desaturated and dimmed so active events read first. */
     .cal-cell .ev.archived,
     .cal-sched .ev-pill.archived,
     .cal-sched .ev-block.archived {
       opacity: 0.45;
       filter: grayscale(0.7);
-      text-decoration: line-through;
-      text-decoration-thickness: 1px;
     }
     .cal-sched .ev-block.archived:hover,
     .cal-sched .ev-pill.archived:hover,
@@ -2003,6 +2000,13 @@
             </div>
           </div>
           <div class="settings-section">
+            <h3>Session</h3>
+            <div class="settings-row">
+              <span class="label" style="color: var(--error)">Log out</span>
+              <button class="btn-danger" id="account-logout-btn">Log out</button>
+            </div>
+          </div>
+          <div class="settings-section">
             <h3>About</h3>
             <p class="wordmark">Aime</p>
             <p class="desc">Your personal assistant.</p>
@@ -2021,9 +2025,13 @@
               <span class="value" id="account-email">—</span>
             </div>
           </div>
-          <div class="settings-section" id="account-access-section" style="display:none">
-            <h3>Aime access</h3>
-            <p class="desc" id="account-access-desc">—</p>
+          <div class="settings-section" id="account-access-section">
+            <h3>Account usage</h3>
+            <div class="settings-row">
+              <span class="label">Used this period</span>
+              <span class="value" id="account-usage-pct">0%</span>
+            </div>
+            <p class="desc" id="account-access-desc" style="display:none">—</p>
             <div class="settings-row" id="account-redeem-row" style="display:none">
               <input id="account-key-input" type="text" autocomplete="off"
                      placeholder="Invite key"
@@ -2038,7 +2046,7 @@
             </div>
             <p class="desc" id="account-redeem-msg" style="display:none;margin-top:0.4rem"></p>
           </div>
-          <div class="settings-section">
+          <div class="settings-section advanced-only">
             <h3>Data</h3>
             <p class="desc">Download your full data set as a zip, restore one,
               or delete saved conversations.</p>
@@ -2069,14 +2077,7 @@
               <button class="btn-danger" id="account-delete-all-btn">Delete all</button>
             </div>
           </div>
-          <div class="settings-section">
-            <h3>Session</h3>
-            <div class="settings-row">
-              <span class="label" style="color: var(--error)">Log out</span>
-              <button class="btn-danger" id="account-logout-btn">Log out</button>
-            </div>
-          </div>
-          <div class="settings-section">
+          <div class="settings-section advanced-only">
             <h3>Delete account</h3>
             <p class="desc">Deactivates your account — it will appear to no
               longer exist. You can recover it by signing in again. After 30
@@ -5483,17 +5484,19 @@ function applyAccessState() {
   }
   if (sendBtn) sendBtn.disabled = locked;
 
-  if (__accessMode !== "keys") { accessSection.style.display = "none"; return; }
-  accessSection.style.display = "";
-  if (__apiAccess) {
-    accessDesc.textContent = "Message access is active on this account.";
+  // The "Account usage" section itself always shows. The invite-key
+  // prompt and redeem row only appear in keys mode for a user without
+  // api_access — otherwise we just show the usage row.
+  if (__accessMode !== "keys" || __apiAccess) {
+    accessDesc.style.display = "none";
     redeemRow.style.display = "none";
-  } else {
-    accessDesc.textContent = "This account can browse topics and past "
-      + "conversations, but needs an invite key before it can send messages "
-      + "to Aime.";
-    redeemRow.style.display = "";
+    return;
   }
+  accessDesc.textContent = "This account can browse topics and past "
+    + "conversations, but needs an invite key before it can send messages "
+    + "to Aime.";
+  accessDesc.style.display = "";
+  redeemRow.style.display = "";
 }
 
 async function refreshMe() {
