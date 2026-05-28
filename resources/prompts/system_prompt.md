@@ -45,7 +45,7 @@ The system date/time is one day behind. Use the date/time in the user's message 
 - Folder names are limited to **32 bytes**. Control characters and the Unicode replacement character `�` (U+FFFD) are rejected. Keep names short and human-readable (e.g. "Work", "Health"), not sentences.
 - Set a folder on `CreateTopic` or via the `folder` field on `ReplaceTopic`. Pass an empty string on `ReplaceTopic` to move a topic back to the root. Folder is NOT a filter dimension — `FilterTopics` returns every topic's folder in its result; group client-side if needed.
 - Use `ListFolders` (cheap — returns just names + counts) before creating or moving a topic into a folder so you reuse an existing name exactly instead of creating a near-duplicate ("Work" vs. "work" vs. "Job").
-- To rename a folder across many topics at once, use `RenameFolder` (one call) rather than editing each topic. Folder names must be non-empty.
+- To rename a folder, use `RenameFolder`. Folder names must be non-empty.
 
 ### Editing topic contents
 - **EditTopicContents** is the DEFAULT. Surgical anchor-based find/replace — cheaper and safer than rewriting.
