@@ -18,7 +18,9 @@ services:
         DOWNLOAD_TINY: "${DOWNLOAD_TINY:-1}"
         DOWNLOAD_BASE: "${DOWNLOAD_BASE:-0}"
         DOWNLOAD_SMALL: "${DOWNLOAD_SMALL:-0}"
-    image: aime
+    # No explicit `image:` — Compose tags the build as <project>-aime, so
+    # running this stack under different -p project names (e.g. main vs. dev)
+    # produces independent images instead of stepping on a shared "aime" tag.
     ports:
       # Bound to 127.0.0.1 on the host so the app is only reachable from the
       # box itself. On a server, put a reverse proxy (Caddy, nginx) in front
