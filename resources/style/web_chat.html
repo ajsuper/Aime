@@ -1352,6 +1352,9 @@
     .settings-tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
     .settings-tab { display: none; }
     .settings-tab.active { display: flex; flex-direction: column; gap: 1.25rem; }
+    /* Simple UI mode — strip advanced-only controls from the chrome. The
+       toggle lives in Settings > General; see `aime.uiMode` in the script. */
+    body.ui-simple .advanced-only { display: none !important; }
     .dev-warn { color: var(--warning); font-size: 0.8rem; margin: 0 0 0.5rem;
                 padding: 0.55rem 0.75rem; border: 1px solid var(--warning);
                 border-radius: 8px; background: rgba(255, 170, 70, 0.06); }
@@ -1751,7 +1754,7 @@
           <div id="topic-divider" title="Drag to resize"></div>
           <div class="topic-content scroll" id="topic-content">
             <div class="topic-toolbar" id="topic-toolbar">
-              <button id="topic-edit-btn" title="Edit topic">Edit</button>
+              <button id="topic-edit-btn" class="advanced-only" title="Edit topic">Edit</button>
               <div class="topic-download-wrap" id="topic-download-wrap">
                 <button id="topic-download-btn" title="Download topic"
                         aria-label="Download topic" aria-haspopup="menu"
@@ -1768,11 +1771,11 @@
                      role="menu" hidden>
                   <button role="menuitem" data-format="pdf">PDF</button>
                   <button role="menuitem" data-format="docx">Word (.docx)</button>
-                  <button role="menuitem" data-format="odt">OpenDocument (.odt)</button>
-                  <button role="menuitem" data-format="html">HTML</button>
-                  <button role="menuitem" data-format="md">Markdown</button>
-                  <button role="menuitem" data-format="epub">EPUB</button>
-                  <button role="menuitem" data-format="rtf">Rich Text (.rtf)</button>
+                  <button role="menuitem" data-format="odt" class="advanced-only">OpenDocument (.odt)</button>
+                  <button role="menuitem" data-format="html" class="advanced-only">HTML</button>
+                  <button role="menuitem" data-format="md" class="advanced-only">Markdown</button>
+                  <button role="menuitem" data-format="epub" class="advanced-only">EPUB</button>
+                  <button role="menuitem" data-format="rtf" class="advanced-only">Rich Text (.rtf)</button>
                   <button role="menuitem" data-format="txt">Plain text</button>
                 </div>
               </div>
@@ -1927,11 +1930,23 @@
                 aria-selected="true">General</button>
         <button class="settings-tab-btn" data-tab="account" role="tab"
                 aria-selected="false">Account</button>
-        <button class="settings-tab-btn" data-tab="developer" role="tab"
+        <button class="settings-tab-btn advanced-only" data-tab="developer" role="tab"
                 aria-selected="false">Developer</button>
       </div>
       <div class="settings-body">
         <div class="settings-tab active" data-tab="user" role="tabpanel">
+          <div class="settings-section">
+            <h3>Mode</h3>
+            <p class="desc">Simple hides advanced controls so the interface
+              stays calm. Advanced reveals every option.</p>
+            <div class="settings-row">
+              <span class="label">Interface</span>
+              <select id="ui-mode-select">
+                <option value="simple">Simple</option>
+                <option value="advanced">Advanced</option>
+              </select>
+            </div>
+          </div>
           <div class="settings-section">
             <h3>Appearance</h3>
             <p class="desc">Visual preferences for the chat interface.</p>
@@ -1949,7 +1964,7 @@
                 <option value="parchment">Parchment (light)</option>
               </select>
             </div>
-            <div class="settings-row">
+            <div class="settings-row advanced-only">
               <span class="label">Information detail</span>
               <select id="verbosity-select">
                 <option value="minimal">Minimal</option>
@@ -1957,11 +1972,11 @@
                 <option value="verbose">Verbose</option>
               </select>
             </div>
-            <p class="desc">Minimal hides tool activity behind a status line.
+            <p class="desc advanced-only">Minimal hides tool activity behind a status line.
               Standard shows a line per step. Verbose shows tool names,
               details, and full error text.</p>
           </div>
-          <div class="settings-section">
+          <div class="settings-section advanced-only">
             <h3>Date & time</h3>
             <p class="desc">How dates and times are displayed. Doesn't change
               how Aime stores them internally.</p>
@@ -2036,7 +2051,7 @@
                 Download .zip
               </button>
             </div>
-            <div class="settings-row">
+            <div class="settings-row advanced-only">
               <span class="label">Import data</span>
               <button class="btn-neutral" id="account-import-btn"
                       style="background:var(--bg-input);color:var(--text);
@@ -5204,6 +5219,37 @@ verbositySelect.value = verbosity;
 verbositySelect.addEventListener("change", () => {
   verbosity = verbositySelect.value;
   localStorage.setItem(VERBOSITY_KEY, verbosity);
+});
+
+// -- UI mode (Simple / Advanced) ----------------------------------------
+// Purely cosmetic: toggles `body.ui-simple`, which hides every element
+// tagged `.advanced-only`. No backend behaviour changes.
+
+const UI_MODE_KEY = "aime.uiMode";
+const DEFAULT_UI_MODE = "simple";
+const uiModeSelect = document.getElementById("ui-mode-select");
+
+function applyUiMode(mode) {
+  const simple = mode !== "advanced";
+  document.body.classList.toggle("ui-simple", simple);
+  // If the Developer tab was active and we just hid it, fall back to General.
+  if (simple) {
+    const devBtn = document.querySelector('.settings-tab-btn[data-tab="developer"]');
+    if (devBtn && devBtn.classList.contains("active")) {
+      const userBtn = document.querySelector('.settings-tab-btn[data-tab="user"]');
+      if (userBtn) userBtn.click();
+    }
+  }
+}
+
+let uiMode = localStorage.getItem(UI_MODE_KEY) || DEFAULT_UI_MODE;
+uiModeSelect.value = uiMode;
+applyUiMode(uiMode);
+
+uiModeSelect.addEventListener("change", () => {
+  uiMode = uiModeSelect.value;
+  localStorage.setItem(UI_MODE_KEY, uiMode);
+  applyUiMode(uiMode);
 });
 
 // -- Date & time format -------------------------------------------------
