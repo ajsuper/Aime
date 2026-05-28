@@ -3782,6 +3782,7 @@ function openEventModal(ev) {
   evFTime.value = (ev.time || "").trim();
   evFCategory.value = ev.category || "";
   evFSummary.value = ev.summary || "";
+  evArchiveBtn.textContent = ev.archived ? "Unarchive" : "Archive";
   setEventEditMode(false);
   eventBackdrop.hidden = false;
   // Defer focus until after the open animation so the input doesn't briefly
@@ -3847,13 +3848,15 @@ async function saveActiveEvent() {
 
 async function archiveActiveEvent() {
   if (!activeEventRecord || activeEventRecord.id == null) return;
+  const unarchiving = !!activeEventRecord.archived;
+  const verb = unarchiving ? "unarchive" : "archive";
   const payload = {
     title: activeEventRecord.title || "",
     summary: activeEventRecord.summary || "",
     category: activeEventRecord.category || "",
     date: activeEventRecord.date || "",
     time: activeEventRecord.time || "",
-    archived: true,
+    archived: !unarchiving,
   };
   try {
     const r = await fetch(
@@ -3863,14 +3866,14 @@ async function archiveActiveEvent() {
     );
     const j = await r.json();
     if (!r.ok || !j.ok) {
-      evModalError.textContent = (j && j.error) || "Couldn't archive.";
+      evModalError.textContent = (j && j.error) || ("Couldn't " + verb + ".");
       evModalError.hidden = false;
       return;
     }
     closeEventModal();
     renderCalendar();
   } catch (err) {
-    evModalError.textContent = "Couldn't archive: " + err;
+    evModalError.textContent = "Couldn't " + verb + ": " + err;
     evModalError.hidden = false;
   }
 }
