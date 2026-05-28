@@ -987,7 +987,19 @@
     .topic-item:hover { background: rgba(124, 140, 255, 0.08); }
     .topic-item.active { background: rgba(124, 140, 255, 0.18); color: var(--accent); }
     .topic-item .cat { color: var(--muted); font-size: 0.7rem; margin-top: 0.1rem; }
-    .topic-item.in-folder { padding-left: 1.6rem; }
+    /* Folder children — indented and marked with a left guide-line so the
+       eye instantly distinguishes them from root-level topics, which sit
+       flush with the search input above. */
+    .topic-folder-group .topic-item.in-folder {
+      padding-left: 1.8rem;
+      position: relative;
+    }
+    .topic-folder-group .topic-item.in-folder::before {
+      content: ""; position: absolute;
+      left: 0.85rem; top: 0; bottom: 0;
+      width: 2px; background: var(--border);
+    }
+    .topic-folder-group .topic-item.in-folder:hover::before { background: var(--accent); }
     /* Folder header — a clickable row that toggles its child topics. The
        chevron rotates rather than swapping glyphs so the transition feels
        smooth and the row width doesn't jitter. */
@@ -1007,6 +1019,13 @@
     .topic-folder-header .count { font-size: 0.7rem; color: var(--muted);
                                   opacity: 0.7; }
     .topic-folder-group.collapsed .topic-item { display: none; }
+    /* Mini-section header above root-level topics, shown only when at least
+       one folder is also visible — otherwise it'd be noise. Styled lighter
+       than the real folder header so it reads as "everything else." */
+    .topic-root-header { padding: 0.4rem 0.8rem; font-size: 0.7rem;
+                         color: var(--muted); letter-spacing: 0.06em;
+                         text-transform: uppercase; opacity: 0.7;
+                         border-bottom: 1px solid var(--border); }
     .topic-content { flex: 1; overflow-y: auto; min-width: 0; }
     .topic-toolbar { position: sticky; top: 0; z-index: 5;
                      background: var(--bg); border-bottom: 1px solid var(--border);
@@ -4463,6 +4482,15 @@ function renderTopicList() {
   });
 
   topicListEl.innerHTML = "";
+  // Only label the root section when there are folders too — otherwise it's
+  // pointless chrome. Folders render after root so the label sits naturally
+  // above its items.
+  if (root.length && folders.size) {
+    const rootHeader = document.createElement("div");
+    rootHeader.className = "topic-root-header";
+    rootHeader.textContent = "Uncategorized";
+    topicListEl.appendChild(rootHeader);
+  }
   root.forEach(t => topicListEl.appendChild(buildTopicItem(t)));
 
   folders.forEach((topics, folderName) => {

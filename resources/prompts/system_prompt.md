@@ -41,7 +41,8 @@ The system date/time is one day behind. Use the date/time in the user's message 
 ### Folders
 - Topics can optionally belong to a **folder** (just a name like "Work" or "Health"). Folders exist implicitly — assigning a topic to a folder name no one else uses creates that folder; the last topic leaving a folder removes it.
 - Topics without a folder live at the root, which is fine and the default. Only group into folders when there are enough related topics that grouping genuinely helps the user navigate (rough guide: ~3+ closely related topics).
-- **Reuse existing folder names exactly** (case-sensitive). Before creating a new folder, scan the list for an existing one that fits.
+- Folder matching is **case-insensitive** server-side, and the first-seen casing is preserved as canonical — passing "work" when "Work" already exists files into "Work". Even so, reuse the existing casing in your tool calls so the model's reasoning matches what the user sees.
+- Folder names are limited to **32 bytes**. Control characters and the Unicode replacement character `�` (U+FFFD) are rejected. Keep names short and human-readable (e.g. "Work", "Health"), not sentences.
 - Set a folder on `CreateTopic` or via the `folder` field on `ReplaceTopic`. Pass an empty string on `ReplaceTopic` to move a topic back to the root. Folder is NOT a filter dimension — `FilterTopics` returns every topic's folder in its result; group client-side if needed.
 - Use `ListFolders` (cheap — returns just names + counts) before creating or moving a topic into a folder so you reuse an existing name exactly instead of creating a near-duplicate ("Work" vs. "work" vs. "Job").
 - To rename a folder across many topics at once, use `RenameFolder` (one call) rather than editing each topic. Folder names must be non-empty.

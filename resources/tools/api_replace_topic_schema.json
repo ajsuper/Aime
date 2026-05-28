@@ -21,7 +21,8 @@
     },
     "folder": {
       "type": "string",
-      "description": "Optional folder name this topic belongs to. Omit to leave the topic's current folder unchanged. Pass an empty string to move it back to the root. To rename a folder across many topics at once, use RenameFolder instead."
+      "maxLength": 32,
+      "description": "Optional folder name this topic belongs to. Omit to leave the topic's current folder unchanged. Pass an empty string to move it back to the root. Matching is case-insensitive: passing a case-variant of an existing folder ('work' vs 'Work') files into that folder. To rename a folder across many topics at once, use RenameFolder instead. Max 32 bytes; control characters and U+FFFD are rejected."
     }
   }
 }

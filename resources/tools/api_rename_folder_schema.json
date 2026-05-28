@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "RenameFolder",
-  "description": "Bulk-rename every topic whose folder == old_name to use new_name instead. Use this instead of editing each topic individually when a folder needs to be renamed. Folder names must be non-empty (whitespace-only is rejected). To move a single topic between folders, use ReplaceTopic with the 'folder' field instead.",
+  "description": "Bulk-rename every topic whose folder matches old_name (case-insensitive) to use new_name instead. Use this when a folder needs to be renamed across many topics at once. Both names must be non-empty (whitespace-only is rejected). To move a single topic between folders, use ReplaceTopic with the 'folder' field instead.",
   "type": "object",
   "additionalProperties": false,
   "required": ["old_name", "new_name"],
@@ -9,12 +9,14 @@
     "old_name": {
       "type": "string",
       "minLength": 1,
-      "description": "The current folder name to rename. Must match existing topics' folder field exactly (case-sensitive)."
+      "maxLength": 32,
+      "description": "The current folder name to rename. Matched case-insensitively against existing topics' folder field, so 'work' will also match 'Work' and 'WORK'."
     },
     "new_name": {
       "type": "string",
       "minLength": 1,
-      "description": "The new folder name. If a folder with this name already exists, topics from old_name are merged into it."
+      "maxLength": 32,
+      "description": "The new folder name. If a folder with this name (case-insensitive) already exists, topics from old_name are merged into it using the existing folder's canonical casing. Max 32 bytes; control characters and U+FFFD are rejected."
     }
   }
 }

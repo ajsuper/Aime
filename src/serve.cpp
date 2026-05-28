@@ -939,11 +939,69 @@ static std::string trimWhitespace(const std::string& s) {
     return s.substr(start, end - start);
 }
 
+// Folder names are user-facing labels — keep them short and printable. Returns
+// "" on success, or a human-readable error reason otherwise. Empty input is
+// considered valid here (callers decide whether "" means "root" or is itself
+// an error — rename_folder rejects empty, create/replace allow it).
+static const size_t FOLDER_NAME_MAX_BYTES = 32;
+static std::string validateFolderName(const std::string& name) {
+    if (name.empty()) return "";
+    if (name.size() > FOLDER_NAME_MAX_BYTES) {
+        return "Folder name is too long (max " +
+               std::to_string(FOLDER_NAME_MAX_BYTES) + " bytes).";
+    }
+    // Reject control chars (incl. tab/newline) and the UTF-8 encoding of the
+    // Unicode replacement character U+FFFD (EF BF BD) which signals upstream
+    // encoding corruption — storing it cements the corruption.
+    for (size_t i = 0; i < name.size(); ++i) {
+        unsigned char c = static_cast<unsigned char>(name[i]);
+        if (c < 0x20 || c == 0x7F) {
+            return "Folder name contains a control character.";
+        }
+        if (c == 0xEF && i + 2 < name.size() &&
+            static_cast<unsigned char>(name[i + 1]) == 0xBF &&
+            static_cast<unsigned char>(name[i + 2]) == 0xBD) {
+            return "Folder name contains the Unicode replacement character (U+FFFD).";
+        }
+    }
+    return "";
+}
+
+// Look up the canonical (first-seen) casing for a folder name by scanning
+// TOPIC_FOLDER values case-insensitively. If any topic already uses a
+// case-variant of `name`, that variant is returned so a second caller passing
+// "testfolder" doesn't fork from an existing "TestFolder". If no match, the
+// input is returned unchanged so the first user of a new folder defines its
+// casing.
+static std::string canonicalFolderName(sqlite3* database, const std::string& name) {
+    if (name.empty()) return name;
+    sqlite3_stmt* stmt;
+    const std::string sql =
+        "SELECT TOPIC_FOLDER FROM TOPIC "
+        "WHERE LOWER(TOPIC_FOLDER) = LOWER(?) AND TOPIC_FOLDER != '' "
+        "LIMIT 1";
+    if (sqlite3_prepare_v2(database, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
+        return name;
+    }
+    sqlite3_bind_text(stmt, 1, name.c_str(), -1, SQLITE_STATIC);
+    std::string canonical = name;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const unsigned char* col = sqlite3_column_text(stmt, 0);
+        if (col) canonical = reinterpret_cast<const char*>(col);
+    }
+    sqlite3_finalize(stmt);
+    return canonical;
+}
+
 // Bulk-rename TOPIC_FOLDER values. Returns number of rows updated, or -1 on
 // SQL error. The replace_topic flow handles the single-topic case.
 int renameFolder(sqlite3* database, const std::string& oldName, const std::string& newName) {
     sqlite3_stmt* stmt;
-    const std::string sql = "UPDATE TOPIC SET TOPIC_FOLDER=? WHERE TOPIC_FOLDER=?";
+    // Match case-insensitively on the old name so "TestFolder" and
+    // "testfolder" rename together — callers no longer need to know the
+    // exact casing stored on disk.
+    const std::string sql =
+        "UPDATE TOPIC SET TOPIC_FOLDER=? WHERE LOWER(TOPIC_FOLDER)=LOWER(?)";
     if (sqlite3_prepare_v2(database, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
         std::cout << "renameFolder prepare failed: " << sqlite3_errmsg(database) << std::endl;
         return -1;
@@ -1186,6 +1244,16 @@ int main(int argc, char* argv[]) {
             Topic topic = parseEditTopic(jsonData);
             topic.id = -1;
             topic.topicFolder = trimWhitespace(topic.topicFolder);
+            {
+                std::string err = validateFolderName(topic.topicFolder);
+                if (!err.empty()) {
+                    crow::json::wvalue response;
+                    response["ok"] = false;
+                    response["error"] = err;
+                    return crow::response(400, response);
+                }
+            }
+            topic.topicFolder = canonicalFolderName(database, topic.topicFolder);
 
             addTopic(database, user_id, topic);
 
@@ -1217,10 +1285,18 @@ int main(int argc, char* argv[]) {
             if (!jsonData.has("folder")) {
                 topic.topicFolder = existing.topicFolder;
             } else {
-                // Validate non-empty when explicitly provided. To clear a
-                // folder, callers send an empty string, so we trim and accept
-                // that as "root". A whitespace-only string is treated as empty.
+                // To clear a folder, callers send an empty string, so we
+                // trim and accept that as "root". A whitespace-only string
+                // is treated as empty.
                 topic.topicFolder = trimWhitespace(topic.topicFolder);
+                std::string err = validateFolderName(topic.topicFolder);
+                if (!err.empty()) {
+                    crow::json::wvalue response;
+                    response["ok"] = false;
+                    response["error"] = err;
+                    return crow::response(400, response);
+                }
+                topic.topicFolder = canonicalFolderName(database, topic.topicFolder);
             }
             updateTopic(database, topic);
 
@@ -1290,6 +1366,19 @@ int main(int argc, char* argv[]) {
                 response["error"] = "Folder names must be non-empty.";
                 return crow::response(400, response);
             }
+            {
+                std::string err = validateFolderName(newName);
+                if (!err.empty()) {
+                    crow::json::wvalue response;
+                    response["ok"] = false;
+                    response["error"] = err;
+                    return crow::response(400, response);
+                }
+            }
+            // If the new name is just a case-variant of an existing folder,
+            // align to that folder's canonical casing so the rename merges
+            // cleanly instead of creating yet another near-duplicate.
+            newName = canonicalFolderName(database, newName);
             int updated = renameFolder(database, oldName, newName);
             crow::json::wvalue response;
             if (updated < 0) {
