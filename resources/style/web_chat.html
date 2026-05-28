@@ -838,11 +838,8 @@
                  overflow: hidden; background: var(--bg);
                  flex: 0 0 auto; min-height: var(--cal-body-h); }
     .cal-sched.show { display: flex; flex-direction: column; }
-    /* Day view places the all-day strip at the bottom (below the hour
-       ladder) — gives it a footer feel rather than competing with the
-       header. Flex order on the strip is enough since head/body sit at
-       default order:0 and follow DOM order. */
-    .cal-sched.day .allday { order: 1; }
+    /* All-day events render as a to-do list strip above the hour ladder.
+       DOM order already places it at the top in every view. */
     .cal-sched .sched-head { display: grid;
                              grid-template-columns: 56px minmax(0, 1fr);
                              background: var(--bg-elev);
@@ -958,6 +955,61 @@
                                   border-radius: 999px; font-size: 0.68rem;
                                   max-width: 100%; overflow: hidden;
                                   text-overflow: ellipsis; white-space: nowrap; }
+
+    /* To-do rows: all-day events render as checkable list items rather
+       than passive pills. The checkbox toggles archived (= done);
+       clicking the label still opens the event modal. */
+    .todo-item { display: flex; align-items: center; gap: 0.5rem;
+                 min-width: 0; padding: 4px 8px;
+                 background: rgba(124, 140, 255, 0.12);
+                 border-radius: 6px; color: var(--text);
+                 font-size: 0.78rem; line-height: 1.25; }
+    .todo-item.compact { padding: 2px 6px; gap: 0.35rem;
+                         font-size: 0.7rem; border-radius: 4px; }
+    .todo-item[style*="--cat-h"] {
+      background: color-mix(in srgb, var(--cat-color) 22%, transparent);
+      box-shadow: inset 3px 0 0 var(--cat-color);
+      padding-left: 10px;
+    }
+    .todo-item.compact[style*="--cat-h"] { padding-left: 8px; }
+    .todo-check { flex: 0 0 auto; width: 16px; height: 16px;
+                  border: 1.5px solid color-mix(in srgb,
+                    var(--text) 55%, transparent);
+                  border-radius: 4px; background: transparent;
+                  display: inline-flex; align-items: center;
+                  justify-content: center; padding: 0; cursor: pointer;
+                  color: transparent;
+                  transition: background 0.12s, border-color 0.12s,
+                              color 0.12s; }
+    .todo-item.compact .todo-check { width: 13px; height: 13px;
+                                     border-radius: 3px; }
+    .todo-check svg { width: 11px; height: 11px; }
+    .todo-item.compact .todo-check svg { width: 9px; height: 9px; }
+    .todo-check:hover { border-color: var(--accent); }
+    .todo-item.done .todo-check { background: var(--accent);
+                                  border-color: var(--accent);
+                                  color: white; }
+    .todo-item[style*="--cat-h"].done .todo-check {
+        background: var(--cat-color); border-color: var(--cat-color); }
+    .todo-label { flex: 1; min-width: 0; cursor: pointer;
+                  overflow: hidden; text-overflow: ellipsis;
+                  white-space: nowrap; }
+    .todo-item.done { opacity: 0.55; }
+    .todo-item.done .todo-label { text-decoration: line-through;
+                                  text-decoration-thickness: 1px;
+                                  color: var(--muted); }
+
+    /* Day view to-do strip: a clear stacked list spanning the full width
+       so it reads as a single panel, not a row of pills. */
+    .cal-sched.day .allday { grid-template-columns: 56px minmax(0, 1fr); }
+    .cal-sched.day .allday .allday-label { padding-top: 8px;
+                                           align-self: flex-start; }
+    .cal-sched.day .allday .allday-col { padding: 6px 8px 8px;
+                                         gap: 4px; }
+
+    /* Month-cell to-do rows: match the chip footprint but include the
+       checkbox. The cell click still selects the day. */
+    .cal-cell .ev-todo { margin-bottom: 2px; }
 
     .day-detail { flex: 0 0 auto; padding: 0.75rem 0;
                   border-top: 1px solid var(--border); min-height: 80px; }
@@ -1136,6 +1188,19 @@
                   border-bottom: 1px solid var(--border); flex-shrink: 0; }
     .modal-head .title { flex: 1; font-weight: 600; font-size: 1.05rem;
                          font-family: var(--font-display); }
+    /* Title-as-input: blend into the header when read-only, surface as a
+       real input when the modal enters edit mode. */
+    input.title { background: transparent; color: var(--text); border: 0;
+                  padding: 0.15rem 0.35rem; margin: -0.15rem -0.35rem;
+                  min-width: 0; width: 100%;
+                  border-radius: 6px;
+                  transition: background 0.15s, box-shadow 0.15s; }
+    input.title::placeholder { color: var(--muted); }
+    input.title:disabled { background: transparent; color: var(--text); }
+    input.title:not(:disabled) { background: var(--bg-input); }
+    input.title:focus { outline: none;
+                        box-shadow: 0 0 0 2px color-mix(in srgb,
+                          var(--accent) 30%, transparent); }
     .modal-close { background: transparent; border: 0; color: var(--muted);
                    width: 32px; height: 32px; border-radius: 6px; cursor: pointer;
                    display: flex; align-items: center; justify-content: center;
@@ -1757,10 +1822,11 @@
        all-day pill in any calendar view. Stores the active event id in
        a data-attribute so save/archive know which record to PUT. -->
   <div id="event-backdrop" class="modal-backdrop" role="dialog"
-       aria-modal="true" aria-labelledby="event-modal-title" hidden>
+       aria-modal="true" aria-labelledby="ev-f-title" hidden>
     <div id="event-modal" class="modal-card">
       <div class="modal-head">
-        <span class="title" id="event-modal-title">Event</span>
+        <input type="text" class="title" id="ev-f-title"
+               aria-label="Event title" placeholder="Event" disabled>
         <button class="modal-close" id="event-close" title="Close"
                 aria-label="Close">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
@@ -1770,10 +1836,6 @@
         </button>
       </div>
       <div class="modal-body">
-        <label class="ev-field">
-          <span class="lbl">Title</span>
-          <input type="text" id="ev-f-title" disabled>
-        </label>
         <div class="ev-row">
           <label class="ev-field">
             <span class="lbl">Date</span>
@@ -3804,11 +3866,19 @@ async function renderMonthView(silent) {
     num.textContent = d;
     cell.appendChild(num);
     (byDay[d] || []).slice(0, 3).forEach(ev => {
-      const e = document.createElement("div");
-      e.className = "ev" + (ev.archived ? " archived" : "");
-      e.textContent = "• " + (ev.title || ev.name || "(untitled)");
-      applyCategoryColor(e, ev.category);
-      cell.appendChild(e);
+      if (parseEventMinutes(ev) === null) {
+        // All-day events render as compact to-do rows so a quick check
+        // toggles done state without leaving the month grid.
+        const todo = buildTodoItem(ev, { compact: true });
+        todo.classList.add("ev", "ev-todo");
+        cell.appendChild(todo);
+      } else {
+        const e = document.createElement("div");
+        e.className = "ev" + (ev.archived ? " archived" : "");
+        e.textContent = "• " + (ev.title || ev.name || "(untitled)");
+        applyCategoryColor(e, ev.category);
+        cell.appendChild(e);
+      }
     });
     cell.addEventListener("click", () => selectDayCell(
       new Date(calYear, calMonth - 1, d)
@@ -4052,6 +4122,75 @@ function layoutOverlaps(items) {
   return out;
 }
 
+// Toggle an event's archived flag without going through the full modal.
+// Used by the to-do checkboxes on all-day items.
+async function setEventArchived(ev, archived) {
+  if (!ev || ev.id == null) return false;
+  const payload = {
+    title: ev.title || "",
+    summary: ev.summary || "",
+    category: ev.category || "",
+    date: ev.date || "",
+    time: ev.time || "",
+    archived: !!archived,
+  };
+  try {
+    const r = await fetch(
+      "/calendar/events/" + encodeURIComponent(ev.id),
+      { method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload) }
+    );
+    const j = await r.json();
+    if (!r.ok || !j.ok) return false;
+    ev.archived = !!archived;
+    return true;
+  } catch (_) { return false; }
+}
+
+// Render an all-day event as a to-do row: checkbox toggles archived
+// (= done); clicking the label opens the event modal as before.
+function buildTodoItem(ev, { compact = false } = {}) {
+  const item = document.createElement("div");
+  item.className = "todo-item" + (compact ? " compact" : "")
+                 + (ev.archived ? " done" : "");
+  applyCategoryColor(item, ev.category);
+
+  const box = document.createElement("button");
+  box.type = "button";
+  box.className = "todo-check";
+  box.setAttribute("role", "checkbox");
+  box.setAttribute("aria-checked", ev.archived ? "true" : "false");
+  box.setAttribute("aria-label",
+    ev.archived ? "Mark not done" : "Mark done");
+  box.innerHTML =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" '
+    + 'stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round">'
+    + '<path d="M5 12l5 5L20 7"/></svg>';
+  box.addEventListener("click", async (e) => {
+    e.stopPropagation();
+    const next = !ev.archived;
+    item.classList.toggle("done", next);
+    box.setAttribute("aria-checked", next ? "true" : "false");
+    const ok = await setEventArchived(ev, next);
+    if (!ok) {
+      // Roll back the optimistic flip so state stays truthful.
+      item.classList.toggle("done", !next);
+      box.setAttribute("aria-checked", !next ? "true" : "false");
+    }
+  });
+  item.appendChild(box);
+
+  const label = document.createElement("span");
+  label.className = "todo-label";
+  label.textContent = ev.title || ev.name || "(untitled)";
+  label.addEventListener("click", (e) => {
+    e.stopPropagation();
+    openEventModal(ev);
+  });
+  item.appendChild(label);
+  return item;
+}
+
 function buildDayColumn(date, events, sched, allDayCol, hourPx, startHour, endHour) {
   const col = document.createElement("div");
   col.className = "day-col";
@@ -4066,22 +4205,15 @@ function buildDayColumn(date, events, sched, allDayCol, hourPx, startHour, endHo
   const startMin = startHour * 60;
   const dayEvents = (events[eventKey(date)] || []);
 
-  // Split into timed vs all-day. All-day events go to the strip above;
-  // timed events get laid out below with overlap-aware column assignment.
+  // Split into timed vs all-day. All-day events become to-do items in the
+  // strip above; timed events get laid out below with overlap-aware
+  // column assignment.
   const timed = [];
   dayEvents.forEach(ev => {
     const start = parseEventMinutes(ev);
     if (start === null) {
       if (allDayCol) {
-        const pill = document.createElement("div");
-        pill.className = "ev-pill" + (ev.archived ? " archived" : "");
-        pill.textContent = ev.title || ev.name || "(untitled)";
-        applyCategoryColor(pill, ev.category);
-        pill.addEventListener("click", (e) => {
-          e.stopPropagation();
-          openEventModal(ev);
-        });
-        allDayCol.appendChild(pill);
+        allDayCol.appendChild(buildTodoItem(ev, { compact: sched !== "day" }));
       }
       return;
     }
@@ -4201,7 +4333,7 @@ async function renderWeekSchedule(silent) {
   if (hasAllDay) {
     const lab = document.createElement("div");
     lab.className = "allday-label";
-    lab.textContent = "all-day";
+    lab.textContent = "to-do";
     allDay.appendChild(lab);
     for (let i = 0; i < 7; i++) {
       const c = document.createElement("div");
@@ -4277,7 +4409,7 @@ async function renderDaySchedule(silent) {
   if (hasAllDay) {
     const lab = document.createElement("div");
     lab.className = "allday-label";
-    lab.textContent = "all-day";
+    lab.textContent = "to-do";
     allDay.appendChild(lab);
     allDayCol = document.createElement("div");
     allDayCol.className = "allday-col";
@@ -4365,7 +4497,7 @@ async function showDayDetailSchedule(date) {
   if (hasAllDay) {
     const lab = document.createElement("div");
     lab.className = "allday-label";
-    lab.textContent = "all-day";
+    lab.textContent = "to-do";
     allDay.appendChild(lab);
     allDayCol = document.createElement("div");
     allDayCol.className = "allday-col";
@@ -4379,8 +4511,8 @@ async function showDayDetailSchedule(date) {
   body.appendChild(buildDayColumn(date, byKey, "day", allDayCol, HOUR_PX_DAY,
                                   startHour, endHour));
 
-  wrap.appendChild(body);
   wrap.appendChild(allDay);
+  wrap.appendChild(body);
   dayDetail.appendChild(wrap);
 }
 
