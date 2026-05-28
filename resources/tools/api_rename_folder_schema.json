@@ -1,0 +1,20 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "RenameFolder",
+  "description": "Bulk-rename every topic whose folder == old_name to use new_name instead. Use this instead of editing each topic individually when a folder needs to be renamed. Folder names must be non-empty (whitespace-only is rejected). To move a single topic between folders, use ReplaceTopic with the 'folder' field instead.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["old_name", "new_name"],
+  "properties": {
+    "old_name": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The current folder name to rename. Must match existing topics' folder field exactly (case-sensitive)."
+    },
+    "new_name": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The new folder name. If a folder with this name already exists, topics from old_name are merged into it."
+    }
+  }
+}
