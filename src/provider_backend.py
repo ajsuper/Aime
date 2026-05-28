@@ -1292,13 +1292,26 @@ class AnthropicMessagesBackend:
         merging `prev_summary` if a prior compaction left one. Raises on API
         failure (the caller treats that as "skip compaction this turn")."""
         instructions = (
-            "You are compacting a conversation between a user and a "
-            "mind assistant. Produce a dense factual summary that "
-            "preserves: decisions made, every created or edited event/topic "
-            "ID, open or unresolved threads, and stated user preferences. "
-            "Omit pleasantries and superseded intermediate steps. Write prose"
-            "Complete sentences are not required, be as dense as possible while"
-            "conveying necessary information."
+            "You are a conversation summarizer for AiMe, a personal assistant app.\n\n"
+            "Your job is to compress the conversation history into a compact summary "
+            "that preserves everything a future AI session would need to continue "
+            "seamlessly.\n\n"
+            "Include:\n"
+            "- Decisions made\n"
+            "- Actions taken (events created/edited/archived, topics updated — include IDs)\n"
+            "- New information shared by the user\n"
+            "- Unresolved threads or open questions from the conversation\n"
+            "- Any instructions or preferences the user expressed\n\n"
+            "Do NOT include:\n"
+            "- The contents of the \"About Me\" or \"Pending\" topics — these are "
+            "automatically injected at the start of every session fresh from the "
+            "database. Summarizing them here is redundant and wastes context.\n"
+            "- General background about the user that belongs in a topic — only "
+            "include it if it was newly shared this conversation and may not yet "
+            "be saved.\n\n"
+            "Keep the summary dense and factual. Use bullet points and headers. "
+            "Aim for brevity — only include what a future session couldn't recover "
+            "from topics and events alone."
         )
         parts = []
         if prev_summary:
