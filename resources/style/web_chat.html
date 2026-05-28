@@ -1196,8 +1196,9 @@
                   border-radius: 6px;
                   transition: background 0.15s, box-shadow 0.15s; }
     input.title::placeholder { color: var(--muted); }
-    input.title:disabled { background: transparent; color: var(--text); }
-    input.title:not(:disabled) { background: var(--bg-input); }
+    input.title[readonly] { background: transparent; color: var(--text);
+                            cursor: pointer; }
+    input.title:not([readonly]) { background: var(--bg-input); }
     input.title:focus { outline: none;
                         box-shadow: 0 0 0 2px color-mix(in srgb,
                           var(--accent) 30%, transparent); }
@@ -1248,9 +1249,9 @@
     .ev-field input:focus, .ev-field textarea:focus {
         outline: none; border-color: var(--accent);
         box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 30%, transparent); }
-    .ev-field input:disabled, .ev-field textarea:disabled {
+    .ev-field input[readonly], .ev-field textarea[readonly] {
         background: transparent; border-color: transparent;
-        color: var(--text); cursor: default;
+        color: var(--text); cursor: pointer;
         padding-left: 0; padding-right: 0; }
     .ev-row { display: flex; gap: 0.85rem; }
     /* Tighter vertical rhythm inside the event modal specifically. */
@@ -1826,7 +1827,7 @@
     <div id="event-modal" class="modal-card">
       <div class="modal-head">
         <input type="text" class="title" id="ev-f-title"
-               aria-label="Event title" placeholder="Event" disabled>
+               aria-label="Event title" placeholder="Event" readonly>
         <button class="modal-close" id="event-close" title="Close"
                 aria-label="Close">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
@@ -1839,20 +1840,20 @@
         <div class="ev-row">
           <label class="ev-field">
             <span class="lbl">Date</span>
-            <input type="date" id="ev-f-date" disabled>
+            <input type="date" id="ev-f-date" readonly>
           </label>
           <label class="ev-field ev-time-field">
             <span class="lbl">Time</span>
-            <input type="time" id="ev-f-time" disabled>
+            <input type="time" id="ev-f-time" readonly>
           </label>
         </div>
         <label class="ev-field">
           <span class="lbl">Category</span>
-          <input type="text" id="ev-f-category" disabled>
+          <input type="text" id="ev-f-category" readonly>
         </label>
         <label class="ev-field stack">
           <span class="lbl">Summary</span>
-          <textarea id="ev-f-summary" rows="3" disabled></textarea>
+          <textarea id="ev-f-summary" rows="3" readonly></textarea>
         </label>
         <p class="ev-modal-error" id="ev-modal-error" hidden></p>
       </div>
@@ -1860,7 +1861,6 @@
         <button id="ev-archive-btn" class="danger">Archive</button>
         <span class="spacer"></span>
         <button id="ev-cancel-btn" hidden>Cancel</button>
-        <button id="ev-edit-btn">Edit</button>
         <button id="ev-save-btn" class="primary" hidden>Save</button>
       </div>
     </div>
@@ -3959,7 +3959,6 @@ const evFDate = document.getElementById("ev-f-date");
 const evFTime = document.getElementById("ev-f-time");
 const evFCategory = document.getElementById("ev-f-category");
 const evFSummary = document.getElementById("ev-f-summary");
-const evEditBtn = document.getElementById("ev-edit-btn");
 const evSaveBtn = document.getElementById("ev-save-btn");
 const evCancelBtn = document.getElementById("ev-cancel-btn");
 const evArchiveBtn = document.getElementById("ev-archive-btn");
@@ -3986,9 +3985,6 @@ function openEventModal(ev) {
   evArchiveBtn.textContent = ev.archived ? "Unarchive" : "Archive";
   setEventEditMode(false);
   eventBackdrop.hidden = false;
-  // Defer focus until after the open animation so the input doesn't briefly
-  // show its focus ring on the wrong side of the transform.
-  setTimeout(() => evFTitle.focus({ preventScroll: true }), 0);
 }
 
 function closeEventModal() {
@@ -3998,13 +3994,24 @@ function closeEventModal() {
 
 function setEventEditMode(on) {
   [evFTitle, evFDate, evFTime, evFCategory, evFSummary].forEach(el => {
-    el.disabled = !on;
+    el.readOnly = !on;
   });
-  evEditBtn.hidden = on;
   evArchiveBtn.hidden = on;
   evSaveBtn.hidden = !on;
   evCancelBtn.hidden = !on;
 }
+
+// Clicking any field while the modal is read-only swaps into edit mode
+// and focuses what the user clicked, so there's no separate Edit button.
+[evFTitle, evFDate, evFTime, evFCategory, evFSummary].forEach(el => {
+  el.addEventListener("mousedown", () => {
+    if (!el.readOnly) return;
+    setEventEditMode(true);
+    // Defer focus past the readonly→editable flip so the caret lands
+    // inside the now-editable field.
+    setTimeout(() => el.focus({ preventScroll: true }), 0);
+  });
+});
 
 async function saveActiveEvent() {
   if (!activeEventRecord || activeEventRecord.id == null) return;
@@ -4079,7 +4086,6 @@ async function archiveActiveEvent() {
   }
 }
 
-evEditBtn.addEventListener("click", () => setEventEditMode(true));
 evCancelBtn.addEventListener("click", () => {
   // Re-populate from the original record so unsaved edits are dropped.
   if (activeEventRecord) openEventModal(activeEventRecord);
