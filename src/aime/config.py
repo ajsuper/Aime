@@ -62,9 +62,6 @@ def _env_flag(name: str, default: bool) -> bool:
 
 # AIME_MODEL_ROUTING=0 forces every turn to Sonnet (the original behavior).
 MODEL_ROUTING_ENABLED = _env_flag("AIME_MODEL_ROUTING", True)
-# AIME_VERBOSE=1 surfaces per-turn routing decisions to the frontend as
-# notices ("[turn → haiku]" / "[turn → sonnet]").
-VERBOSE_MODE = _env_flag("AIME_VERBOSE", False)
 
 
 def load_system_prompt(path: str = SYSTEM_PROMPT_PATH) -> str:

@@ -88,16 +88,11 @@ class ConversationController:
         backend: AgentBackend,
         tool_gateway: ToolGateway,
         worker_spawner: WorkerSpawner,
-        verbose: bool = False,
     ):
         self._backend = backend
         self._tools = tool_gateway
         self._spawn_worker = worker_spawner
         self._subscribers: list[Subscriber] = []
-        # When True, routing decisions are surfaced as notices to the
-        # frontend. Off by default — toggled by AIME_VERBOSE env or by the
-        # /verbose slash command at runtime.
-        self._verbose = verbose
         # Conversation-level state. Presentation flags (e.g. whether the
         # "thinking…" line is visible) live in the frontend, not here.
         self._is_idle = True
@@ -186,14 +181,6 @@ class ConversationController:
                 kind="notice",
                 severity="info",
                 text=f"Log model thinking set to: {self._log_model_thinking}",
-            ))
-            return False
-        if text == "/verbose":
-            self._verbose = not self._verbose
-            self._emit(CoreEvent(
-                kind="notice",
-                severity="info",
-                text=f"Verbose mode: {'on' if self._verbose else 'off'}",
             ))
             return False
         self.send_user_message(text, images=images)
@@ -380,19 +367,14 @@ class ConversationController:
         elif kind == "assistant_use_tool":
             self._handle_tool_use(event)
         elif kind == "turn_routing":
-            # Verbose-only — surface the router's pick so the operator can
-            # eyeball routing decisions live. Dropped silently otherwise.
-            if self._verbose:
-                label = (event.text or "").strip() or "sonnet"
-                self._emit(CoreEvent(
-                    kind="turn_routing",
-                    text=label,
-                ))
-                self._emit(CoreEvent(
-                    kind="notice",
-                    severity="info",
-                    text=f"[turn → {label}]",
-                ))
+            # Always forward the router's pick to frontends; whether it
+            # actually surfaces in the UI is the frontend's verbosity
+            # decision. The web frontend gates this on its `verbosity ===
+            # "verbose"` setting (see web_chat.html); the TUI can do
+            # similarly. Keeping the gate frontend-side avoids a
+            # backend/frontend toggle pair that disagree.
+            label = (event.text or "").strip() or "sonnet"
+            self._emit(CoreEvent(kind="turn_routing", text=label))
         elif kind == "turn_end":
             self._emit(CoreEvent(
                 kind="turn_end",

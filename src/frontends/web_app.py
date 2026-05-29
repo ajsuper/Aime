@@ -351,7 +351,6 @@ class UserContext:
             backend=backend,
             tool_gateway=gateway,
             worker_spawner=spawn_worker,
-            verbose=aime_config.VERBOSE_MODE,
         )
 
         self.controller.subscribe(self._fanout)

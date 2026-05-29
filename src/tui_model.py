@@ -549,7 +549,6 @@ class Aime(App):
             backend=backend,
             tool_gateway=gateway,
             worker_spawner=self._spawn_stream_worker,
-            verbose=aime_config.VERBOSE_MODE,
         )
 
     def _spawn_stream_worker(self, fn) -> None:

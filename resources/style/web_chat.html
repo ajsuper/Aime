@@ -2966,6 +2966,13 @@ es.onmessage = (ev) => {
       // replaying tool calls would otherwise linger — drop it here.
       clearWorkingIndicator();
       break;
+    case "turn_routing":
+      // Per-turn model-routing decision. Only surfaced in Verbose so the
+      // calmer tiers don't see internal routing chatter.
+      if (verbosity === "verbose") {
+        appendNotice("· turn → " + (e.text || "sonnet"), "info");
+      }
+      break;
     case "tool_call":
       if (verbosity === "verbose") {
         appendNotice("· tool: " + e.tool_name +
