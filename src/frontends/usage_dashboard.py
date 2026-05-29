@@ -187,6 +187,85 @@ def _aggregate_by_model(records):
     return models
 
 
+# --- tool-cost model -------------------------------------------------------
+#
+# The agent doesn't get a per-tool token bill — a turn that emits N tool_use
+# blocks is one API call charging for the whole assistant message, and the
+# tool_results come back in the *next* user turn's input. So tool cost is an
+# attribution. We use the actionable one: each tool record carries the byte
+# size of the result it pushed back into the prompt; that becomes fresh input
+# tokens on the next turn, billed at the emitting turn's model rate. Removing
+# the tool would remove that cost — which is exactly the "what should I cut
+# first?" question this view answers. Server tools (web_search) additionally
+# pay a flat per-request charge that we count exactly.
+#
+# 4 bytes per token is the rough UTF-8 average for JSON tool results; close
+# enough for a ranking, and the dashboard tooltip flags it as an estimate.
+_BYTES_PER_TOKEN = 4.0
+
+
+def _tool_record_cost(rec) -> float:
+    """Estimated USD cost of one tool record.
+
+    Downstream-input estimate (`result_bytes / 4` ≈ tokens, priced at the
+    turn's model input rate) plus the exact flat per-request server-tool
+    charge for web_search. Output-side cost of the tool_use block itself is
+    *not* attributed here — it stays on the API record and shows up under
+    the model that produced it; double-counting would over-state savings.
+    """
+    p = _report._price_for(rec.get("model", ""))
+    bytes_ = rec.get("result_bytes", 0) or 0
+    tokens = bytes_ / _BYTES_PER_TOKEN
+    token_cost = tokens * p["in"] / 1_000_000.0
+    flat = (rec.get("web_search_requests", 0) or 0) * _report.WEB_SEARCH_COST_PER_REQUEST
+    return token_cost + flat
+
+
+def _aggregate_by_tool(records):
+    """Fold tool records into per-tool totals.
+
+    Returns `{tool_name: {calls, kind, result_bytes, web_search_requests,
+    cost}}` keyed by the agent-side tool name (e.g. ``CreateEvent``,
+    ``web_search``). `kind` is the most recently seen "client" / "server"
+    label — every record for a given tool name uses the same one in practice,
+    so this is just a display hint for the table.
+    """
+    tools = {}
+    for rec in records:
+        if rec.get("kind") != "tool":
+            continue
+        name = rec.get("tool_name") or "(unknown)"
+        t = tools.setdefault(name, {
+            "calls": 0, "kind": rec.get("tool_kind") or "client",
+            "result_bytes": 0, "web_search_requests": 0, "cost": 0.0,
+        })
+        t["calls"] += 1
+        t["kind"] = rec.get("tool_kind") or t["kind"]
+        t["result_bytes"] += rec.get("result_bytes", 0) or 0
+        t["web_search_requests"] += rec.get("web_search_requests", 0) or 0
+        t["cost"] += _tool_record_cost(rec)
+    return tools
+
+
+def _aggregate_tool_per_day(records, day_keys):
+    """Per-tool daily cost series, aligned to `day_keys`. Same shape as
+    `_aggregate_by_day_model` — the Tools tab stacks these into a daily bar
+    chart and feeds them to the per-tool sparklines."""
+    idx = {d: i for i, d in enumerate(day_keys)}
+    out = {}
+    for rec in records:
+        if rec.get("kind") != "tool":
+            continue
+        day = str(rec.get("ts", ""))[:10]
+        if day not in idx:
+            continue
+        name = rec.get("tool_name") or "(unknown)"
+        row = out.setdefault(name, [0.0] * len(day_keys))
+        row[idx[day]] += _tool_record_cost(rec)
+    # Sort tools by total cost desc — drives stacking order and palette indexing.
+    return sorted(out.items(), key=lambda kv: sum(kv[1]), reverse=True)
+
+
 def _prompt_costs(rec):
     """Return (with_cache, without_cache) prompt-token cost for an api record.
 
@@ -1800,6 +1879,88 @@ _FRAGMENT_ACTIVITY = """<div class="meta">
   {% endif %}"""
 
 
+# Tools tab — per-tool cost ranking. Each tool record carries the byte size
+# of the result it injected back into the prompt; that becomes fresh input on
+# the next turn, billed at the emitting turn's model rate (≈ result_bytes / 4
+# tokens × model.input). web_search additionally pays a flat per-request
+# charge. The donut + table answer "which tool should I trim or gate first?".
+_FRAGMENT_TOOLS = """<div class="meta">
+    <span title="Filesystem path of the usage.jsonl log being read.">log: {{ log }}</span><br>
+    <span title="Records matching the current filters.">{{ record_count }} records</span>
+    &middot; <span title="Window the figures cover.">{{ window }}</span>
+    {% if user_raw %} &middot; <span>user: {{ user_raw }}</span>{% endif %}
+    {% if model_raw %} &middot; <span>model: {{ model_raw }}</span>{% endif %}
+</div>
+
+  <div class="cards">
+    <div class="card accent-blue"
+      title="Total estimated USD cost attributable to tool use in this window. = sum across tool records of (result_bytes / 4 tokens × the turn's model input rate) + exact flat per-request charges for web_search. An estimate, not your invoice — but the figure that moves if you remove a tool.">
+      <div class="num blue">${{ '%.2f' % tool_total_cost }}</div>
+      <div class="lbl">est. tool cost</div></div>
+    <div class="card accent-amber"
+      title="Total tool invocations in this window. Counted at the point the result lands (so failed / interrupted tool calls without a returned result are not counted).">
+      <div class="num warn">{{ '{:,}'.format(tool_total_calls) }}</div>
+      <div class="lbl">tool calls</div></div>
+    <div class="card accent-red"
+      title="Most expensive tool in this window and its share of estimated tool cost — the first place to look at trimming.">
+      <div class="num bad">{{ tool_top_name }}</div>
+      <div class="lbl">top tool · ${{ '%.2f' % tool_top_cost }}</div></div>
+  </div>
+
+  <h2 title="Daily tool cost stacked by tool name, top 6 by total cost plus an 'other' bucket. The widest band is the tool carrying the most spend in this window.">Cost by tool (daily)</h2>
+  {{ chart_tool_stack | safe }}
+
+  <div class="two-col">
+    <div>
+      <h2 title="Share of estimated tool cost in this window. Slice = (result_bytes / 4 × model input rate) summed across that tool's records, plus its exact web_search flat charge if applicable.">Tool mix</h2>
+      {{ chart_tool_donut | safe }}
+    </div>
+    <div>
+      <h2 title="Quick reading guide for the cost figure.">How this is estimated</h2>
+      <p>Tool cost is an attribution, not a line item on the invoice — a turn that emits N tool_use blocks is billed as one API call, and each tool_result comes back as fresh input on the next turn.</p>
+      <p>For each tool record we estimate <code>result_bytes ÷ 4 ≈ tokens</code>, then price those tokens at the emitting turn's model input rate. <code>web_search</code> adds Anthropic's flat $10 / 1,000 requests on top.</p>
+      <p>Removing or gating a tool removes roughly the cost in its row — useful for deciding where to cut.</p>
+    </div>
+  </div>
+
+  <h2 title="One row per tool, sorted by estimated cost. 'kind' is client (locally executed) or server (Anthropic-side, e.g. web_search). 'result bytes' is the total payload pushed back into prompts — the main cost driver for client tools. 'flat $' is the exact server-tool per-request charge.">By tool</h2>
+  <table>
+    <thead>
+      <tr>
+        <th title="Tool name as the agent sees it. Click-through navigation not implemented yet.">Tool</th>
+        <th title="Daily estimated-cost trend for this tool across the visible window.">Trend</th>
+        <th title="client = executed by Aime's local tool gateway. server = executed by Anthropic (currently only web_search).">Kind</th>
+        <th title="Invocations of this tool. Counted at result arrival, so tools whose result never landed (interrupt before tool_result) are not counted.">Calls</th>
+        <th title="Total bytes of tool_result this tool injected back into prompts. Approximated as ÷4 to tokens to estimate next-turn input cost.">Result bytes</th>
+        <th title="Mean result-payload size for this tool (total bytes ÷ calls). A small, frequent tool can still dominate cost if calls add up.">Avg bytes/call</th>
+        <th title="Flat per-request charge ($10 / 1,000) for server-side web_search. Zero for client tools.">Flat $</th>
+        <th title="Estimated USD cost = (result_bytes / 4 tokens) × emitting turn's model input rate, plus the flat web_search charge.">Est. cost</th>
+        <th title="Share of total estimated tool cost in this window.">Share</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% if by_tool %}
+        {% for name, t in by_tool %}
+        <tr>
+          <td>{{ name }}</td>
+          <td class="spark">{{ tool_sparklines.get(name, '') | safe }}</td>
+          <td class="dim">{{ t.kind }}</td>
+          <td>{{ '{:,}'.format(t.calls) }}</td>
+          <td>{{ '{:,}'.format(t.result_bytes) }}</td>
+          <td>{{ '{:,.0f}'.format((t.result_bytes / t.calls) if t.calls else 0) }}</td>
+          <td>{{ ('$%.2f' % (t.web_search_requests * 0.01)) if t.web_search_requests else '—' }}</td>
+          <td>${{ '%.4f' % t.cost }}</td>
+          <td>{{ ('%.1f%%' % (100.0 * t.cost / tool_total_cost)) if tool_total_cost else '—' }}</td>
+        </tr>
+        {% endfor %}
+      {% else %}
+        <tr><td colspan="9" class="dim">No tool records in this window. Tool-use accounting requires <code>AIME_USAGE_STATS=1</code>; the dashboard will start showing rows here once tools fire under that flag.</td></tr>
+      {% endif %}
+    </tbody>
+  </table>
+"""
+
+
 # Trends tab — period-over-period deltas, anomaly highlights, and a top-N
 # table for the single most expensive turns in the window. Designed for a
 # weekly-glance "did anything weird happen" read, not deep forensics.
@@ -2677,6 +2838,8 @@ _PAGE = """<!doctype html>
       title="Whether prompt caching is actually saving money — reuse factors, hypothetical no-cache cost, and 5-minute-TTL warnings.">Cache Efficacy</a>
     <a href="/?{{ qs_activity }}" class="{{ 'active' if tab == 'activity' else '' }}"
       title="What the API is being used for — call purpose, stop-reason mix, latency percentiles, and when of day traffic happens.">Activity</a>
+    <a href="/?{{ qs_tools }}" class="{{ 'active' if tab == 'tools' else '' }}"
+      title="How much each agent tool is costing — invocation counts, estimated downstream input cost, and exact server-tool (web_search) charges. Use this to decide which tools to trim or gate.">Tools</a>
     <a href="/?{{ qs_trends }}" class="{{ 'active' if tab == 'trends' else '' }}"
       title="Period-over-period deltas, anomaly day flags, top-N most expensive turns and top spenders.">Trends</a>
     <a href="/?{{ qs_users }}" class="{{ 'active' if tab == 'users' else '' }}"
@@ -2693,7 +2856,7 @@ _PAGE = """<!doctype html>
   <div class="flash {{ f.level }}">{{ f.msg }}</div>
   {% endfor %}
 
-  {% if tab in ('overview', 'cache', 'activity', 'trends', 'users') %}
+  {% if tab in ('overview', 'cache', 'activity', 'tools', 'trends', 'users') %}
   <form class="filter" method="get">
     <input type="hidden" name="tab" value="{{ tab }}">
     <label title="Only include records on or after this date, interpreted in UTC. Accepts YYYY-MM-DD or a full ISO-8601 timestamp. Leave blank for no lower bound.">Since (UTC)
@@ -2952,7 +3115,12 @@ def _compute(args):
             return False
         if model_raw and (rec.get("model") or "(unknown)") != model_raw:
             return False
-        if purpose_raw and (rec.get("purpose") or "(unspecified)") != purpose_raw:
+        # The Purpose filter only applies to api records, which are the only
+        # records that carry a `purpose` field. Applying it to tool / stt
+        # records would silently empty the Tools tab whenever Purpose is set.
+        if purpose_raw and rec.get("kind") == "api" and (
+            (rec.get("purpose") or "(unspecified)") != purpose_raw
+        ):
             return False
         return True
 
@@ -3112,6 +3280,30 @@ def _compute(args):
     user_sparklines = {n: _svg_sparkline(vs) for n, vs in user_spark.items()}
     model_sparklines = {n: _svg_sparkline(vs) for n, vs in model_spark.items()}
 
+    # --- Tools tab aggregations ---
+    # By-tool table, daily stacked bar of cost-by-tool, and a donut of total
+    # share. The estimate ranks "which tool should I trim first?"; see
+    # _tool_record_cost for the attribution.
+    by_tool_map = _aggregate_by_tool(records)
+    by_tool = sorted(by_tool_map.items(), key=lambda kv: kv[1]["cost"], reverse=True)
+    by_day_tool = _aggregate_tool_per_day(records, day_keys)
+    by_day_tool_top = _top_n_series(by_day_tool)
+    chart_tool_stack = _svg_stacked_bars(
+        day_keys, by_day_tool_top, money=True,
+    )
+    tool_slices = [
+        (name, t["cost"], _color_for(i))
+        for i, (name, t) in enumerate(by_tool)
+        if t["cost"] > 0
+    ]
+    chart_tool_donut = _svg_donut(tool_slices[:8])
+    tool_sparklines = {
+        name: _svg_sparkline(vs) for name, vs in by_day_tool
+    }
+    tool_total_cost = sum(t["cost"] for _n, t in by_tool)
+    tool_total_calls = sum(t["calls"] for _n, t in by_tool)
+    tool_top_name, tool_top_cost = (by_tool[0][0], by_tool[0][1]["cost"]) if by_tool else ("—", 0.0)
+
     return dict(
         log=path,
         record_count=len(records),
@@ -3178,6 +3370,15 @@ def _compute(args):
         chart_heatmap=chart_heatmap,
         user_sparklines=user_sparklines,
         model_sparklines=model_sparklines,
+        # tools
+        by_tool=by_tool,
+        chart_tool_stack=chart_tool_stack,
+        chart_tool_donut=chart_tool_donut,
+        tool_sparklines=tool_sparklines,
+        tool_total_cost=tool_total_cost,
+        tool_total_calls=tool_total_calls,
+        tool_top_name=tool_top_name,
+        tool_top_cost=tool_top_cost,
         # records carried for Trends-tab post-processing
         _records=records,
         _all_records=all_records,
@@ -3417,14 +3618,15 @@ def _user_context(username: str):
 
 def _tab(args) -> str:
     t = args.get("tab")
-    return t if t in ("overview", "cache", "activity", "trends", "users",
-                      "accounts", "keys", "system") else "overview"
+    return t if t in ("overview", "cache", "activity", "tools", "trends",
+                      "users", "accounts", "keys", "system") else "overview"
 
 
 def _render_fragment(ctx, tab) -> str:
     template = {
         "cache": _FRAGMENT_CACHE,
         "activity": _FRAGMENT_ACTIVITY,
+        "tools": _FRAGMENT_TOOLS,
         "trends": _FRAGMENT_TRENDS,
         "users": _FRAGMENT_USERS,
         "accounts": _FRAGMENT_ACCOUNTS,
@@ -3530,7 +3732,7 @@ def index():
             for k in ("since", "until", "user", "model", "purpose", "auto")
             if request.args.get(k)}
     qs = {t: urlencode({**keep, "tab": t})
-          for t in ("overview", "cache", "activity", "trends", "users",
+          for t in ("overview", "cache", "activity", "tools", "trends", "users",
                     "accounts", "keys", "system")}
 
     return render_template_string(
@@ -3538,8 +3740,8 @@ def index():
         auto_label=_AUTO_LABELS.get(auto, "second"),
         csrf=csrf, flashes=flashes,
         qs_overview=qs["overview"], qs_cache=qs["cache"],
-        qs_activity=qs["activity"], qs_trends=qs["trends"],
-        qs_users=qs["users"],
+        qs_activity=qs["activity"], qs_tools=qs["tools"],
+        qs_trends=qs["trends"], qs_users=qs["users"],
         qs_accounts=qs["accounts"], qs_keys=qs["keys"],
         qs_system=qs["system"], **page_ctx,
     )
@@ -3581,15 +3783,15 @@ def user_drilldown(username):
                           model_raw="", purpose_raw="",
                           all_users=[], all_models=[], all_purposes=[])
     qs = {t: urlencode({"tab": t})
-          for t in ("overview", "cache", "activity", "trends", "users",
+          for t in ("overview", "cache", "activity", "tools", "trends", "users",
                     "accounts", "keys", "system")}
     return render_template_string(
         _PAGE, fragment=fragment, tab="user", auto=0,
         auto_label="second",
         csrf=csrf, flashes=flashes,
         qs_overview=qs["overview"], qs_cache=qs["cache"],
-        qs_activity=qs["activity"], qs_trends=qs["trends"],
-        qs_users=qs["users"],
+        qs_activity=qs["activity"], qs_tools=qs["tools"],
+        qs_trends=qs["trends"], qs_users=qs["users"],
         qs_accounts=qs["accounts"], qs_keys=qs["keys"],
         qs_system=qs["system"], **empty_page_ctx,
     )
