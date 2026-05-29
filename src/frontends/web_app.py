@@ -298,6 +298,16 @@ class UserContext:
         # needed. login_required gates everything that reaches here.
         dek = _auth_backend.get_dek(user_id)
 
+        from aime.model_router import ModelRouter
+        from aime import usage as _aime_usage
+        router = ModelRouter(
+            haiku_model=aime_config.HAIKU_MODEL,
+            sonnet_model=aime_config.SONNET_MODEL,
+            router_model=aime_config.ROUTER_MODEL,
+            enabled=aime_config.MODEL_ROUTING_ENABLED,
+            usage_label=username,
+            record_api=_aime_usage.record_api,
+        )
         backend = AnthropicMessagesBackend(
             system_prompt=aime_config.load_system_prompt(),
             model=aime_config.AGENT_MODEL,
@@ -305,6 +315,7 @@ class UserContext:
             conversations_dir=conv_dir,
             dek=dek,
             usage_label=username,
+            router=router,
         )
         backend.new_session()
 
@@ -340,6 +351,7 @@ class UserContext:
             backend=backend,
             tool_gateway=gateway,
             worker_spawner=spawn_worker,
+            verbose=aime_config.VERBOSE_MODE,
         )
 
         self.controller.subscribe(self._fanout)

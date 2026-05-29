@@ -522,12 +522,22 @@ class Aime(App):
         os.makedirs(conv_dir, exist_ok=True)
         dek = _enc.load_or_create_key_file(os.path.join(tui_user_dir, "tui_dek"))
 
+        from aime.model_router import ModelRouter
+        from aime import usage as _aime_usage
+        router = ModelRouter(
+            haiku_model=aime_config.HAIKU_MODEL,
+            sonnet_model=aime_config.SONNET_MODEL,
+            router_model=aime_config.ROUTER_MODEL,
+            enabled=aime_config.MODEL_ROUTING_ENABLED,
+            record_api=_aime_usage.record_api,
+        )
         backend = AnthropicMessagesBackend(
             system_prompt=aime_config.load_system_prompt(),
             model=aime_config.AGENT_MODEL,
             schema_files=aime_config.SCHEMA_FILES,
             conversations_dir=conv_dir,
             dek=dek,
+            router=router,
         )
         backend.new_session()
 
@@ -539,6 +549,7 @@ class Aime(App):
             backend=backend,
             tool_gateway=gateway,
             worker_spawner=self._spawn_stream_worker,
+            verbose=aime_config.VERBOSE_MODE,
         )
 
     def _spawn_stream_worker(self, fn) -> None:

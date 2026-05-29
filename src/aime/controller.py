@@ -47,6 +47,8 @@ CoreEventKind = Literal[
     "session_restart",          # transcript should be cleared (reset or load)
     "session_terminated",       # backend session closed
     "error",                    # unrecoverable controller/backend error
+    "turn_routing",             # router picked a model for the next turn
+                                # (emitted only when verbose mode is on)
 ]
 
 
@@ -86,11 +88,16 @@ class ConversationController:
         backend: AgentBackend,
         tool_gateway: ToolGateway,
         worker_spawner: WorkerSpawner,
+        verbose: bool = False,
     ):
         self._backend = backend
         self._tools = tool_gateway
         self._spawn_worker = worker_spawner
         self._subscribers: list[Subscriber] = []
+        # When True, routing decisions are surfaced as notices to the
+        # frontend. Off by default — toggled by AIME_VERBOSE env or by the
+        # /verbose slash command at runtime.
+        self._verbose = verbose
         # Conversation-level state. Presentation flags (e.g. whether the
         # "thinking…" line is visible) live in the frontend, not here.
         self._is_idle = True
@@ -179,6 +186,14 @@ class ConversationController:
                 kind="notice",
                 severity="info",
                 text=f"Log model thinking set to: {self._log_model_thinking}",
+            ))
+            return False
+        if text == "/verbose":
+            self._verbose = not self._verbose
+            self._emit(CoreEvent(
+                kind="notice",
+                severity="info",
+                text=f"Verbose mode: {'on' if self._verbose else 'off'}",
             ))
             return False
         self.send_user_message(text, images=images)
@@ -364,6 +379,20 @@ class ConversationController:
                 self._emit(CoreEvent(kind="assistant_thinking", text=event.text or ""))
         elif kind == "assistant_use_tool":
             self._handle_tool_use(event)
+        elif kind == "turn_routing":
+            # Verbose-only — surface the router's pick so the operator can
+            # eyeball routing decisions live. Dropped silently otherwise.
+            if self._verbose:
+                label = (event.text or "").strip() or "sonnet"
+                self._emit(CoreEvent(
+                    kind="turn_routing",
+                    text=label,
+                ))
+                self._emit(CoreEvent(
+                    kind="notice",
+                    severity="info",
+                    text=f"[turn → {label}]",
+                ))
         elif kind == "turn_end":
             self._emit(CoreEvent(
                 kind="turn_end",

@@ -89,6 +89,10 @@ EventKind = Literal[
     "session_terminated",
     # A structurally broken history was flattened so the turn could proceed.
     "history_recovered",
+    # The router picked a model for the next turn. Carried in `text` as the
+    # label ("haiku" or "sonnet"); the controller surfaces this only when
+    # verbose mode is on.
+    "turn_routing",
 ]
 
 
@@ -234,10 +238,21 @@ class AnthropicMessagesBackend:
         dek: bytes,
         max_tokens: int = 8192,
         usage_label: str | None = None,
+        router=None,
     ):
         self._client = Anthropic(max_retries=3)
         self._system_prompt = system_prompt
+        # `model` is the *default* / fallback. When a router is attached, each
+        # turn picks between Haiku and Sonnet; the default is what we fall
+        # back to (and what continuations inside a tool loop keep using).
         self._model = model
+        self._router = router
+        # Sticky pick for the current tool-loop. Set when a fresh user turn
+        # starts and the router picks; reused for every continuation turn
+        # (the agent loop after tool_results) until the loop ends. None means
+        # "this is a fresh user turn, ask the router".
+        self._current_turn_model: str | None = None
+        self._current_turn_label: str | None = None
         self._schema_files = schema_files
         self._max_tokens = max_tokens
         # Identifier (username) attributed to this backend's API usage in the
@@ -390,6 +405,8 @@ class AnthropicMessagesBackend:
             self._expected_tool_use_ids = set()
             self._tool_attrib.clear()
             self._session_context = ""
+            self._current_turn_model = None
+            self._current_turn_label = None
         self._terminated.clear()
         self._turn_trigger.clear()
         stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -428,6 +445,8 @@ class AnthropicMessagesBackend:
             self._expected_tool_use_ids = set()
             self._tool_attrib.clear()
             self._session_context = ""
+            self._current_turn_model = None
+            self._current_turn_label = None
         self._terminated.clear()
         self._turn_trigger.clear()
 
@@ -933,10 +952,36 @@ class AnthropicMessagesBackend:
             # sees a _messages tail that already contains the tool_use block —
             # avoiding the "tool_result without matching tool_use" 400.
             self._messages.append({"role": "assistant", "content": assistant_blocks})
+            sticky_model = self._current_turn_model
+            sticky_label = self._current_turn_label
+
+        # Routing: a fresh user turn (no sticky pick) asks the router; a
+        # continuation inside a tool loop sticks with whatever model started
+        # the loop. Downgrading mid-loop would strand tool_use blocks the
+        # cheap model didn't plan for and invalidate the prompt cache.
+        if sticky_model is None:
+            if self._router is not None:
+                has_images = self._last_user_has_images(messages_snapshot)
+                turn_model, turn_label = self._router.choose(
+                    messages_snapshot,
+                    is_continuation=False,
+                    has_images=has_images,
+                    session_id=self._session_id,
+                )
+            else:
+                turn_model, turn_label = self._model, "sonnet"
+            with self._lock:
+                self._current_turn_model = turn_model
+                self._current_turn_label = turn_label
+            # Notify the controller of the routing decision. The controller
+            # only surfaces this when verbose mode is on; otherwise dropped.
+            yield BackendEvent(kind="turn_routing", text=turn_label)
+        else:
+            turn_model, turn_label = sticky_model, sticky_label
 
         turn_started = datetime.datetime.now()
         with self._client.messages.stream(
-            model=self._model,
+            model=turn_model,
             system=self._build_system(),
             tools=self._tools,
             messages=self._cacheable_messages(messages_snapshot),
@@ -980,7 +1025,7 @@ class AnthropicMessagesBackend:
                                 self._usage_label,
                                 "web_search",
                                 "server",
-                                model=self._model,
+                                model=turn_model,
                                 result_bytes=len(json.dumps(result_block.get("content"))),
                                 web_search_requests=1,
                                 session_id=self._session_id,
@@ -1025,7 +1070,7 @@ class AnthropicMessagesBackend:
                                 # byte size to this tool, priced at this turn's
                                 # model rate.
                                 self._tool_attrib[current_tool["id"]] = (
-                                    current_tool["name"], self._model,
+                                    current_tool["name"], turn_model,
                                 )
                         yield BackendEvent(
                             kind="assistant_use_tool",
@@ -1051,6 +1096,9 @@ class AnthropicMessagesBackend:
                 # the stream was aborted, calling it can raise.
                 self._cleanup_interrupted_turn(assistant_blocks)
                 self._interrupted.clear()
+                with self._lock:
+                    self._current_turn_model = None
+                    self._current_turn_label = None
                 yield BackendEvent(kind="turn_end", stop_reason="interrupted")
                 return
 
@@ -1059,10 +1107,11 @@ class AnthropicMessagesBackend:
             turn_ms = (datetime.datetime.now() - turn_started).total_seconds() * 1000.0
             self._record_usage(
                 getattr(final, "usage", None),
-                getattr(final, "model", None) or self._model,
+                getattr(final, "model", None) or turn_model,
                 purpose="turn",
                 stop_reason=stop_reason,
                 duration_ms=turn_ms,
+                routed_decision=turn_label,
             )
 
         with self._lock:
@@ -1091,6 +1140,11 @@ class AnthropicMessagesBackend:
         self._persist()
 
         if stop_reason != "tool_use":
+            # Tool loop is over — drop the sticky pick so the next user turn
+            # re-asks the router.
+            with self._lock:
+                self._current_turn_model = None
+                self._current_turn_label = None
             # Kick off compaction *after* the turn has finished streaming so the
             # Haiku summary + title-refresh calls never delay the user-visible
             # response. The next turn pays full prefix cost only if compaction
@@ -1492,6 +1546,23 @@ class AnthropicMessagesBackend:
             "input_schema": input_schema,
         }
 
+    @staticmethod
+    def _last_user_has_images(messages: list[dict]) -> bool:
+        """True when the most recent user message carries an image block.
+        The router uses this as a "force Sonnet" signal — image-bearing turns
+        are almost never read-only lookups in this app."""
+        for msg in reversed(messages):
+            if msg.get("role") != "user":
+                continue
+            content = msg.get("content")
+            if not isinstance(content, list):
+                return False
+            return any(
+                isinstance(b, dict) and b.get("type") == "image"
+                for b in content
+            )
+        return False
+
     def _record_usage(
         self,
         usage,
@@ -1500,6 +1571,7 @@ class AnthropicMessagesBackend:
         *,
         stop_reason: str | None = None,
         duration_ms: float | None = None,
+        routed_decision: str | None = None,
     ) -> None:
         """Hand one API call's token usage to the opt-in usage log. Imported
         lazily and fully guarded — usage accounting must never break a turn.
@@ -1514,6 +1586,7 @@ class AnthropicMessagesBackend:
                 session_id=self._session_id,
                 stop_reason=stop_reason,
                 duration_ms=duration_ms,
+                routed_decision=routed_decision,
             )
         except Exception:
             pass

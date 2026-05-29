@@ -102,6 +102,7 @@ def record_api(
     session_id: str | None = None,
     stop_reason: str | None = None,
     duration_ms: float | None = None,
+    routed_decision: str | None = None,
 ) -> None:
     """Record one Anthropic API call's token usage.
 
@@ -120,6 +121,12 @@ def record_api(
       * ``stop_reason`` — "end_turn" / "tool_use" / "max_tokens" / ..., so you
                           can see how often turns are truncated or tool-driven.
       * ``duration_ms`` — wall-clock latency of the API call.
+      * ``routed_decision`` — "haiku" or "sonnet" when the model-routing
+                              layer picked the model for this turn. Lets the
+                              dashboard compute Haiku-vs-Sonnet savings by
+                              re-pricing the same token counts at the other
+                              pole's rates. None for unrouted calls (compaction,
+                              title, route classifier itself).
 
     Cache *writes* are recorded split by TTL — the Anthropic usage object
     carries a nested ``cache_creation`` breakdown, and a 1-hour cache write is
@@ -179,6 +186,7 @@ def record_api(
         "cache_creation_5m_tokens": cc_5m,
         "cache_creation_1h_tokens": cc_1h,
         "web_search_requests": web_search_requests,
+        "routed_decision": routed_decision or None,
     })
     _append(rec)
 
