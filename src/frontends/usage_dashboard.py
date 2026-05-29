@@ -96,7 +96,10 @@ _GRACE_DAYS = _accounts.DEFAULT_GRACE_DAYS
 # rejected back to the default so a hand-edited query string can't wedge the
 # page into a 1ms reload loop.
 _REFRESH_CHOICES = (0, 1, 30, 300)
-_REFRESH_DEFAULT = 1
+# Off by default — the live refresh swaps the data region, which can cancel an
+# in-flight click on the chip filter or the Total/Avg toggle. Admins who want
+# live polling can re-enable it from the Auto-refresh dropdown.
+_REFRESH_DEFAULT = 0
 
 # 5-minute cache TTL, in seconds. Median request spacing above this means a
 # 5m-TTL cache write tends to expire before it is ever read back.
@@ -2062,35 +2065,6 @@ _FRAGMENT_USERS = """<div class="meta">
     </tbody>
   </table>
 
-  <script>
-    // Pattern filter — pure DOM hide/show, no fetch. Runs against the
-    // already-rendered table so it stays in sync with the visible filter
-    // window above (date / model / purpose).
-    (function () {
-      var bar = document.querySelector(".userfilter");
-      if (!bar) return;
-      var rows = document.querySelectorAll("#userstable tbody tr");
-      bar.addEventListener("click", function (e) {
-        var b = e.target.closest("button[data-pattern]");
-        if (!b) return;
-        bar.querySelectorAll(".chipbtn").forEach(function (x) {
-          x.classList.remove("active");
-        });
-        b.classList.add("active");
-        var p = b.getAttribute("data-pattern");
-        rows.forEach(function (r) {
-          var show = (
-            p === "all" ||
-            r.getAttribute("data-pattern") === p ||
-            (p === "heavy" && r.getAttribute("data-heavy") === "1") ||
-            (p === "dormant" && r.getAttribute("data-status") === "dormant")
-          );
-          r.style.display = show ? "" : "none";
-        });
-      });
-    })();
-  </script>
-
   {% endif %}"""
 
 
@@ -2791,6 +2765,30 @@ _PAGE = """<!doctype html>
       }
     }
     dressTooltips(document);
+
+    // Pattern chip filter on the Users tab — uses event delegation on
+    // document so the listener survives every fragment refresh (the auto-
+    // refresh replaces #data's innerHTML, which would otherwise wipe any
+    // listener attached to a child element inside the fragment).
+    document.addEventListener("click", function (e) {
+      var b = e.target.closest(".userfilter button[data-pattern]");
+      if (!b) return;
+      var bar = b.parentElement;
+      bar.querySelectorAll(".chipbtn").forEach(function (x) {
+        x.classList.remove("active");
+      });
+      b.classList.add("active");
+      var p = b.getAttribute("data-pattern");
+      document.querySelectorAll("#userstable tbody tr").forEach(function (r) {
+        var show = (
+          p === "all" ||
+          r.getAttribute("data-pattern") === p ||
+          (p === "heavy" && r.getAttribute("data-heavy") === "1") ||
+          (p === "dormant" && r.getAttribute("data-status") === "dormant")
+        );
+        r.style.display = show ? "" : "none";
+      });
+    });
 
     // Quick-range presets: fill the Since/Until fields and submit the filter
     // form. `days` is the inclusive window size (0 = today only); null clears
