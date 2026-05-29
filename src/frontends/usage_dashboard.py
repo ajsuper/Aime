@@ -705,6 +705,281 @@ def _new_users_per_day(backend, day_keys):
     return out
 
 
+def _daily_summary(records, day_keys):
+    """Rich per-day row: calls, active users, cost, $/call, p50 latency,
+    cache hit %, top model (by cost), top user (by cost).
+
+    One row per ``day_keys`` entry, in the same dense order so the table on
+    the page never has visual gaps for quiet days.
+    """
+    idx = {d: i for i, d in enumerate(day_keys)}
+    rows = [
+        {
+            "day": d, "calls": 0, "users": set(),
+            "input": 0, "cache_r": 0, "cost": 0.0,
+            "lats": [],
+            "by_model": {}, "by_user": {},
+        }
+        for d in day_keys
+    ]
+    for rec in records:
+        if rec.get("kind") != "api":
+            continue
+        day = str(rec.get("ts", ""))[:10]
+        if day not in idx:
+            continue
+        r = rows[idx[day]]
+        c = _report._api_cost(rec)
+        r["calls"] += 1
+        r["users"].add(rec.get("user") or "(anonymous)")
+        r["input"] += rec.get("input_tokens", 0)
+        r["cache_r"] += rec.get("cache_read_tokens", 0)
+        r["cost"] += c
+        d = rec.get("duration_ms")
+        if d is not None:
+            try:
+                r["lats"].append(float(d))
+            except (TypeError, ValueError):
+                pass
+        model = rec.get("model") or "(unknown)"
+        user = rec.get("user") or "(anonymous)"
+        r["by_model"][model] = r["by_model"].get(model, 0.0) + c
+        r["by_user"][user] = r["by_user"].get(user, 0.0) + c
+
+    out = []
+    for r in rows:
+        lats = sorted(r["lats"])
+        denom = r["input"] + r["cache_r"]
+        out.append({
+            "day": r["day"],
+            "calls": r["calls"],
+            "active_users": len(r["users"]),
+            "cost": r["cost"],
+            "cost_per_call": (r["cost"] / r["calls"]) if r["calls"] else 0.0,
+            "p50": _percentile(lats, 50) if lats else None,
+            "cache_hit_pct": (100.0 * r["cache_r"] / denom) if denom else 0.0,
+            "top_model": max(r["by_model"].items(), key=lambda kv: kv[1])[0]
+                if r["by_model"] else "—",
+            "top_user": max(r["by_user"].items(), key=lambda kv: kv[1])[0]
+                if r["by_user"] else "—",
+        })
+    return out
+
+
+def _weekday_hour_heatmap(records):
+    """7×24 grid of call counts keyed by (UTC weekday, UTC hour-of-day).
+
+    Weekday axis is Mon..Sun, matching how a calendar-week dashboard would be
+    read. Empty input returns a zero grid so the heatmap still draws.
+    """
+    grid = [[0] * 24 for _ in range(7)]
+    for rec in records:
+        if rec.get("kind") != "api":
+            continue
+        try:
+            ts = datetime.datetime.fromisoformat(rec["ts"])
+        except (ValueError, KeyError):
+            continue
+        grid[ts.weekday()][ts.hour] += 1
+    return grid
+
+
+def _rolling_average(values, window=7):
+    """Centred trailing rolling mean for charts — empty / None-tolerant.
+
+    Padding the front with the running mean keeps the line visible from day
+    one rather than only kicking in at index ``window-1`` (which would draw a
+    confusing gap on a 5-day window).
+    """
+    out = []
+    acc = []
+    for v in values:
+        acc.append(v)
+        if len(acc) > window:
+            acc.pop(0)
+        out.append(sum(acc) / len(acc))
+    return out
+
+
+def _classify_users(all_records, *, since, until, dormant_days=14):
+    """Per-user activity classification.
+
+    Returns a dict of three lists plus a per-user record dict — every active
+    account that has ever shown up in the usage log gets a row:
+
+      * ``new``       — users whose first-ever record falls in [since, until].
+      * ``returning`` — users active in this window AND in the prior window.
+      * ``dormant``   — users whose latest record is more than ``dormant_days``
+                        old relative to ``until`` (or now, when ``until`` is
+                        unset). A retention triage list.
+      * ``rows``      — list of dicts with username + first_seen, last_seen,
+                        days_since_last, lifetime_calls, lifetime_cost,
+                        window_calls, window_cost, status.
+    """
+    now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+    end = until or now
+    start = since or (end - datetime.timedelta(days=30))
+    span = end - start
+    prev_start = start - span
+    prev_end = start
+
+    per = {}
+    for rec in all_records:
+        if rec.get("kind") != "api":
+            continue
+        try:
+            ts = datetime.datetime.fromisoformat(rec["ts"])
+        except (ValueError, KeyError):
+            continue
+        name = rec.get("user") or "(anonymous)"
+        p = per.setdefault(name, {
+            "first_seen": ts, "last_seen": ts,
+            "lifetime_calls": 0, "lifetime_cost": 0.0,
+            "window_calls": 0, "window_cost": 0.0,
+            "prev_calls": 0, "prev_cost": 0.0,
+        })
+        if ts < p["first_seen"]:
+            p["first_seen"] = ts
+        if ts > p["last_seen"]:
+            p["last_seen"] = ts
+        p["lifetime_calls"] += 1
+        cost = _report._api_cost(rec)
+        p["lifetime_cost"] += cost
+        if start <= ts <= end:
+            p["window_calls"] += 1
+            p["window_cost"] += cost
+        if prev_start <= ts < prev_end:
+            p["prev_calls"] += 1
+            p["prev_cost"] += cost
+
+    new_users = []
+    returning = []
+    dormant = []
+    rows = []
+    for name, p in per.items():
+        days_since = (end - p["last_seen"]).days
+        in_window = p["window_calls"] > 0
+        in_prev = p["prev_calls"] > 0
+        is_new = start <= p["first_seen"] <= end
+        if in_window and is_new:
+            new_users.append(name)
+            status = "new"
+        elif in_window and in_prev:
+            returning.append(name)
+            status = "returning"
+        elif in_window:
+            status = "active"
+        elif days_since >= dormant_days:
+            dormant.append(name)
+            status = "dormant"
+        else:
+            status = "inactive"
+        rows.append({
+            "username": name,
+            "first_seen": p["first_seen"].isoformat(timespec="seconds"),
+            "last_seen": p["last_seen"].isoformat(timespec="seconds"),
+            "days_since_last": days_since,
+            "lifetime_calls": p["lifetime_calls"],
+            "lifetime_cost": p["lifetime_cost"],
+            "window_calls": p["window_calls"],
+            "window_cost": p["window_cost"],
+            "prev_calls": p["prev_calls"],
+            "prev_cost": p["prev_cost"],
+            "status": status,
+        })
+    rows.sort(key=lambda r: r["lifetime_cost"], reverse=True)
+    return {
+        "rows": rows,
+        "new": sorted(new_users),
+        "returning": sorted(returning),
+        "dormant": sorted(dormant, key=lambda n:
+                          next(r["days_since_last"] for r in rows
+                               if r["username"] == n), reverse=True),
+        "window": (start, end),
+    }
+
+
+def _svg_heatmap(grid, *, width=720, height=200, row_labels=None,
+                 col_labels=None, title=""):
+    """Heatmap of a 2-D integer grid. ``grid[r][c]`` shades a single cell.
+
+    Colour scale is a simple linear ramp from the background to a saturated
+    blue, with the max-value cell at full saturation. Returns a ``<svg>`` plus
+    optional row/column axes labels.
+    """
+    if not grid or not grid[0]:
+        return ""
+    rows = len(grid)
+    cols = len(grid[0])
+    pad_l, pad_t, pad_b, pad_r = 36, 18, 22, 8
+    plot_w = width - pad_l - pad_r
+    plot_h = height - pad_t - pad_b
+    cw = plot_w / cols
+    ch = plot_h / rows
+
+    hi = 0
+    for row in grid:
+        for v in row:
+            if v > hi:
+                hi = v
+    if hi == 0:
+        hi = 1
+
+    rects = []
+    for r in range(rows):
+        for c in range(cols):
+            v = grid[r][c]
+            frac = v / hi
+            # interpolate from #8881 (idle) to #2f6fd0 (peak)
+            if v == 0:
+                fill = "#8881"
+            else:
+                # Linear ramp in HSL would be nicer, but a single-stop alpha
+                # over the brand blue keeps the SVG self-contained.
+                alpha = max(0.18, frac)
+                fill = f"rgba(47,111,208,{alpha:.2f})"
+            x = pad_l + c * cw
+            y = pad_t + r * ch
+            label = (row_labels[r] if row_labels else str(r))
+            col_lbl = (col_labels[c] if col_labels else str(c))
+            rects.append(
+                f'<rect x="{x:.1f}" y="{y:.1f}" width="{cw - 1:.1f}" '
+                f'height="{ch - 1:.1f}" fill="{fill}" rx="2">'
+                f'<title>{label} {col_lbl} — {v:,} call{"s" if v != 1 else ""}</title>'
+                f'</rect>'
+            )
+
+    row_lbls = []
+    if row_labels:
+        for r in range(rows):
+            y = pad_t + r * ch + ch / 2 + 3
+            row_lbls.append(
+                f'<text x="{pad_l - 6}" y="{y:.1f}" font-size="10" '
+                f'text-anchor="end" fill="#888">{row_labels[r]}</text>'
+            )
+    col_lbls = []
+    if col_labels:
+        step = max(1, cols // 12)
+        for c in range(0, cols, step):
+            x = pad_l + c * cw + cw / 2
+            col_lbls.append(
+                f'<text x="{x:.1f}" y="{height - 6}" font-size="10" '
+                f'text-anchor="middle" fill="#888">{col_labels[c]}</text>'
+            )
+
+    title_svg = (
+        f'<text x="{pad_l}" y="12" font-size="10" fill="#888">{title}</text>'
+        if title else ""
+    )
+
+    return (
+        f'<svg class="chart" width="{width}" height="{height}" '
+        f'viewBox="0 0 {width} {height}">'
+        + title_svg + "".join(rects) + "".join(row_lbls) + "".join(col_lbls)
+        + "</svg>"
+    )
+
+
 def _recent_records(records, n=25, user=None):
     """The N most-recent API records, optionally filtered to one user."""
     out = []
@@ -1161,8 +1436,8 @@ _FRAGMENT_OVERVIEW = """<div class="meta">
       <div class="lbl">cache read share</div></div>
   </div>
 
-  <h2 title="Estimated USD cost charged per UTC day in this window. Gives the headline trend at a glance — a sudden spike usually means a runaway loop or a new heavy user.">Cost over time</h2>
-  {{ chart_daily_cost|safe }}
+  <h2 title="Estimated USD cost charged per UTC day in this window, with a 7-day rolling average overlay so a single spike doesn't dominate the trend read.">Cost over time</h2>
+  {{ chart_daily_cost_smoothed|safe }}
 
   <h2 title="Daily cost split by model id, stacked. The widest band is the model carrying the most spend.">Cost by model (daily)</h2>
   {{ chart_model_stack|safe }}
@@ -1224,29 +1499,41 @@ _FRAGMENT_OVERVIEW = """<div class="meta">
     </tfoot>
   </table>
 
-  <h2 title="API token cost grouped by calendar date (UTC), newest first.">By day</h2>
+  <h2 title="Rich per-day summary across the visible window, newest first. Combines the old 'by day' table with active-user counts, p50 latency, cache hit %, and the most expensive model / user that day.">Daily summary</h2>
+  {% if not daily_rows %}
+    <p class="empty">No daily activity in this window.</p>
+  {% else %}
   <table>
     <thead>
       <tr>
-        <th title="Calendar date (UTC) the requests were made.">Date</th>
-        <th title="Requests sent to the Anthropic Messages API on this date.">API calls</th>
-        <th title="Fresh, uncached input tokens on this date.">Input</th>
-        <th title="Tokens generated by the model on this date.">Output</th>
-        <th title="Estimated USD cost for this date.">Est. cost</th>
+        <th title="UTC calendar date.">Date</th>
+        <th title="API calls on this date.">Calls</th>
+        <th title="Distinct users active on this date.">Users</th>
+        <th title="Estimated USD cost on this date.">Cost</th>
+        <th title="Mean USD cost per call on this date — a high value means heavy turns.">$/call</th>
+        <th title="Median wall-clock latency on this date (records that carry duration_ms).">p50 ms</th>
+        <th title="Share of read-side prompt tokens served from cache rather than billed fresh.">Cache hit</th>
+        <th title="Model with the most cost attributed on this date.">Top model</th>
+        <th title="User with the most cost attributed on this date.">Top user</th>
       </tr>
     </thead>
     <tbody>
-      {% for day, d in by_day %}
+      {% for r in daily_rows|reverse %}
       <tr>
-        <td>{{ day }}</td>
-        <td>{{ "{:,}".format(d.api_calls) }}</td>
-        <td>{{ "{:,}".format(d.input) }}</td>
-        <td>{{ "{:,}".format(d.output) }}</td>
-        <td class="cost good">${{ "%.4f"|format(d.cost) }}</td>
+        <td>{{ r.day }}</td>
+        <td>{{ "{:,}".format(r.calls) }}</td>
+        <td>{{ r.active_users }}</td>
+        <td class="cost good">${{ "%.4f"|format(r.cost) }}</td>
+        <td>${{ "%.5f"|format(r.cost_per_call) }}</td>
+        <td>{{ ('%.0f' % r.p50) if r.p50 is not none else '—' }}</td>
+        <td class="{{ 'good' if r.cache_hit_pct >= 70 else 'warn' if r.cache_hit_pct >= 40 else 'bad' }}">{{ '%.0f'|format(r.cache_hit_pct) }}%</td>
+        <td>{{ r.top_model }}</td>
+        <td><a href="/user/{{ r.top_user|urlencode }}" class="userlink">{{ r.top_user }}</a></td>
       </tr>
       {% endfor %}
     </tbody>
   </table>
+  {% endif %}
 
   <h2 title="API token cost grouped by the model id stamped on each record, most expensive first.">By model</h2>
   <table>
@@ -1477,6 +1764,9 @@ _FRAGMENT_ACTIVITY = """<div class="meta">
   <h2 title="API calls bucketed by UTC hour-of-day across the visible window. Tall bars are busy hours. Use this to spot off-hours background traffic, or to size capacity to peak.">Hourly traffic (UTC)</h2>
   {{ chart_hours|safe }}
 
+  <h2 title="Calls bucketed by UTC weekday × hour. Darker cells are heavier. The pattern often picks out workweek office hours, or surfaces background plumbing that runs on a cron.">Weekday × hour heatmap</h2>
+  <div class="chart-wrap">{{ chart_heatmap|safe }}</div>
+
   <h2 title="p50 and p90 latency per UTC day. Diverging lines mean a long tail is opening up — usually a slower model, larger prompts, or contention with a tool call.">Latency over time</h2>
   {{ chart_latency_day|safe }}
 
@@ -1635,6 +1925,101 @@ _FRAGMENT_TRENDS = """<div class="meta">
         <td class="cost good">${{ "%.4f"|format(u.cost) }}</td>
         <td>{{ "%.1f"|format(100.0 * u.cost / grand_cost if grand_cost else 0) }}%</td>
         <td class="spark">{{ user_sparklines.get(name, '')|safe }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}"""
+
+
+# Users tab — engagement view: who is new, who is returning, who has gone
+# dormant. Useful for retention conversations rather than cost ones.
+_FRAGMENT_USERS = """<div class="meta">
+    <span title="Filesystem path of the usage.jsonl log being read.">log: {{ log }}</span><br>
+    <span title="Records matching the current filters.">{{ record_count }} records</span>
+    &middot;
+    <span title="Date range currently in view.">window: {{ window }}</span>
+    &middot;
+    <span title="Cohort window used by the New / Returning / Dormant lists.">cohort: {{ cohort_window }}</span>
+  </div>
+
+  {% for e in errors %}<p class="err">{{ e }}</p>{% endfor %}
+
+  <div class="cards">
+    <div class="card accent-blue"
+      title="Distinct users with at least one API record in this window.">
+      <div class="num blue">{{ counts.active }}</div>
+      <div class="lbl">active in window</div></div>
+    <div class="card accent-green"
+      title="Users whose first-ever record falls within this window — fresh signups, effectively.">
+      <div class="num good">{{ counts.new }}</div>
+      <div class="lbl">new this window</div></div>
+    <div class="card accent-purple"
+      title="Users active in this window AND in the immediately-prior equal-length window. Closest thing to a retention metric the log can answer.">
+      <div class="num purple">{{ counts.returning }}</div>
+      <div class="lbl">returning</div></div>
+    <div class="card accent-amber"
+      title="Users whose latest record is more than {{ dormant_days }} days old. Candidates for a re-engagement nudge — or, with permission, a soft-delete.">
+      <div class="num warn">{{ counts.dormant }}</div>
+      <div class="lbl">dormant ({{ dormant_days }}d+)</div></div>
+  </div>
+
+  <h2 title="Distinct active users per UTC day in the visible window. A steady line means a healthy returning base; a saw-tooth means traffic is bursty.">Daily active users</h2>
+  {{ chart_active_users|safe }}
+
+  {% if classification.new %}
+  <h2 title="Users whose first record is inside the current window. Sorted alphabetically.">New this window ({{ classification.new|length }})</h2>
+  <p class="userchips">
+    {% for n in classification.new %}<a class="chip" href="/user/{{ n|urlencode }}">{{ n }}</a>{% endfor %}
+  </p>
+  {% endif %}
+
+  {% if classification.dormant %}
+  <h2 title="Users with no record in the last {{ dormant_days }} days. Ordered by 'most dormant first' — the top of the list is the freshest re-engagement candidate.">Dormant users ({{ classification.dormant|length }})</h2>
+  <p class="userchips">
+    {% for n in classification.dormant %}<a class="chip" href="/user/{{ n|urlencode }}">{{ n }}</a>{% endfor %}
+  </p>
+  {% endif %}
+
+  <h2 title="One row per user that has ever appeared in the log, ordered by lifetime cost.">All users</h2>
+  {% if not classification.rows %}
+    <p class="empty">No users have any logged API records yet.</p>
+  {% else %}
+  <table>
+    <thead>
+      <tr>
+        <th>User</th>
+        <th title="Classification in the current window: new / returning / active / dormant / inactive.">Status</th>
+        <th title="UTC timestamp of the very first record for this user.">First seen</th>
+        <th title="UTC timestamp of the most recent record for this user.">Last seen</th>
+        <th title="Days since the last record (relative to the window end).">Idle</th>
+        <th title="Lifetime API call count.">Lifetime calls</th>
+        <th title="Lifetime estimated USD cost.">Lifetime cost</th>
+        <th title="API calls in the current window.">Window calls</th>
+        <th title="Estimated USD cost in the current window.">Window cost</th>
+        <th title="Percent change in window cost vs the immediately-prior equal-length window. Red is growing spend.">Δ vs prior</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in classification.rows %}
+      <tr>
+        <td><a href="/user/{{ r.username|urlencode }}" class="userlink">{{ r.username }}</a></td>
+        <td><span class="status-pill status-{{ r.status }}">{{ r.status }}</span></td>
+        <td>{{ r.first_seen|truncate(19, true, '') }}</td>
+        <td>{{ r.last_seen|truncate(19, true, '') }}</td>
+        <td class="{{ 'bad' if r.days_since_last >= dormant_days else 'warn' if r.days_since_last >= 7 else '' }}">{{ r.days_since_last }}d</td>
+        <td>{{ "{:,}".format(r.lifetime_calls) }}</td>
+        <td class="cost good">${{ "%.4f"|format(r.lifetime_cost) }}</td>
+        <td>{{ "{:,}".format(r.window_calls) }}</td>
+        <td class="cost good">${{ "%.4f"|format(r.window_cost) }}</td>
+        <td>
+          {% if r.prev_cost == 0 and r.window_cost == 0 %}—
+          {% elif r.prev_cost == 0 %}<span class="bad">new</span>
+          {% else %}
+            {% set d = 100.0 * (r.window_cost - r.prev_cost) / r.prev_cost %}
+            <span class="{{ 'bad' if d > 0 else 'good' if d < 0 else '' }}">{{ '%+.0f'|format(d) }}%</span>
+          {% endif %}
+        </td>
       </tr>
       {% endfor %}
     </tbody>
@@ -2100,6 +2485,56 @@ _PAGE = """<!doctype html>
     .delta.down { color: #2e9e4f; }
     .delta.flat { color: #888; }
 
+    /* Status pill + user chip (Users tab). */
+    .status-pill { display: inline-block; padding: .05rem .55rem;
+      font-size: .75rem; border-radius: 999px; border: 1px solid #8884; }
+    .status-new       { background: #2e9e4f22; border-color: #2e9e4f88; color: #2e9e4f; }
+    .status-returning { background: #8a4fd022; border-color: #8a4fd088; color: #8a4fd0; }
+    .status-active    { background: #2f6fd022; border-color: #2f6fd088; color: #2f6fd0; }
+    .status-dormant   { background: #d2333322; border-color: #d2333388; color: #d23; }
+    .status-inactive  { background: #8882; color: #888; }
+
+    .userchips { display: flex; flex-wrap: wrap; gap: .35rem; margin: 0 0 1rem; }
+    .chip { display: inline-block; padding: .15rem .55rem;
+      font-size: .8rem; border-radius: 999px; border: 1px solid #8884;
+      text-decoration: none; color: inherit; background: #8881; }
+    .chip:hover { background: #8883; border-color: #8886; }
+
+    /* Print export — kept off-screen on screen-media, opened by a topbar
+       button. Hide the entire chrome (nav, filter form, action buttons,
+       refresh footer, the lit-up auto-refresh JS, the back link, anchors)
+       so the printed page reads as a clean report rather than a UI capture. */
+    .toolbar { display: flex; gap: .5rem; align-items: center; }
+    .toolbar form { margin: 0; }
+    @media print {
+      @page { margin: 14mm 12mm; }
+      body { max-width: none; margin: 0; padding: 0; color: #000;
+        font-size: 11pt; }
+      .topbar, nav.tabs, form.filter, .view-toggle,
+      .logout-form, .toolbar, .auto, .flash, .inline-action,
+      td.actions, .userlink, a.chip, p > a {
+        /* fold most UI affordances; keep core data tables and headings */
+      }
+      nav.tabs, form.filter, .view-toggle, .logout-form, .toolbar,
+      .auto, .flash, .inline-action, td.actions { display: none !important; }
+      .topbar h1 { font-size: 16pt; margin: 0 0 .3rem; }
+      .topbar form { display: none; }
+      a, a:visited { color: #000; text-decoration: none; }
+      .card { border-color: #888; box-shadow: none; }
+      table { font-size: 9.5pt; page-break-inside: avoid; }
+      h2 { page-break-after: avoid; }
+      .chart-wrap, .donut-wrap, table, .cards { page-break-inside: avoid; }
+      /* Inline-bar fills don't print without explicit colour adjust on most
+         engines; force exact rendering so the SVG charts come through. */
+      .chart, .sparkline, .inline-bar .fill { -webkit-print-color-adjust: exact;
+        print-color-adjust: exact; color-adjust: exact; }
+      .print-only { display: block !important; }
+      .print-header { margin-bottom: .6rem; }
+      .print-header .h { font-size: 14pt; font-weight: 600; }
+      .print-header .sub { font-size: 9pt; color: #444; }
+    }
+    .print-only { display: none; }
+
     .banner { padding: .6rem .9rem; border-radius: 6px; margin-bottom: 1rem; }
     .banner.good { background: #2e9e4f22; border: 1px solid #2e9e4f88; }
     .banner.warn { background: #c8860a22; border: 1px solid #c8860a88; }
@@ -2153,10 +2588,25 @@ _PAGE = """<!doctype html>
 <body>
   <div class="topbar">
     <h1 title="Aime admin dashboard: usage statistics plus account and invite-key management.">Aime admin</h1>
-    <form method="post" action="logout" class="logout-form">
-      <input type="hidden" name="csrf" value="{{ csrf }}">
-      <button type="submit" class="logout">Log out</button>
-    </form>
+    <div class="toolbar">
+      <button type="button" class="print-btn"
+        onclick="window.print()"
+        title="Open the system print dialog. The print stylesheet hides the navigation, filter form, and action buttons so the output reads as a clean report. Save as PDF from the dialog if you want a file.">Print</button>
+      <form method="post" action="/logout" class="logout-form">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <button type="submit" class="logout">Log out</button>
+      </form>
+    </div>
+  </div>
+
+  <div class="print-only print-header">
+    <div class="h">Aime admin — {{ tab }}</div>
+    <div class="sub">
+      {% if since_raw or until_raw %}window: {{ since_raw or 'start' }} → {{ until_raw or 'now' }} (UTC){% else %}window: all time{% endif %}
+      {% if user_raw %} &middot; user: {{ user_raw }}{% endif %}
+      {% if model_raw %} &middot; model: {{ model_raw }}{% endif %}
+      {% if purpose_raw %} &middot; purpose: {{ purpose_raw }}{% endif %}
+    </div>
   </div>
 
   <nav class="tabs">
@@ -2168,6 +2618,8 @@ _PAGE = """<!doctype html>
       title="What the API is being used for — call purpose, stop-reason mix, latency percentiles, and when of day traffic happens.">Activity</a>
     <a href="/?{{ qs_trends }}" class="{{ 'active' if tab == 'trends' else '' }}"
       title="Period-over-period deltas, anomaly day flags, top-N most expensive turns and top spenders.">Trends</a>
+    <a href="/?{{ qs_users }}" class="{{ 'active' if tab == 'users' else '' }}"
+      title="Engagement view: who is new, returning, or dormant.">Users</a>
     <a href="/?{{ qs_accounts }}" class="{{ 'active' if tab == 'accounts' else '' }}"
       title="List, grant/revoke, soft-delete, restore and purge user accounts.">Accounts</a>
     <a href="/?{{ qs_keys }}" class="{{ 'active' if tab == 'keys' else '' }}"
@@ -2180,7 +2632,7 @@ _PAGE = """<!doctype html>
   <div class="flash {{ f.level }}">{{ f.msg }}</div>
   {% endfor %}
 
-  {% if tab in ('overview', 'cache', 'activity', 'trends') %}
+  {% if tab in ('overview', 'cache', 'activity', 'trends', 'users') %}
   <form class="filter" method="get">
     <input type="hidden" name="tab" value="{{ tab }}">
     <label title="Only include records on or after this date, interpreted in UTC. Accepts YYYY-MM-DD or a full ISO-8601 timestamp. Leave blank for no lower bound.">Since (UTC)
@@ -2542,6 +2994,28 @@ def _compute(args):
     )
     chart_hours = _svg_hour_bars(hours)
 
+    # Rich per-day summary + 7-day rolling-mean overlay on the daily cost
+    # chart, so a single weekly spike doesn't dominate the headline trend.
+    daily_rows = _daily_summary(records, day_keys)
+    rolling_cost = _rolling_average(daily_cost, window=7)
+    chart_daily_cost_smoothed = _svg_line_chart(
+        day_keys,
+        [("daily", daily_cost), ("7-day avg", rolling_cost)],
+        y_label="USD", money=True,
+        colors=["#2f6fd0", "#c8860a"],
+    )
+
+    # Weekday × hour heatmap for the Activity tab. Records are taken from the
+    # current filter window, not the full log — admins typically want to see
+    # the pattern for the same window the rest of the page describes.
+    weekday_labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    hour_labels = [f"{h:02d}" for h in range(24)]
+    heatmap_grid = _weekday_hour_heatmap(records)
+    chart_heatmap = _svg_heatmap(
+        heatmap_grid, row_labels=weekday_labels, col_labels=hour_labels,
+        title="weekday × hour (UTC)",
+    )
+
     # Donut: cost share by model in this window.
     model_total = [
         (name, m["cost"], _color_for(i))
@@ -2614,6 +3088,9 @@ def _compute(args):
         chart_latency_day=chart_latency_day,
         chart_hours=chart_hours,
         chart_model_donut=chart_model_donut,
+        daily_rows=daily_rows,
+        chart_daily_cost_smoothed=chart_daily_cost_smoothed,
+        chart_heatmap=chart_heatmap,
         user_sparklines=user_sparklines,
         model_sparklines=model_sparklines,
         # records carried for Trends-tab post-processing
@@ -2751,6 +3228,40 @@ def _trends_context(compute_ctx):
     return compute_ctx
 
 
+def _users_context(compute_ctx, dormant_days=14):
+    """Build the Users-tab template context on top of an Overview-style
+    ``_compute`` result. Shares filter args so what you see on Users matches
+    what you see on Overview for the same date / model / purpose pick."""
+    all_records = compute_ctx.pop("_all_records")
+    since = compute_ctx.pop("_since")
+    until = compute_ctx.pop("_until")
+    compute_ctx.pop("_records", None)
+
+    classification = _classify_users(all_records, since=since, until=until,
+                                     dormant_days=dormant_days)
+    counts = {
+        "active": sum(1 for r in classification["rows"] if r["window_calls"] > 0),
+        "new": len(classification["new"]),
+        "returning": len(classification["returning"]),
+        "dormant": len(classification["dormant"]),
+    }
+    cs, ce = classification["window"]
+    cohort_window = f"{cs.date()} → {ce.date()}"
+    chart_active_users = _svg_line_chart(
+        compute_ctx["day_keys"],
+        [("active users", compute_ctx["daily_active"])],
+        y_label="users", colors=["#c8860a"],
+    )
+    compute_ctx.update(
+        classification=classification,
+        counts=counts,
+        cohort_window=cohort_window,
+        dormant_days=dormant_days,
+        chart_active_users=chart_active_users,
+    )
+    return compute_ctx
+
+
 def _user_context(username: str):
     """All-time drill-down for a single user."""
     path = _log_path()
@@ -2814,7 +3325,7 @@ def _user_context(username: str):
 
 def _tab(args) -> str:
     t = args.get("tab")
-    return t if t in ("overview", "cache", "activity", "trends",
+    return t if t in ("overview", "cache", "activity", "trends", "users",
                       "accounts", "keys", "system") else "overview"
 
 
@@ -2823,6 +3334,7 @@ def _render_fragment(ctx, tab) -> str:
         "cache": _FRAGMENT_CACHE,
         "activity": _FRAGMENT_ACTIVITY,
         "trends": _FRAGMENT_TRENDS,
+        "users": _FRAGMENT_USERS,
         "accounts": _FRAGMENT_ACCOUNTS,
         "keys": _FRAGMENT_KEYS,
         "system": _FRAGMENT_SYSTEM,
@@ -2909,6 +3421,8 @@ def index():
             ctx["qs_view_avg"] = urlencode({**keep_view, "tab": "overview", "view": "avg"})
         if tab == "trends":
             ctx = _trends_context(ctx)
+        elif tab == "users":
+            ctx = _users_context(ctx)
         else:
             # Drop transient keys carried for the Trends post-process so they
             # don't leak into other fragment renders.
@@ -2924,7 +3438,7 @@ def index():
             for k in ("since", "until", "user", "model", "purpose", "auto")
             if request.args.get(k)}
     qs = {t: urlencode({**keep, "tab": t})
-          for t in ("overview", "cache", "activity", "trends",
+          for t in ("overview", "cache", "activity", "trends", "users",
                     "accounts", "keys", "system")}
 
     return render_template_string(
@@ -2933,6 +3447,7 @@ def index():
         csrf=csrf, flashes=flashes,
         qs_overview=qs["overview"], qs_cache=qs["cache"],
         qs_activity=qs["activity"], qs_trends=qs["trends"],
+        qs_users=qs["users"],
         qs_accounts=qs["accounts"], qs_keys=qs["keys"],
         qs_system=qs["system"], **page_ctx,
     )
@@ -2948,6 +3463,8 @@ def fragment():
     ctx = _compute(request.args)
     if tab == "trends":
         ctx = _trends_context(ctx)
+    elif tab == "users":
+        ctx = _users_context(ctx)
     else:
         for k in ("_records", "_all_records", "_since", "_until"):
             ctx.pop(k, None)
@@ -2972,7 +3489,7 @@ def user_drilldown(username):
                           model_raw="", purpose_raw="",
                           all_users=[], all_models=[], all_purposes=[])
     qs = {t: urlencode({"tab": t})
-          for t in ("overview", "cache", "activity", "trends",
+          for t in ("overview", "cache", "activity", "trends", "users",
                     "accounts", "keys", "system")}
     return render_template_string(
         _PAGE, fragment=fragment, tab="user", auto=0,
@@ -2980,6 +3497,7 @@ def user_drilldown(username):
         csrf=csrf, flashes=flashes,
         qs_overview=qs["overview"], qs_cache=qs["cache"],
         qs_activity=qs["activity"], qs_trends=qs["trends"],
+        qs_users=qs["users"],
         qs_accounts=qs["accounts"], qs_keys=qs["keys"],
         qs_system=qs["system"], **empty_page_ctx,
     )
