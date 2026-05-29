@@ -4761,7 +4761,18 @@ function renderTopicList() {
         return title.includes(q) || summary.includes(q)
             || category.includes(q) || folder.includes(q);
       })
-    : allTopics;
+    : allTopics.slice();
+
+  // Sort by category (case-insensitive, alphabetical). Uncategorized topics
+  // sink to the end so they don't break up the alphabetical run.
+  filtered.sort((a, b) => {
+    const ac = (a.category || "").toLowerCase();
+    const bc = (b.category || "").toLowerCase();
+    if (!ac && !bc) return 0;
+    if (!ac) return 1;
+    if (!bc) return -1;
+    return ac.localeCompare(bc);
+  });
 
   topicCountEl.textContent = q
     ? `${filtered.length}/${allTopics.length}`

@@ -454,6 +454,12 @@ class TopicView(Container):
             target.update("[dim]no topics yet[/dim]")
             return
 
+        # Uncategorized topics sink to the end so the alphabetical run stays intact.
+        topics = sorted(
+            topics,
+            key=lambda tp: (not (tp.get("category") or ""), (tp.get("category") or "").lower()),
+        )
+
         lines = []
         for tp in topics:
             title = tp.get("title") or tp.get("name") or "(untitled)"
