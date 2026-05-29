@@ -802,26 +802,29 @@ def _rolling_average(values, window=7):
 
 
 def _classify_users(all_records, *, since, until, dormant_days=14):
-    """Per-user activity classification.
+    """Per-user activity classification — three statuses, one engagement pattern.
 
-    Returns a dict of three lists plus a per-user record dict — every active
-    account that has ever shown up in the usage log gets a row:
+    Status (mutually exclusive):
+      * ``new``     — first-ever record falls inside the window.
+      * ``active``  — at least one record in the window (and not new).
+      * ``dormant`` — no record in the window AND last record is at least
+                      ``dormant_days`` old relative to the window end.
 
-      * ``new``       — users whose first-ever record falls in [since, until].
-      * ``returning`` — users active in this window AND in the prior window.
-      * ``dormant``   — users whose latest record is more than ``dormant_days``
-                        old relative to ``until`` (or now, when ``until`` is
-                        unset). A retention triage list.
-      * ``rows``      — list of dicts with username + first_seen, last_seen,
-                        days_since_last, lifetime_calls, lifetime_cost,
-                        window_calls, window_cost, status.
+    Engagement pattern (derived from window-only activity, by *day presence*):
+      * ``daily``      — appears on every UTC day of the window.
+      * ``most-days``  — appears on ≥50% of the window's days (and >1 day).
+      * ``occasional`` — appears on 2 or more days, below half.
+      * ``once``       — appears on exactly one day.
+      * ``none``       — no records in the window.
+
+    A separate ``heavy`` flag fires when the user averages ≥5 calls per
+    active day — that's the "logged on multiple times per day" cohort the
+    admin asked for, surfaced as a filter chip rather than a status.
     """
     now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
     end = until or now
     start = since or (end - datetime.timedelta(days=30))
-    span = end - start
-    prev_start = start - span
-    prev_end = start
+    window_days = max(1, (end.date() - start.date()).days + 1)
 
     per = {}
     for rec in all_records:
@@ -836,7 +839,7 @@ def _classify_users(all_records, *, since, until, dormant_days=14):
             "first_seen": ts, "last_seen": ts,
             "lifetime_calls": 0, "lifetime_cost": 0.0,
             "window_calls": 0, "window_cost": 0.0,
-            "prev_calls": 0, "prev_cost": 0.0,
+            "window_days": set(),
         })
         if ts < p["first_seen"]:
             p["first_seen"] = ts
@@ -848,32 +851,48 @@ def _classify_users(all_records, *, since, until, dormant_days=14):
         if start <= ts <= end:
             p["window_calls"] += 1
             p["window_cost"] += cost
-        if prev_start <= ts < prev_end:
-            p["prev_calls"] += 1
-            p["prev_cost"] += cost
+            p["window_days"].add(ts.date())
 
     new_users = []
-    returning = []
     dormant = []
     rows = []
     for name, p in per.items():
         days_since = (end - p["last_seen"]).days
+        active_days = len(p["window_days"])
         in_window = p["window_calls"] > 0
-        in_prev = p["prev_calls"] > 0
         is_new = start <= p["first_seen"] <= end
-        if in_window and is_new:
-            new_users.append(name)
+
+        if is_new:
             status = "new"
-        elif in_window and in_prev:
-            returning.append(name)
-            status = "returning"
+            new_users.append(name)
         elif in_window:
             status = "active"
         elif days_since >= dormant_days:
-            dormant.append(name)
             status = "dormant"
+            dormant.append(name)
         else:
-            status = "inactive"
+            # No window activity, last seen recently — count as dormant too
+            # rather than carry a separate 'inactive' status that the admin
+            # would just have to mentally fold together with dormant anyway.
+            status = "dormant"
+            dormant.append(name)
+
+        if active_days == 0:
+            pattern = "none"
+        elif active_days >= window_days:
+            pattern = "daily"
+        elif active_days * 2 >= window_days and active_days > 1:
+            pattern = "most-days"
+        elif active_days >= 2:
+            pattern = "occasional"
+        else:
+            pattern = "once"
+
+        calls_per_active_day = (
+            p["window_calls"] / active_days if active_days else 0.0
+        )
+        heavy = calls_per_active_day >= 5.0
+
         rows.append({
             "username": name,
             "first_seen": p["first_seen"].isoformat(timespec="seconds"),
@@ -883,19 +902,21 @@ def _classify_users(all_records, *, since, until, dormant_days=14):
             "lifetime_cost": p["lifetime_cost"],
             "window_calls": p["window_calls"],
             "window_cost": p["window_cost"],
-            "prev_calls": p["prev_calls"],
-            "prev_cost": p["prev_cost"],
+            "active_days": active_days,
+            "calls_per_active_day": calls_per_active_day,
+            "pattern": pattern,
+            "heavy": heavy,
             "status": status,
         })
     rows.sort(key=lambda r: r["lifetime_cost"], reverse=True)
     return {
         "rows": rows,
         "new": sorted(new_users),
-        "returning": sorted(returning),
         "dormant": sorted(dormant, key=lambda n:
                           next(r["days_since_last"] for r in rows
                                if r["username"] == n), reverse=True),
         "window": (start, end),
+        "window_days": window_days,
     }
 
 
@@ -1932,8 +1953,8 @@ _FRAGMENT_TRENDS = """<div class="meta">
   {% endif %}"""
 
 
-# Users tab — engagement view: who is new, who is returning, who has gone
-# dormant. Useful for retention conversations rather than cost ones.
+# Users tab — engagement view: simplified status (new / active / dormant)
+# plus an in-browser pattern chip filter that hides rows by log frequency.
 _FRAGMENT_USERS = """<div class="meta">
     <span title="Filesystem path of the usage.jsonl log being read.">log: {{ log }}</span><br>
     <span title="Records matching the current filters.">{{ record_count }} records</span>
@@ -1954,14 +1975,14 @@ _FRAGMENT_USERS = """<div class="meta">
       title="Users whose first-ever record falls within this window — fresh signups, effectively.">
       <div class="num good">{{ counts.new }}</div>
       <div class="lbl">new this window</div></div>
-    <div class="card accent-purple"
-      title="Users active in this window AND in the immediately-prior equal-length window. Closest thing to a retention metric the log can answer.">
-      <div class="num purple">{{ counts.returning }}</div>
-      <div class="lbl">returning</div></div>
     <div class="card accent-amber"
-      title="Users whose latest record is more than {{ dormant_days }} days old. Candidates for a re-engagement nudge — or, with permission, a soft-delete.">
+      title="Users whose latest record is more than {{ dormant_days }} days old AND are not active in this window. Candidates for a re-engagement nudge.">
       <div class="num warn">{{ counts.dormant }}</div>
       <div class="lbl">dormant ({{ dormant_days }}d+)</div></div>
+    <div class="card accent-purple"
+      title="Users averaging 5 or more API calls per active day in this window — the 'logged on multiple times per day' cohort.">
+      <div class="num purple">{{ counts.heavy }}</div>
+      <div class="lbl">heavy (≥5 calls / active day)</div></div>
   </div>
 
   <h2 title="Distinct active users per UTC day in the visible window. A steady line means a healthy returning base; a saw-tooth means traffic is bursty.">Daily active users</h2>
@@ -1985,11 +2006,33 @@ _FRAGMENT_USERS = """<div class="meta">
   {% if not classification.rows %}
     <p class="empty">No users have any logged API records yet.</p>
   {% else %}
-  <table>
+
+  <div class="userfilter" title="Filter the table below by engagement pattern. The filter runs in the browser — no reload — so it composes with the date / model / purpose filter above without losing your scroll position.">
+    <span class="lbl">Pattern:</span>
+    <button type="button" class="chipbtn active" data-pattern="all"
+      title="Show every user, regardless of how often they appeared in the window.">All <span class="note">({{ classification.rows|length }})</span></button>
+    <button type="button" class="chipbtn" data-pattern="daily"
+      title="Users that appeared on every UTC day of the current window — the most consistent cohort.">Every day <span class="note">({{ pattern_counts['daily'] }})</span></button>
+    <button type="button" class="chipbtn" data-pattern="most-days"
+      title="Users active on at least half of the window's days, but not every day.">Most days <span class="note">({{ pattern_counts['most-days'] }})</span></button>
+    <button type="button" class="chipbtn" data-pattern="occasional"
+      title="Users active on two or more days, below the 'most days' threshold.">Occasional <span class="note">({{ pattern_counts['occasional'] }})</span></button>
+    <button type="button" class="chipbtn" data-pattern="once"
+      title="Users with activity on exactly one day in the window — a single visit, possibly a try-out.">Once <span class="note">({{ pattern_counts['once'] }})</span></button>
+    <button type="button" class="chipbtn" data-pattern="heavy"
+      title="Users averaging 5 or more API calls per active day — the 'logged on multiple times per day' cohort.">Multiple/day <span class="note">({{ counts.heavy }})</span></button>
+    <button type="button" class="chipbtn" data-pattern="dormant"
+      title="Users with no record in the last {{ dormant_days }} days.">Dormant <span class="note">({{ counts.dormant }})</span></button>
+  </div>
+
+  <table id="userstable">
     <thead>
       <tr>
         <th>User</th>
-        <th title="Classification in the current window: new / returning / active / dormant / inactive.">Status</th>
+        <th title="Classification in the current window: new / active / dormant.">Status</th>
+        <th title="Engagement pattern in the window: daily / most-days / occasional / once / none.">Pattern</th>
+        <th title="Distinct UTC days in the window the user appeared on.">Active days</th>
+        <th title="Mean API calls per active day in the window. A '!' flag marks users averaging 5+ — the 'multiple per day' cohort.">Calls/day</th>
         <th title="UTC timestamp of the very first record for this user.">First seen</th>
         <th title="UTC timestamp of the most recent record for this user.">Last seen</th>
         <th title="Days since the last record (relative to the window end).">Idle</th>
@@ -1997,14 +2040,16 @@ _FRAGMENT_USERS = """<div class="meta">
         <th title="Lifetime estimated USD cost.">Lifetime cost</th>
         <th title="API calls in the current window.">Window calls</th>
         <th title="Estimated USD cost in the current window.">Window cost</th>
-        <th title="Percent change in window cost vs the immediately-prior equal-length window. Red is growing spend.">Δ vs prior</th>
       </tr>
     </thead>
     <tbody>
       {% for r in classification.rows %}
-      <tr>
+      <tr data-status="{{ r.status }}" data-pattern="{{ r.pattern }}" data-heavy="{{ '1' if r.heavy else '0' }}">
         <td><a href="/user/{{ r.username|urlencode }}" class="userlink">{{ r.username }}</a></td>
         <td><span class="status-pill status-{{ r.status }}">{{ r.status }}</span></td>
+        <td><span class="pattern-pill pattern-{{ r.pattern }}">{{ r.pattern }}</span></td>
+        <td>{{ r.active_days }} <span class="note">/ {{ classification.window_days }}</span></td>
+        <td class="{{ 'warn' if r.heavy else '' }}">{{ "%.1f"|format(r.calls_per_active_day) }}{% if r.heavy %} <span title="averages 5+ calls per active day">!</span>{% endif %}</td>
         <td>{{ r.first_seen|truncate(19, true, '') }}</td>
         <td>{{ r.last_seen|truncate(19, true, '') }}</td>
         <td class="{{ 'bad' if r.days_since_last >= dormant_days else 'warn' if r.days_since_last >= 7 else '' }}">{{ r.days_since_last }}d</td>
@@ -2012,18 +2057,40 @@ _FRAGMENT_USERS = """<div class="meta">
         <td class="cost good">${{ "%.4f"|format(r.lifetime_cost) }}</td>
         <td>{{ "{:,}".format(r.window_calls) }}</td>
         <td class="cost good">${{ "%.4f"|format(r.window_cost) }}</td>
-        <td>
-          {% if r.prev_cost == 0 and r.window_cost == 0 %}—
-          {% elif r.prev_cost == 0 %}<span class="bad">new</span>
-          {% else %}
-            {% set d = 100.0 * (r.window_cost - r.prev_cost) / r.prev_cost %}
-            <span class="{{ 'bad' if d > 0 else 'good' if d < 0 else '' }}">{{ '%+.0f'|format(d) }}%</span>
-          {% endif %}
-        </td>
       </tr>
       {% endfor %}
     </tbody>
   </table>
+
+  <script>
+    // Pattern filter — pure DOM hide/show, no fetch. Runs against the
+    // already-rendered table so it stays in sync with the visible filter
+    // window above (date / model / purpose).
+    (function () {
+      var bar = document.querySelector(".userfilter");
+      if (!bar) return;
+      var rows = document.querySelectorAll("#userstable tbody tr");
+      bar.addEventListener("click", function (e) {
+        var b = e.target.closest("button[data-pattern]");
+        if (!b) return;
+        bar.querySelectorAll(".chipbtn").forEach(function (x) {
+          x.classList.remove("active");
+        });
+        b.classList.add("active");
+        var p = b.getAttribute("data-pattern");
+        rows.forEach(function (r) {
+          var show = (
+            p === "all" ||
+            r.getAttribute("data-pattern") === p ||
+            (p === "heavy" && r.getAttribute("data-heavy") === "1") ||
+            (p === "dormant" && r.getAttribute("data-status") === "dormant")
+          );
+          r.style.display = show ? "" : "none";
+        });
+      });
+    })();
+  </script>
+
   {% endif %}"""
 
 
@@ -2489,10 +2556,30 @@ _PAGE = """<!doctype html>
     .status-pill { display: inline-block; padding: .05rem .55rem;
       font-size: .75rem; border-radius: 999px; border: 1px solid #8884; }
     .status-new       { background: #2e9e4f22; border-color: #2e9e4f88; color: #2e9e4f; }
-    .status-returning { background: #8a4fd022; border-color: #8a4fd088; color: #8a4fd0; }
     .status-active    { background: #2f6fd022; border-color: #2f6fd088; color: #2f6fd0; }
     .status-dormant   { background: #d2333322; border-color: #d2333388; color: #d23; }
-    .status-inactive  { background: #8882; color: #888; }
+
+    .pattern-pill { display: inline-block; padding: .05rem .55rem;
+      font-size: .75rem; border-radius: 999px; border: 1px solid #8884;
+      color: #888; }
+    .pattern-daily      { background: #2e9e4f22; border-color: #2e9e4f88; color: #2e9e4f; }
+    .pattern-most-days  { background: #2f6fd022; border-color: #2f6fd088; color: #2f6fd0; }
+    .pattern-occasional { background: #c8860a22; border-color: #c8860a88; color: #c8860a; }
+    .pattern-once       { background: #8a4fd022; border-color: #8a4fd088; color: #8a4fd0; }
+    .pattern-none       { background: #8882; }
+
+    /* Pattern filter chip bar (Users tab). */
+    .userfilter { display: flex; flex-wrap: wrap; gap: .35rem;
+      align-items: center; margin: .2rem 0 .8rem; }
+    .userfilter .lbl { color: #888; font-size: .8rem; margin-right: .4rem; }
+    .userfilter .chipbtn { font: inherit; font-size: .8rem;
+      padding: .15rem .65rem; border-radius: 999px;
+      border: 1px solid #8884; background: transparent; color: inherit;
+      cursor: pointer; }
+    .userfilter .chipbtn:hover { background: #8881; }
+    .userfilter .chipbtn.active { background: #2f6fd022;
+      border-color: #2f6fd088; color: #2f6fd0; font-weight: 600; }
+    .userfilter .chipbtn .note { color: #888; font-weight: normal; }
 
     .userchips { display: flex; flex-wrap: wrap; gap: .35rem; margin: 0 0 1rem; }
     .chip { display: inline-block; padding: .15rem .55rem;
@@ -2619,7 +2706,7 @@ _PAGE = """<!doctype html>
     <a href="/?{{ qs_trends }}" class="{{ 'active' if tab == 'trends' else '' }}"
       title="Period-over-period deltas, anomaly day flags, top-N most expensive turns and top spenders.">Trends</a>
     <a href="/?{{ qs_users }}" class="{{ 'active' if tab == 'users' else '' }}"
-      title="Engagement view: who is new, returning, or dormant.">Users</a>
+      title="Engagement view: who is new, active, or dormant — plus a small chip filter for log-frequency patterns (every day, most days, occasional, once, multiple/day).">Users</a>
     <a href="/?{{ qs_accounts }}" class="{{ 'active' if tab == 'accounts' else '' }}"
       title="List, grant/revoke, soft-delete, restore and purge user accounts.">Accounts</a>
     <a href="/?{{ qs_keys }}" class="{{ 'active' if tab == 'keys' else '' }}"
@@ -3242,8 +3329,14 @@ def _users_context(compute_ctx, dormant_days=14):
     counts = {
         "active": sum(1 for r in classification["rows"] if r["window_calls"] > 0),
         "new": len(classification["new"]),
-        "returning": len(classification["returning"]),
         "dormant": len(classification["dormant"]),
+        "heavy": sum(1 for r in classification["rows"] if r["heavy"]),
+    }
+    pattern_counts = {
+        "daily":      sum(1 for r in classification["rows"] if r["pattern"] == "daily"),
+        "most-days":  sum(1 for r in classification["rows"] if r["pattern"] == "most-days"),
+        "occasional": sum(1 for r in classification["rows"] if r["pattern"] == "occasional"),
+        "once":       sum(1 for r in classification["rows"] if r["pattern"] == "once"),
     }
     cs, ce = classification["window"]
     cohort_window = f"{cs.date()} → {ce.date()}"
@@ -3255,6 +3348,7 @@ def _users_context(compute_ctx, dormant_days=14):
     compute_ctx.update(
         classification=classification,
         counts=counts,
+        pattern_counts=pattern_counts,
         cohort_window=cohort_window,
         dormant_days=dormant_days,
         chart_active_users=chart_active_users,
