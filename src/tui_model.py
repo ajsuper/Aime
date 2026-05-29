@@ -454,6 +454,12 @@ class TopicView(Container):
             target.update("[dim]no topics yet[/dim]")
             return
 
+        # Uncategorized topics sink to the end so the alphabetical run stays intact.
+        topics = sorted(
+            topics,
+            key=lambda tp: (not (tp.get("category") or ""), (tp.get("category") or "").lower()),
+        )
+
         lines = []
         for tp in topics:
             title = tp.get("title") or tp.get("name") or "(untitled)"
@@ -516,12 +522,22 @@ class Aime(App):
         os.makedirs(conv_dir, exist_ok=True)
         dek = _enc.load_or_create_key_file(os.path.join(tui_user_dir, "tui_dek"))
 
+        from aime.model_router import ModelRouter
+        from aime import usage as _aime_usage
+        router = ModelRouter(
+            haiku_model=aime_config.HAIKU_MODEL,
+            sonnet_model=aime_config.SONNET_MODEL,
+            router_model=aime_config.ROUTER_MODEL,
+            enabled=aime_config.MODEL_ROUTING_ENABLED,
+            record_api=_aime_usage.record_api,
+        )
         backend = AnthropicMessagesBackend(
             system_prompt=aime_config.load_system_prompt(),
             model=aime_config.AGENT_MODEL,
             schema_files=aime_config.SCHEMA_FILES,
             conversations_dir=conv_dir,
             dek=dek,
+            router=router,
         )
         backend.new_session()
 

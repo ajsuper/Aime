@@ -342,6 +342,135 @@ def _aggregate_cache(records):
     return users
 
 
+def _haiku_price() -> dict:
+    """Look up Haiku's base prices via the same prefix-match path the
+    dashboard uses for any other model id. Centralised here so a model id
+    change in usage_report.PRICES propagates to the routing tab."""
+    return _report._price_for("claude-haiku-4-5")
+
+
+def _sonnet_price() -> dict:
+    return _report._price_for("claude-sonnet-4-6")
+
+
+def _api_cost_at(rec: dict, price: dict) -> float:
+    """Same shape as ``_report._api_cost``, but bills the record's token
+    counts at an arbitrary ``price`` dict instead of the model the record
+    actually used. Lets the routing tab compute the counterfactual cost of
+    every Haiku-routed turn as if Sonnet had handled it (and vice versa).
+    Web-search is a flat per-request charge and is identical regardless of
+    routing, so it carries straight through."""
+    cc_5m, cc_1h = _report._cache_write_tokens(rec)
+    token_cost = (
+        rec.get("input_tokens", 0)        * price["in"]
+        + rec.get("output_tokens", 0)     * price["out"]
+        + rec.get("cache_read_tokens", 0) * price["in"] * _report.CACHE_READ_MULT
+        + cc_5m                           * price["in"] * _report.CACHE_WRITE_5M_MULT
+        + cc_1h                           * price["in"] * _report.CACHE_WRITE_1H_MULT
+    ) / 1_000_000.0
+    return token_cost + rec.get("web_search_requests", 0) * _report.WEB_SEARCH_COST_PER_REQUEST
+
+
+def _aggregate_routing(records):
+    """Build the Model Routing tab's figures.
+
+    Looks at api records carrying ``routed_decision`` (set by the backend
+    when the router picked the model for that turn) and at api records
+    with ``purpose == "route"`` (the classifier calls themselves).
+
+    For each routed turn:
+      * ``actual``        — what the call billed (same as ``_api_cost``).
+      * ``counterfactual`` — what the SAME token counts would have billed
+                             if priced at the OTHER pole's rate. For
+                             Haiku-routed turns this is the Sonnet cost we
+                             avoided; for Sonnet-routed turns it is the
+                             (hypothetical) Haiku cost — surfaced as info
+                             only, since we don't claim savings on those.
+
+    Per-user and overall figures:
+      * ``haiku_turns`` / ``sonnet_turns``
+      * ``haiku_savings``  — sum of (counterfactual − actual) on
+                             Haiku-routed turns. Always >= 0 by construction
+                             of the price table.
+      * ``router_cost``    — sum of actual cost of ``purpose="route"``
+                             classifier calls.
+      * ``net_savings``    — ``haiku_savings - router_cost``.
+      * ``maybe_misclass`` — Haiku-routed turns whose stop_reason is
+                             "max_tokens" OR whose token-count looks
+                             Sonnet-sized (>3000 input tokens). Hints that
+                             the classifier is being too generous.
+    """
+    sonnet_p = _sonnet_price()
+    haiku_p = _haiku_price()
+    users: dict = {}
+    for rec in records:
+        if rec.get("kind") != "api":
+            continue
+        name = rec.get("user") or "(anonymous)"
+        u = users.setdefault(name, {
+            "haiku_turns": 0, "sonnet_turns": 0,
+            "haiku_actual": 0.0, "haiku_counterfactual": 0.0,
+            "sonnet_actual": 0.0, "sonnet_counterfactual": 0.0,
+            "router_calls": 0, "router_cost": 0.0,
+            "maybe_misclass": 0,
+        })
+        purpose = rec.get("purpose") or ""
+        decision = rec.get("routed_decision")
+        if purpose == "route":
+            u["router_calls"] += 1
+            u["router_cost"] += _report._api_cost(rec)
+            continue
+        if decision == "haiku":
+            actual = _api_cost_at(rec, haiku_p)
+            counter = _api_cost_at(rec, sonnet_p)
+            u["haiku_turns"] += 1
+            u["haiku_actual"] += actual
+            u["haiku_counterfactual"] += counter
+            if (
+                rec.get("stop_reason") == "max_tokens"
+                or rec.get("input_tokens", 0) > 3000
+            ):
+                u["maybe_misclass"] += 1
+        elif decision == "sonnet":
+            actual = _api_cost_at(rec, sonnet_p)
+            counter = _api_cost_at(rec, haiku_p)
+            u["sonnet_turns"] += 1
+            u["sonnet_actual"] += actual
+            u["sonnet_counterfactual"] += counter
+    for u in users.values():
+        u["haiku_savings"] = max(
+            0.0, u["haiku_counterfactual"] - u["haiku_actual"]
+        )
+        u["net_savings"] = u["haiku_savings"] - u["router_cost"]
+        u["total_turns"] = u["haiku_turns"] + u["sonnet_turns"]
+        u["haiku_pct"] = (
+            100.0 * u["haiku_turns"] / u["total_turns"]
+            if u["total_turns"] else 0.0
+        )
+    return users
+
+
+def _routing_daily(records, day_keys):
+    """Two parallel series of length ``len(day_keys)``: Haiku-routed turns
+    per day and Sonnet-routed turns per day. Drives the stacked bar chart
+    on the routing tab."""
+    idx = {d: i for i, d in enumerate(day_keys)}
+    haiku = [0] * len(day_keys)
+    sonnet = [0] * len(day_keys)
+    for rec in records:
+        if rec.get("kind") != "api":
+            continue
+        day = (rec.get("ts") or "")[:10]
+        if day not in idx:
+            continue
+        decision = rec.get("routed_decision")
+        if decision == "haiku":
+            haiku[idx[day]] += 1
+        elif decision == "sonnet":
+            sonnet[idx[day]] += 1
+    return haiku, sonnet
+
+
 def _percentile(sorted_values, pct: float):
     """Linear-interpolated percentile of a pre-sorted list (or None if empty)."""
     if not sorted_values:
@@ -1961,6 +2090,101 @@ _FRAGMENT_TOOLS = """<div class="meta">
 """
 
 
+# Model Routing tab — how much the per-turn Haiku/Sonnet router saves vs an
+# always-Sonnet baseline, after subtracting the cheap classifier-call
+# overhead. Empty-state when no records carry a `routed_decision` (routing
+# disabled or pre-routing log entries).
+_FRAGMENT_ROUTING = """<div class="meta">
+    <span title="Filesystem path of the usage.jsonl log being read.">log: {{ log }}</span><br>
+    <span title="Records matching the current filters.">{{ record_count }} records</span>
+    &middot; <span title="Window the figures cover.">{{ window }}</span>
+    {% if user_raw %} &middot; <span>user: {{ user_raw }}</span>{% endif %}
+</div>
+
+{% if routing_total.total_turns == 0 and routing_total.router_calls == 0 %}
+  <p class="dim">No routed turns in this window. The Model Routing layer
+  records a <code>routed_decision</code> field on each turn it routes; if
+  this tab is empty, routing is either disabled
+  (<code>AIME_MODEL_ROUTING=0</code>) or the window predates the feature.</p>
+{% else %}
+
+  <div class="cards">
+    <div class="card accent-green"
+      title="Net USD saved by routing in this window. = (Sonnet cost we avoided by routing turns to Haiku) − (cost of the classifier calls themselves). Negative means the router is paying more than it saves — usually a sign the prompt mix is mostly hard turns.">
+      <div class="num good">${{ '%.2f' % routing_total.net_savings }}</div>
+      <div class="lbl">net savings</div></div>
+    <div class="card accent-blue"
+      title="Gross USD saved before subtracting classifier overhead. Computed by re-pricing every Haiku-routed turn's token counts at Sonnet's rate and taking the difference.">
+      <div class="num blue">${{ '%.2f' % routing_total.haiku_savings }}</div>
+      <div class="lbl">gross savings</div></div>
+    <div class="card accent-amber"
+      title="USD spent on the classifier Haiku calls themselves (purpose=route). Subtracted from gross savings to get net.">
+      <div class="num warn">${{ '%.4f' % routing_total.router_cost }}</div>
+      <div class="lbl">router overhead</div></div>
+    <div class="card accent-blue"
+      title="Share of routed turns sent to Haiku. A higher number means the router thinks more of the conversation is read-only lookups.">
+      <div class="num">{{ '%.1f%%' % routing_total.haiku_pct }}</div>
+      <div class="lbl">{{ '{:,}'.format(routing_total.haiku_turns) }} / {{ '{:,}'.format(routing_total.total_turns) }} → haiku</div></div>
+    {% if routing_total.maybe_misclass %}
+    <div class="card accent-red"
+      title="Haiku-routed turns that look mis-routed: either the model hit max_tokens or the input was Sonnet-sized (>3000 input tokens). Use as a hint to harden the classifier prompt, not a hard error count.">
+      <div class="num bad">{{ '{:,}'.format(routing_total.maybe_misclass) }}</div>
+      <div class="lbl">likely misclassified</div></div>
+    {% endif %}
+  </div>
+
+  <h2 title="Per-day count of routed turns split by which model handled them. Watch this for whether the cheap-model share is growing, shrinking, or stable.">Routed turns per day</h2>
+  {{ chart_routing_stack | safe }}
+
+  <h2 title="One row per user with at least one routed turn. Sorted by net savings (largest first). 'Likely misclass' counts Haiku-routed turns that look like they should have been Sonnet — use as a tuning hint, not a hard error count.">By user</h2>
+  <table>
+    <thead>
+      <tr>
+        <th title="Username, or (anonymous) when user linkage is off.">User</th>
+        <th title="Turns the router sent to Haiku.">→ Haiku</th>
+        <th title="Turns the router sent to Sonnet.">→ Sonnet</th>
+        <th title="Share of this user's routed turns that went to Haiku.">Cheap %</th>
+        <th title="USD this user actually spent on Haiku-routed turns.">Haiku $</th>
+        <th title="USD Sonnet would have charged for the same token counts. The difference is the gross saving.">Counterfactual $</th>
+        <th title="Gross USD saved on Haiku-routed turns (counterfactual − actual).">Gross $</th>
+        <th title="USD this user's classifier (route) calls cost.">Router $</th>
+        <th title="Net USD saved = gross − router overhead. Negative if the classifier ate more than it saved.">Net $</th>
+        <th title="Haiku-routed turns whose stop_reason is max_tokens OR whose input was Sonnet-sized (>3000 input tokens). Hint that the classifier was too generous.">Likely misclass</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for name, u in routing_users %}
+      <tr>
+        <td><a href="/user/{{ name }}">{{ name }}</a></td>
+        <td>{{ '{:,}'.format(u.haiku_turns) }}</td>
+        <td>{{ '{:,}'.format(u.sonnet_turns) }}</td>
+        <td>{{ '%.1f%%' % u.haiku_pct }}</td>
+        <td>${{ '%.4f' % u.haiku_actual }}</td>
+        <td>${{ '%.4f' % u.haiku_counterfactual }}</td>
+        <td>${{ '%.4f' % u.haiku_savings }}</td>
+        <td>${{ '%.4f' % u.router_cost }}</td>
+        <td class="{{ 'good' if u.net_savings > 0 else ('bad' if u.net_savings < 0 else 'dim') }}">${{ '%.4f' % u.net_savings }}</td>
+        <td class="{{ 'bad' if u.maybe_misclass else 'dim' }}">{{ '{:,}'.format(u.maybe_misclass) if u.maybe_misclass else '—' }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  <h2 title="How the savings number is computed.">How this is estimated</h2>
+  <p>For every turn the router handled, the backend stamps the api record
+  with <code>routed_decision</code> (<em>haiku</em> or <em>sonnet</em>). For
+  each Haiku-routed turn the dashboard re-prices the exact same token counts
+  (input, output, cache reads, cache writes at their TTL splits) at Sonnet's
+  base rates; the difference is what routing saved on that turn. Web-search
+  flat charges are identical regardless of routing and cancel out.</p>
+  <p>The classifier itself is a tiny Haiku call (one user message,
+  <code>max_tokens=4</code>) tagged with <code>purpose=route</code>. Its
+  actual billed cost is subtracted to get the net figure shown in the
+  green card.</p>
+{% endif %}
+"""
+
+
 # Trends tab — period-over-period deltas, anomaly highlights, and a top-N
 # table for the single most expensive turns in the window. Designed for a
 # weekly-glance "did anything weird happen" read, not deep forensics.
@@ -2842,6 +3066,8 @@ _PAGE = """<!doctype html>
       title="How much each agent tool is costing — invocation counts, estimated downstream input cost, and exact server-tool (web_search) charges. Use this to decide which tools to trim or gate.">Tools</a>
     <a href="/?{{ qs_trends }}" class="{{ 'active' if tab == 'trends' else '' }}"
       title="Period-over-period deltas, anomaly day flags, top-N most expensive turns and top spenders.">Trends</a>
+    <a href="/?{{ qs_routing }}" class="{{ 'active' if tab == 'routing' else '' }}"
+      title="Per-turn Haiku/Sonnet routing — estimated cost saved versus an always-Sonnet baseline, after subtracting the cheap classifier overhead.">Model Routing</a>
     <a href="/?{{ qs_users }}" class="{{ 'active' if tab == 'users' else '' }}"
       title="Engagement view: who is new, active, or dormant — plus a small chip filter for log-frequency patterns (every day, most days, occasional, once, multiple/day).">Users</a>
     <a href="/?{{ qs_accounts }}" class="{{ 'active' if tab == 'accounts' else '' }}"
@@ -2856,7 +3082,7 @@ _PAGE = """<!doctype html>
   <div class="flash {{ f.level }}">{{ f.msg }}</div>
   {% endfor %}
 
-  {% if tab in ('overview', 'cache', 'activity', 'tools', 'trends', 'users') %}
+  {% if tab in ('overview', 'cache', 'activity', 'tools', 'trends', 'users', 'routing') %}
   <form class="filter" method="get">
     <input type="hidden" name="tab" value="{{ tab }}">
     <label title="Only include records on or after this date, interpreted in UTC. Accepts YYYY-MM-DD or a full ISO-8601 timestamp. Leave blank for no lower bound.">Since (UTC)
@@ -3304,6 +3530,44 @@ def _compute(args):
     tool_total_calls = sum(t["calls"] for _n, t in by_tool)
     tool_top_name, tool_top_cost = (by_tool[0][0], by_tool[0][1]["cost"]) if by_tool else ("—", 0.0)
 
+    # --- Model Routing tab aggregations ---
+    # Sums savings from Haiku-routed turns (vs counterfactual Sonnet cost on
+    # the same token counts), subtracts the classifier-call overhead, and
+    # tallies misclassification hints. Renders empty-state gracefully when
+    # the log carries no `routed_decision` field yet (pre-routing records or
+    # routing disabled).
+    routing_users_map = _aggregate_routing(records)
+    routing_users = sorted(
+        routing_users_map.items(),
+        key=lambda kv: kv[1]["net_savings"],
+        reverse=True,
+    )
+    routing_total = {
+        "haiku_turns": sum(u["haiku_turns"] for _n, u in routing_users),
+        "sonnet_turns": sum(u["sonnet_turns"] for _n, u in routing_users),
+        "haiku_actual": sum(u["haiku_actual"] for _n, u in routing_users),
+        "haiku_counterfactual": sum(u["haiku_counterfactual"] for _n, u in routing_users),
+        "haiku_savings": sum(u["haiku_savings"] for _n, u in routing_users),
+        "router_calls": sum(u["router_calls"] for _n, u in routing_users),
+        "router_cost": sum(u["router_cost"] for _n, u in routing_users),
+        "maybe_misclass": sum(u["maybe_misclass"] for _n, u in routing_users),
+    }
+    routing_total["total_turns"] = (
+        routing_total["haiku_turns"] + routing_total["sonnet_turns"]
+    )
+    routing_total["haiku_pct"] = (
+        100.0 * routing_total["haiku_turns"] / routing_total["total_turns"]
+        if routing_total["total_turns"] else 0.0
+    )
+    routing_total["net_savings"] = (
+        routing_total["haiku_savings"] - routing_total["router_cost"]
+    )
+    routing_haiku_daily, routing_sonnet_daily = _routing_daily(records, day_keys)
+    chart_routing_stack = _svg_stacked_bars(
+        day_keys,
+        [("haiku", routing_haiku_daily), ("sonnet", routing_sonnet_daily)],
+    )
+
     return dict(
         log=path,
         record_count=len(records),
@@ -3379,6 +3643,10 @@ def _compute(args):
         tool_total_calls=tool_total_calls,
         tool_top_name=tool_top_name,
         tool_top_cost=tool_top_cost,
+        # model routing
+        routing_users=routing_users,
+        routing_total=routing_total,
+        chart_routing_stack=chart_routing_stack,
         # records carried for Trends-tab post-processing
         _records=records,
         _all_records=all_records,
@@ -3619,7 +3887,8 @@ def _user_context(username: str):
 def _tab(args) -> str:
     t = args.get("tab")
     return t if t in ("overview", "cache", "activity", "tools", "trends",
-                      "users", "accounts", "keys", "system") else "overview"
+                      "users", "routing", "accounts", "keys",
+                      "system") else "overview"
 
 
 def _render_fragment(ctx, tab) -> str:
@@ -3629,6 +3898,7 @@ def _render_fragment(ctx, tab) -> str:
         "tools": _FRAGMENT_TOOLS,
         "trends": _FRAGMENT_TRENDS,
         "users": _FRAGMENT_USERS,
+        "routing": _FRAGMENT_ROUTING,
         "accounts": _FRAGMENT_ACCOUNTS,
         "keys": _FRAGMENT_KEYS,
         "system": _FRAGMENT_SYSTEM,
@@ -3733,7 +4003,7 @@ def index():
             if request.args.get(k)}
     qs = {t: urlencode({**keep, "tab": t})
           for t in ("overview", "cache", "activity", "tools", "trends", "users",
-                    "accounts", "keys", "system")}
+                    "routing", "accounts", "keys", "system")}
 
     return render_template_string(
         _PAGE, fragment=fragment, tab=tab, auto=auto,
@@ -3742,6 +4012,7 @@ def index():
         qs_overview=qs["overview"], qs_cache=qs["cache"],
         qs_activity=qs["activity"], qs_tools=qs["tools"],
         qs_trends=qs["trends"], qs_users=qs["users"],
+        qs_routing=qs["routing"],
         qs_accounts=qs["accounts"], qs_keys=qs["keys"],
         qs_system=qs["system"], **page_ctx,
     )
@@ -3784,7 +4055,7 @@ def user_drilldown(username):
                           all_users=[], all_models=[], all_purposes=[])
     qs = {t: urlencode({"tab": t})
           for t in ("overview", "cache", "activity", "tools", "trends", "users",
-                    "accounts", "keys", "system")}
+                    "routing", "accounts", "keys", "system")}
     return render_template_string(
         _PAGE, fragment=fragment, tab="user", auto=0,
         auto_label="second",
@@ -3792,6 +4063,7 @@ def user_drilldown(username):
         qs_overview=qs["overview"], qs_cache=qs["cache"],
         qs_activity=qs["activity"], qs_tools=qs["tools"],
         qs_trends=qs["trends"], qs_users=qs["users"],
+        qs_routing=qs["routing"],
         qs_accounts=qs["accounts"], qs_keys=qs["keys"],
         qs_system=qs["system"], **empty_page_ctx,
     )

@@ -42,6 +42,27 @@ SCHEMA_FILES = [
 
 AGENT_MODEL = "claude-sonnet-4-6"
 
+# Model routing: cheap Haiku for read-only lookup turns, Sonnet for anything
+# that creates/edits state or needs multi-step reasoning. A small classifier
+# Haiku call picks per turn; see aime.model_router.
+SONNET_MODEL = "claude-sonnet-4-6"
+HAIKU_MODEL = "claude-haiku-4-5-20251001"
+ROUTER_MODEL = "claude-haiku-4-5-20251001"
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return bool(int(raw))
+    except ValueError:
+        return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+# AIME_MODEL_ROUTING=0 forces every turn to Sonnet (the original behavior).
+MODEL_ROUTING_ENABLED = _env_flag("AIME_MODEL_ROUTING", True)
+
 
 def load_system_prompt(path: str = SYSTEM_PROMPT_PATH) -> str:
     with open(path) as f:

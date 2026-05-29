@@ -47,6 +47,8 @@ CoreEventKind = Literal[
     "session_restart",          # transcript should be cleared (reset or load)
     "session_terminated",       # backend session closed
     "error",                    # unrecoverable controller/backend error
+    "turn_routing",             # router picked a model for the next turn
+                                # (emitted only when verbose mode is on)
 ]
 
 
@@ -364,6 +366,15 @@ class ConversationController:
                 self._emit(CoreEvent(kind="assistant_thinking", text=event.text or ""))
         elif kind == "assistant_use_tool":
             self._handle_tool_use(event)
+        elif kind == "turn_routing":
+            # Always forward the router's pick to frontends; whether it
+            # actually surfaces in the UI is the frontend's verbosity
+            # decision. The web frontend gates this on its `verbosity ===
+            # "verbose"` setting (see web_chat.html); the TUI can do
+            # similarly. Keeping the gate frontend-side avoids a
+            # backend/frontend toggle pair that disagree.
+            label = (event.text or "").strip() or "sonnet"
+            self._emit(CoreEvent(kind="turn_routing", text=label))
         elif kind == "turn_end":
             self._emit(CoreEvent(
                 kind="turn_end",
