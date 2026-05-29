@@ -183,6 +183,46 @@ def record_api(
     _append(rec)
 
 
+def record_tool_use(
+    user: str | None,
+    tool_name: str,
+    tool_kind: str,
+    *,
+    model: str | None = None,
+    result_bytes: int = 0,
+    web_search_requests: int = 0,
+    session_id: str | None = None,
+) -> None:
+    """Record one tool invocation by the agent.
+
+    Emitted once per tool_use block: client tools record at the point the UI
+    returns its tool_result (so `result_bytes` reflects what actually gets
+    re-injected as fresh input on the next turn); server tools (web_search)
+    record inline when their server-side result lands.
+
+    `tool_kind` is "client" (locally executed, gateway-backed) or "server"
+    (Anthropic-side, e.g. web_search). For server tools, `web_search_requests`
+    is the count Anthropic billed for that block — used to render exact
+    flat-rate cost rather than estimating from bytes.
+
+    `model` is the model id of the turn that emitted the tool_use, recorded
+    so the dashboard can price the result's downstream input-token cost at
+    that turn's rate (rather than guessing a default).
+    """
+    if not _enabled():
+        return
+    rec = _base_record("tool", user)
+    rec.update({
+        "tool_name": tool_name or "(unknown)",
+        "tool_kind": tool_kind or "client",
+        "model": model or "",
+        "result_bytes": int(result_bytes or 0),
+        "web_search_requests": int(web_search_requests or 0),
+        "session_id": session_id if (session_id and _link_users()) else None,
+    })
+    _append(rec)
+
+
 def record_stt(
     user: str | None,
     model: str,

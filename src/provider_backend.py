@@ -291,6 +291,11 @@ class AnthropicMessagesBackend:
         self._messages: list[dict] = []
         self._pending_tool_results: list[dict] = []
         self._expected_tool_use_ids: set[str] = set()
+        # Maps a live tool_use id to (tool_name, model) so that when the
+        # matching tool_result lands we can attribute its byte size to the
+        # right tool and price it at the turn's model rate. Entries are
+        # popped on tool_send_response; an interrupt cleanup clears the dict.
+        self._tool_attrib: dict[str, tuple[str, str]] = {}
         self._turn_trigger = threading.Event()
         self._terminated = threading.Event()
         # Set by interrupt_turn() to stop the current _run_turn loop without
@@ -383,6 +388,7 @@ class AnthropicMessagesBackend:
             self._title_generating = False
             self._pending_tool_results = []
             self._expected_tool_use_ids = set()
+            self._tool_attrib.clear()
             self._session_context = ""
         self._terminated.clear()
         self._turn_trigger.clear()
@@ -420,6 +426,7 @@ class AnthropicMessagesBackend:
             self._title_generating = False
             self._pending_tool_results = []
             self._expected_tool_use_ids = set()
+            self._tool_attrib.clear()
             self._session_context = ""
         self._terminated.clear()
         self._turn_trigger.clear()
@@ -631,6 +638,23 @@ class AnthropicMessagesBackend:
                 # even streams out, which leaves B landing in an assistant
                 # message that already has a following user message — i.e.
                 # an orphan tool_use.
+                attrib = self._tool_attrib.pop(event.tool_use_id, None)
+            if attrib is not None:
+                # Recorded after releasing the lock: usage IO must not block
+                # the agent loop, and a stats failure must never break a turn.
+                try:
+                    import aime.usage as _usage
+                    tname, tmodel = attrib
+                    _usage.record_tool_use(
+                        self._usage_label,
+                        tname,
+                        "client",
+                        model=tmodel,
+                        result_bytes=len(content_text.encode("utf-8")),
+                        session_id=self._session_id,
+                    )
+                except Exception:
+                    pass
         else:
             raise ValueError(f"submit() does not accept event kind: {event.kind}")
 
@@ -873,6 +897,7 @@ class AnthropicMessagesBackend:
             }]
             self._pending_tool_results = []
             self._expected_tool_use_ids = set()
+            self._tool_attrib.clear()
         self._persist()
 
     def _discard_failed_assistant_placeholder(self) -> None:
@@ -946,6 +971,22 @@ class AnthropicMessagesBackend:
                         with self._lock:
                             assistant_blocks.append(result_block)
                         count = len(result_block["content"]) if isinstance(result_block["content"], list) else 0
+                        # Server tool: bills flat per request, but its result
+                        # block still injects bytes into the next-turn prompt
+                        # as input. Record both — dashboard combines them.
+                        try:
+                            import aime.usage as _usage
+                            _usage.record_tool_use(
+                                self._usage_label,
+                                "web_search",
+                                "server",
+                                model=self._model,
+                                result_bytes=len(json.dumps(result_block.get("content"))),
+                                web_search_requests=1,
+                                session_id=self._session_id,
+                            )
+                        except Exception:
+                            pass
                         yield BackendEvent(
                             kind="assistant_use_tool",
                             tool_name="web_search_result",
@@ -979,6 +1020,13 @@ class AnthropicMessagesBackend:
                                 # tool_send_response can't see an empty set and
                                 # prematurely flush pending results.
                                 self._expected_tool_use_ids.add(current_tool["id"])
+                                # Stash name + model so the matching
+                                # tool_send_response can attribute the result's
+                                # byte size to this tool, priced at this turn's
+                                # model rate.
+                                self._tool_attrib[current_tool["id"]] = (
+                                    current_tool["name"], self._model,
+                                )
                         yield BackendEvent(
                             kind="assistant_use_tool",
                             tool_name=current_tool["name"],
@@ -1131,6 +1179,7 @@ class AnthropicMessagesBackend:
             # Discard any tool_results we haven't yet appended as a user
             # message — they belong to tool_use IDs we're about to orphan.
             self._pending_tool_results = []
+            self._tool_attrib.clear()
 
             # Locate the assistant placeholder we appended at the start
             # of this turn (mid-stream cases). The reference comparison
