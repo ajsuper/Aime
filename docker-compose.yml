@@ -44,6 +44,11 @@ services:
       AIME_USAGE_STATS: "${AIME_USAGE_STATS:-0}"
       AIME_USAGE_LINK_USERS: "${AIME_USAGE_LINK_USERS:-0}"
       AIME_USAGE_DASHBOARD: "${AIME_USAGE_DASHBOARD:-0}"
+      # Number of reverse-proxy hops between the client and Flask. 1 matches
+      # the documented "Caddy/nginx -> Flask" topology. Set to 0 only if
+      # Flask is reached directly (loopback). Setting this higher than the
+      # actual hop count lets clients spoof X-Forwarded-For.
+      AIME_TRUSTED_PROXY_HOPS: "${AIME_TRUSTED_PROXY_HOPS:-1}"
     volumes:
       # All persistent state: user databases, conversations, encryption keys,
       # auth, and the self-signed TLS cert. Losing this loses everything.

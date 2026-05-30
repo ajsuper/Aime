@@ -481,6 +481,25 @@ def _context_for(user_id: int) -> UserContext:
 
 app = Flask(__name__)
 app.secret_key = _SECRET_KEY
+
+# Reverse-proxy awareness. When AIME_TRUSTED_PROXY_HOPS > 0, ProxyFix rewrites
+# request.remote_addr and request.scheme from X-Forwarded-For / -Proto so the
+# signup IP rate limiter and the security audit log see the real client IP
+# instead of the proxy's. The hop count must equal the number of proxies
+# actually in front of Flask — trusting more hops than exist lets a client
+# spoof their source IP via a forged header. Default 0 (ignore forwarded
+# headers) is the safe value for direct/loopback installs; set to 1 when
+# running behind a single reverse proxy (Caddy, nginx, ALB). The docker-compose
+# defaults this to 1 because that deployment is documented as behind-a-proxy.
+_TRUSTED_PROXY_HOPS = int(os.environ.get("AIME_TRUSTED_PROXY_HOPS", "0"))
+if _TRUSTED_PROXY_HOPS > 0:
+    from werkzeug.middleware.proxy_fix import ProxyFix
+    app.wsgi_app = ProxyFix(
+        app.wsgi_app,
+        x_for=_TRUSTED_PROXY_HOPS,
+        x_proto=_TRUSTED_PROXY_HOPS,
+        x_host=_TRUSTED_PROXY_HOPS,
+    )
 # Session cookie hardening. `Secure` is conditional so local http://127.0.0.1
 # development still works; flip on AIME_HTTPS=1 when serving behind TLS.
 app.config.update(
@@ -764,7 +783,9 @@ def login_submit():
     username = (request.form.get("username") or "").strip()
     password = request.form.get("password") or ""
     try:
-        user, _dek, was_reinitialized = _auth_backend.verify(username, password)
+        user, _dek, was_reinitialized = _auth_backend.verify(
+            username, password, ip=request.remote_addr,
+        )
     except _auth.AccountLocked as e:
         return Response(
             _load_login_page(login_error=str(e)),
@@ -993,6 +1014,9 @@ def signup_submit():
     # remote_addr — we don't honor X-Forwarded-For unless explicitly set up
     # to (avoids spoofed-header bypass when running without a trusted proxy).
     if not _signup_limiter.hit(request.remote_addr or "unknown"):
+        _auth_backend.log_event(
+            _auth.EVENT_SIGNUP_RATE_LIMITED, ip=request.remote_addr,
+        )
         return Response(
             _load_login_page(signup_error="Too many signups from this address. Try again later."),
             mimetype="text/html", status=429,
@@ -1003,6 +1027,10 @@ def signup_submit():
     password2 = request.form.get("password2") or ""
 
     def _signup_err(msg: str, status: int = 400):
+        _auth_backend.log_event(
+            _auth.EVENT_SIGNUP_FAILED,
+            username=username or None, ip=request.remote_addr, detail=msg,
+        )
         return Response(
             _load_login_page(
                 signup_error=msg,

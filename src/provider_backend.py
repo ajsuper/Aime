@@ -1187,8 +1187,15 @@ class AnthropicMessagesBackend:
                 **new_content[-1],
                 "cache_control": {"type": "ephemeral", "ttl": "5m"},
             }
-            # Trails the breakpoint: uncached, changes every minute, harmless.
-            new_content.append(self._date_block())
+            # Only attach the clock to fresh user-text turns. On tool_result
+            # turns the trailing <clock> block becomes the sole "textual" thing
+            # the model sees the user say, which makes it narrate as if the
+            # user's message was empty (and tempts Haiku to echo the tag back).
+            if last.get("role") == "user" and not any(
+                isinstance(b, dict) and b.get("type") == "tool_result"
+                for b in content
+            ):
+                new_content.append(self._date_block())
             out[-1] = {**last, "content": new_content}
         return out
 
