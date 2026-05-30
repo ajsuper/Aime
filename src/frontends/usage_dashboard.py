@@ -36,6 +36,7 @@ import os
 import sys
 import secrets
 import datetime
+import zoneinfo
 from functools import wraps
 from urllib.parse import urlencode
 
@@ -104,6 +105,64 @@ _REFRESH_DEFAULT = 0
 # 5-minute cache TTL, in seconds. Median request spacing above this means a
 # 5m-TTL cache write tends to expire before it is ever read back.
 _CACHE_5M_TTL = 300
+
+# Time zones offered in the dashboard's tz dropdown. UTC stays first as the
+# safe default for shared / production deploys; the rest are picked for the
+# current beta cohort. "auto" is resolved client-side via Intl before submit.
+_COMMON_TIMEZONES = (
+    "UTC",
+    "America/Los_Angeles",
+    "America/Denver",
+    "America/Chicago",
+    "America/New_York",
+    "Europe/London",
+    "Europe/Berlin",
+    "Asia/Tokyo",
+    "Australia/Sydney",
+)
+
+
+def _resolve_zone(tz_raw: str) -> tuple[zoneinfo.ZoneInfo | None, str]:
+    """Map the raw `tz` query arg to (ZoneInfo|None, display label).
+
+    None means UTC — we skip the per-record shift in that case. Unknown names
+    (including the literal "auto", which JS is supposed to replace before the
+    form submits) also degrade to UTC rather than 500ing the page.
+    """
+    name = (tz_raw or "").strip()
+    if not name or name.upper() == "UTC" or name.lower() == "auto":
+        return None, "UTC"
+    try:
+        return zoneinfo.ZoneInfo(name), name
+    except zoneinfo.ZoneInfoNotFoundError:
+        return None, "UTC"
+
+
+def _shift_records_to_zone(records, zone: zoneinfo.ZoneInfo) -> None:
+    """Rewrite each record's `ts` field from naive-UTC to naive-local in
+    `zone`, in place. Handled per-record so DST transitions inside the visible
+    window are converted correctly rather than at a single window-wide offset."""
+    for rec in records:
+        ts = rec.get("ts")
+        if not ts:
+            continue
+        try:
+            dt_utc = datetime.datetime.fromisoformat(ts).replace(
+                tzinfo=datetime.timezone.utc)
+        except ValueError:
+            continue
+        rec["ts"] = dt_utc.astimezone(zone).replace(tzinfo=None).isoformat(
+            timespec="seconds")
+
+
+def _local_now(zone: zoneinfo.ZoneInfo | None) -> datetime.datetime:
+    """`datetime.now()` in the dashboard's selected display zone, returned as
+    a naive value so it can be compared against the (already-shifted) `ts`
+    strings without tripping aware/naive type errors."""
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    if zone is None:
+        return now_utc.replace(tzinfo=None)
+    return now_utc.astimezone(zone).replace(tzinfo=None)
 
 # Lazily-built shared auth backend (holds a sqlite connection). Built on first
 # admin use so a usage-only glance never opens auth.sql.
@@ -813,7 +872,7 @@ def _per_model_sparkline_data(records, day_keys):
     return out
 
 
-def _compare_periods(all_records, since, until):
+def _compare_periods(all_records, since, until, *, now=None):
     """Headline figures for the current window and the immediately-preceding
     equal-length window — for the Trends tab's period-over-period KPI cards.
 
@@ -823,9 +882,10 @@ def _compare_periods(all_records, since, until):
     needs to render as "no comparison available" simply because the admin did
     not type a date.
     """
-    # Naive UTC to match how every other timestamp in the log is parsed
-    # (datetime.fromisoformat on the stored 'ts' returns naive datetimes).
-    now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+    # Naive value in the dashboard's selected display zone, to match the (also
+    # shifted) `ts` strings on each record.
+    if now is None:
+        now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
     end = until or now
     if since:
         start = since
@@ -1012,7 +1072,7 @@ def _rolling_average(values, window=7):
     return out
 
 
-def _classify_users(all_records, *, since, until, dormant_days=14):
+def _classify_users(all_records, *, since, until, dormant_days=14, now=None):
     """Per-user activity classification — three statuses, one engagement pattern.
 
     Status (mutually exclusive):
@@ -1032,7 +1092,8 @@ def _classify_users(all_records, *, since, until, dormant_days=14):
     active day — that's the "logged on multiple times per day" cohort the
     admin asked for, surfaced as a filter chip rather than a status.
     """
-    now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+    if now is None:
+        now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
     end = until or now
     start = since or (end - datetime.timedelta(days=30))
     window_days = max(1, (end.date() - start.date()).days + 1)
@@ -1466,7 +1527,7 @@ def _svg_stacked_bars(day_keys, series, *, width=720, height=220, money=False):
     )
 
 
-def _svg_hour_bars(hours, *, width=720, height=120):
+def _svg_hour_bars(hours, *, width=720, height=120, tz_label="UTC"):
     """A wider, labelled replacement for the inline-CSS hourly bar block."""
     if not hours:
         return ""
@@ -1486,7 +1547,7 @@ def _svg_hour_bars(hours, *, width=720, height=120):
         rects.append(
             f'<rect x="{x:.1f}" y="{y:.1f}" width="{bar_w:.1f}" '
             f'height="{max(1, h):.1f}" fill="{col}" rx="1"><title>'
-            f'{i:02d}:00 UTC — {c:,} call{"s" if c != 1 else ""}</title></rect>'
+            f'{i:02d}:00 {tz_label} — {c:,} call{"s" if c != 1 else ""}</title></rect>'
         )
 
     labels = []
@@ -3048,7 +3109,7 @@ _PAGE = """<!doctype html>
   <div class="print-only print-header">
     <div class="h">Aime admin — {{ tab }}</div>
     <div class="sub">
-      {% if since_raw or until_raw %}window: {{ since_raw or 'start' }} → {{ until_raw or 'now' }} (UTC){% else %}window: all time{% endif %}
+      {% if since_raw or until_raw %}window: {{ since_raw or 'start' }} → {{ until_raw or 'now' }} ({{ tz_label or 'UTC' }}){% else %}window: all time ({{ tz_label or 'UTC' }}){% endif %}
       {% if user_raw %} &middot; user: {{ user_raw }}{% endif %}
       {% if model_raw %} &middot; model: {{ model_raw }}{% endif %}
       {% if purpose_raw %} &middot; purpose: {{ purpose_raw }}{% endif %}
@@ -3085,10 +3146,10 @@ _PAGE = """<!doctype html>
   {% if tab in ('overview', 'cache', 'activity', 'tools', 'trends', 'users', 'routing') %}
   <form class="filter" method="get">
     <input type="hidden" name="tab" value="{{ tab }}">
-    <label title="Only include records on or after this date, interpreted in UTC. Accepts YYYY-MM-DD or a full ISO-8601 timestamp. Leave blank for no lower bound.">Since (UTC)
+    <label title="Only include records on or after this date, interpreted in the selected time zone. Accepts YYYY-MM-DD or a full ISO-8601 timestamp. Leave blank for no lower bound.">Since ({{ tz_label or 'UTC' }})
       <input type="text" name="since" value="{{ since_raw }}" placeholder="YYYY-MM-DD">
     </label>
-    <label title="Only include records on or before this date, interpreted in UTC. A bare YYYY-MM-DD covers the whole UTC day (through 23:59:59 UTC). Leave blank for no upper bound.">Until (UTC)
+    <label title="Only include records on or before this date, interpreted in the selected time zone. A bare YYYY-MM-DD covers the whole day in that zone (through 23:59:59). Leave blank for no upper bound.">Until ({{ tz_label or 'UTC' }})
       <input type="text" name="until" value="{{ until_raw }}" placeholder="YYYY-MM-DD">
     </label>
     <div class="quick-group" title="Quick presets that fill the Since / Until fields and apply immediately."><span>Quick range</span>
@@ -3125,6 +3186,17 @@ _PAGE = """<!doctype html>
         {% endfor %}
       </select>
     </label>
+    <label title="Time zone used to interpret the Since/Until filters and to bucket records by day and hour-of-day. UTC is the safe default for shared deployments; Auto reads the browser's IANA zone via JavaScript and uses it as the dashboard's display zone.">Time zone
+      <select name="tz">
+        <option value="auto" {{ 'selected' if tz_raw == 'auto' else '' }}>Auto (browser)</option>
+        {% for name in tz_options %}
+        <option value="{{ name }}" {{ 'selected' if tz_raw == name or (not tz_raw and name == 'UTC') else '' }}>{{ name }}</option>
+        {% endfor %}
+        {% if tz_raw and tz_raw != 'auto' and tz_raw not in tz_options %}
+        <option value="{{ tz_raw }}" selected>{{ tz_raw }}</option>
+        {% endif %}
+      </select>
+    </label>
     <label title="How often the figures reload in place. The data region updates without disturbing this form or your scroll position.">Auto-refresh
       <select name="auto">
         <option value="0" {{ 'selected' if auto == 0 else '' }}>off</option>
@@ -3136,7 +3208,7 @@ _PAGE = """<!doctype html>
     <button type="submit" title="Apply the filters above and reload the data.">Apply</button>
     <a href="{{ request.path }}?tab={{ tab }}" title="Clear all filters and return to the all-time view on this tab.">reset</a>
   </form>
-  <p class="note" title="Dates and timestamps throughout the dashboard — the Since/Until filters, the By day grouping, and log timestamps — are all UTC. The dashboard runs in a container with no timezone configured, so it uses UTC by default.">All dates and times shown are <strong>UTC</strong>.</p>
+  <p class="note" title="Dates and timestamps throughout the dashboard — the Since/Until filters, the By day grouping, and log timestamps — are interpreted in the selected time zone. Pick UTC for a deploy-wide view, a named zone to anchor a specific region, or Auto to follow the browser's IANA zone.">All dates and times shown are <strong>{{ tz_label or 'UTC' }}</strong>.</p>
   {% endif %}
 
   <div id="data">{{ fragment|safe }}</div>
@@ -3178,6 +3250,38 @@ _PAGE = """<!doctype html>
         r.style.display = show ? "" : "none";
       });
     });
+
+    // When the tz select is "auto", resolve it to the browser's IANA zone
+    // before the filter form submits so the server sees a concrete name.
+    // Quick-range presets and the regular Apply submit both flow through here.
+    (function () {
+      var form = document.querySelector("form.filter");
+      if (!form) return;
+      form.addEventListener("submit", function () {
+        var tz = form.elements["tz"];
+        if (tz && tz.value === "auto") {
+          try {
+            var detected = Intl.DateTimeFormat().resolvedOptions().timeZone;
+            if (detected) {
+              // Carry the original mode as a hidden field so the next render
+              // can re-select "Auto" in the dropdown rather than the resolved
+              // name — keeps the choice sticky across navigations.
+              var mode = document.createElement("input");
+              mode.type = "hidden";
+              mode.name = "tz";
+              mode.value = detected;
+              form.appendChild(mode);
+              tz.disabled = true;
+              var flag = document.createElement("input");
+              flag.type = "hidden";
+              flag.name = "tz_auto";
+              flag.value = "1";
+              form.appendChild(flag);
+            }
+          } catch (e) { /* leave tz=auto; server falls back to UTC */ }
+        }
+      });
+    })();
 
     // Quick-range presets: fill the Since/Until fields and submit the filter
     // form. `days` is the inclusive window size (0 = today only); null clears
@@ -3309,10 +3413,18 @@ def _compute(args):
     user_raw = args.get("user", "").strip()
     model_raw = args.get("model", "").strip()
     purpose_raw = args.get("purpose", "").strip()
+    tz_raw = args.get("tz", "").strip()
+    tz_auto = args.get("tz_auto") == "1"
 
     since, since_err = _parse_bound(since_raw, end=False)
     until, until_err = _parse_bound(until_raw, end=True)
     errors = [e for e in (since_err, until_err) if e]
+
+    zone, tz_label = _resolve_zone(tz_raw)
+    # When the JS auto-detect resolved a real zone, the form still wants the
+    # dropdown to show "Auto" rather than the resolved name — keeps the user's
+    # original intent sticky across navigation.
+    tz_display = "auto" if tz_auto else tz_raw
 
     # Load the whole log once so the dropdowns can list every user / model /
     # purpose ever seen, not just those that the current filter would keep. A
@@ -3320,6 +3432,13 @@ def _compute(args):
     all_records = []
     if os.path.exists(path):
         all_records = list(_report.load_records(path, None, None, None))
+    if zone is not None:
+        # Records on disk are naive UTC; shift each `ts` into the selected
+        # display zone so every downstream aggregation that slices by day or
+        # hour-of-day reads the user's local clock. The since/until bounds are
+        # already-typed local values from _parse_bound, so they line up.
+        _shift_records_to_zone(all_records, zone)
+    now_local = _local_now(zone)
     all_users = sorted({r.get("user") or "(anonymous)" for r in all_records})
     all_models = sorted({r.get("model") or "(unknown)"
                          for r in all_records if r.get("kind") == "api"})
@@ -3471,7 +3590,7 @@ def _compute(args):
         day_keys, [("p50", lat_p50_day), ("p90", lat_p90_day)],
         y_label="ms",
     )
-    chart_hours = _svg_hour_bars(hours)
+    chart_hours = _svg_hour_bars(hours, tz_label=tz_label)
 
     # Rich per-day summary + 7-day rolling-mean overlay on the daily cost
     # chart, so a single weekly spike doesn't dominate the headline trend.
@@ -3492,7 +3611,7 @@ def _compute(args):
     heatmap_grid = _weekday_hour_heatmap(records)
     chart_heatmap = _svg_heatmap(
         heatmap_grid, row_labels=weekday_labels, col_labels=hour_labels,
-        title="weekday × hour (UTC)",
+        title=f"weekday × hour ({tz_label})",
     )
 
     # Donut: cost share by model in this window.
@@ -3652,6 +3771,14 @@ def _compute(args):
         _all_records=all_records,
         _since=since,
         _until=until,
+        _now=now_local,
+        # tz state — surfaced into the page chrome (filter form, print header,
+        # tab-nav qs) so the user's choice survives navigation and re-renders.
+        tz_raw=tz_display,
+        tz_resolved=tz_raw,
+        tz_auto=tz_auto,
+        tz_label=tz_label,
+        tz_options=_COMMON_TIMEZONES,
     )
 
 
@@ -3740,11 +3867,13 @@ def _trends_context(compute_ctx):
     all_records = compute_ctx.pop("_all_records")
     since = compute_ctx.pop("_since")
     until = compute_ctx.pop("_until")
+    now = compute_ctx.pop("_now", None)
     day_keys = compute_ctx["day_keys"]
     daily_cost = compute_ctx["daily_cost"]
     daily_active = compute_ctx["daily_active"]
 
-    curr, prev, (cs, ce, ps, pe) = _compare_periods(all_records, since, until)
+    curr, prev, (cs, ce, ps, pe) = _compare_periods(
+        all_records, since, until, now=now)
     delta = {
         "cost":   _delta_pct(curr["cost"],   prev["cost"]),
         "calls":  _delta_pct(curr["calls"],  prev["calls"]),
@@ -3789,10 +3918,11 @@ def _users_context(compute_ctx, dormant_days=14):
     all_records = compute_ctx.pop("_all_records")
     since = compute_ctx.pop("_since")
     until = compute_ctx.pop("_until")
+    now = compute_ctx.pop("_now", None)
     compute_ctx.pop("_records", None)
 
     classification = _classify_users(all_records, since=since, until=until,
-                                     dormant_days=dormant_days)
+                                     dormant_days=dormant_days, now=now)
     counts = {
         "active": sum(1 for r in classification["rows"] if r["window_calls"] > 0),
         "new": len(classification["new"]),
@@ -3823,12 +3953,15 @@ def _users_context(compute_ctx, dormant_days=14):
     return compute_ctx
 
 
-def _user_context(username: str):
+def _user_context(username: str, tz_raw: str = ""):
     """All-time drill-down for a single user."""
     path = _log_path()
     all_records = []
     if os.path.exists(path):
         all_records = list(_report.load_records(path, None, None, None))
+    zone, _tz_label = _resolve_zone(tz_raw)
+    if zone is not None:
+        _shift_records_to_zone(all_records, zone)
     records = [r for r in all_records
                if (r.get("user") or "(anonymous)") == username]
 
@@ -3951,6 +4084,8 @@ def index():
 
     empty_page_ctx = dict(since_raw="", until_raw="", user_raw="",
                           model_raw="", purpose_raw="",
+                          tz_raw="", tz_label="UTC",
+                          tz_options=_COMMON_TIMEZONES,
                           all_users=[], all_models=[], all_purposes=[])
 
     if tab == "accounts":
@@ -3974,12 +4109,13 @@ def index():
         page_ctx = {k: ctx[k] for k in
                     ("since_raw", "until_raw", "user_raw",
                      "model_raw", "purpose_raw",
+                     "tz_raw", "tz_label", "tz_options",
                      "all_users", "all_models", "all_purposes")}
         # Overview view toggle: preserve filters, flip `view`.
         if tab == "overview":
             keep_view = {k: request.args.get(k)
                          for k in ("since", "until", "user", "model",
-                                   "purpose", "auto")
+                                   "purpose", "auto", "tz", "tz_auto")
                          if request.args.get(k)}
             ctx["qs_view_total"] = urlencode({**keep_view, "tab": "overview", "view": "total"})
             ctx["qs_view_avg"] = urlencode({**keep_view, "tab": "overview", "view": "avg"})
@@ -3990,7 +4126,7 @@ def index():
         else:
             # Drop transient keys carried for the Trends post-process so they
             # don't leak into other fragment renders.
-            for k in ("_records", "_all_records", "_since", "_until"):
+            for k in ("_records", "_all_records", "_since", "_until", "_now"):
                 ctx.pop(k, None)
 
     fragment = _render_fragment(ctx, tab)
@@ -3999,7 +4135,8 @@ def index():
     # `view` is overview-only and intentionally NOT carried so switching tabs
     # doesn't preserve a stale toggle state for tabs that don't have one.
     keep = {k: request.args.get(k)
-            for k in ("since", "until", "user", "model", "purpose", "auto")
+            for k in ("since", "until", "user", "model", "purpose", "auto",
+                      "tz", "tz_auto")
             if request.args.get(k)}
     qs = {t: urlencode({**keep, "tab": t})
           for t in ("overview", "cache", "activity", "tools", "trends", "users",
@@ -4031,7 +4168,7 @@ def fragment():
     elif tab == "users":
         ctx = _users_context(ctx)
     else:
-        for k in ("_records", "_all_records", "_since", "_until"):
+        for k in ("_records", "_all_records", "_since", "_until", "_now"):
             ctx.pop(k, None)
     return _render_fragment(ctx, tab)
 
@@ -4045,15 +4182,23 @@ def user_drilldown(username):
     snapshot of the user, not a slice of one."""
     csrf = _csrf_token()
     flashes = session.pop("flash", [])
-    ctx = _user_context(username)
+    tz_raw = request.args.get("tz", "")
+    tz_auto = request.args.get("tz_auto") == "1"
+    ctx = _user_context(username, tz_raw=tz_raw)
     fragment = render_template_string(_FRAGMENT_USER, **ctx)
 
     # No filter form on the user page; pass the empty page-ctx + qs so the
     # tab nav still renders.
+    _, tz_label = _resolve_zone(tz_raw)
     empty_page_ctx = dict(since_raw="", until_raw="", user_raw="",
                           model_raw="", purpose_raw="",
+                          tz_raw="auto" if tz_auto else tz_raw,
+                          tz_label=tz_label,
+                          tz_options=_COMMON_TIMEZONES,
                           all_users=[], all_models=[], all_purposes=[])
-    qs = {t: urlencode({"tab": t})
+    keep_tz = {k: request.args.get(k) for k in ("tz", "tz_auto")
+               if request.args.get(k)}
+    qs = {t: urlencode({**keep_tz, "tab": t})
           for t in ("overview", "cache", "activity", "tools", "trends", "users",
                     "routing", "accounts", "keys", "system")}
     return render_template_string(
