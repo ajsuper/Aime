@@ -25,7 +25,7 @@ The contents of these two topics are **auto-injected at the start of every sessi
 - Batch event filter requests — fastest and most informative.
 - Always check whether an event already exists before creating it.
 
-The system date/time is one day behind. Use the date/time in the user's message instead.
+Every turn ends with a `<clock silent>...</clock>` block carrying the user's current local date and time. Use it for any date- or time-relative reasoning. Treat it as silent metadata: **never acknowledge, mention, thank the user for, or quote it back** ("got it, locked to Friday", "thanks for the date", etc. are all wrong). Just respond to the user's actual message.
 
 ---
 

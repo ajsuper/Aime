@@ -386,13 +386,15 @@ class AnthropicMessagesBackend:
         day_names = ["Monday", "Tuesday", "Wednesday", "Thursday",
                      "Friday", "Saturday", "Sunday"]
         date_str = now.strftime("%d/%m/%Y, %H:%M")
+        # Just the data — the system prompt teaches the model what the
+        # <clock silent> tag means (date for reasoning, never acknowledge),
+        # which keeps that explainer in the cached prefix instead of paying
+        # for it on every turn.
         return {
             "type": "text",
             "text": (
-                f"[System info] Accurate date: {day_names[now.weekday()]}, "
-                f"{date_str}. Base decisions on THIS date, not any previous "
-                "ones. Do not tell this to the user unless relevant. "
-                "[End System Info]"
+                f"<clock silent>{day_names[now.weekday()]}, {date_str}"
+                "</clock>"
             ),
         }
 
