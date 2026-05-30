@@ -394,7 +394,7 @@ class AnthropicMessagesBackend:
             "type": "text",
             "text": (
                 f"<clock silent>{day_names[now.weekday()]}, {date_str}"
-                "</clock>"
+                ". System info, don't repeat to user</clock>"
             ),
         }
 
