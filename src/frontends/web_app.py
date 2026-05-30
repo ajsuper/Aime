@@ -356,6 +356,43 @@ class UserContext:
         self.controller.subscribe(self._fanout)
         self.controller.start()
 
+        # Tracks records the user has edited via the UI since the model last
+        # took a turn. Drained as a compact <stale> tag on the next /send so
+        # the model knows its earlier view of those records is out of date.
+        # Tuple is (kind, id, title); kind is "topic" or "event".
+        self._stale_lock = threading.Lock()
+        self._stale_records: list[tuple[str, int, str]] = []
+
+    # ---- Stale-record tracking --------------------------------------------
+
+    def mark_record_stale(self, kind: str, record_id: int, title: str) -> None:
+        """Note that the user just edited a record via the UI. Dedupes on
+        (kind, id) so repeated edits to the same record only cost one entry."""
+        title = (title or "").strip()
+        with self._stale_lock:
+            self._stale_records = [
+                e for e in self._stale_records
+                if not (e[0] == kind and e[1] == record_id)
+            ]
+            self._stale_records.append((kind, record_id, title))
+
+    def drain_stale_tag(self) -> str:
+        """Build the <stale> tag for the next user turn, then clear the list.
+        Format: `<stale>e23 boxing match;t7 grocery list</stale>` — kind is
+        a single letter (e/t) followed by the id, then a space and title.
+        Entries are joined with `;` and there is no trailing whitespace, so
+        the tag stays as token-cheap as possible. Returns "" when empty."""
+        with self._stale_lock:
+            if not self._stale_records:
+                return ""
+            records = self._stale_records
+            self._stale_records = []
+        parts: list[str] = []
+        for kind, rid, title in records:
+            tag = "e" if kind == "event" else "t"
+            parts.append(f"{tag}{rid} {title}" if title else f"{tag}{rid}")
+        return "<stale>" + ";".join(parts) + "</stale>"
+
     # ---- SSE primitives ---------------------------------------------------
 
     def attach_client(self) -> tuple[queue.Queue, list[dict]]:
@@ -1725,7 +1762,10 @@ def send():
     tz = data.get("tz")
     if isinstance(tz, str) and tz:
         ctx.controller.set_client_timezone(tz)
-    should_quit = ctx.controller.dispatch_input(text, images=images or None)
+    stale_tag = ctx.drain_stale_tag()
+    should_quit = ctx.controller.dispatch_input(
+        text, images=images or None, hidden_prefix=stale_tag,
+    )
     return jsonify({"ok": True, "quit": should_quit})
 
 
@@ -1835,8 +1875,9 @@ def calendar_event_update(event_id: int):
     archived = data.get("archived", False)
     if not isinstance(title, str) or not isinstance(date, str):
         return jsonify({"ok": False, "error": "title and date are required"}), 400
+    ctx = _context_for(g.user_id)
     try:
-        result = _context_for(g.user_id).calendar_service.replace_event(
+        result = ctx.calendar_service.replace_event(
             event_id,
             title=title,
             summary=summary if isinstance(summary, str) else "",
@@ -1847,6 +1888,7 @@ def calendar_event_update(event_id: int):
         )
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 500
+    ctx.mark_record_stale("event", event_id, title)
     return jsonify({"ok": True, "result": result})
 
 
@@ -2041,10 +2083,24 @@ def topic_contents_save(topic_id: str):
     # from filling the disk via repeated PUTs.
     if len(contents.encode("utf-8")) > 2 * 1024 * 1024:
         return jsonify({"ok": False, "error": "contents too large (max 2 MiB)"}), 413
+    ctx = _context_for(g.user_id)
+    tid = int(topic_id)
     try:
-        _context_for(g.user_id).topic_service.replace_topic_contents(int(topic_id), contents)
+        ctx.topic_service.replace_topic_contents(tid, contents)
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 500
+    # Look up the title so the <stale> tag carries a recognizable name. If the
+    # list call fails for any reason, fall through with an empty title — the id
+    # alone is still enough for the model to know the record changed.
+    title = ""
+    try:
+        for t in ctx.topic_service.list_topics():
+            if int(t.get("id", -1)) == tid:
+                title = (t.get("title") or "").strip()
+                break
+    except Exception:
+        pass
+    ctx.mark_record_stale("topic", tid, title)
     return jsonify({"ok": True})
 
 

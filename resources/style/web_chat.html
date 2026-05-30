@@ -1314,7 +1314,7 @@
         margin-left: -1em; }
     .ev-summary-rendered li.task-list-item input[type="checkbox"] {
         margin: 0 0.45em 0 0; vertical-align: -1px; cursor: pointer;
-        accent-color: var(--accent); }
+        accent-color: var(--cta); }
     .ev-modal-error { color: var(--warning, #e29a4a); font-size: 0.8rem;
                       margin: 0; }
     /* Schedule and pill events should look interactive. */
@@ -1952,13 +1952,17 @@
           <span class="lbl">Category</span>
           <input type="text" id="ev-f-category" readonly>
         </label>
-        <label class="ev-field stack">
+        <!-- Not a <label>: the rendered markdown can contain its own
+             form controls (task-list checkboxes), and a wrapping <label>
+             would forward any stray click in the description to the first
+             of them. -->
+        <div class="ev-field stack">
           <span class="lbl">Summary</span>
           <div id="ev-f-summary-rendered" class="ev-summary-rendered"
                role="button" tabindex="0"
                aria-label="Edit description"></div>
           <textarea id="ev-f-summary" rows="6" hidden></textarea>
-        </label>
+        </div>
         <p class="ev-modal-error" id="ev-modal-error" hidden></p>
       </div>
       <div class="modal-foot">
