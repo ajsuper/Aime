@@ -1192,6 +1192,283 @@ def _classify_users(all_records, *, since, until, dormant_days=14, now=None):
     }
 
 
+# ---------------------------------------------------------------------------
+# Session-grouped aggregations
+#
+# Records carry `session_id` when AIME_USAGE_LINK_USERS=1 (and the backend
+# stamps it). Grouping by session_id turns the log into "one row per
+# conversation" — the most direct way to answer "what kinds of conversations
+# are actually happening, and which ones are expensive?".
+# ---------------------------------------------------------------------------
+
+
+def _aggregate_by_session(records):
+    """Group api + tool records by session_id; return rows ready to render.
+
+    Each row carries: user, started, last_active, msgs (assistant turns),
+    api_calls, tool_calls, total_cost, top_model, top_tool, has_compaction,
+    has_max_tokens. Records without a session_id (anonymized mode, or
+    pre-session-id logs) are skipped — they cannot be grouped meaningfully.
+    """
+    sessions: dict = {}
+    for rec in records:
+        sid = rec.get("session_id")
+        if not sid:
+            continue
+        s = sessions.setdefault(sid, {
+            "session_id": sid,
+            "user": rec.get("user") or "(anonymous)",
+            "first_ts": rec.get("ts") or "",
+            "last_ts": rec.get("ts") or "",
+            "api_calls": 0,
+            "tool_calls": 0,
+            "turns": 0,
+            "compaction_calls": 0,
+            "max_tokens_hits": 0,
+            "cost": 0.0,
+            "by_model": {},
+            "by_tool": {},
+        })
+        ts = rec.get("ts") or ""
+        if ts and ts < s["first_ts"]:
+            s["first_ts"] = ts
+        if ts and ts > s["last_ts"]:
+            s["last_ts"] = ts
+        # Take a user from any record that has one — earlier (anonymized)
+        # records may leave it null.
+        if rec.get("user") and s["user"] == "(anonymous)":
+            s["user"] = rec["user"]
+        kind = rec.get("kind")
+        if kind == "api":
+            s["api_calls"] += 1
+            cost = _report._api_cost(rec)
+            s["cost"] += cost
+            purpose = rec.get("purpose") or "turn"
+            if purpose == "turn":
+                s["turns"] += 1
+            elif purpose == "compaction":
+                s["compaction_calls"] += 1
+            if rec.get("stop_reason") == "max_tokens":
+                s["max_tokens_hits"] += 1
+            model = rec.get("model") or "(unknown)"
+            s["by_model"][model] = s["by_model"].get(model, 0.0) + cost
+        elif kind == "tool":
+            s["tool_calls"] += 1
+            s["cost"] += _tool_record_cost(rec)
+            tname = rec.get("tool_name") or "(unknown)"
+            s["by_tool"][tname] = s["by_tool"].get(tname, 0) + 1
+
+    rows = []
+    for s in sessions.values():
+        s["top_model"] = (
+            max(s["by_model"].items(), key=lambda kv: kv[1])[0]
+            if s["by_model"] else "—"
+        )
+        s["top_tool"] = (
+            max(s["by_tool"].items(), key=lambda kv: kv[1])[0]
+            if s["by_tool"] else "—"
+        )
+        # Duration in minutes, clamped to >= 0 so a single-record session
+        # doesn't render negative when first_ts == last_ts and tz shifting
+        # somehow nudges them off by a second.
+        try:
+            dt0 = datetime.datetime.fromisoformat(s["first_ts"])
+            dt1 = datetime.datetime.fromisoformat(s["last_ts"])
+            s["duration_min"] = max(0.0, (dt1 - dt0).total_seconds() / 60.0)
+        except (ValueError, TypeError):
+            s["duration_min"] = 0.0
+        rows.append(s)
+    rows.sort(key=lambda r: r["cost"], reverse=True)
+    return rows
+
+
+def _session_detail(all_records, session_id: str):
+    """Per-session timeline + breakdowns for the session-detail route.
+
+    Returns (header, timeline, by_model, by_tool, by_purpose, total_cost)
+    where `timeline` is a chronological list of `{ts, kind, model, purpose,
+    tool_name, tokens_in, tokens_out, cost, stop_reason, duration_ms,
+    routed_decision}` dicts the template formats inline.
+    """
+    rows = [r for r in all_records if r.get("session_id") == session_id]
+    rows.sort(key=lambda r: r.get("ts") or "")
+    by_model: dict = {}
+    by_tool: dict = {}
+    by_purpose: dict = {}
+    timeline = []
+    total = 0.0
+    user = "(anonymous)"
+    first_ts = last_ts = ""
+    for rec in rows:
+        if rec.get("user") and user == "(anonymous)":
+            user = rec["user"]
+        ts = rec.get("ts") or ""
+        if ts and (not first_ts or ts < first_ts):
+            first_ts = ts
+        if ts and (not last_ts or ts > last_ts):
+            last_ts = ts
+        kind = rec.get("kind")
+        if kind == "api":
+            cost = _report._api_cost(rec)
+            total += cost
+            model = rec.get("model") or "(unknown)"
+            by_model[model] = by_model.get(model, 0.0) + cost
+            purpose = rec.get("purpose") or "turn"
+            by_purpose[purpose] = by_purpose.get(purpose, 0.0) + cost
+            timeline.append({
+                "ts": ts,
+                "kind": "api",
+                "model": model,
+                "purpose": purpose,
+                "tool_name": "",
+                "tokens_in": rec.get("input_tokens", 0),
+                "tokens_out": rec.get("output_tokens", 0),
+                "cost": cost,
+                "stop_reason": rec.get("stop_reason") or "",
+                "duration_ms": rec.get("duration_ms"),
+                "routed_decision": rec.get("routed_decision") or "",
+            })
+        elif kind == "tool":
+            cost = _tool_record_cost(rec)
+            total += cost
+            tname = rec.get("tool_name") or "(unknown)"
+            by_tool[tname] = by_tool.get(tname, 0.0) + cost
+            timeline.append({
+                "ts": ts,
+                "kind": "tool",
+                "model": rec.get("model") or "",
+                "purpose": "",
+                "tool_name": tname,
+                "tokens_in": 0,
+                "tokens_out": 0,
+                "cost": cost,
+                "stop_reason": "",
+                "duration_ms": None,
+                "routed_decision": "",
+                "result_bytes": rec.get("result_bytes", 0) or 0,
+            })
+    header = {
+        "session_id": session_id,
+        "user": user,
+        "first_ts": first_ts,
+        "last_ts": last_ts,
+        "record_count": len(rows),
+        "api_calls": sum(1 for r in rows if r.get("kind") == "api"),
+        "tool_calls": sum(1 for r in rows if r.get("kind") == "tool"),
+        "turns": sum(1 for r in rows
+                     if r.get("kind") == "api" and (r.get("purpose") or "turn") == "turn"),
+        "compaction_calls": sum(1 for r in rows
+                                if r.get("kind") == "api" and r.get("purpose") == "compaction"),
+        "max_tokens_hits": sum(1 for r in rows if r.get("stop_reason") == "max_tokens"),
+    }
+    return header, timeline, by_model, by_tool, by_purpose, total
+
+
+def _user_sessions(records, username: str):
+    """All sessions belonging to one user, sorted newest first. Same row shape
+    as `_aggregate_by_session` but pre-filtered."""
+    own = [r for r in records
+           if (r.get("user") or "(anonymous)") == username]
+    rows = _aggregate_by_session(own)
+    rows.sort(key=lambda r: r["last_ts"], reverse=True)
+    return rows
+
+
+def _user_behavior(records, username: str):
+    """Per-user behavioral profile: sessions, avg msgs/session, active days,
+    top tool, median $/turn, routing rate. Used by the user drill-down.
+
+    `records` here is the user's full record list (api + tool). Day counting
+    uses the timezone-adjusted `ts` so the "active days" figure matches what
+    the rest of the dashboard renders.
+    """
+    api = [r for r in records
+           if r.get("kind") == "api" and (r.get("purpose") or "turn") == "turn"]
+    tools = [r for r in records if r.get("kind") == "tool"]
+    sessions = {r.get("session_id") for r in records if r.get("session_id")}
+
+    # Active days = distinct UTC-or-zone-adjusted dates with any api record.
+    days = set()
+    for r in records:
+        if r.get("kind") == "api":
+            d = str(r.get("ts", ""))[:10]
+            if d:
+                days.add(d)
+    active_days = len(days)
+
+    # Median $/turn: cost per "turn"-purpose call.
+    turn_costs = sorted(_report._api_cost(r) for r in api)
+    median_turn = _median(turn_costs) or 0.0
+
+    # Tool mix (top 3 by call count).
+    tool_counts: dict = {}
+    for r in tools:
+        n = r.get("tool_name") or "(unknown)"
+        tool_counts[n] = tool_counts.get(n, 0) + 1
+    top_tools = sorted(tool_counts.items(), key=lambda kv: kv[1], reverse=True)[:5]
+
+    # Routing rate: among routed-decision api records, fraction Haiku.
+    routed = [r for r in records
+              if r.get("kind") == "api" and r.get("routed_decision")
+              and (r.get("purpose") or "turn") == "turn"]
+    haiku = sum(1 for r in routed if r.get("routed_decision") == "haiku")
+    routing_rate = (100.0 * haiku / len(routed)) if routed else None
+
+    msgs_per_session = (len(api) / len(sessions)) if sessions else 0.0
+
+    # User-type badge — one short word the admin can scan.
+    if active_days == 0:
+        badge = "none"
+    elif active_days >= 14 and msgs_per_session >= 6:
+        badge = "power"
+    elif active_days >= 7:
+        badge = "regular"
+    elif active_days >= 2:
+        badge = "casual"
+    else:
+        badge = "one-off"
+
+    return {
+        "sessions": len(sessions),
+        "msgs_per_session": msgs_per_session,
+        "active_days": active_days,
+        "median_turn_cost": median_turn,
+        "top_tools": top_tools,
+        "routing_rate_pct": routing_rate,
+        "badge": badge,
+    }
+
+
+def _user_weekday_hour(records):
+    """Per-user 7×24 weekday-hour grid — same shape as the global heatmap."""
+    grid = [[0] * 24 for _ in range(7)]
+    for rec in records:
+        if rec.get("kind") != "api":
+            continue
+        try:
+            ts = datetime.datetime.fromisoformat(rec["ts"])
+        except (ValueError, KeyError):
+            continue
+        grid[ts.weekday()][ts.hour] += 1
+    return grid
+
+
+def _records_are_anonymized(records) -> bool:
+    """True when at least one api record exists and none carry a user.
+
+    This is the symptom of AIME_USAGE_LINK_USERS=0 in a deploy with traffic:
+    every per-user view collapses to a single '(anonymous)' bucket. Surfaced
+    as a banner so the admin doesn't wonder why the dashboard is empty.
+    """
+    has_api = False
+    for rec in records:
+        if rec.get("kind") == "api":
+            has_api = True
+            if rec.get("user"):
+                return False
+    return has_api
+
+
 def _svg_heatmap(grid, *, width=720, height=200, row_labels=None,
                  col_labels=None, title=""):
     """Heatmap of a 2-D integer grid. ``grid[r][c]`` shades a single cell.
@@ -1687,13 +1964,25 @@ def admin_post(view):
 # ---------------------------------------------------------------------------
 
 _FRAGMENT_OVERVIEW = """<div class="meta">
-    <span title="Filesystem path of the usage.jsonl log being read. Resolved from AIME_DATABASE_DIR, identical to the CLI usage report.">log: {{ log }}</span><br>
+    <span title="Filesystem path of the usage.jsonl log being read.">log: {{ log }}</span><br>
     <span title="Number of log records matching the current filters.">{{ record_count }} records</span>
     &middot;
     <span title="Date range currently in view, set by the Since / Until filters above.">window: {{ window }}</span>
+    {% if delta %} &middot;
+    <span title="Equal-length window immediately before the current one — used by the period-over-period deltas on the cards.">vs prior {{ prev_window }}</span>
+    {% endif %}
   </div>
 
   {% for e in errors %}<p class="err">{{ e }}</p>{% endfor %}
+
+  {% if anonymized %}
+  <div class="banner warn">
+    <strong>User attribution is disabled.</strong>
+    Every per-user view collapses to a single "(anonymous)" bucket because
+    <code>AIME_USAGE_LINK_USERS=1</code> is not set. Aggregate totals still
+    work; per-user and per-conversation breakdowns won't.
+  </div>
+  {% endif %}
 
   {% if not users %}
     <p class="empty">No usage recorded in this window. Collection is enabled
@@ -1701,32 +1990,65 @@ _FRAGMENT_OVERVIEW = """<div class="meta">
   {% else %}
 
   <div class="view-toggle"
-    title="Switch the headline cards between window totals and the per-user average for the {{ user_count }} user(s) active in this window. The 'cache read share' card is a ratio and is unaffected.">
+    title="Switch the headline cards between window totals and the per-user average. Deltas compare against the same prior window.">
     <span class="lbl">Show:</span>
     <a href="/?{{ qs_view_total }}" class="{{ 'active' if view == 'total' else '' }}"
-      title="Show totals across every user active in this window.">Total</a>
+      title="Totals across every user active in this window.">Total</a>
     <a href="/?{{ qs_view_avg }}" class="{{ 'active' if view == 'avg' else '' }}"
-      title="Divide the cost / call / token figures by the {{ user_count }} user(s) active in this window. The 'cache read share' card is a ratio and is unaffected.">Avg / user</a>
+      title="Divide $ / call / token figures by the {{ user_count }} user(s) active in this window.">Avg / user</a>
     <span class="note">({{ user_count }} user{{ '' if user_count == 1 else 's' }} active in this window)</span>
   </div>
 
   <div class="cards">
     <div class="card accent-green"
-      title="{% if view == 'avg' %}Per-user average — total estimated USD cost divided by the {{ user_count }} user(s) active in this window.{% else %}Total estimated USD cost of every API call in this window: input + output + cache + web-search charges combined.{% endif %} An estimate from list prices — not your actual invoice. Larger than the Cache Efficacy tab's 'prompt cost' figures, which isolate prompt-side tokens only.">
+      title="Total billed cost in this window: input + output + cache + web-search charges. An estimate from list prices, not the literal invoice.">
       <div class="num good">${{ "%.4f"|format(card_cost) }}</div>
-      <div class="lbl">{{ 'avg cost / user' if view == 'avg' else 'estimated total cost (all charges)' }}</div></div>
+      <div class="lbl">{{ 'avg $ / user' if view == 'avg' else '$ spent' }}</div>
+      {% if delta and view == 'total' %}
+        {% if delta.cost is none %}
+          <div class="delta flat">no prior baseline</div>
+        {% else %}
+          <div class="delta {{ 'up' if delta.cost > 0 else 'down' if delta.cost < 0 else 'flat' }}"
+            title="Cost in the prior equal-length window was ${{ '%.4f'|format(prev.cost) }}.">
+            {{ "%+.1f"|format(delta.cost) }}% vs prior
+          </div>
+        {% endif %}
+      {% endif %}
+    </div>
     <div class="card accent-blue"
-      title="{% if view == 'avg' %}Average requests sent per active user.{% else %}Number of requests sent to the Anthropic Messages API in this window.{% endif %}">
+      title="API calls in this window.">
       <div class="num blue">{{ ('%.1f' % card_calls) if view == 'avg' else '{:,}'.format(card_calls) }}</div>
-      <div class="lbl">{{ 'avg API calls / user' if view == 'avg' else 'API calls' }}</div></div>
+      <div class="lbl">{{ 'avg API calls / user' if view == 'avg' else 'API calls' }}</div>
+      {% if delta and view == 'total' %}
+        {% if delta.calls is none %}
+          <div class="delta flat">no prior baseline</div>
+        {% else %}
+          <div class="delta {{ 'up' if delta.calls > 0 else 'down' if delta.calls < 0 else 'flat' }}"
+            title="Prior window: {{ '{:,}'.format(prev.calls) }} calls.">
+            {{ "%+.1f"|format(delta.calls) }}% vs prior
+          </div>
+        {% endif %}
+      {% endif %}
+    </div>
     <div class="card accent-purple"
-      title="{% if view == 'avg' %}Average fresh input + output tokens per active user.{% else %}Fresh (uncached) input tokens plus output tokens.{% endif %} Excludes cache read/write tokens — see 'cache read share'.">
-      <div class="num purple">{{ ('%.0f' % card_tokens) if view == 'avg' else '{:,}'.format(card_tokens) }}</div>
-      <div class="lbl">{{ 'avg tokens / user' if view == 'avg' else 'tokens (in+out)' }}</div></div>
+      title="Distinct users with at least one API record in this window.">
+      <div class="num purple">{{ user_count }}</div>
+      <div class="lbl">active users</div>
+      {% if delta and view == 'total' %}
+        {% if delta.users is none %}
+          <div class="delta flat">no prior baseline</div>
+        {% else %}
+          <div class="delta {{ 'up' if delta.users > 0 else 'down' if delta.users < 0 else 'flat' }}"
+            title="Prior window: {{ prev.users }} active users.">
+            {{ "%+.1f"|format(delta.users) }}% vs prior
+          </div>
+        {% endif %}
+      {% endif %}
+    </div>
     <div class="card {{ 'accent-green' if cache_hit_pct >= 70 else 'accent-amber' if cache_hit_pct >= 40 else 'accent-red' }}"
-      title="Share of read-side prompt tokens served from cache (cache reads) rather than billed as fresh input. Higher is cheaper. This is a ratio, identical whether you view totals or per-user averages. Green at 70%+, amber 40-70%, red below 40%.">
+      title="Share of read-side prompt tokens served from cache rather than billed as fresh input. Higher is cheaper. Green ≥70%, amber 40–70%, red <40%.">
       <div class="num {{ 'good' if cache_hit_pct >= 70 else 'warn' if cache_hit_pct >= 40 else 'bad' }}">{{ "%.0f"|format(cache_hit_pct) }}%</div>
-      <div class="lbl">cache read share</div></div>
+      <div class="lbl">cache hit rate</div></div>
   </div>
 
   <h2 title="Estimated USD cost charged per UTC day in this window, with a 7-day rolling average overlay so a single spike doesn't dominate the trend read.">Cost over time</h2>
@@ -1746,39 +2068,34 @@ _FRAGMENT_OVERVIEW = """<div class="meta">
     </div>
   </div>
 
-  <h2 title="One row per user, totalling every API and speech-to-text record in the window. Click a username to open that user's drill-down.">By user</h2>
+  <h2 title="One row per user with any activity in the window — click a username for behavior, conversations, and tools. Token plumbing lives on the drill-down.">By user</h2>
   <table>
     <thead>
       <tr>
-        <th title="Username the record was logged under. Click to open the per-user drill-down. (anonymous) covers records with no username (AIME_USAGE_LINK_USERS=0).">User</th>
-        <th title="Per-day cost trend for this user across the visible window.">Trend</th>
-        <th title="Requests sent to the Anthropic Messages API.">API calls</th>
-        <th title="Fresh, uncached input tokens — billed at the model's base input rate.">Input</th>
-        <th title="Tokens generated by the model — billed at the base output rate.">Output</th>
-        <th title="Tokens written into the prompt cache, split by time-to-live. 5m write is billed at 1.25x base input, 1h write at 2x.">Cache wr (5m/1h)</th>
-        <th title="Tokens read back from the prompt cache — billed at just 0.10x base input.">Cache rd</th>
-        <th title="Server-side web_search tool requests — billed flat at $10 per 1,000 requests.">Web search</th>
-        <th title="Local speech-to-text transcription calls.">STT calls</th>
-        <th title="Total seconds of audio transcribed by speech-to-text.">Audio (s)</th>
-        <th title="Wall-clock seconds of local compute spent on speech-to-text.">Compute (s)</th>
-        <th title="Estimated total USD cost for this user: input + output + cache reads/writes + web-search charges combined. This is broader than the Cache Efficacy tab's 'Cost (cache)' column, which only counts the prompt side (fresh input + cache reads + cache writes) and excludes output tokens and web-search charges — so that figure will always be smaller.">Est. total cost</th>
+        <th title="Username. Click to open the per-user drill-down.">User</th>
+        <th title="Daily cost trend across the visible window.">Trend</th>
+        <th title="Profile badge derived from the user's lifetime activity: power / regular / casual / one-off.">Profile</th>
+        <th title="Distinct conversations (session_ids) this user had in the window.">Conv.</th>
+        <th title="Distinct calendar days this user appeared on within the window.">Active days</th>
+        <th title="API calls in the window.">API calls</th>
+        <th title="Median billed cost of an assistant turn — distinguishes light Q&A users from heavy reasoning ones.">$/turn</th>
+        <th title="Billed cost in this window: input + output + cache + web-search.">$ spent</th>
       </tr>
     </thead>
     <tbody>
       {% for name, u in users %}
       <tr>
         <td><a href="/user/{{ name|urlencode }}" class="userlink"
-              title="Open the per-user drill-down for {{ name }} — daily cost, model mix, recent activity, cache health.">{{ name }}</a></td>
+              title="Open {{ name }}'s drill-down.">{{ name }}</a></td>
         <td class="spark">{{ user_sparklines.get(name, '')|safe }}</td>
+        <td>
+          {% set b = user_badges.get(name, 'none') %}
+          <span class="badge badge-{{ b }}">{{ b }}</span>
+        </td>
+        <td>{{ user_session_counts.get(name, 0) }}</td>
+        <td>{{ user_active_days.get(name, 0) }}</td>
         <td>{{ "{:,}".format(u.api_calls) }}</td>
-        <td>{{ "{:,}".format(u.input) }}</td>
-        <td>{{ "{:,}".format(u.output) }}</td>
-        <td>{{ "{:,}".format(u.cache_w_5m) }} / {{ "{:,}".format(u.cache_w_1h) }}</td>
-        <td>{{ "{:,}".format(u.cache_r) }}</td>
-        <td>{{ "{:,}".format(u.web_searches) }}</td>
-        <td>{{ "{:,}".format(u.stt_calls) }}</td>
-        <td>{{ "%.1f"|format(u.audio_seconds) }}</td>
-        <td>{{ "%.1f"|format(u.compute_ms / 1000.0) }}</td>
+        <td>${{ "%.5f"|format(user_median_turn.get(name, 0)) }}</td>
         <td class="cost good">${{ "%.4f"|format(u.cost) }}</td>
       </tr>
       {% endfor %}
@@ -1786,7 +2103,7 @@ _FRAGMENT_OVERVIEW = """<div class="meta">
     <tfoot>
       <tr>
         <td>Total</td>
-        <td colspan="10"></td>
+        <td colspan="6"></td>
         <td class="cost good">${{ "%.4f"|format(grand_cost) }}</td>
       </tr>
     </tfoot>
@@ -1880,12 +2197,12 @@ _FRAGMENT_CACHE = """<div class="meta">
   {% endif %}
 
   <div class="cards">
-    <div class="card accent-blue" title="Actual prompt-side cost with caching on — counting only fresh input (1x), cache reads (0.10x), 5m writes (1.25x), and 1h writes (2x base input). Excludes output tokens and web-search charges, which are identical with or without caching and would only obscure the comparison. This is smaller than Overview's 'Est. total cost' for the same reason.">
+    <div class="card accent-blue" title="Prompt-side cost with caching on — only counts input/cache-read/cache-write tokens at their actual billed rates. Output tokens and web-search are excluded because they are identical with or without caching, so this is a clean comparison rather than a total. For total spend, see Overview.">
       <div class="num blue">${{ "%.4f"|format(cache_with) }}</div>
-      <div class="lbl">prompt-side cost, caching on</div></div>
-    <div class="card accent-purple" title="Hypothetical prompt-side cost with caching off: every cache read and cache write token re-billed as plain input at the 1x base rate. Output and web-search charges are excluded for the same reason as the 'caching on' card.">
+      <div class="lbl">prompt cost (cached)</div></div>
+    <div class="card accent-purple" title="Hypothetical prompt-side cost if caching were off — every cache read and write re-billed as plain input at 1x. Output and web-search excluded for apples-to-apples with the 'cached' card.">
       <div class="num purple">${{ "%.4f"|format(cache_without) }}</div>
-      <div class="lbl">prompt-side cost, no caching</div></div>
+      <div class="lbl">prompt cost (no cache)</div></div>
     <div class="card {{ 'accent-green' if cache_savings >= 0 else 'accent-red' }}"
       title="No-cache cost minus actual cost. Positive (green) means caching saved money; negative (red) means the write premium outran the read discount.">
       <div class="num {{ 'good' if cache_savings >= 0 else 'bad' }}">${{ "%.4f"|format(cache_savings) }}</div>
@@ -1924,8 +2241,8 @@ _FRAGMENT_CACHE = """<div class="meta">
         <th title="Cache reads divided by cache writes. Above 1x the cache is recouping its write premium; below 1x it is losing money.">Reuse</th>
         <th title="Cache-write tokens not covered by an equal number of reads (writes minus reads, floored at 0). A lower bound on write premium paid for no read discount.">Unread writes</th>
         <th title="Median time between this user's consecutive API requests. Above 5 minutes, a 5m-TTL cache write tends to expire before it is read back (row turns red with a warning sign).">Median gap</th>
-        <th title="Actual prompt-side cost for this user with caching on — counting only fresh input + cache reads + cache writes. Excludes output tokens and web-search charges (those are identical with or without caching), so this is smaller than the Overview tab's 'Est. total cost' column.">Prompt cost (cache)</th>
-        <th title="Hypothetical prompt-side cost for this user if caching were off — every cache read/write re-billed as plain input. Also excludes output and web-search charges, for the same apples-to-apples reason.">Prompt cost (no cache)</th>
+        <th title="Prompt-side cost with caching on (input + cache reads + cache writes). Output and web-search excluded — they are identical with or without caching, so this is a clean comparison column.">Prompt $ (cached)</th>
+        <th title="Hypothetical prompt-side cost if caching were off — every cache read/write re-billed as plain input.">Prompt $ (no cache)</th>
         <th title="No-cache cost minus actual cost for this user. Positive = caching saved money.">Savings</th>
       </tr>
     </thead>
@@ -2514,14 +2831,228 @@ _FRAGMENT_USERS = """<div class="meta">
   {% endif %}"""
 
 
+# Conversations tab — one row per session_id, sorted by cost. The biggest gap
+# the old dashboard had: even with session_id recorded on every record, there
+# was no place to ask "which conversations are running up the bill?" or
+# "what's the typical conversation shape?". Click into /session/<id> for the
+# detailed timeline.
+_FRAGMENT_CONVERSATIONS = """<div class="meta">
+    <span title="Filesystem path of the usage.jsonl log being read.">log: {{ log }}</span><br>
+    <span title="Records matching the current filters.">{{ record_count }} records</span>
+    &middot; <span title="Window the figures cover.">{{ window }}</span>
+  </div>
+
+  {% for e in errors %}<p class="err">{{ e }}</p>{% endfor %}
+
+  {% if anonymized %}
+  <div class="banner warn">
+    <strong>User attribution is disabled.</strong>
+    Conversation grouping needs a session id on each record, which is gated
+    behind <code>AIME_USAGE_LINK_USERS=1</code>. Set it to populate this view.
+  </div>
+  {% endif %}
+
+  {% if not sessions %}
+    <p class="empty">No conversations have been recorded in this window.</p>
+  {% else %}
+
+  <div class="cards">
+    <div class="card accent-blue"
+      title="Distinct conversations in this window — every record carrying a session_id is one conversation.">
+      <div class="num blue">{{ '{:,}'.format(session_count) }}</div>
+      <div class="lbl">conversations</div></div>
+    <div class="card accent-green"
+      title="Total billed cost across every conversation in this window.">
+      <div class="num good">${{ '%.2f'|format(sessions_total_cost) }}</div>
+      <div class="lbl">$ across conversations</div></div>
+    <div class="card accent-purple"
+      title="Mean billed cost per conversation. A small handful of expensive sessions usually dominate the average — see the table below.">
+      <div class="num purple">${{ '%.4f'|format(sessions_avg_cost) }}</div>
+      <div class="lbl">avg $ / conversation</div></div>
+    <div class="card accent-amber"
+      title="Mean assistant turns per conversation (purpose=turn api records grouped by session).">
+      <div class="num warn">{{ '%.1f'|format(sessions_avg_turns) }}</div>
+      <div class="lbl">avg turns / conversation</div></div>
+  </div>
+
+  <h2 title="One row per conversation, heaviest first. Click 'open' for the per-session timeline.">Conversations</h2>
+  <p class="note">
+    A <em>turn</em> is one assistant reply (purpose=turn). <em>Tool calls</em>
+    counts tool_result records inside the conversation. <em>Top tool</em> is
+    the tool invoked most often. The compaction icon (&#8634;) appears when
+    a conversation has triggered Haiku-based compaction at least once.
+  </p>
+  <table>
+    <thead>
+      <tr>
+        <th title="Conversation owner. Click the username to open their drill-down.">User</th>
+        <th title="Session id — the on-disk name of the encrypted conversation file. Truncated for display; the full id is in the link target.">Session</th>
+        <th title="Local timestamp of the first record in this conversation.">Started</th>
+        <th title="Local timestamp of the most recent record.">Last active</th>
+        <th title="Length of the conversation in minutes (first to last record).">Duration</th>
+        <th title="Number of assistant turns (purpose=turn API records).">Turns</th>
+        <th title="Tool invocations made during this conversation.">Tools</th>
+        <th title="Model that carried the most $ within this conversation.">Top model</th>
+        <th title="Tool invoked most often.">Top tool</th>
+        <th title="Flags. ⟲ = compaction ran. ⚠ = at least one turn hit max_tokens.">Flags</th>
+        <th title="Total billed cost of every record in this conversation, including any compaction overhead.">$ cost</th>
+        <th title="Open the per-conversation timeline.">&nbsp;</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for s in sessions %}
+      <tr>
+        <td><a href="/user/{{ s.user|urlencode }}" class="userlink">{{ s.user }}</a></td>
+        <td><code title="{{ s.session_id }}">{{ s.session_id[:10] }}…</code></td>
+        <td>{{ s.first_ts[:16] }}</td>
+        <td>{{ s.last_ts[:16] }}</td>
+        <td>{{ '%.0f'|format(s.duration_min) }}m</td>
+        <td>{{ s.turns }}</td>
+        <td>{{ s.tool_calls }}</td>
+        <td>{{ s.top_model }}</td>
+        <td>{{ s.top_tool }}</td>
+        <td>
+          {%- if s.compaction_calls -%}<span title="Compaction ran {{ s.compaction_calls }}× — Haiku folded older messages into a summary.">⟲</span>{%- endif -%}
+          {%- if s.max_tokens_hits -%} <span class="warn" title="{{ s.max_tokens_hits }} turn(s) hit max_tokens — output was truncated.">⚠</span>{%- endif -%}
+          {%- if not s.compaction_calls and not s.max_tokens_hits -%}—{%- endif -%}
+        </td>
+        <td class="cost good">${{ '%.4f'|format(s.cost) }}</td>
+        <td><a href="/session/{{ s.session_id|urlencode }}" class="userlink">open →</a></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+    <tfoot>
+      <tr>
+        <td colspan="10">Total ({{ session_count }} conversation{{ '' if session_count == 1 else 's' }})</td>
+        <td class="cost good">${{ '%.4f'|format(sessions_total_cost) }}</td>
+        <td></td>
+      </tr>
+    </tfoot>
+  </table>
+
+  {% endif %}"""
+
+
+# Per-session detail — the timeline of records belonging to one session_id,
+# with breakdowns by model / tool / purpose. Reached from the Conversations
+# tab and from a user's drill-down.
+_FRAGMENT_SESSION = """<div class="meta">
+    <span title="Conversation owner.">user: <strong><a href="/user/{{ header.user|urlencode }}" class="userlink">{{ header.user }}</a></strong></span><br>
+    <span title="On-disk session id of the encrypted conversation file.">session: <code>{{ header.session_id }}</code></span>
+    &middot; <span title="Number of records in this conversation.">{{ header.record_count }} records</span>
+  </div>
+
+  <p><a href="/?tab=conversations">&larr; back to conversations</a></p>
+
+  {% if not timeline %}
+    <p class="empty">No records found for this session.</p>
+  {% else %}
+
+  <div class="cards">
+    <div class="card accent-green"
+      title="Total billed cost for this conversation: every API + tool record summed.">
+      <div class="num good">${{ '%.4f'|format(total_cost) }}</div>
+      <div class="lbl">$ for this conversation</div></div>
+    <div class="card accent-blue"
+      title="Assistant turns (purpose=turn API records). Excludes background plumbing (title, compaction) and tool records.">
+      <div class="num blue">{{ header.turns }}</div>
+      <div class="lbl">turns</div></div>
+    <div class="card accent-purple"
+      title="Tool invocations during this conversation.">
+      <div class="num purple">{{ header.tool_calls }}</div>
+      <div class="lbl">tool calls</div></div>
+    <div class="card accent-amber"
+      title="Background Haiku compaction calls — fired by the backend when history grew past the compaction threshold.">
+      <div class="num warn">{{ header.compaction_calls }}</div>
+      <div class="lbl">compactions</div></div>
+    {% if header.max_tokens_hits %}
+    <div class="card accent-red"
+      title="Turns that ended in stop_reason=max_tokens — the model output was truncated.">
+      <div class="num bad">{{ header.max_tokens_hits }}</div>
+      <div class="lbl">max_tokens hits</div></div>
+    {% endif %}
+  </div>
+
+  <div class="two-col">
+    <div>
+      <h2 title="Share of cost by model within this conversation.">By model</h2>
+      {{ chart_model_donut|safe }}
+    </div>
+    <div>
+      <h2 title="Share of cost by purpose — user turns vs background plumbing.">By purpose</h2>
+      {{ chart_purpose_donut|safe }}
+    </div>
+  </div>
+
+  {% if by_tool %}
+  <h2 title="Tool invocations grouped by name, ordered by attributed cost.">Tools used</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Tool</th>
+        <th>Calls</th>
+        <th>$ attributed</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for name, cost in by_tool %}
+      <tr>
+        <td>{{ name }}</td>
+        <td>{{ tool_call_counts.get(name, 0) }}</td>
+        <td class="cost good">${{ '%.4f'|format(cost) }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+
+  <h2 title="Every record in this conversation, oldest first. Tool calls inline with the API turns that produced them.">Timeline</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>When</th>
+        <th>Kind</th>
+        <th>Purpose / tool</th>
+        <th>Model / route</th>
+        <th>Tokens in/out</th>
+        <th>Stop</th>
+        <th>Latency</th>
+        <th>$</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in timeline %}
+      <tr class="{{ 'dim' if r.kind == 'tool' else '' }}">
+        <td>{{ r.ts[:19] }}</td>
+        <td>{{ r.kind }}</td>
+        <td>
+          {%- if r.kind == 'api' -%}{{ r.purpose }}
+          {%- else -%}{{ r.tool_name }} ({{ '{:,}'.format(r.result_bytes) }} B)
+          {%- endif -%}
+        </td>
+        <td>{{ r.model }}{% if r.routed_decision %} <span class="note">→{{ r.routed_decision }}</span>{% endif %}</td>
+        <td>{% if r.kind == 'api' %}{{ '{:,}'.format(r.tokens_in) }} / {{ '{:,}'.format(r.tokens_out) }}{% else %}—{% endif %}</td>
+        <td class="{{ 'bad' if r.stop_reason == 'max_tokens' else '' }}">{{ r.stop_reason or '—' }}</td>
+        <td>{{ ('%.0f ms' % r.duration_ms) if r.duration_ms is not none else '—' }}</td>
+        <td class="cost good">${{ '%.5f'|format(r.cost) }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  {% endif %}"""
+
+
 # Per-user drill-down — KPI cards, daily cost line, model & purpose donuts,
 # recent activity table. Linked from the Overview "By user" table.
 _FRAGMENT_USER = """<div class="meta">
-    <span title="Username being inspected.">user: <strong>{{ username }}</strong></span><br>
-    <span title="All-time figures, unfiltered. Use the back link to return to the filtered Overview.">{{ record_count }} records</span>
+    <span title="Username being inspected.">user: <strong>{{ username }}</strong></span>
+    {% if behavior.badge %}<span class="badge badge-{{ behavior.badge }}" title="Activity profile derived from how often this user shows up and how heavy their turns are. power = ≥14 active days and ≥6 messages/session; regular = ≥7 active days; casual = 2–6 active days; one-off = single active day; none = no traffic.">{{ behavior.badge }}</span>{% endif %}
+    <br>
+    <span title="All-time figures across this user's entire history.">{{ record_count }} records</span>
   </div>
 
-  <p><a href="/?tab=overview">&larr; back to overview</a></p>
+  <p><a href="/?tab=users">&larr; back to users</a></p>
 
   {% if not has_data %}
     <p class="empty">No API records found for this user.</p>
@@ -2529,73 +3060,100 @@ _FRAGMENT_USER = """<div class="meta">
 
   <div class="cards">
     <div class="card accent-green"
-      title="All-time estimated USD cost for this user.">
+      title="Lifetime billed cost for this user — every charge stamped on every API and tool record.">
       <div class="num good">${{ "%.4f"|format(u.cost) }}</div>
-      <div class="lbl">total cost</div></div>
+      <div class="lbl">$ spent (lifetime)</div></div>
     <div class="card accent-blue"
-      title="All-time API request count for this user.">
-      <div class="num blue">{{ "{:,}".format(u.api_calls) }}</div>
-      <div class="lbl">API calls</div></div>
+      title="Distinct conversations (session_ids) this user has had. Requires AIME_USAGE_LINK_USERS=1; '—' otherwise.">
+      <div class="num blue">{{ behavior.sessions if behavior.sessions else '—' }}</div>
+      <div class="lbl">conversations</div></div>
     <div class="card accent-purple"
-      title="Fresh input + output tokens (excludes cache).">
-      <div class="num purple">{{ "{:,}".format(u.input + u.output) }}</div>
-      <div class="lbl">tokens</div></div>
-    <div class="card {{ 'accent-green' if cache_hit_pct >= 70 else 'accent-amber' if cache_hit_pct >= 40 else 'accent-red' }}"
-      title="Share of read-side prompt tokens served from cache rather than billed fresh. Higher is cheaper.">
-      <div class="num {{ 'good' if cache_hit_pct >= 70 else 'warn' if cache_hit_pct >= 40 else 'bad' }}">{{ "%.0f"|format(cache_hit_pct) }}%</div>
-      <div class="lbl">cache read share</div></div>
+      title="Mean assistant turns per conversation — a quick read on whether this user's conversations are short Q&A or deep multi-turn work.">
+      <div class="num purple">{{ '%.1f'|format(behavior.msgs_per_session) }}</div>
+      <div class="lbl">avg turns / conversation</div></div>
     <div class="card accent-amber"
-      title="Mean cost per API call — a quick read on how heavy this user's typical turn is.">
-      <div class="num warn">${{ "%.5f"|format(u.cost / u.api_calls if u.api_calls else 0) }}</div>
-      <div class="lbl">cost / call</div></div>
+      title="Distinct calendar days with at least one API record. Counts engagement breadth — daily users vs binge-and-vanish users.">
+      <div class="num warn">{{ behavior.active_days }}</div>
+      <div class="lbl">active days (lifetime)</div></div>
     <div class="card accent-blue"
-      title="Median wall-clock latency across calls that carry duration_ms.">
-      <div class="num blue">{{ ('%.0f ms' % lat_p50) if lat_p50 is not none else '—' }}</div>
-      <div class="lbl">latency p50</div></div>
+      title="Median billed cost of an assistant turn. Low = short Q&A user; high = heavy reasoning / large prompts.">
+      <div class="num blue">${{ '%.5f'|format(behavior.median_turn_cost) }}</div>
+      <div class="lbl">median $ / turn</div></div>
+    <div class="card {{ 'accent-green' if cache_hit_pct >= 70 else 'accent-amber' if cache_hit_pct >= 40 else 'accent-red' }}"
+      title="Share of read-side prompt tokens served from cache (cheap) rather than billed fresh. Higher is cheaper. Green ≥70%, amber 40–70%, red <40%.">
+      <div class="num {{ 'good' if cache_hit_pct >= 70 else 'warn' if cache_hit_pct >= 40 else 'bad' }}">{{ "%.0f"|format(cache_hit_pct) }}%</div>
+      <div class="lbl">cache hit rate</div></div>
   </div>
 
-  <h2 title="Cost charged to this user per UTC day, across their full history.">Cost over time</h2>
+  <h2 title="Cost charged to this user per day across their full history.">Cost over time</h2>
   {{ chart_daily_cost|safe }}
 
   <div class="two-col">
     <div>
-      <h2 title="Model mix — share of this user's spend per model.">Model mix</h2>
+      <h2 title="Share of this user's spend by model.">Model mix</h2>
       {{ chart_model_donut|safe }}
     </div>
     <div>
-      <h2 title="Purpose mix — what fraction of calls were user turns vs background plumbing.">Purpose mix</h2>
+      <h2 title="Share of this user's spend by call purpose. 'turn' is a user-facing reply; 'title' / 'compaction' are background Haiku jobs the user never sees directly.">Purpose mix</h2>
       {{ chart_purpose_donut|safe }}
     </div>
   </div>
 
-  <h2 title="The 25 most recent API records for this user.">Recent activity</h2>
-  {% if not recent %}
-    <p class="empty">No recent activity.</p>
+  <div class="two-col">
+    <div>
+      <h2 title="Calls bucketed by weekday × hour. Darker cells are heavier — a quick visual read of when this user actually talks to Aime.">When they talk</h2>
+      <div class="chart-wrap">{{ chart_user_heatmap|safe }}</div>
+    </div>
+    <div>
+      <h2 title="Tools this user invokes most often. Strong signal for what they actually use Aime for.">Top tools</h2>
+      {% if behavior.top_tools %}
+      <table>
+        <thead><tr><th>Tool</th><th>Calls</th></tr></thead>
+        <tbody>
+          {% for name, count in behavior.top_tools %}
+          <tr><td>{{ name }}</td><td>{{ '{:,}'.format(count) }}</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% else %}
+        <p class="empty">No tool calls recorded for this user yet.</p>
+      {% endif %}
+      {% if behavior.routing_rate_pct is not none %}
+      <p class="note" title="Share of this user's routed turns that the Haiku/Sonnet classifier sent to Haiku. Higher = more of their turns are lookup-shaped.">
+        Router rate: <strong>{{ '%.0f%%'|format(behavior.routing_rate_pct) }}</strong> of turns go to Haiku.
+      </p>
+      {% endif %}
+    </div>
+  </div>
+
+  <h2 title="Every conversation this user has had, newest first. Click 'open' for the timeline.">Conversations ({{ user_sessions|length }})</h2>
+  {% if not user_sessions %}
+    <p class="empty">No grouped conversations — session_id is gated behind AIME_USAGE_LINK_USERS=1.</p>
   {% else %}
   <table>
     <thead>
       <tr>
-        <th>When (UTC)</th>
-        <th>Model</th>
-        <th>Purpose</th>
-        <th>Input</th>
-        <th>Output</th>
-        <th title="Whether the model finished cleanly, ran out of tokens, or handed off to a tool.">Stop</th>
-        <th>Latency</th>
-        <th>Cost</th>
+        <th>Started</th>
+        <th>Turns</th>
+        <th>Tools</th>
+        <th>Top model</th>
+        <th>Top tool</th>
+        <th>Duration</th>
+        <th>$ cost</th>
+        <th>&nbsp;</th>
       </tr>
     </thead>
     <tbody>
-      {% for rec in recent %}
+      {% for s in user_sessions %}
       <tr>
-        <td>{{ rec.ts|truncate(19, true, '') }}</td>
-        <td>{{ rec.model or '(unknown)' }}</td>
-        <td>{{ rec.purpose or '(unspecified)' }}</td>
-        <td>{{ "{:,}".format(rec.input_tokens or 0) }}</td>
-        <td>{{ "{:,}".format(rec.output_tokens or 0) }}</td>
-        <td>{{ rec.stop_reason or '—' }}</td>
-        <td>{{ ("%.0f ms" % rec.duration_ms) if rec.duration_ms is not none else '—' }}</td>
-        <td class="cost good">${{ "%.5f"|format(_costs[loop.index0]) }}</td>
+        <td>{{ s.first_ts[:16] }}</td>
+        <td>{{ s.turns }}</td>
+        <td>{{ s.tool_calls }}</td>
+        <td>{{ s.top_model }}</td>
+        <td>{{ s.top_tool }}</td>
+        <td>{{ '%.0f'|format(s.duration_min) }}m</td>
+        <td class="cost good">${{ '%.4f'|format(s.cost) }}</td>
+        <td><a href="/session/{{ s.session_id|urlencode }}" class="userlink">open →</a></td>
       </tr>
       {% endfor %}
     </tbody>
@@ -2886,12 +3444,28 @@ _PAGE = """<!doctype html>
     .logout { font-size: .85rem; }
 
     /* tabs */
-    nav.tabs { display: flex; gap: .3rem; border-bottom: 2px solid #8884; margin-bottom: 1rem; }
+    nav.tabs { display: flex; gap: .3rem; border-bottom: 2px solid #8884; margin-bottom: 1rem; flex-wrap: wrap; align-items: stretch; }
     nav.tabs a { padding: .45rem .9rem; text-decoration: none; color: #888;
       border: 1px solid transparent; border-bottom: none; border-radius: 6px 6px 0 0; }
     nav.tabs a:hover { background: #8881; }
     nav.tabs a.active { color: inherit; font-weight: 600;
       border-color: #8884; background: #8881; margin-bottom: -2px; }
+    nav.tabs .tab-sep { display: inline-block; width: 1px; background: #8884;
+      margin: .25rem .35rem; align-self: stretch; }
+
+    /* User-type badge — short word on the drill-down and By-user table. */
+    .badge { display: inline-block; padding: .05rem .55rem; margin-left: .4rem;
+      font-size: .72rem; border-radius: 999px; border: 1px solid #8884;
+      color: #888; font-weight: 600; vertical-align: middle; }
+    .badge-power    { background: #d2336622; border-color: #d2336688; color: #d23; }
+    .badge-regular  { background: #2e9e4f22; border-color: #2e9e4f88; color: #2e9e4f; }
+    .badge-casual   { background: #c8860a22; border-color: #c8860a88; color: #c8860a; }
+    .badge-one-off  { background: #8a4fd022; border-color: #8a4fd088; color: #8a4fd0; }
+    .badge-none     { background: #8882; }
+
+    /* Used by the session-detail timeline to soften the tool-record rows. */
+    tr.dim td { color: #888; }
+    .dim { color: #888; }
 
     form.filter { display: flex; flex-wrap: wrap; gap: .8rem; align-items: end;
       margin-bottom: 1rem; padding: .8rem; border: 1px solid #8884; border-radius: 6px; }
@@ -3117,33 +3691,37 @@ _PAGE = """<!doctype html>
   </div>
 
   <nav class="tabs">
-    <a href="/?{{ qs_overview }}" class="{{ 'active' if tab == 'overview' else '' }}"
-      title="Per-user, per-day and per-model token usage and cost.">Overview</a>
-    <a href="/?{{ qs_cache }}" class="{{ 'active' if tab == 'cache' else '' }}"
-      title="Whether prompt caching is actually saving money — reuse factors, hypothetical no-cache cost, and 5-minute-TTL warnings.">Cache Efficacy</a>
-    <a href="/?{{ qs_activity }}" class="{{ 'active' if tab == 'activity' else '' }}"
-      title="What the API is being used for — call purpose, stop-reason mix, latency percentiles, and when of day traffic happens.">Activity</a>
-    <a href="/?{{ qs_tools }}" class="{{ 'active' if tab == 'tools' else '' }}"
-      title="How much each agent tool is costing — invocation counts, estimated downstream input cost, and exact server-tool (web_search) charges. Use this to decide which tools to trim or gate.">Tools</a>
-    <a href="/?{{ qs_trends }}" class="{{ 'active' if tab == 'trends' else '' }}"
-      title="Period-over-period deltas, anomaly day flags, top-N most expensive turns and top spenders.">Trends</a>
-    <a href="/?{{ qs_routing }}" class="{{ 'active' if tab == 'routing' else '' }}"
-      title="Per-turn Haiku/Sonnet routing — estimated cost saved versus an always-Sonnet baseline, after subtracting the cheap classifier overhead.">Model Routing</a>
     <a href="/?{{ qs_users }}" class="{{ 'active' if tab == 'users' else '' }}"
-      title="Engagement view: who is new, active, or dormant — plus a small chip filter for log-frequency patterns (every day, most days, occasional, once, multiple/day).">Users</a>
+      title="Who is using Aime — profiles, behavior patterns, engagement classification.">Users</a>
+    <a href="/?{{ qs_conversations }}" class="{{ 'active' if tab == 'conversations' else '' }}"
+      title="One row per conversation. Sortable by cost — answers 'what kinds of conversations are happening, and which ones are expensive?'.">Conversations</a>
+    <a href="/?{{ qs_overview }}" class="{{ 'active' if tab == 'overview' else '' }}"
+      title="The top-line $ spend view — totals, deltas vs prior period, by-user and daily summary.">Costs</a>
+    <span class="tab-sep"></span>
+    <a href="/?{{ qs_cache }}" class="{{ 'active' if tab == 'cache' else '' }}"
+      title="Whether prompt caching is paying for itself — reuse factors, hypothetical no-cache cost, 5m-TTL warnings.">Cache</a>
+    <a href="/?{{ qs_activity }}" class="{{ 'active' if tab == 'activity' else '' }}"
+      title="Call purpose, stop reasons, latency percentiles, hour-of-day shape.">Activity</a>
+    <a href="/?{{ qs_tools }}" class="{{ 'active' if tab == 'tools' else '' }}"
+      title="Per-tool cost — which tool is worth trimming first.">Tools</a>
+    <a href="/?{{ qs_routing }}" class="{{ 'active' if tab == 'routing' else '' }}"
+      title="Per-turn Haiku/Sonnet routing — net cost saved vs always-Sonnet, after subtracting classifier overhead.">Routing</a>
+    <a href="/?{{ qs_trends }}" class="{{ 'active' if tab == 'trends' else '' }}"
+      title="Anomaly day flags and the top-N most expensive turns.">Trends</a>
+    <span class="tab-sep"></span>
     <a href="/?{{ qs_accounts }}" class="{{ 'active' if tab == 'accounts' else '' }}"
-      title="List, grant/revoke, soft-delete, restore and purge user accounts.">Accounts</a>
+      title="List, grant/revoke, soft-delete, restore and purge accounts.">Accounts</a>
     <a href="/?{{ qs_keys }}" class="{{ 'active' if tab == 'keys' else '' }}"
-      title="Mint and revoke single-use invite keys.">Keys</a>
+      title="Mint and revoke invite keys.">Keys</a>
     <a href="/?{{ qs_system }}" class="{{ 'active' if tab == 'system' else '' }}"
-      title="Operator-level health: account/key counts, storage per user (sizes and file counts only — never content), usage-log status.">System</a>
+      title="Operator health — account/key counts, storage per user, log size.">System</a>
   </nav>
 
   {% for f in flashes %}
   <div class="flash {{ f.level }}">{{ f.msg }}</div>
   {% endfor %}
 
-  {% if tab in ('overview', 'cache', 'activity', 'tools', 'trends', 'users', 'routing') %}
+  {% if tab in ('overview', 'cache', 'activity', 'tools', 'trends', 'users', 'routing', 'conversations') %}
   <form class="filter" method="get">
     <input type="hidden" name="tab" value="{{ tab }}">
     <label title="Only include records on or after this date, interpreted in the selected time zone. Accepts YYYY-MM-DD or a full ISO-8601 timestamp. Leave blank for no lower bound.">Since ({{ tz_label or 'UTC' }})
@@ -3687,6 +4265,45 @@ def _compute(args):
         [("haiku", routing_haiku_daily), ("sonnet", routing_sonnet_daily)],
     )
 
+    # Per-user behavior signals for the slim by-user table on Overview. Each
+    # is keyed by the same username as `users`; missing keys default to
+    # zero/"none" in the template via .get().
+    user_badges = {}
+    user_session_counts = {}
+    user_active_days = {}
+    user_median_turn = {}
+    for name in users.keys():
+        own = [r for r in records
+               if (r.get("user") or "(anonymous)") == name]
+        b = _user_behavior(own, name)
+        user_badges[name] = b["badge"]
+        user_session_counts[name] = b["sessions"]
+        user_active_days[name] = b["active_days"]
+        user_median_turn[name] = b["median_turn_cost"]
+
+    # Period-over-period deltas — surfaced on Overview cards (previously only
+    # on Trends). The window we compare against is the prior equal-length
+    # window relative to (since, until); _compare_periods handles the unset
+    # case by defaulting to last-30d-vs-prior-30d.
+    curr_p, prev_p, (cs_p, ce_p, ps_p, pe_p) = _compare_periods(
+        all_records, since, until, now=now_local)
+    overview_delta = {
+        "cost":   _delta_pct(curr_p["cost"],   prev_p["cost"]),
+        "calls":  _delta_pct(curr_p["calls"],  prev_p["calls"]),
+        "tokens": _delta_pct(curr_p["tokens"], prev_p["tokens"]),
+        "users":  _delta_pct(curr_p["users"],  prev_p["users"]),
+    }
+    overview_prev_window = f"{ps_p.date()} → {pe_p.date()}"
+    anonymized = _records_are_anonymized(records)
+
+    # Sessions for the Conversations tab (and reusable elsewhere).
+    sessions = _aggregate_by_session(records)
+    sessions_total_cost = sum(s["cost"] for s in sessions)
+    sessions_avg_cost = (sessions_total_cost / len(sessions)) if sessions else 0.0
+    sessions_avg_turns = (
+        sum(s["turns"] for s in sessions) / len(sessions)
+    ) if sessions else 0.0
+
     return dict(
         log=path,
         record_count=len(records),
@@ -3709,6 +4326,21 @@ def _compute(args):
         cache_hit_pct=cache_hit_pct,
         by_day=by_day,
         by_model=by_model,
+        anonymized=anonymized,
+        user_badges=user_badges,
+        user_session_counts=user_session_counts,
+        user_active_days=user_active_days,
+        user_median_turn=user_median_turn,
+        delta=overview_delta,
+        curr=curr_p,
+        prev=prev_p,
+        prev_window=overview_prev_window,
+        # conversations
+        sessions=sessions,
+        session_count=len(sessions),
+        sessions_total_cost=sessions_total_cost,
+        sessions_avg_cost=sessions_avg_cost,
+        sessions_avg_turns=sessions_avg_turns,
         # overview view toggle
         view=view,
         user_count=user_count,
@@ -3999,8 +4631,15 @@ def _user_context(username: str, tz_raw: str = ""):
                       for i, (name, p) in enumerate(by_purpose[:8])]
     chart_purpose_donut = _svg_donut(purpose_slices)
 
-    recent = _recent_records(records, n=25)
-    recent_costs = [_report._api_cost(r) for r in recent]
+    behavior = _user_behavior(records, username)
+    user_sessions_rows = _user_sessions(records, username)
+    weekday_grid = _user_weekday_hour(records)
+    weekday_labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    hour_labels = [f"{h:02d}" for h in range(24)]
+    chart_user_heatmap = _svg_heatmap(
+        weekday_grid, row_labels=weekday_labels, col_labels=hour_labels,
+        width=520, height=180,
+    )
 
     return dict(
         username=username,
@@ -4012,16 +4651,17 @@ def _user_context(username: str, tz_raw: str = ""):
         chart_daily_cost=chart_daily_cost,
         chart_model_donut=chart_model_donut,
         chart_purpose_donut=chart_purpose_donut,
-        recent=recent,
-        _costs=recent_costs,
+        behavior=behavior,
+        user_sessions=user_sessions_rows,
+        chart_user_heatmap=chart_user_heatmap,
     )
 
 
 def _tab(args) -> str:
     t = args.get("tab")
     return t if t in ("overview", "cache", "activity", "tools", "trends",
-                      "users", "routing", "accounts", "keys",
-                      "system") else "overview"
+                      "users", "conversations", "routing", "accounts", "keys",
+                      "system") else "users"
 
 
 def _render_fragment(ctx, tab) -> str:
@@ -4031,11 +4671,13 @@ def _render_fragment(ctx, tab) -> str:
         "tools": _FRAGMENT_TOOLS,
         "trends": _FRAGMENT_TRENDS,
         "users": _FRAGMENT_USERS,
+        "conversations": _FRAGMENT_CONVERSATIONS,
         "routing": _FRAGMENT_ROUTING,
         "accounts": _FRAGMENT_ACCOUNTS,
         "keys": _FRAGMENT_KEYS,
         "system": _FRAGMENT_SYSTEM,
-    }.get(tab, _FRAGMENT_OVERVIEW)
+        "overview": _FRAGMENT_OVERVIEW,
+    }.get(tab, _FRAGMENT_USERS)
     return render_template_string(template, **ctx)
 
 
@@ -4140,7 +4782,7 @@ def index():
             if request.args.get(k)}
     qs = {t: urlencode({**keep, "tab": t})
           for t in ("overview", "cache", "activity", "tools", "trends", "users",
-                    "routing", "accounts", "keys", "system")}
+                    "conversations", "routing", "accounts", "keys", "system")}
 
     return render_template_string(
         _PAGE, fragment=fragment, tab=tab, auto=auto,
@@ -4149,6 +4791,7 @@ def index():
         qs_overview=qs["overview"], qs_cache=qs["cache"],
         qs_activity=qs["activity"], qs_tools=qs["tools"],
         qs_trends=qs["trends"], qs_users=qs["users"],
+        qs_conversations=qs["conversations"],
         qs_routing=qs["routing"],
         qs_accounts=qs["accounts"], qs_keys=qs["keys"],
         qs_system=qs["system"], **page_ctx,
@@ -4200,7 +4843,7 @@ def user_drilldown(username):
                if request.args.get(k)}
     qs = {t: urlencode({**keep_tz, "tab": t})
           for t in ("overview", "cache", "activity", "tools", "trends", "users",
-                    "routing", "accounts", "keys", "system")}
+                    "conversations", "routing", "accounts", "keys", "system")}
     return render_template_string(
         _PAGE, fragment=fragment, tab="user", auto=0,
         auto_label="second",
@@ -4208,6 +4851,83 @@ def user_drilldown(username):
         qs_overview=qs["overview"], qs_cache=qs["cache"],
         qs_activity=qs["activity"], qs_tools=qs["tools"],
         qs_trends=qs["trends"], qs_users=qs["users"],
+        qs_conversations=qs["conversations"],
+        qs_routing=qs["routing"],
+        qs_accounts=qs["accounts"], qs_keys=qs["keys"],
+        qs_system=qs["system"], **empty_page_ctx,
+    )
+
+
+@app.route("/session/<path:session_id>")
+@admin_required
+def session_drilldown(session_id):
+    """Timeline + breakdowns for one session_id. Linked from the
+    Conversations tab and from a user's drill-down."""
+    csrf = _csrf_token()
+    flashes = session.pop("flash", [])
+    tz_raw = request.args.get("tz", "")
+    tz_auto = request.args.get("tz_auto") == "1"
+
+    path = _log_path()
+    all_records = []
+    if os.path.exists(path):
+        all_records = list(_report.load_records(path, None, None, None))
+    zone, tz_label = _resolve_zone(tz_raw)
+    if zone is not None:
+        _shift_records_to_zone(all_records, zone)
+
+    header, timeline, by_model, by_tool, by_purpose, total_cost = (
+        _session_detail(all_records, session_id)
+    )
+
+    # Donut breakdowns reuse the standard SVG helper. Donut slices want a
+    # stable colour per model/purpose; iteration order in the underlying
+    # dicts is insertion order, which is acceptable here.
+    model_slices = [(name, cost, _color_for(i))
+                    for i, (name, cost) in enumerate(
+                        sorted(by_model.items(), key=lambda kv: kv[1], reverse=True))]
+    purpose_slices = [(name, cost, _color_for(i))
+                      for i, (name, cost) in enumerate(
+                          sorted(by_purpose.items(), key=lambda kv: kv[1], reverse=True))]
+    chart_model_donut = _svg_donut(model_slices[:8])
+    chart_purpose_donut = _svg_donut(purpose_slices[:8])
+
+    tool_call_counts: dict = {}
+    for r in all_records:
+        if r.get("session_id") == session_id and r.get("kind") == "tool":
+            n = r.get("tool_name") or "(unknown)"
+            tool_call_counts[n] = tool_call_counts.get(n, 0) + 1
+
+    fragment = render_template_string(
+        _FRAGMENT_SESSION,
+        header=header,
+        timeline=timeline,
+        by_tool=sorted(by_tool.items(), key=lambda kv: kv[1], reverse=True),
+        tool_call_counts=tool_call_counts,
+        total_cost=total_cost,
+        chart_model_donut=chart_model_donut,
+        chart_purpose_donut=chart_purpose_donut,
+    )
+
+    empty_page_ctx = dict(since_raw="", until_raw="", user_raw="",
+                          model_raw="", purpose_raw="",
+                          tz_raw="auto" if tz_auto else tz_raw,
+                          tz_label=tz_label,
+                          tz_options=_COMMON_TIMEZONES,
+                          all_users=[], all_models=[], all_purposes=[])
+    keep_tz = {k: request.args.get(k) for k in ("tz", "tz_auto")
+               if request.args.get(k)}
+    qs = {t: urlencode({**keep_tz, "tab": t})
+          for t in ("overview", "cache", "activity", "tools", "trends", "users",
+                    "conversations", "routing", "accounts", "keys", "system")}
+    return render_template_string(
+        _PAGE, fragment=fragment, tab="session", auto=0,
+        auto_label="second",
+        csrf=csrf, flashes=flashes,
+        qs_overview=qs["overview"], qs_cache=qs["cache"],
+        qs_activity=qs["activity"], qs_tools=qs["tools"],
+        qs_trends=qs["trends"], qs_users=qs["users"],
+        qs_conversations=qs["conversations"],
         qs_routing=qs["routing"],
         qs_accounts=qs["accounts"], qs_keys=qs["keys"],
         qs_system=qs["system"], **empty_page_ctx,
