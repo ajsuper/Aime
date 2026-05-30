@@ -3248,6 +3248,102 @@ _FRAGMENT_SYSTEM = """
   {% endif %}"""
 
 
+# Security tab. Surfaces the auth_events audit log so the operator can spot
+# abnormal login/signup activity without having to grep auth.sql by hand.
+_FRAGMENT_SECURITY = """
+  <div class="cards">
+    <div class="card accent-red"
+      title="Failed logins where the username does not match any account. A spike here usually means someone is iterating through guessed usernames.">
+      <div class="num bad">{{ counts_24h.login_unknown_user }}</div>
+      <div class="lbl">unknown-user logins (24h)</div></div>
+    <div class="card accent-amber"
+      title="Failed logins against a real account with a wrong password. Per-account lockout kicks in after 5 of these in a 15-minute window.">
+      <div class="num warn">{{ counts_24h.login_bad_password }}</div>
+      <div class="lbl">bad password (24h)</div></div>
+    <div class="card accent-red"
+      title="Login attempts against an account that is currently locked out. Each one means the lockout is doing its job.">
+      <div class="num bad">{{ counts_24h.login_while_locked }}</div>
+      <div class="lbl">attempts on locked accounts (24h)</div></div>
+    <div class="card accent-amber"
+      title="Accounts that crossed the failure threshold and got locked during this window.">
+      <div class="num warn">{{ counts_24h.lockout_started }}</div>
+      <div class="lbl">lockouts started (24h)</div></div>
+  </div>
+
+  <div class="cards">
+    <div class="card accent-red"
+      title="Signup attempts blocked by the per-IP rate limiter (5 per hour per source IP). A spike means someone is trying to bulk-register accounts.">
+      <div class="num bad">{{ counts_24h.signup_rate_limited }}</div>
+      <div class="lbl">signup rate-limited (24h)</div></div>
+    <div class="card accent-amber"
+      title="Signup form submissions that failed validation (weak password, invalid username, taken username, invalid email).">
+      <div class="num warn">{{ counts_24h.signup_failed }}</div>
+      <div class="lbl">signup failures (24h)</div></div>
+    <div class="card accent-blue"
+      title="Same counters, narrowed to the last hour. A 1h:24h ratio close to 1.0 means activity is concentrated right now.">
+      <div class="num blue">{{ total_1h }}</div>
+      <div class="lbl">total events (1h)</div></div>
+    <div class="card accent-purple"
+      title="Retention window for the audit log. Older rows are pruned opportunistically on every write.">
+      <div class="num purple">{{ retention_days }}d</div>
+      <div class="lbl">audit log retention</div></div>
+  </div>
+
+  <h2 title="Source IPs with the highest auth-failure count in the last 24 hours. NULL IPs (background callers) are excluded. If one IP dominates, consider blocking it upstream in Caddy.">Top source IPs (24h)</h2>
+  {% if not top_ips %}
+    <p class="empty">No IP-attributed auth failures in the last 24 hours.</p>
+  {% else %}
+  <table>
+    <thead>
+      <tr>
+        <th title="Source IP (post-ProxyFix, i.e. the real client IP behind the reverse proxy).">IP</th>
+        <th title="Number of auth-failure events from this IP in the window.">Events</th>
+        <th title="Most recent failure timestamp from this IP, in the dashboard time zone.">Last seen</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in top_ips %}
+      <tr>
+        <td><code>{{ r.ip }}</code></td>
+        <td>{{ "{:,}".format(r.count) }}</td>
+        <td>{{ r.last_ts_h }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+
+  <h2 title="The newest {{ events|length }} auth events, regardless of kind. Most recent first.">Recent events</h2>
+  {% if not events %}
+    <p class="empty">No auth events recorded yet.</p>
+  {% else %}
+  <table>
+    <thead>
+      <tr>
+        <th title="When the event was recorded, in the dashboard time zone.">When</th>
+        <th title="The event type. login_* are login failures; lockout_started fires when an account crosses the threshold; signup_* covers the signup flow.">Kind</th>
+        <th title="Username supplied with the attempt. For login_unknown_user this is the value the attacker tried, not a real account.">Username</th>
+        <th title="Source IP (post-ProxyFix). NULL for events not tied to an HTTP request.">IP</th>
+        <th title="Freeform context — failure counter, lockout duration, validation message, etc.">Detail</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for e in events %}
+      <tr>
+        <td>{{ e.ts_h }}</td>
+        <td><span class="kind kind-{{ e.kind }}">{{ e.kind }}</span></td>
+        <td>{{ e.username or '' }}</td>
+        <td>{% if e.ip %}<code>{{ e.ip }}</code>{% endif %}</td>
+        <td>{{ e.detail or '' }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p class="note">Showing the last {{ events|length }} events. Older rows are
+    pruned after {{ retention_days }} days.</p>
+  {% endif %}"""
+
+
 # Accounts admin. A web equivalent of scripts/access_keys.py (grant/revoke,
 # revoke-all) + scripts/manage_users.py (delete/restore/purge). Every form
 # carries the session CSRF token.
@@ -3715,6 +3811,8 @@ _PAGE = """<!doctype html>
       title="Mint and revoke invite keys.">Keys</a>
     <a href="/?{{ qs_system }}" class="{{ 'active' if tab == 'system' else '' }}"
       title="Operator health — account/key counts, storage per user, log size.">System</a>
+    <a href="/?{{ qs_security }}" class="{{ 'active' if tab == 'security' else '' }}"
+      title="Audit log of failed logins, lockouts, and signup throttles.">Security</a>
   </nav>
 
   {% for f in flashes %}
@@ -4488,6 +4586,43 @@ def _system_context() -> dict:
     )
 
 
+def _security_context(tz_raw: str) -> dict:
+    """Template context for the Security tab.
+
+    Resolves the dashboard time zone so the audit log's unix timestamps render
+    in the same zone as the rest of the UI, then asks the auth backend for the
+    rollups + the newest events.
+    """
+    backend = _auth_backend()
+    zone, tz_label = _resolve_zone(tz_raw)
+    counts_24h = backend.auth_event_summary(24 * 60 * 60)
+    counts_1h = backend.auth_event_summary(60 * 60)
+    top_ips_raw = backend.distinct_event_ips(24 * 60 * 60, limit=10)
+    events = backend.recent_auth_events(limit=200)
+
+    def _fmt(ts: int) -> str:
+        dt = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc)
+        if zone is not None:
+            dt = dt.astimezone(zone)
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    top_ips = [
+        {"ip": r["ip"], "count": r["count"], "last_ts_h": _fmt(r["last_ts"])}
+        for r in top_ips_raw
+    ]
+    events_h = [
+        {**e, "ts_h": _fmt(e["ts"])} for e in events
+    ]
+    return dict(
+        counts_24h=counts_24h,
+        total_1h=sum(counts_1h.values()),
+        top_ips=top_ips,
+        events=events_h,
+        retention_days=_auth._AUTH_EVENT_TTL // (24 * 60 * 60),
+        tz_label=tz_label,
+    )
+
+
 def _trends_context(compute_ctx):
     """Compute period-over-period figures and the anomaly / top-N tables.
 
@@ -4661,7 +4796,7 @@ def _tab(args) -> str:
     t = args.get("tab")
     return t if t in ("overview", "cache", "activity", "tools", "trends",
                       "users", "conversations", "routing", "accounts", "keys",
-                      "system") else "users"
+                      "system", "security") else "users"
 
 
 def _render_fragment(ctx, tab) -> str:
@@ -4676,6 +4811,7 @@ def _render_fragment(ctx, tab) -> str:
         "accounts": _FRAGMENT_ACCOUNTS,
         "keys": _FRAGMENT_KEYS,
         "system": _FRAGMENT_SYSTEM,
+        "security": _FRAGMENT_SECURITY,
         "overview": _FRAGMENT_OVERVIEW,
     }.get(tab, _FRAGMENT_USERS)
     return render_template_string(template, **ctx)
@@ -4745,6 +4881,13 @@ def index():
         ctx = _system_context()
         auto = 0
         page_ctx = empty_page_ctx
+    elif tab == "security":
+        # Carry the time-zone query arg so the audit log renders in the same
+        # zone as every other tab. The Security tab does not poll, so no
+        # auto-refresh is wired up.
+        ctx = _security_context(request.args.get("tz", ""))
+        auto = 0
+        page_ctx = {**empty_page_ctx, "tz_label": ctx["tz_label"]}
     else:
         ctx = _compute(request.args)
         auto = _refresh_seconds(request.args)
@@ -4782,7 +4925,8 @@ def index():
             if request.args.get(k)}
     qs = {t: urlencode({**keep, "tab": t})
           for t in ("overview", "cache", "activity", "tools", "trends", "users",
-                    "conversations", "routing", "accounts", "keys", "system")}
+                    "conversations", "routing", "accounts", "keys", "system",
+                    "security")}
 
     return render_template_string(
         _PAGE, fragment=fragment, tab=tab, auto=auto,
@@ -4794,7 +4938,7 @@ def index():
         qs_conversations=qs["conversations"],
         qs_routing=qs["routing"],
         qs_accounts=qs["accounts"], qs_keys=qs["keys"],
-        qs_system=qs["system"], **page_ctx,
+        qs_system=qs["system"], qs_security=qs["security"], **page_ctx,
     )
 
 
@@ -4843,7 +4987,8 @@ def user_drilldown(username):
                if request.args.get(k)}
     qs = {t: urlencode({**keep_tz, "tab": t})
           for t in ("overview", "cache", "activity", "tools", "trends", "users",
-                    "conversations", "routing", "accounts", "keys", "system")}
+                    "conversations", "routing", "accounts", "keys", "system",
+                    "security")}
     return render_template_string(
         _PAGE, fragment=fragment, tab="user", auto=0,
         auto_label="second",
@@ -4854,7 +4999,7 @@ def user_drilldown(username):
         qs_conversations=qs["conversations"],
         qs_routing=qs["routing"],
         qs_accounts=qs["accounts"], qs_keys=qs["keys"],
-        qs_system=qs["system"], **empty_page_ctx,
+        qs_system=qs["system"], qs_security=qs["security"], **empty_page_ctx,
     )
 
 
@@ -4919,7 +5064,8 @@ def session_drilldown(session_id):
                if request.args.get(k)}
     qs = {t: urlencode({**keep_tz, "tab": t})
           for t in ("overview", "cache", "activity", "tools", "trends", "users",
-                    "conversations", "routing", "accounts", "keys", "system")}
+                    "conversations", "routing", "accounts", "keys", "system",
+                    "security")}
     return render_template_string(
         _PAGE, fragment=fragment, tab="session", auto=0,
         auto_label="second",
@@ -4930,7 +5076,7 @@ def session_drilldown(session_id):
         qs_conversations=qs["conversations"],
         qs_routing=qs["routing"],
         qs_accounts=qs["accounts"], qs_keys=qs["keys"],
-        qs_system=qs["system"], **empty_page_ctx,
+        qs_system=qs["system"], qs_security=qs["security"], **empty_page_ctx,
     )
 
 

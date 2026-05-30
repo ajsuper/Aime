@@ -184,7 +184,7 @@ class AuthBackend(Protocol):
     # and the caller should wipe them. See LEGACY MIGRATION AUTH in
     # LocalAuthBackend.verify().
     def verify(
-        self, username: str, password: str
+        self, username: str, password: str, *, ip: str | None = None,
     ) -> tuple[UserRecord, bytes, bool]: ...
     def lookup(self, user_id: int) -> UserRecord | None: ...
     # For background services (Midnight) that need a user's DEK without the
@@ -223,6 +223,19 @@ _MIN_PASSWORD_LEN = 8
 _FAIL_WINDOW_SECONDS = 15 * 60
 _FAIL_THRESHOLD = 5
 _LOCK_SECONDS = 15 * 60
+
+# Auth-event retention. Rows older than this are dropped opportunistically on
+# each write so the table can't grow without bound on a long-running host.
+_AUTH_EVENT_TTL = 30 * 24 * 60 * 60  # 30 days
+
+# Recognized event kinds. Kept as constants so the dashboard and the backend
+# agree on the strings.
+EVENT_LOGIN_UNKNOWN_USER  = "login_unknown_user"
+EVENT_LOGIN_BAD_PASSWORD  = "login_bad_password"
+EVENT_LOGIN_WHILE_LOCKED  = "login_while_locked"
+EVENT_LOCKOUT_STARTED     = "lockout_started"
+EVENT_SIGNUP_RATE_LIMITED = "signup_rate_limited"
+EVENT_SIGNUP_FAILED       = "signup_failed"
 
 # A pre-computed Argon2 hash of an unguessable string. We verify against this
 # whenever a username doesn't exist, so the request takes the same amount of
@@ -290,6 +303,25 @@ class LocalAuthBackend:
                     redeemed_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
                     redeemed_at TEXT
                 );
+                -- Auth-event audit log. Written on every failed login, lockout
+                -- trip, signup throttle, and signup failure so the admin
+                -- dashboard can surface abnormal patterns. `ts` is a unix
+                -- timestamp (seconds). `username` and `ip` may be NULL when
+                -- not applicable; `detail` is a short freeform note (e.g. a
+                -- specific failure reason). Rows older than _AUTH_EVENT_TTL
+                -- seconds are pruned opportunistically.
+                CREATE TABLE IF NOT EXISTS auth_events (
+                    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts       INTEGER NOT NULL,
+                    kind     TEXT    NOT NULL,
+                    username TEXT,
+                    ip       TEXT,
+                    detail   TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_auth_events_ts
+                    ON auth_events(ts DESC);
+                CREATE INDEX IF NOT EXISTS idx_auth_events_kind_ts
+                    ON auth_events(kind, ts DESC);
                 """
             )
             # LEGACY MIGRATION AUTH — pre-encryption databases predate the
@@ -422,7 +454,7 @@ class LocalAuthBackend:
             )
 
     def verify(
-        self, username: str, password: str
+        self, username: str, password: str, *, ip: str | None = None,
     ) -> tuple[UserRecord, bytes, bool]:
         """Authenticate (username, password) and return the user's DEK.
 
@@ -434,7 +466,7 @@ class LocalAuthBackend:
         """
         # Check lockout up front so a locked account never advances to a
         # hash verify (saves CPU and ensures the error is consistent).
-        self._raise_if_locked(username)
+        self._raise_if_locked(username, ip=ip)
 
         with self._lock:
             row = self._conn.execute(
@@ -451,7 +483,7 @@ class LocalAuthBackend:
                 self._hasher.verify(self._dummy_hash, password)
             except VerifyMismatchError:
                 pass
-            self._register_failure(username)
+            self._register_failure(username, ip=ip, unknown_user=(row is None))
             raise InvalidCredentials("invalid username or password")
 
         (user_id, stored_username, pw_hash, salt_dek, wrapped_dek_v2,
@@ -459,7 +491,7 @@ class LocalAuthBackend:
         try:
             self._hasher.verify(pw_hash, password)
         except (VerifyMismatchError, InvalidHashError):
-            self._register_failure(username)
+            self._register_failure(username, ip=ip, unknown_user=(row is None))
             raise InvalidCredentials("invalid username or password")
 
         # Successful verify. Opportunistically re-hash if argon2 has updated
@@ -1144,7 +1176,7 @@ class LocalAuthBackend:
 
     # ---- Lockout bookkeeping ---------------------------------------------
 
-    def _raise_if_locked(self, username: str) -> None:
+    def _raise_if_locked(self, username: str, *, ip: str | None = None) -> None:
         now = int(time.time())
         with self._lock:
             row = self._conn.execute(
@@ -1152,9 +1184,16 @@ class LocalAuthBackend:
                 (username,),
             ).fetchone()
         if row and row[0] and row[0] > now:
+            self.log_event(
+                EVENT_LOGIN_WHILE_LOCKED, username=username, ip=ip,
+                detail=f"{row[0] - now}s remaining",
+            )
             raise AccountLocked(seconds_remaining=row[0] - now)
 
-    def _register_failure(self, username: str) -> None:
+    def _register_failure(
+        self, username: str, *, ip: str | None = None,
+        unknown_user: bool = False,
+    ) -> None:
         now = int(time.time())
         with self._lock:
             row = self._conn.execute(
@@ -1167,6 +1206,9 @@ class LocalAuthBackend:
                 fail_count, first_fail_at = 1, now
             else:
                 fail_count, first_fail_at = row[0] + 1, row[1]
+            newly_locked = fail_count >= _FAIL_THRESHOLD and not (
+                row and row[0] >= _FAIL_THRESHOLD
+            )
             locked_until = (now + _LOCK_SECONDS) if fail_count >= _FAIL_THRESHOLD else None
             self._conn.execute(
                 """
@@ -1180,6 +1222,18 @@ class LocalAuthBackend:
                 (username, fail_count, first_fail_at, locked_until),
             )
             self._conn.commit()
+        # Audit-log the failure outside the lock to keep the critical section
+        # short. The log_event call takes its own lock.
+        self.log_event(
+            EVENT_LOGIN_UNKNOWN_USER if unknown_user else EVENT_LOGIN_BAD_PASSWORD,
+            username=username, ip=ip,
+            detail=f"fail_count={fail_count}",
+        )
+        if newly_locked:
+            self.log_event(
+                EVENT_LOCKOUT_STARTED, username=username, ip=ip,
+                detail=f"locked {_LOCK_SECONDS}s after {fail_count} failures",
+            )
 
     def _clear_failures(self, username: str) -> None:
         with self._lock:
@@ -1187,6 +1241,93 @@ class LocalAuthBackend:
                 "DELETE FROM auth_attempts WHERE username = ?", (username,)
             )
             self._conn.commit()
+
+    # ---- Auth-event audit log --------------------------------------------
+
+    def log_event(
+        self, kind: str, *,
+        username: str | None = None,
+        ip: str | None = None,
+        detail: str | None = None,
+    ) -> None:
+        """Append one row to auth_events. Caller-facing entry point so the web
+        frontend can log non-verify failures (signup throttles, signup form
+        rejections) at the layer that knows the source IP. Prunes rows older
+        than _AUTH_EVENT_TTL on roughly one in 64 writes — cheap amortized
+        bound on table size."""
+        now = int(time.time())
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO auth_events (ts, kind, username, ip, detail) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (now, kind, username, ip, detail),
+            )
+            if now & 0x3F == 0:
+                self._conn.execute(
+                    "DELETE FROM auth_events WHERE ts < ?",
+                    (now - _AUTH_EVENT_TTL,),
+                )
+            self._conn.commit()
+
+    def recent_auth_events(
+        self, limit: int = 200, *, since_ts: int | None = None,
+        kinds: tuple[str, ...] | None = None,
+    ) -> list[dict]:
+        """Newest first. `since_ts` and `kinds` are optional filters. Returns
+        plain dicts so the dashboard can pass them straight to the template."""
+        q = "SELECT id, ts, kind, username, ip, detail FROM auth_events"
+        clauses, params = [], []
+        if since_ts is not None:
+            clauses.append("ts >= ?")
+            params.append(since_ts)
+        if kinds:
+            clauses.append("kind IN (" + ",".join("?" * len(kinds)) + ")")
+            params.extend(kinds)
+        if clauses:
+            q += " WHERE " + " AND ".join(clauses)
+        q += " ORDER BY ts DESC, id DESC LIMIT ?"
+        params.append(int(limit))
+        with self._lock:
+            rows = self._conn.execute(q, params).fetchall()
+        return [
+            {"id": r[0], "ts": r[1], "kind": r[2],
+             "username": r[3], "ip": r[4], "detail": r[5]}
+            for r in rows
+        ]
+
+    def auth_event_summary(self, window_seconds: int) -> dict[str, int]:
+        """Counts by kind over the last `window_seconds`. Drives the
+        dashboard's at-a-glance counters. Unknown kinds are reported as 0 so
+        the template can render a stable row order."""
+        cutoff = int(time.time()) - window_seconds
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT kind, COUNT(*) FROM auth_events WHERE ts >= ? "
+                "GROUP BY kind",
+                (cutoff,),
+            ).fetchall()
+        counts = {k: 0 for k in (
+            EVENT_LOGIN_UNKNOWN_USER, EVENT_LOGIN_BAD_PASSWORD,
+            EVENT_LOGIN_WHILE_LOCKED, EVENT_LOCKOUT_STARTED,
+            EVENT_SIGNUP_RATE_LIMITED, EVENT_SIGNUP_FAILED,
+        )}
+        for kind, n in rows:
+            counts[kind] = n
+        return counts
+
+    def distinct_event_ips(self, window_seconds: int, limit: int = 25) -> list[dict]:
+        """Top IPs by failure volume in the last `window_seconds`. Useful for
+        spotting a single host hammering the login. Excludes NULL IPs (those
+        come from background callers, not network requests)."""
+        cutoff = int(time.time()) - window_seconds
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT ip, COUNT(*) AS n, MAX(ts) AS last_ts "
+                "FROM auth_events WHERE ts >= ? AND ip IS NOT NULL "
+                "GROUP BY ip ORDER BY n DESC, last_ts DESC LIMIT ?",
+                (cutoff, int(limit)),
+            ).fetchall()
+        return [{"ip": r[0], "count": r[1], "last_ts": r[2]} for r in rows]
 
 
 # ---------------------------------------------------------------------------

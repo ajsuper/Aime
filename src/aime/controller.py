@@ -150,11 +150,20 @@ class ConversationController:
 
     # --- input ---
 
-    def dispatch_input(self, raw: str, images: list[dict] | None = None) -> bool:
+    def dispatch_input(
+        self,
+        raw: str,
+        images: list[dict] | None = None,
+        *,
+        hidden_prefix: str = "",
+    ) -> bool:
         """Process a line of user input (slash commands or plain text).
         Optional `images` are forwarded to the backend with the next user
-        message; ignored for slash commands. Returns True if the frontend
-        should quit the app."""
+        message; ignored for slash commands. `hidden_prefix` is prepended to
+        the text sent to the model but NOT shown in the user_message_shown
+        event — used for out-of-band context (e.g. <stale> markers) that the
+        model should see but the user shouldn't have echoed back in their own
+        chat bubble. Returns True if the frontend should quit the app."""
         text = (raw or "").strip()
         if not text and not images:
             return False
@@ -183,18 +192,30 @@ class ConversationController:
                 text=f"Log model thinking set to: {self._log_model_thinking}",
             ))
             return False
-        self.send_user_message(text, images=images)
+        self.send_user_message(text, images=images, hidden_prefix=hidden_prefix)
         return False
 
-    def send_user_message(self, text: str, images: list[dict] | None = None) -> None:
+    def send_user_message(
+        self,
+        text: str,
+        images: list[dict] | None = None,
+        *,
+        hidden_prefix: str = "",
+    ) -> None:
         """Send (or queue) a plain user message without slash parsing."""
         if not self._is_idle:
             self._pending_user_messages.append((text, images))
             self._emit(CoreEvent(kind="user_message_queued", text=text))
             return
-        self._dispatch_user_message(text, images=images)
+        self._dispatch_user_message(text, images=images, hidden_prefix=hidden_prefix)
 
-    def _dispatch_user_message(self, text: str, images: list[dict] | None = None) -> None:
+    def _dispatch_user_message(
+        self,
+        text: str,
+        images: list[dict] | None = None,
+        *,
+        hidden_prefix: str = "",
+    ) -> None:
         attachments: list[dict] = []
         for img in (images or []):
             mt = img.get("media_type")
@@ -211,9 +232,13 @@ class ConversationController:
             if bootstrap:
                 self._backend.set_session_context(bootstrap)
             self._user_first_interaction = False
+        # The prefix carries out-of-band context (e.g. <stale>…</stale>) that
+        # the model should see but the user shouldn't — user_message_shown
+        # above used the raw text, so the chat bubble doesn't include this.
+        backend_text = (hidden_prefix + "\n" + text) if hidden_prefix else text
         try:
             self._backend.submit(BackendEvent(
-                kind="user_send_message", text=text, images=images,
+                kind="user_send_message", text=backend_text, images=images,
             ))
             self._is_idle = False
             self._idle_event.clear()
