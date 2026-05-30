@@ -1257,8 +1257,64 @@
         color: var(--text); cursor: pointer;
         padding-left: 0; padding-right: 0; }
     .ev-row { display: flex; gap: 0.85rem; }
-    /* Tighter vertical rhythm inside the event modal specifically. */
-    #event-modal .modal-body { gap: 0.55rem; padding: 0.9rem 1.1rem; }
+    /* The event modal is the busiest of the reusable modals — it carries a
+       description that can run several paragraphs of markdown, so give it
+       more room than the 480px default. On mobile, fill the screen so the
+       description has space to breathe. */
+    #event-modal { max-width: 680px; }
+    #event-modal .modal-body { gap: 0.7rem; padding: 1rem 1.2rem;
+                               min-height: min(60vh, 460px); }
+    @media (max-width: 768px) {
+      #event-backdrop { padding: 0.75rem; }
+      #event-modal { max-width: 100%; height: 100%; max-height: 100%; }
+      #event-modal .modal-body { flex: 1; min-height: 0; }
+    }
+    /* Read-only description renders as markdown; the textarea takes over in
+       edit mode. Clicking the rendered block swaps into edit mode just like
+       the other ev-fields. */
+    .ev-summary-rendered { background: transparent; color: var(--text);
+                           border: 1px solid transparent; border-radius: 6px;
+                           padding: 0.5rem 0.6rem; min-height: 5em;
+                           cursor: pointer; font-size: 0.95rem; line-height: 1.5;
+                           overflow-wrap: anywhere;
+                           transition: background 0.15s, border-color 0.15s; }
+    .ev-summary-rendered:hover { background: var(--bg-input);
+                                 border-color: var(--border); }
+    .ev-summary-rendered.is-empty { color: var(--muted); font-style: italic; }
+    .ev-summary-rendered p { margin: 0 0 0.6em; }
+    .ev-summary-rendered > :last-child { margin-bottom: 0; }
+    .ev-summary-rendered h1, .ev-summary-rendered h2,
+    .ev-summary-rendered h3, .ev-summary-rendered h4 {
+        margin: 0.6em 0 0.3em; font-family: var(--font-display);
+        line-height: 1.25; }
+    .ev-summary-rendered h1 { font-size: 1.25rem; }
+    .ev-summary-rendered h2 { font-size: 1.15rem; }
+    .ev-summary-rendered h3 { font-size: 1.05rem; }
+    .ev-summary-rendered ul, .ev-summary-rendered ol {
+        margin: 0.3em 0 0.6em; padding-left: 1.4em; }
+    .ev-summary-rendered li { margin: 0.15em 0; }
+    .ev-summary-rendered code { background:
+        color-mix(in srgb, var(--text) 8%, transparent);
+        padding: 0.05em 0.35em; border-radius: 4px;
+        font-size: 0.9em; font-family: ui-monospace, SFMono-Regular,
+        Menlo, Consolas, monospace; }
+    .ev-summary-rendered pre { background:
+        color-mix(in srgb, var(--text) 6%, transparent);
+        padding: 0.6em 0.75em; border-radius: 8px;
+        overflow-x: auto; margin: 0.4em 0 0.7em; }
+    .ev-summary-rendered pre code { background: transparent; padding: 0;
+                                    font-size: 0.88em; }
+    .ev-summary-rendered a { color: var(--accent); text-decoration: underline;
+                             text-decoration-thickness: 1px;
+                             text-underline-offset: 2px; }
+    .ev-summary-rendered blockquote { margin: 0.4em 0; padding: 0.1em 0.8em;
+        border-left: 3px solid var(--border); color: var(--muted); }
+    /* Task lists — `- [ ] thing` — render as clickable rows without bullets. */
+    .ev-summary-rendered li.task-list-item { list-style: none;
+        margin-left: -1em; }
+    .ev-summary-rendered li.task-list-item input[type="checkbox"] {
+        margin: 0 0.45em 0 0; vertical-align: -1px; cursor: pointer;
+        accent-color: var(--accent); }
     .ev-modal-error { color: var(--warning, #e29a4a); font-size: 0.8rem;
                       margin: 0; }
     /* Schedule and pill events should look interactive. */
@@ -1898,7 +1954,10 @@
         </label>
         <label class="ev-field stack">
           <span class="lbl">Summary</span>
-          <textarea id="ev-f-summary" rows="3" readonly></textarea>
+          <div id="ev-f-summary-rendered" class="ev-summary-rendered"
+               role="button" tabindex="0"
+               aria-label="Edit description"></div>
+          <textarea id="ev-f-summary" rows="6" hidden></textarea>
         </label>
         <p class="ev-modal-error" id="ev-modal-error" hidden></p>
       </div>
@@ -4042,6 +4101,7 @@ const evFDate = document.getElementById("ev-f-date");
 const evFTime = document.getElementById("ev-f-time");
 const evFCategory = document.getElementById("ev-f-category");
 const evFSummary = document.getElementById("ev-f-summary");
+const evFSummaryRendered = document.getElementById("ev-f-summary-rendered");
 const evSaveBtn = document.getElementById("ev-save-btn");
 const evCancelBtn = document.getElementById("ev-cancel-btn");
 const evArchiveBtn = document.getElementById("ev-archive-btn");
@@ -4057,6 +4117,73 @@ function inputDateToBackend(d) {
   return m ? `${m[3]}/${m[2]}/${m[1]}` : "";
 }
 
+function renderEventSummary(md) {
+  const text = (md || "").trim();
+  if (!text) {
+    evFSummaryRendered.classList.add("is-empty");
+    evFSummaryRendered.textContent = "Add a description…";
+    return;
+  }
+  evFSummaryRendered.classList.remove("is-empty");
+  if (window.marked) {
+    const rawHtml = window.marked.parse(text);
+    evFSummaryRendered.innerHTML = window.DOMPurify
+      ? window.DOMPurify.sanitize(rawHtml,
+          {ADD_ATTR: ["checked", "disabled"]})
+      : rawHtml;
+  } else {
+    evFSummaryRendered.textContent = text;
+  }
+  // Marked renders task-list items with a disabled checkbox by default.
+  // Enable them and index each so toggles can flip the right markdown marker.
+  const boxes = evFSummaryRendered.querySelectorAll('input[type="checkbox"]');
+  boxes.forEach((box, idx) => {
+    box.disabled = false;
+    box.dataset.taskIndex = String(idx);
+    box.addEventListener("change", onEventCheckboxToggle);
+  });
+}
+
+let evSummarySaveInFlight = Promise.resolve();
+function onEventCheckboxToggle(e) {
+  const box = e.currentTarget;
+  const idx = parseInt(box.dataset.taskIndex, 10);
+  if (isNaN(idx) || !activeEventRecord || activeEventRecord.id == null) return;
+  const current = activeEventRecord.summary || "";
+  const updated = flipNthTask(current, idx, box.checked);
+  if (updated === current) return;
+  activeEventRecord.summary = updated;
+  evFSummary.value = updated;
+  const eventId = activeEventRecord.id;
+  const payload = {
+    title: activeEventRecord.title || "",
+    summary: updated,
+    category: activeEventRecord.category || "",
+    date: activeEventRecord.date || "",
+    time: activeEventRecord.time || "",
+    archived: !!activeEventRecord.archived,
+  };
+  // Serialize saves so rapid toggles can't reorder on the server.
+  evSummarySaveInFlight = evSummarySaveInFlight.then(async () => {
+    try {
+      const res = await fetch(
+        "/calendar/events/" + encodeURIComponent(eventId),
+        { method: "PUT", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload) }
+      );
+      const data = await res.json().catch(() => ({ok: false}));
+      if (!data.ok) {
+        evModalError.textContent =
+          (data && data.error) || "Couldn't save checkbox.";
+        evModalError.hidden = false;
+      }
+    } catch (err) {
+      evModalError.textContent = "Couldn't save checkbox: " + err;
+      evModalError.hidden = false;
+    }
+  });
+}
+
 function openEventModal(ev) {
   activeEventRecord = { ...ev };
   evModalError.hidden = true;
@@ -4065,6 +4192,7 @@ function openEventModal(ev) {
   evFTime.value = (ev.time || "").trim();
   evFCategory.value = ev.category || "";
   evFSummary.value = ev.summary || "";
+  renderEventSummary(ev.summary || "");
   evArchiveBtn.textContent = ev.archived ? "Unarchive" : "Archive";
   setEventEditMode(false);
   eventBackdrop.hidden = false;
@@ -4076,9 +4204,14 @@ function closeEventModal() {
 }
 
 function setEventEditMode(on) {
-  [evFTitle, evFDate, evFTime, evFCategory, evFSummary].forEach(el => {
+  [evFTitle, evFDate, evFTime, evFCategory].forEach(el => {
     el.readOnly = !on;
   });
+  // The summary swaps between a rendered-markdown view (read-only) and a
+  // plain textarea (edit). Two elements, one logical field.
+  evFSummary.hidden = !on;
+  evFSummary.readOnly = !on;
+  evFSummaryRendered.hidden = on;
   evArchiveBtn.hidden = on;
   evSaveBtn.hidden = !on;
   evCancelBtn.hidden = !on;
@@ -4086,7 +4219,7 @@ function setEventEditMode(on) {
 
 // Clicking any field while the modal is read-only swaps into edit mode
 // and focuses what the user clicked, so there's no separate Edit button.
-[evFTitle, evFDate, evFTime, evFCategory, evFSummary].forEach(el => {
+[evFTitle, evFDate, evFTime, evFCategory].forEach(el => {
   el.addEventListener("mousedown", () => {
     if (!el.readOnly) return;
     setEventEditMode(true);
@@ -4094,6 +4227,27 @@ function setEventEditMode(on) {
     // inside the now-editable field.
     setTimeout(() => el.focus({ preventScroll: true }), 0);
   });
+});
+
+// Rendered summary view: click or keyboard activation flips into edit mode
+// and focuses the textarea so typing lands where the user expects.
+function enterSummaryEdit() {
+  if (evFSummaryRendered.hidden) return;
+  setEventEditMode(true);
+  setTimeout(() => evFSummary.focus({ preventScroll: true }), 0);
+}
+evFSummaryRendered.addEventListener("mousedown", (e) => {
+  // Let link clicks and checkbox toggles inside the rendered markdown work
+  // normally — swapping to edit mode here would eat the click.
+  if (e.target.closest("a, input[type=checkbox], label")) return;
+  e.preventDefault();
+  enterSummaryEdit();
+});
+evFSummaryRendered.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" || e.key === " ") {
+    e.preventDefault();
+    enterSummaryEdit();
+  }
 });
 
 async function saveActiveEvent() {

@@ -27,7 +27,7 @@
     },
     "summary": {
       "type": "string",
-      "description": "A detailed description of the event containing information such as where an event occurs, what the event is in more detail, and whatever other important information is applicable."
+      "description": "A detailed description of the event containing information such as where an event occurs, what the event is in more detail, and whatever other important information is applicable. Rendered as GitHub-flavored Markdown in the UI, so use it where it helps the reader: headings, **bold**, *italic*, lists, links, and `code`. When the event has things to do, prepare, pack, or check off, write them as a markdown task list (`- [ ] item`) — these render as real checkboxes the user can tick, which then flip to `- [x]` in the stored summary."
     },
     "title": {
       "type": "string",
