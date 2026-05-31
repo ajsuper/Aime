@@ -240,6 +240,7 @@ class AnthropicMessagesBackend:
         usage_label: str | None = None,
         router=None,
         web_search_schema: str | None = None,
+        onboarding_tool_schema: str | None = None,
     ):
         self._client = Anthropic(max_retries=3)
         self._system_prompt = system_prompt
@@ -287,6 +288,16 @@ class AnthropicMessagesBackend:
                 **self._tools[-1],
                 "cache_control": {"type": "ephemeral", "ttl": "1h"},
             }
+        # The onboarding-completion tool is special: it's only offered to the
+        # model *during* first-time onboarding (see set_onboarding_tool_active).
+        # It is deliberately NOT part of self._tools / the cached prefix —
+        # _tools_for_turn appends it AFTER the cache breakpoint, so toggling it
+        # on and off never invalidates the cached tool prefix.
+        self._onboarding_tool = (
+            self._load_schema(onboarding_tool_schema)
+            if onboarding_tool_schema else None
+        )
+        self._onboarding_tool_active = False
         # Per-session dynamic context (e.g. bootstrapped topic contents). Lives
         # in the system array rather than the message history so it stays out
         # of compaction and doesn't get replayed inside user turns.
@@ -343,6 +354,31 @@ class AnthropicMessagesBackend:
         session is opened. Read by the controller so sub-agent usage (e.g. the
         web-search Haiku call) can be attributed to the same conversation."""
         return self._session_id
+
+    @property
+    def conversations_dir(self) -> str:
+        """Per-user directory where this backend's encrypted conversation files
+        live. Also the natural home for small per-user state files (e.g. the
+        onboarding-complete flag)."""
+        return self._conversations_dir
+
+    def set_onboarding_tool_active(self, active: bool) -> None:
+        """Offer (or withdraw) the CompleteOnboarding tool to the model. The
+        controller turns it on while first-time onboarding is in flight and off
+        once the model has called it (or on reset/load). No-op if no onboarding
+        tool schema was configured."""
+        with self._lock:
+            self._onboarding_tool_active = bool(active) and self._onboarding_tool is not None
+
+    def _tools_for_turn(self) -> list[dict]:
+        """The cached base tools, plus the onboarding tool appended after the
+        cache breakpoint while onboarding is active. Appending (rather than
+        rebuilding) keeps the cached tool prefix byte-stable."""
+        with self._lock:
+            active = self._onboarding_tool_active
+        if active and self._onboarding_tool is not None:
+            return [*self._tools, self._onboarding_tool]
+        return self._tools
 
     def set_session_context(self, text: str) -> None:
         """Attach session-scoped context (e.g. bootstrapped topic contents) as
@@ -998,7 +1034,7 @@ class AnthropicMessagesBackend:
         with self._client.messages.stream(
             model=turn_model,
             system=self._build_system(),
-            tools=self._tools,
+            tools=self._tools_for_turn(),
             messages=self._cacheable_messages(messages_snapshot),
             max_tokens=self._max_tokens,
         ) as stream:

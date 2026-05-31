@@ -61,6 +61,12 @@ WEB_SEARCH_SCHEMA = "../resources/tools/api_web_search_schema.json"
 WEB_SEARCH_MODEL = HAIKU_MODEL
 WEB_SEARCH_TOOL_VERSION = "web_search_20250305"
 
+# Tool offered to the model only during first-time onboarding, so it can mark
+# the flow finished once it delivers its closing message. Presentation is gated
+# per-turn by the backend (see set_onboarding_tool_active); the schema just
+# loads here like any other.
+ONBOARDING_TOOL_SCHEMA = "../resources/tools/api_complete_onboarding_schema.json"
+
 
 def _env_flag(name: str, default: bool) -> bool:
     raw = os.environ.get(name)

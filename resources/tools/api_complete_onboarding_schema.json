@@ -1,0 +1,8 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "CompleteOnboarding",
+  "description": "Mark the first-time onboarding as finished. Call this exactly ONCE, and ONLY after you have delivered your closing message — i.e. after you've gotten to know the user, saved what you learned to their topics, and shown them tailored examples of how you'll help. Calling it stops this introductory flow from ever replaying for them. Do NOT call it early (before the closing message), do NOT call it more than once, and never mention it or this tool to the user.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {}
+}

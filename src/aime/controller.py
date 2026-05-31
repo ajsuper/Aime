@@ -32,7 +32,8 @@ from .tool_formatting import (
 )
 from .onboarding import (
     bootstrap_special_topics,
-    is_first_conversation,
+    should_run_onboarding,
+    OnboardingState,
     ONBOARDING_PROMPT,
 )
 
@@ -138,6 +139,13 @@ class ConversationController:
         self._pending_user_messages: list[str] = []
         self._user_first_interaction = True
         self._log_model_thinking = False
+        # Onboarding: a persisted per-user flag is the source of truth (see
+        # OnboardingState). While onboarding is in flight we offer the model the
+        # CompleteOnboarding tool; the model calls it after its closing message,
+        # which is what marks onboarding done — see _handle_tool_use.
+        self._onboarding = OnboardingState(
+            getattr(self._backend, "conversations_dir", None)
+        )
 
     # --- subscription ---
 
@@ -160,13 +168,19 @@ class ConversationController:
         self._maybe_start_onboarding()
 
     def _maybe_start_onboarding(self) -> None:
-        if not is_first_conversation(self._backend, self._tools):
+        # Called on every entry into a fresh/empty conversation (app start and
+        # /reset). Re-fires until the user has actually engaged, so a user who
+        # saw the greeting but never replied gets it again instead of landing
+        # in a blank chat — the bug that hit every beta tester.
+        if not should_run_onboarding(self._onboarding, self._tools):
             return
         bootstrap = bootstrap_special_topics(self._tools)
         if bootstrap:
             self._backend.set_session_context(bootstrap)
         # bootstrap already ran — don't repeat on first user message
         self._user_first_interaction = False
+        # Offer the CompleteOnboarding tool for the duration of the flow.
+        self._set_onboarding_tool(True)
         try:
             self._backend.submit(BackendEvent(
                 kind="system_send_message", text=ONBOARDING_PROMPT
@@ -174,6 +188,14 @@ class ConversationController:
             self._is_idle = False
         except Exception as exc:
             self._emit(CoreEvent(kind="error", text=f"onboarding send failed: {exc}"))
+
+    def _set_onboarding_tool(self, active: bool) -> None:
+        """Toggle the model-facing CompleteOnboarding tool. Guarded so backends
+        that don't support it (e.g. the legacy Sessions backend) degrade to the
+        flag/backfill path rather than erroring."""
+        setter = getattr(self._backend, "set_onboarding_tool_active", None)
+        if setter is not None:
+            setter(active)
 
     def shutdown(self) -> None:
         try:
@@ -326,6 +348,9 @@ class ConversationController:
             text="New conversation started",
         ))
         self._spawn_worker(self.run_stream_loop)
+        # A returning user who never finished onboarding gets it again here,
+        # rather than a blank new chat. No-op (and cheap) once they've engaged.
+        self._maybe_start_onboarding()
 
     def load(self, session_id: str) -> None:
         # Switching conversations stops the model mid-turn — see stop_model().
@@ -369,6 +394,9 @@ class ConversationController:
 
     def _reset_internal_state(self) -> None:
         self._user_first_interaction = True
+        # Withdraw the onboarding tool when leaving a conversation (reset/load).
+        # reset() re-arms it via _maybe_start_onboarding if onboarding is due.
+        self._set_onboarding_tool(False)
         self._is_idle = True
         self._idle_event.set()
         self._pending_user_messages = []
@@ -476,6 +504,28 @@ class ConversationController:
         ))
         if not event.expects_response:
             # Server-side / provider-managed tool: display only.
+            return
+        # CompleteOnboarding is a client tool the model calls once, after its
+        # closing message, to mark first-time onboarding finished. Persist the
+        # flag and withdraw the tool so it can't be called again. Handled here
+        # (not via the gateway) since it's controller/session state, not a
+        # backend data mutation.
+        if tool_name == "CompleteOnboarding":
+            self._onboarding.mark_complete()
+            self._set_onboarding_tool(False)
+            self._emit(CoreEvent(
+                kind="tool_result",
+                tool_name=tool_name,
+                tool_result_summary="onboarding complete",
+            ))
+            try:
+                self._backend.submit(BackendEvent(
+                    kind="tool_send_response",
+                    tool_use_id=event.tool_use_id,
+                    tool_result="Onboarding marked complete. Do not call this tool again.",
+                ))
+            except Exception as exc:
+                self._emit(CoreEvent(kind="error", text=f"tool result send failed: {exc}"))
             return
         # WebSearch is a client tool backed by the Haiku sub-agent rather than
         # the HTTP gateway: hand it the request, get back a compact digest +

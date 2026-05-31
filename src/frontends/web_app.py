@@ -326,6 +326,7 @@ class UserContext:
             web_search_schema=(
                 aime_config.WEB_SEARCH_SCHEMA if aime_config.WEB_SEARCH_ENABLED else None
             ),
+            onboarding_tool_schema=aime_config.ONBOARDING_TOOL_SCHEMA,
         )
         backend.new_session()
 
