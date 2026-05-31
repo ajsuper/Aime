@@ -523,6 +523,7 @@ class Aime(App):
         dek = _enc.load_or_create_key_file(os.path.join(tui_user_dir, "tui_dek"))
 
         from aime.model_router import ModelRouter
+        from aime.web_search_agent import WebSearchAgent
         from aime import usage as _aime_usage
         router = ModelRouter(
             haiku_model=aime_config.HAIKU_MODEL,
@@ -531,6 +532,11 @@ class Aime(App):
             enabled=aime_config.MODEL_ROUTING_ENABLED,
             record_api=_aime_usage.record_api,
         )
+        web_search_agent = WebSearchAgent(
+            model=aime_config.WEB_SEARCH_MODEL,
+            tool_version=aime_config.WEB_SEARCH_TOOL_VERSION,
+            record_api=_aime_usage.record_api,
+        ) if aime_config.WEB_SEARCH_ENABLED else None
         backend = AnthropicMessagesBackend(
             system_prompt=aime_config.load_system_prompt(),
             model=aime_config.AGENT_MODEL,
@@ -538,6 +544,9 @@ class Aime(App):
             conversations_dir=conv_dir,
             dek=dek,
             router=router,
+            web_search_schema=(
+                aime_config.WEB_SEARCH_SCHEMA if aime_config.WEB_SEARCH_ENABLED else None
+            ),
         )
         backend.new_session()
 
@@ -549,6 +558,7 @@ class Aime(App):
             backend=backend,
             tool_gateway=gateway,
             worker_spawner=self._spawn_stream_worker,
+            web_search_agent=web_search_agent,
         )
 
     def _spawn_stream_worker(self, fn) -> None:

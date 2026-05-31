@@ -1,0 +1,14 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "WebSearch",
+  "description": "Search the web for current information beyond your knowledge. A research assistant runs the searches, reads the pages, and returns a concise digest plus a Sources list — you never see raw pages. Describe exactly what you need (the question plus any specifics: dates, numbers, comparisons); the more precise the request, the better the digest. When you use web info in your reply, cite from the returned Sources.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["request"],
+  "properties": {
+    "request": {
+      "type": "string",
+      "description": "What to find, in detail — the question and any specifics you need back."
+    }
+  }
+}

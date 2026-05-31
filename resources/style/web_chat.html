@@ -434,6 +434,31 @@
                          transition: opacity 0.45s ease; }
     .msg.notice.loaded::before { display: none; }
     .msg.notice.loaded.fading { opacity: 0; }
+    /* Verbose-mode tool entries: a <details> disclosure. We hide the notice
+       bullet and the native marker, and supply our own caret that rotates
+       open. Expanding reveals the full tool input/result in a scrollable pre. */
+    .msg.notice.tool-notice::before { display: none; }
+    .tool-notice > summary {
+      cursor: pointer; list-style: none; user-select: none;
+      display: flex; align-items: baseline; gap: 0.4rem;
+      white-space: pre-wrap; margin-left: -0.4rem;
+    }
+    .tool-notice > summary::-webkit-details-marker { display: none; }
+    .tool-notice > summary:hover { color: var(--text); }
+    .tool-notice .caret {
+      flex: 0 0 auto; font-size: 0.7em; opacity: 0.7; line-height: 1.3;
+      transition: transform 0.15s ease;
+    }
+    .tool-notice[open] > summary .caret { transform: rotate(90deg); }
+    .tool-notice .tool-detail {
+      margin: 0.4rem 0 0.2rem; padding: 0.55rem 0.7rem;
+      background: rgba(127, 127, 127, 0.09);
+      border: 1px solid var(--border); border-radius: 6px;
+      font-family: ui-monospace, "SF Mono", Menlo, monospace;
+      font-size: 0.82em; line-height: 1.4; color: var(--text);
+      white-space: pre-wrap; word-break: break-word;
+      max-height: 22rem; overflow: auto;
+    }
     .msg .content :is(pre, code) {
       font-family: ui-monospace, "SF Mono", Menlo, monospace;
       font-size: 0.88em;
@@ -2033,8 +2058,9 @@
               </select>
             </div>
             <p class="desc advanced-only">Minimal hides tool activity behind a status line.
-              Standard shows a line per step. Verbose shows tool names,
-              details, and full error text.</p>
+              Standard shows a line per step. Verbose shows tool names and
+              full error text, with a dropdown arrow on each tool step to
+              expand its complete input and result.</p>
           </div>
           <div class="settings-section advanced-only">
             <h3>Date & time</h3>
@@ -2739,6 +2765,33 @@ function appendNotice(text, severity) {
   return div;
 }
 
+// Like appendNotice, but when detailText is present renders a native <details>
+// disclosure: the one-line summary stays visible with a dropdown arrow, and
+// clicking it reveals the full tool input/result. Used in Verbose mode so the
+// transcript stays scannable while every detail is one click away. Falls back
+// to a plain notice when there's nothing extra to show.
+function appendToolNotice(summaryText, severity, detailText) {
+  if (!detailText) return appendNotice(summaryText, severity);
+  const det = document.createElement("details");
+  det.className = "msg notice tool-notice " + (severity || "info");
+  const sum = document.createElement("summary");
+  const caret = document.createElement("span");
+  caret.className = "caret";
+  caret.setAttribute("aria-hidden", "true");
+  caret.textContent = "▸";  // ▸ — rotates to ▾ when open (CSS)
+  sum.appendChild(caret);
+  sum.appendChild(document.createTextNode(summaryText));
+  det.appendChild(sum);
+  const pre = document.createElement("pre");
+  pre.className = "tool-detail";
+  // textContent (never innerHTML): tool inputs/results are untrusted content.
+  pre.textContent = detailText;
+  det.appendChild(pre);
+  logInner.appendChild(det);
+  scrollToBottom();
+  return det;
+}
+
 // The "Loaded conversation…" line and the new-conversation welcome splash —
 // kept so both can be faded out the moment the user sends a message (see the
 // user_message_shown handler).
@@ -3038,8 +3091,11 @@ es.onmessage = (ev) => {
       break;
     case "tool_call":
       if (verbosity === "verbose") {
-        appendNotice("· tool: " + e.tool_name +
-                     (e.tool_details ? " — " + e.tool_details : ""), "info");
+        // Collapsed dropdown: one-line summary + an arrow to expand the full
+        // tool input.
+        appendToolNotice("· tool: " + e.tool_name +
+                     (e.tool_details ? " — " + e.tool_details : ""),
+                     "info", e.tool_detail_full);
       } else if (verbosity === "standard") {
         appendNotice(toolLabel(e.tool_name, e.tool_details), "info");
       } else {  // minimal — a single shared status line
@@ -3048,9 +3104,11 @@ es.onmessage = (ev) => {
       break;
     case "tool_result":
       if (verbosity === "verbose") {
-        appendNotice("· tool done: " + e.tool_name +
+        // Collapsed dropdown: one-line result summary + an arrow to expand the
+        // full tool result.
+        appendToolNotice("· tool done: " + e.tool_name +
                      (e.tool_result_summary ? " — " + e.tool_result_summary : ""),
-                     "info");
+                     "info", e.tool_detail_full);
       }
       // Pane refresh is driven by `remote_edit` (fired for every backend
       // mutation regardless of origin — AI tool call or direct UI edit on

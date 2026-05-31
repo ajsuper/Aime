@@ -239,6 +239,7 @@ class AnthropicMessagesBackend:
         max_tokens: int = 8192,
         usage_label: str | None = None,
         router=None,
+        web_search_schema: str | None = None,
     ):
         self._client = Anthropic(max_retries=3)
         self._system_prompt = system_prompt
@@ -263,10 +264,15 @@ class AnthropicMessagesBackend:
         # and the data key that decrypts them. Both are required for any IO.
         self._conversations_dir = conversations_dir
         self._dek = dek
-        self._tools = [
-            {"type": "web_search_20250305", "name": "web_search"},
-            *[self._load_schema(p) for p in schema_files],
-        ]
+        self._tools = [self._load_schema(p) for p in schema_files]
+        # Web search is offloaded to a Haiku sub-agent via a small client-side
+        # `WebSearch` tool (see aime.web_search_agent and the controller's tool
+        # dispatch). When enabled, its schema loads like any other; the native
+        # server-side web_search tool is intentionally NOT exposed to the
+        # conversational model — that keeps bulky search results out of this
+        # model's re-cached context.
+        if web_search_schema:
+            self._tools.insert(0, self._load_schema(web_search_schema))
         # System prompt and tool schemas are byte-identical on every turn, so
         # mark them as prompt-cache breakpoints with a 1-hour TTL — across the
         # gaps typical of personal-assistant chat the 5-min default TTL would
@@ -330,6 +336,13 @@ class AnthropicMessagesBackend:
         self._persist_lock = threading.Lock()
 
     # --- AgentBackend interface ---
+
+    @property
+    def session_id(self) -> str | None:
+        """The on-disk name of the active conversation file, or None before a
+        session is opened. Read by the controller so sub-agent usage (e.g. the
+        web-search Haiku call) can be attributed to the same conversation."""
+        return self._session_id
 
     def set_session_context(self, text: str) -> None:
         """Attach session-scoped context (e.g. bootstrapped topic contents) as

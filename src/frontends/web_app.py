@@ -299,6 +299,7 @@ class UserContext:
         dek = _auth_backend.get_dek(user_id)
 
         from aime.model_router import ModelRouter
+        from aime.web_search_agent import WebSearchAgent
         from aime import usage as _aime_usage
         router = ModelRouter(
             haiku_model=aime_config.HAIKU_MODEL,
@@ -308,6 +309,12 @@ class UserContext:
             usage_label=username,
             record_api=_aime_usage.record_api,
         )
+        web_search_agent = WebSearchAgent(
+            model=aime_config.WEB_SEARCH_MODEL,
+            tool_version=aime_config.WEB_SEARCH_TOOL_VERSION,
+            usage_label=username,
+            record_api=_aime_usage.record_api,
+        ) if aime_config.WEB_SEARCH_ENABLED else None
         backend = AnthropicMessagesBackend(
             system_prompt=aime_config.load_system_prompt(),
             model=aime_config.AGENT_MODEL,
@@ -316,6 +323,9 @@ class UserContext:
             dek=dek,
             usage_label=username,
             router=router,
+            web_search_schema=(
+                aime_config.WEB_SEARCH_SCHEMA if aime_config.WEB_SEARCH_ENABLED else None
+            ),
         )
         backend.new_session()
 
@@ -351,6 +361,7 @@ class UserContext:
             backend=backend,
             tool_gateway=gateway,
             worker_spawner=spawn_worker,
+            web_search_agent=web_search_agent,
         )
 
         self.controller.subscribe(self._fanout)
@@ -463,6 +474,7 @@ class UserContext:
             "tool_name": event.tool_name,
             "tool_details": event.tool_details,
             "tool_result_summary": event.tool_result_summary,
+            "tool_detail_full": event.tool_detail_full,
             "severity": event.severity,
             "stop_reason": event.stop_reason,
             "from_replay": event.from_replay,

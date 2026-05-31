@@ -530,6 +530,41 @@ def _routing_daily(records, day_keys):
     return haiku, sonnet
 
 
+def _aggregate_web_search(records):
+    """Web-search offload savings.
+
+    Web search runs on a Haiku sub-agent (``purpose == "web_search"``): it does
+    the searching, reads the raw results, and hands the conversational model a
+    compact digest. Re-pricing the sub-agent's token counts at Sonnet's rate
+    approximates what the expensive model would have spent ingesting those same
+    raw results inline — a conservative floor on the saving, since it ignores
+    the bigger recurring win (those results never enter the conversation, so
+    they're never re-read from cache on later turns or re-summarised at
+    compaction).
+
+    The flat per-search fee ($10 / 1000) is charged whoever runs the search, so
+    it lands in both ``actual`` and ``counterfactual`` (via ``_api_cost_at``)
+    and cancels out of the saving; it's surfaced separately as ``flat_cost``.
+    """
+    sonnet_p = _sonnet_price()
+    haiku_p = _haiku_price()
+    out = {
+        "calls": 0, "searches": 0,
+        "actual": 0.0, "counterfactual": 0.0, "savings": 0.0, "flat_cost": 0.0,
+    }
+    for rec in records:
+        if rec.get("kind") != "api" or (rec.get("purpose") or "") != "web_search":
+            continue
+        out["calls"] += 1
+        out["actual"] += _api_cost_at(rec, haiku_p)
+        out["counterfactual"] += _api_cost_at(rec, sonnet_p)
+        n = rec.get("web_search_requests", 0) or 0
+        out["searches"] += n
+        out["flat_cost"] += n * _report.WEB_SEARCH_COST_PER_REQUEST
+    out["savings"] = max(0.0, out["counterfactual"] - out["actual"])
+    return out
+
+
 def _percentile(sorted_values, pct: float):
     """Linear-interpolated percentile of a pre-sorted list (or None if empty)."""
     if not sorted_values:
@@ -2560,6 +2595,34 @@ _FRAGMENT_ROUTING = """<div class="meta">
   actual billed cost is subtracted to get the net figure shown in the
   green card.</p>
 {% endif %}
+
+{% if web_search_summary.calls %}
+  <h2 title="Savings from running web search on a Haiku sub-agent instead of inline on the conversational model.">Web search offload</h2>
+  <div class="cards">
+    <div class="card accent-green"
+      title="USD saved by offloading web search to Haiku. The sub-agent reads the raw results and returns a digest, so the same token counts are billed at Haiku rates instead of Sonnet's. Computed by re-pricing those counts at Sonnet's rate and taking the difference. Conservative — it ignores the bigger recurring win that raw results never enter the conversation to be re-cached on later turns.">
+      <div class="num good">${{ '%.2f' % web_search_summary.savings }}</div>
+      <div class="lbl">offload savings</div></div>
+    <div class="card accent-blue"
+      title="Total searches executed (each billed at the flat $10/1,000 rate) across this many sub-agent calls.">
+      <div class="num">{{ '{:,}'.format(web_search_summary.searches) }}</div>
+      <div class="lbl">searches / {{ '{:,}'.format(web_search_summary.calls) }} calls</div></div>
+    <div class="card accent-amber"
+      title="Flat per-search charge ($10 / 1,000). Charged whoever runs the search, so it is NOT part of the savings — shown here as its own cost line.">
+      <div class="num warn">${{ '%.2f' % web_search_summary.flat_cost }}</div>
+      <div class="lbl">search fees</div></div>
+    <div class="card"
+      title="Actual USD the web-search sub-agent billed on Haiku (tokens + flat search fees).">
+      <div class="num">${{ '%.4f' % web_search_summary.actual }}</div>
+      <div class="lbl">haiku cost</div></div>
+  </div>
+  <p class="dim">Web search runs on a Haiku sub-agent that does the searching,
+  reads the raw results, and hands the conversational model a compact digest +
+  sources. The bulky raw pages never enter the conversation, so they're never
+  re-read from cache on later turns. Savings re-price the sub-agent's token
+  counts at Sonnet's rate; the $10/1,000 search fee is identical either way and
+  is excluded from savings.</p>
+{% endif %}
 """
 
 
@@ -4357,6 +4420,9 @@ def _compute(args):
     routing_total["net_savings"] = (
         routing_total["haiku_savings"] - routing_total["router_cost"]
     )
+    # Web-search offload savings (Haiku sub-agent vs. doing it inline on
+    # Sonnet). Shown on the routing/savings tab alongside model-routing.
+    web_search_summary = _aggregate_web_search(records)
     routing_haiku_daily, routing_sonnet_daily = _routing_daily(records, day_keys)
     chart_routing_stack = _svg_stacked_bars(
         day_keys,
@@ -4496,6 +4562,7 @@ def _compute(args):
         routing_users=routing_users,
         routing_total=routing_total,
         chart_routing_stack=chart_routing_stack,
+        web_search_summary=web_search_summary,
         # records carried for Trends-tab post-processing
         _records=records,
         _all_records=all_records,

@@ -17,6 +17,7 @@ event (worker thread for agent output; calling thread for input handlers);
 frontends are responsible for thread-marshaling if their UI toolkit needs it.
 """
 
+import json
 import threading
 from dataclasses import dataclass, field
 from typing import Callable, Literal
@@ -69,6 +70,11 @@ class CoreEvent:
     tool_name: str = ""
     tool_details: str = ""
     tool_result_summary: str = ""
+    # The complete, multi-line detail behind the one-line summaries above: the
+    # full tool input on a `tool_call`, the full result on a `tool_result`. A
+    # verbose-mode frontend can show it in a collapsible dropdown; quieter
+    # tiers ignore it. Empty when there's nothing more than the summary.
+    tool_detail_full: str = ""
     severity: Severity = "info"
     restart_reason: RestartReason | None = None
     stop_reason: str = ""
@@ -86,16 +92,39 @@ Subscriber = Callable[[CoreEvent], None]
 WorkerSpawner = Callable[[Callable[[], None]], None]
 
 
+def _full_detail_text(value) -> str:
+    """The complete, human-readable detail behind a tool's one-line summary —
+    the full input args or the full result — for a verbose-mode dropdown.
+
+    Strings (e.g. the WebSearch digest) pass through; dicts/lists are
+    pretty-printed JSON. Best-effort: an unserializable value falls back to its
+    repr rather than raising, since this only feeds an optional UI affordance.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, indent=2, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return str(value)
+
+
 class ConversationController:
     def __init__(
         self,
         backend: AgentBackend,
         tool_gateway: ToolGateway,
         worker_spawner: WorkerSpawner,
+        web_search_agent=None,
     ):
         self._backend = backend
         self._tools = tool_gateway
         self._spawn_worker = worker_spawner
+        # Optional Haiku-backed web search. When set, the `WebSearch` tool is
+        # executed here (not via the HTTP gateway) by handing the request to
+        # the sub-agent; see _handle_tool_use.
+        self._web_search_agent = web_search_agent
         self._subscribers: list[Subscriber] = []
         # Conversation-level state. Presentation flags (e.g. whether the
         # "thinking…" line is visible) live in the frontend, not here.
@@ -443,18 +472,43 @@ class ConversationController:
             kind="tool_call",
             tool_name=tool_name,
             tool_details=details,
+            tool_detail_full=_full_detail_text(tool_input),
         ))
         if not event.expects_response:
             # Server-side / provider-managed tool: display only.
             return
-        result = self._tools.execute(tool_name, tool_input)
-        summary = format_tool_response(tool_name, result)
-        if summary:
+        # WebSearch is a client tool backed by the Haiku sub-agent rather than
+        # the HTTP gateway: hand it the request, get back a compact digest +
+        # Sources string, and pass that to the model. The bulky raw results
+        # never touch this (re-cached) conversation.
+        if tool_name == "WebSearch" and self._web_search_agent is not None:
+            digest = self._web_search_agent.search(
+                tool_input.get("request") or "",
+                session_id=getattr(self._backend, "session_id", None),
+            )
             self._emit(CoreEvent(
                 kind="tool_result",
                 tool_name=tool_name,
-                tool_result_summary=summary,
+                tool_result_summary="searched the web",
+                tool_detail_full=_full_detail_text(digest),
             ))
+            try:
+                self._backend.submit(BackendEvent(
+                    kind="tool_send_response",
+                    tool_use_id=event.tool_use_id,
+                    tool_result=digest,
+                ))
+            except Exception as exc:
+                self._emit(CoreEvent(kind="error", text=f"tool result send failed: {exc}"))
+            return
+        result = self._tools.execute(tool_name, tool_input)
+        summary = format_tool_response(tool_name, result)
+        self._emit(CoreEvent(
+            kind="tool_result",
+            tool_name=tool_name,
+            tool_result_summary=summary,
+            tool_detail_full=_full_detail_text(result),
+        ))
         # For the high-volume read tools, hand the model a compact text view
         # instead of raw JSON — same information, far fewer cached tokens on
         # every subsequent turn. Other tools (and the UI summary above) keep

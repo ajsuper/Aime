@@ -49,6 +49,18 @@ SONNET_MODEL = "claude-sonnet-4-6"
 HAIKU_MODEL = "claude-haiku-4-5-20251001"
 ROUTER_MODEL = "claude-haiku-4-5-20251001"
 
+# Web search is offloaded to a Haiku sub-agent (see aime.web_search_agent): the
+# conversational model calls a single `WebSearch` tool, and Haiku runs the
+# native server-side search, reads the raw results, and returns a compact
+# summary + sources. Keeps bulky search results out of the expensive model's
+# (re-cached every turn) context. WEB_SEARCH_MODEL is the model that runs the
+# search; WEB_SEARCH_TOOL_VERSION is the native tool it uses (the 20250305
+# version is GA on Haiku — dynamic filtering isn't needed, Haiku's read+
+# summarize IS the filtering).
+WEB_SEARCH_SCHEMA = "../resources/tools/api_web_search_schema.json"
+WEB_SEARCH_MODEL = HAIKU_MODEL
+WEB_SEARCH_TOOL_VERSION = "web_search_20250305"
+
 
 def _env_flag(name: str, default: bool) -> bool:
     raw = os.environ.get(name)
@@ -62,6 +74,9 @@ def _env_flag(name: str, default: bool) -> bool:
 
 # AIME_MODEL_ROUTING=0 forces every turn to Sonnet (the original behavior).
 MODEL_ROUTING_ENABLED = _env_flag("AIME_MODEL_ROUTING", True)
+
+# AIME_WEB_SEARCH=0 drops the WebSearch tool entirely (no web access).
+WEB_SEARCH_ENABLED = _env_flag("AIME_WEB_SEARCH", True)
 
 
 def load_system_prompt(path: str = SYSTEM_PROMPT_PATH) -> str:

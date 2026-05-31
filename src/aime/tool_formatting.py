@@ -90,6 +90,10 @@ def format_tool_details(name: str, inp: dict) -> str:
             f"\"{_truncate_for_log(inp.get('old_name'), 30) or '?'}\""
             f" → \"{_truncate_for_log(inp.get('new_name'), 30) or '?'}\""
         )
+    elif name == "WebSearch":
+        q = _truncate_for_log(inp.get("request"), 60)
+        if q:
+            parts.append(f"\"{q}\"")
     elif name == "GetTopicContents":
         parts.append(f"id={inp.get('id', '?')}")
     elif name == "ReplaceTopicContents":
