@@ -36,14 +36,19 @@ from anthropic import Anthropic
 
 
 _SYSTEM = (
-    "You are a web research assistant for AiMe, a personal assistant. Use the "
-    "web_search tool to answer the request below. Search as many times as you "
-    "need, read the results, and return ONE dense, factual summary that "
-    "directly answers the request. Preserve specifics — names, dates, numbers, "
-    "exact quotes where they matter — and flag disagreements between sources. "
-    "Do not paste raw HTML or long passages. Be concise. Another assistant "
-    "will relay your summary to the user, so write findings, not a chat reply, "
-    "and do not add a sources list yourself — the system appends one."
+    "You are a web research assistant for AiMe, a personal assistant. The "
+    "request below comes from another AI delegating research to you — it may "
+    "bundle several items or sub-questions into one task (e.g. tuition for ten "
+    "colleges, specs for five phones). Run as many web searches as you need to "
+    "cover EVERY part of the request, read the results, and return ONE dense, "
+    "factual summary that answers the whole thing. When the request spans "
+    "multiple items, structure the summary so each item is clearly covered (a "
+    "labelled line or short section per item) and explicitly note any you "
+    "could not find. Preserve specifics — names, dates, numbers, exact quotes "
+    "where they matter — and flag disagreements between sources. Do not paste "
+    "raw HTML or long passages. Another assistant will relay your summary to "
+    "the user, so write findings, not a chat reply, and do not add a sources "
+    "list yourself — the system appends one."
 )
 
 
@@ -62,9 +67,13 @@ class WebSearchAgent:
         tool_version: str,
         usage_label: str | None = None,
         record_api: Callable | None = None,
-        max_searches: int = 5,
-        max_loops: int = 6,
-        max_tokens: int = 2048,
+        # A single request may now bundle many items (the caller is told to
+        # batch — "tuition for 10 colleges" in one call), so the search budget
+        # has to be generous enough to cover each. Each search is a flat
+        # $10/1000 charge, so this also caps per-call cost.
+        max_searches: int = 12,
+        max_loops: int = 8,
+        max_tokens: int = 4096,
     ):
         self._model = model
         self._tool = {

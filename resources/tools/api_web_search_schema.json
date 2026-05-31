@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "WebSearch",
-  "description": "Search the web for current information beyond your knowledge. A research assistant runs the searches, reads the pages, and returns a concise digest plus a Sources list — you never see raw pages. Describe exactly what you need (the question plus any specifics: dates, numbers, comparisons); the more precise the request, the better the digest. When you use web info in your reply, cite from the returned Sources.",
+  "description": "Delegate a research task to a capable web-research assistant. This is NOT a search-query box — it is a message to another AI that runs as many web searches as it needs, reads the pages, and returns a digest plus a Sources list (you never see raw pages). Put your ENTIRE research need in ONE call: if you need the same kind of information for many items (e.g. tuition for 10 colleges, specs for 5 phones, hours for several stores), describe all of them in a single request and the assistant will research each — do NOT make one call per item. Be specific about what to find and how you want it back (dates, numbers, comparisons, a per-item breakdown). Cite the returned Sources when you use the findings.",
   "type": "object",
   "additionalProperties": false,
   "required": ["request"],
