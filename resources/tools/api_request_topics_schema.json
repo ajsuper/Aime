@@ -1,29 +1,29 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "FilterTopics",
-  "description": "Request body for POST /api. All fields are optional; omitted fields use their defaults. The tool gets a list of topics based on the filters. Each returned topic includes its 'folder' name (empty string = root); folder is NOT a filter dimension — fetch all topics and group by folder client-side if needed.",
+  "description": "List topics. All fields optional. Each result includes its folder (empty = root); folder is not filterable — group client-side if needed.",
   "type": "object",
   "additionalProperties": false,
   "properties": {
     "category": {
       "type": "string",
-      "description": "Exact single-category match. Takes precedence over 'categories' if both are provided."
+      "description": "Exact single-category match. Overrides 'categories'."
     },
     "categories": {
       "type": "array",
       "items": { "type": "string" },
       "minItems": 1,
-      "description": "OR match across multiple categories. Ignored if 'category' is also set."
+      "description": "OR match across categories. Ignored if 'category' is set."
     },
     "keyword": {
       "type": "string",
-      "description": "Case-insensitive substring search across topic title and summary."
+      "description": "Case-insensitive substring search over title and summary."
     },
     "limit": {
       "type": "integer",
       "minimum": 0,
       "default": 0,
-      "description": "Maximum number of results to return. 0 means unlimited."
+      "description": "Max results; 0 = unlimited."
     }
   }
 }

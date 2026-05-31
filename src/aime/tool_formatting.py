@@ -114,6 +114,84 @@ def format_tool_details(name: str, inp: dict) -> str:
     return ", ".join(parts)
 
 
+def _render_events(events: list) -> str:
+    n = len(events)
+    if n == 0:
+        return "No events match the filters."
+    lines = [f"{n} event{'s' if n != 1 else ''}:"]
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        eid = ev.get("id", "?")
+        title = (ev.get("title") or "(untitled)").strip()
+        when = ev.get("date") or "?"
+        if ev.get("time"):
+            when += f" {ev['time']}"
+        head = f"• #{eid} {title} | {when}"
+        if ev.get("category"):
+            head += f" | {ev['category']}"
+        if ev.get("archived"):
+            head += " | [archived]"
+        lines.append(head)
+        summary = (ev.get("summary") or "").strip()
+        for sline in summary.splitlines():
+            lines.append(f"    {sline}")
+    return "\n".join(lines)
+
+
+def _render_topics(topics: list) -> str:
+    n = len(topics)
+    if n == 0:
+        return "No topics match the filters."
+    lines = [f"{n} topic{'s' if n != 1 else ''}:"]
+    for tp in topics:
+        if not isinstance(tp, dict):
+            continue
+        tid = tp.get("id", "?")
+        title = (tp.get("title") or tp.get("name") or "(untitled)").strip()
+        head = f"• #{tid} {title}"
+        if tp.get("category"):
+            head += f" | {tp['category']}"
+        folder = (tp.get("folder") or "").strip()
+        head += f" | folder: {folder}" if folder else " | (root)"
+        lines.append(head)
+        summary = (tp.get("summary") or "").strip()
+        for sline in summary.splitlines():
+            lines.append(f"    {sline}")
+    return "\n".join(lines)
+
+
+def format_tool_result_for_model(name: str, result):
+    """Render get-events / get-topics results as a compact text view for the
+    model instead of raw JSON. Returns None for every other tool, signalling
+    the caller to send the raw result unchanged.
+
+    Errors on these two tools are still surfaced to the model — as a clean
+    `Error: ...` line so it can explain the failure and help the user — rather
+    than dropped or dumped as raw JSON.
+
+    JSON serialization of these list results is token-heavy: each item repeats
+    field names, quotes, and braces, and escapes every markdown newline in a
+    summary as a literal `\\n`. A flat text layout keeps every field the model
+    needs to act on — crucially the id — while shedding that syntactic
+    overhead, which is the bulk of the cached-context cost on read turns."""
+    if name not in ("FilterUsersEvents", "FilterTopics"):
+        return None
+    if isinstance(result, dict) and "error" in result:
+        return f"Error: {result.get('error')}"
+    if name == "FilterUsersEvents":
+        if isinstance(result, list):
+            return _render_events(result)
+        if isinstance(result, dict):
+            return _render_events(result.get("events") or [])
+    else:  # FilterTopics
+        if isinstance(result, list):
+            return _render_topics(result)
+        if isinstance(result, dict):
+            return _render_topics(result.get("topics") or [])
+    return None
+
+
 def format_tool_response(name: str, result) -> str:
     """One-line description of what a tool call returned. Mirrors
     format_tool_details. Empty string if nothing notable."""

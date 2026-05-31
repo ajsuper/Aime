@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "CreateEvent",
-  "description": "Submit event body for POST /api. Creates a new event. The ID is assigned automatically by the server. Use this when adding a new event; use EditEvent only to modify an existing event.",
+  "description": "Create a new event (ID assigned by the server). Use EditEvent to modify an existing one.",
   "type": "object",
   "additionalProperties": false,
   "required": ["date", "title", "summary", "category", "archived"],
@@ -9,29 +9,29 @@
     "date": {
       "type": "string",
       "pattern": "^\\d{2}/\\d{2}/\\d{4}$",
-      "description": "Date on which the event occurs. Also marks the start of a multi day event."
+      "description": "DD/MM/YYYY. For a multi-day event, the start date."
     },
     "time": {
       "type": "string",
       "pattern": "^\\d{2}:\\d{2}$",
-      "description": "Format: HH:MM. The time the event starts. Optional."
+      "description": "Start time, HH:MM. Optional."
     },
     "category": {
       "type": "string",
-      "description": "A one word category to help summarise and identify words. Please attempt to use categories that are already being used by other events and only use a new category if you think it is needed."
+      "description": "One-word category; reuse an existing one where possible."
     },
     "archived": {
       "type": "boolean",
       "default": false,
-      "description": "When true, an event is considered to be completed or past or not to be worried about for some reason. Use this instead of deleting events or whenever they are completed."
+      "description": "True = completed/past/not a concern. Archive instead of deleting."
     },
     "summary": {
       "type": "string",
-      "description": "A detailed description of the event containing information such as where an event occurs, what the event is in more detail, and whatever other important information is applicable. Rendered as GitHub-flavored Markdown in the UI, so use it where it helps the reader: headings, **bold**, *italic*, lists, links, and `code`. When the event has things to do, prepare, pack, or check off, write them as a markdown task list (`- [ ] item`) — these render as real checkboxes the user can tick, which then flip to `- [x]` in the stored summary."
+      "description": "Event details as GitHub-flavored Markdown (see the Events section of the system prompt for the markdown/checkbox conventions)."
     },
     "title": {
       "type": "string",
-      "description": "A title saying what the event is. Should be short (20 characters or less)"
+      "description": "Short title (≤20 chars)."
     }
   }
 }

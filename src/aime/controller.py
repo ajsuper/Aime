@@ -24,7 +24,11 @@ from typing import Callable, Literal
 from provider_backend import AgentBackend, BackendEvent, SessionInfo
 
 from .tool_gateway import ToolGateway
-from .tool_formatting import format_tool_details, format_tool_response
+from .tool_formatting import (
+    format_tool_details,
+    format_tool_response,
+    format_tool_result_for_model,
+)
 from .onboarding import (
     bootstrap_special_topics,
     is_first_conversation,
@@ -451,11 +455,16 @@ class ConversationController:
                 tool_name=tool_name,
                 tool_result_summary=summary,
             ))
+        # For the high-volume read tools, hand the model a compact text view
+        # instead of raw JSON — same information, far fewer cached tokens on
+        # every subsequent turn. Other tools (and the UI summary above) keep
+        # the raw result. A string result is forwarded verbatim by the backend.
+        model_result = format_tool_result_for_model(tool_name, result)
         try:
             self._backend.submit(BackendEvent(
                 kind="tool_send_response",
                 tool_use_id=event.tool_use_id,
-                tool_result=result,
+                tool_result=result if model_result is None else model_result,
             ))
         except Exception as exc:
             self._emit(CoreEvent(kind="error", text=f"tool result send failed: {exc}"))

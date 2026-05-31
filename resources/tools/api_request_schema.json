@@ -1,75 +1,75 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "FilterUsersEvents",
-  "description": "Request body for POST /api. All fields are optional; omitted fields use their defaults. The tool gets a list of the users scheduled events based on the filters. Try to use at least 1 filter option to maximize effeciency - fetching all events unconditionally wastes valuable API tokens.",
+  "description": "List the user's events. All fields optional. Always pass at least one filter — fetching everything wastes context.",
   "type": "object",
   "additionalProperties": false,
   "properties": {
     "filter_by_date": {
       "type": "boolean",
       "default": false,
-      "description": "When true, restricts results to events whose date falls within [start_date, end_date]."
+      "description": "Restrict to [start_date, end_date]."
     },
     "start_date": {
       "type": "string",
       "pattern": "^\\d{2}/\\d{2}/\\d{4}$",
       "default": "01/01/1970",
-      "description": "Inclusive start of the date range. Format: DD/MM/YYYY. Ignored unless filter_by_date is true."
+      "description": "Inclusive range start, DD/MM/YYYY. Used only if filter_by_date."
     },
     "end_date": {
       "type": "string",
       "pattern": "^\\d{2}/\\d{2}/\\d{4}$",
       "default": "31/12/9999",
-      "description": "Inclusive end of the date range. Format: DD/MM/YYYY. Ignored unless filter_by_date is true."
+      "description": "Inclusive range end, DD/MM/YYYY. Used only if filter_by_date."
     },
     "filter_by_time": {
       "type": "boolean",
       "default": false,
-      "description": "When true, restricts results to events whose time falls within [start_time, end_time]."
+      "description": "Restrict to [start_time, end_time]."
     },
     "start_time": {
       "type": "string",
       "pattern": "^\\d{2}:\\d{2}$",
       "default": "00:00",
-      "description": "Inclusive start of the time range. Format: HH:MM. Ignored unless filter_by_time is true."
+      "description": "Inclusive range start, HH:MM. Used only if filter_by_time."
     },
     "end_time": {
       "type": "string",
       "pattern": "^\\d{2}:\\d{2}$",
       "default": "23:59",
-      "description": "Inclusive end of the time range. Format: HH:MM. Ignored unless filter_by_time is true."
+      "description": "Inclusive range end, HH:MM. Used only if filter_by_time."
     },
     "category": {
       "type": "string",
-      "description": "Exact single-category match. Takes precedence over 'categories' if both are provided."
+      "description": "Exact single-category match. Overrides 'categories'."
     },
     "categories": {
       "type": "array",
       "items": { "type": "string" },
       "minItems": 1,
-      "description": "OR match across multiple categories. Ignored if 'category' is also set."
+      "description": "OR match across categories. Ignored if 'category' is set."
     },
     "keyword": {
       "type": "string",
-      "description": "Case-insensitive substring search across event title and summary."
+      "description": "Case-insensitive substring search over title and summary."
     },
     "archived": {
       "type": "string",
       "enum": ["active_only", "archived_only", "all"],
       "default": "active_only",
-      "description": "'active_only' returns non-archived events only, 'archived_only' returns archived only, 'all' returns both. If you cannot find something, check both as it might be archived or unarchived by mistake."
+      "description": "Which events to include. If you can't find something, try 'all' — it may be mis-archived."
     },
     "sort_order": {
       "type": "string",
       "enum": ["asc", "desc"],
       "default": "asc",
-      "description": "Sort results by date ascending or descending. Ties are broken by time, always ascending."
+      "description": "Sort by date; ties broken by time ascending."
     },
     "limit": {
       "type": "integer",
       "minimum": 0,
       "default": 0,
-      "description": "Maximum number of results to return. 0 means unlimited."
+      "description": "Max results; 0 = unlimited."
     }
   }
 }

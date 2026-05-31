@@ -1,18 +1,18 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "EditTopicContents",
-  "description": "Submit to POST /api. Performs surgical anchor-based find/replace edits on a topic's markdown content. This is the preferred tool for editing an existing topic — far more efficient than rewriting the whole file. Submit one or more patches in a single call; patches are applied sequentially top-to-bottom (each patch sees the result of the previous one). Each patch's 'find' string must match EXACTLY ONCE in the current state of the file (use \\n for newlines, include surrounding context to disambiguate). If 'find' is not unique the call fails loudly with the match count — widen 'find' and retry. Returns ok=true with applied count on success.",
+  "description": "Preferred way to edit a topic: surgical find/replace patches, applied top-to-bottom. Each 'find' must match EXACTLY ONCE (if not, it fails with the count — widen and retry). See the system prompt's editing rules.",
   "type": "object",
   "additionalProperties": false,
   "required": ["id", "patches"],
   "properties": {
     "id": {
       "type": "integer",
-      "description": "The ID of the topic to edit."
+      "description": "ID of the topic to edit."
     },
     "patches": {
       "type": "array",
-      "description": "Find/replace patches applied sequentially top-to-bottom. Batch multiple edits here in one call rather than making several calls.",
+      "description": "Patches applied sequentially; batch all edits into one call.",
       "items": {
         "type": "object",
         "additionalProperties": false,
@@ -20,11 +20,11 @@
         "properties": {
           "find": {
             "type": "string",
-            "description": "Exact text to locate in the file. Must match exactly once. Use \\n for newlines. Include enough surrounding context to be unique."
+            "description": "Exact text to locate; must match once. Use \\n for newlines; include context to be unique."
           },
           "replace": {
             "type": "string",
-            "description": "Text to substitute in place of the matched 'find'. Use \\n for newlines. Can be longer or shorter than 'find', or contain multiple lines."
+            "description": "Replacement text. Use \\n for newlines."
           }
         }
       }
