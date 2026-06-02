@@ -321,7 +321,10 @@ class UserContext:
         # the controller so Aime's SendMessage tool can reach the user's phone.
         _user_rec = _auth_backend.lookup(user_id)
         messaging_contact = _user_rec.messaging_contact if _user_rec else None
-        messenger = _aime_messaging.get_messenger() if messaging_contact else None
+        # The messenger reflects server capability; the recipient is this user's
+        # contact. Kept separate so the controller can distinguish "not set up on
+        # the server" from "no contact connected" (see _deliver_message).
+        messenger = _aime_messaging.get_messenger()
         router = ModelRouter(
             haiku_model=aime_config.HAIKU_MODEL,
             sonnet_model=aime_config.SONNET_MODEL,
@@ -1360,8 +1363,7 @@ def messaging_contact():
     ctx = _user_contexts.get(g.user_id)
     if ctx is not None:
         from aime import messaging as _aime_messaging
-        messenger = _aime_messaging.get_messenger() if contact else None
-        ctx.controller.set_messaging_target(messenger, contact)
+        ctx.controller.set_messaging_target(_aime_messaging.get_messenger(), contact)
     return jsonify({"ok": True, "messaging_contact": contact})
 
 
@@ -1958,6 +1960,13 @@ def agents_run():
     username = ctx.username
     dek = _auth_backend.get_dek(user_id)
     runs_dir = _agent_runs_dir(user_id)
+    # Outbound-messaging destination for this user, read fresh from auth (the
+    # source of truth — it may have changed since the session was built). Passed
+    # to the runner so the agent's SendMessage tool / SubmitResult
+    # `message_to_user` can actually reach the user. None => the agent gets a
+    # graceful "no contact connected" result instead of a misfire.
+    _rec = _auth_backend.lookup(user_id)
+    messaging_contact = _rec.messaging_contact if _rec else None
 
     # Unique, registry-safe name for this one-off agent. The timestamp keeps
     # runs listed in creation order; the random suffix avoids collisions.
@@ -1980,6 +1989,7 @@ def agents_run():
                 runs_dir=runs_dir,
                 usage_label=username,
                 client_tz=client_tz,
+                messaging_contact=messaging_contact,
                 api_url=aime_config.API_URL,
             )
         except Exception:

@@ -531,7 +531,9 @@ class Aime(App):
         # from AIME_MESSAGING_CONTACT in the environment rather than a stored
         # per-account contact (which is the web app's path).
         messaging_contact = _aime_messaging.env_recipient()
-        messenger = _aime_messaging.get_messenger() if messaging_contact else None
+        # Messenger = server capability; recipient = the env contact. Separate so
+        # the controller can say "not set up" vs "no contact connected" distinctly.
+        messenger = _aime_messaging.get_messenger()
         router = ModelRouter(
             haiku_model=aime_config.HAIKU_MODEL,
             sonnet_model=aime_config.SONNET_MODEL,

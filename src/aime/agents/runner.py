@@ -174,10 +174,12 @@ class BackgroundAgentRunner:
                 target=fn, name=f"agent-run-{spec.name}", daemon=True
             ).start()
 
-        # Only wire a messenger when this user actually has a contact connected,
-        # so a worker that calls SendMessage / sets message_to_user without a
-        # destination gets a clean "not connected" result rather than a misfire.
-        messenger = _messaging.get_messenger() if messaging_contact else None
+        # The messenger reflects *server* capability (is a channel configured?),
+        # independent of whether this user connected a contact. Keeping them
+        # separate lets the controller tell "messaging isn't set up on this
+        # server" apart from "no contact connected for this user" — two
+        # different, separately-actionable states.
+        messenger = _messaging.get_messenger()
 
         controller = ConversationController(
             backend=backend,
