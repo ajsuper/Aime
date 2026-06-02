@@ -94,6 +94,15 @@ def format_tool_details(name: str, inp: dict) -> str:
         q = _truncate_for_log(inp.get("request"), 60)
         if q:
             parts.append(f"\"{q}\"")
+    elif name in ("GetCommitmentHistory", "GetPatternSummary", "GetRecentActivity"):
+        if inp.get("commitment_id"):
+            parts.append(f"commitment={inp['commitment_id']}")
+        if inp.get("category"):
+            parts.append(f"category={inp['category']}")
+        if inp.get("since_date"):
+            parts.append(f"since {inp['since_date']}")
+        if inp.get("limit"):
+            parts.append(f"limit={inp['limit']}")
     elif name == "GetTopicContents":
         parts.append(f"id={inp.get('id', '?')}")
     elif name == "ReplaceTopicContents":
@@ -244,6 +253,11 @@ def format_tool_response(name: str, result) -> str:
                 keys = list(result.keys())[:3]
                 if keys:
                     parts.append("keys: " + ", ".join(keys))
+    elif name in ("GetCommitmentHistory", "GetPatternSummary", "GetRecentActivity"):
+        # These tools return a text digest; its first line is the headline
+        # (e.g. "5 instance(s) of 'bouldering'…" or "Pattern summary for…").
+        first_line = str(result).splitlines()[0] if result else ""
+        parts.append(_truncate_for_log(first_line, 80))
     elif name == "GetTopicContents":
         if isinstance(result, dict):
             contents = result.get("contents", "") or ""

@@ -25,6 +25,7 @@ from typing import Callable, Literal
 from provider_backend import AgentBackend, BackendEvent, SessionInfo
 
 from .tool_gateway import ToolGateway
+from .commitments import CommitmentService
 from .tool_formatting import (
     format_tool_details,
     format_tool_response,
@@ -122,6 +123,10 @@ class ConversationController:
         self._backend = backend
         self._tools = tool_gateway
         self._spawn_worker = worker_spawner
+        # Commitment-pattern tools (GetCommitmentHistory / GetPatternSummary /
+        # GetRecentActivity) are computed in Python over `get_events` rather than
+        # forwarded to the backend; handled in _handle_tool_use like WebSearch.
+        self._commitments = CommitmentService(tool_gateway)
         # Optional Haiku-backed web search. When set, the `WebSearch` tool is
         # executed here (not via the HTTP gateway) by handing the request to
         # the sub-agent; see _handle_tool_use.
@@ -551,6 +556,26 @@ class ConversationController:
             except Exception as exc:
                 self._emit(CoreEvent(kind="error", text=f"tool result send failed: {exc}"))
             return
+        # Commitment-pattern tools are computed in Python over get_events (see
+        # CommitmentService); they return a ready-to-read text digest, never raw
+        # JSON, so they bypass the gateway and format_tool_result_for_model.
+        if tool_name in ("GetCommitmentHistory", "GetPatternSummary", "GetRecentActivity"):
+            digest = self._run_commitment_tool(tool_name, tool_input)
+            self._emit(CoreEvent(
+                kind="tool_result",
+                tool_name=tool_name,
+                tool_result_summary=format_tool_response(tool_name, digest),
+                tool_detail_full=_full_detail_text(digest),
+            ))
+            try:
+                self._backend.submit(BackendEvent(
+                    kind="tool_send_response",
+                    tool_use_id=event.tool_use_id,
+                    tool_result=digest,
+                ))
+            except Exception as exc:
+                self._emit(CoreEvent(kind="error", text=f"tool result send failed: {exc}"))
+            return
         result = self._tools.execute(tool_name, tool_input)
         summary = format_tool_response(tool_name, result)
         self._emit(CoreEvent(
@@ -572,3 +597,30 @@ class ConversationController:
             ))
         except Exception as exc:
             self._emit(CoreEvent(kind="error", text=f"tool result send failed: {exc}"))
+
+    def _run_commitment_tool(self, tool_name: str, tool_input: dict) -> str:
+        """Dispatch a commitment-pattern tool to CommitmentService and return its
+        text digest. Any failure becomes a clean `Error: ...` string so the model
+        can explain it rather than the turn breaking."""
+        inp = tool_input or {}
+        try:
+            if tool_name == "GetCommitmentHistory":
+                return self._commitments.commitment_history(
+                    inp.get("commitment_id", ""),
+                    since_date=inp.get("since_date", ""),
+                    limit=int(inp.get("limit", 0) or 0),
+                )
+            if tool_name == "GetPatternSummary":
+                return self._commitments.pattern_summary(
+                    commitment_id=inp.get("commitment_id", ""),
+                    category=inp.get("category", ""),
+                    since_date=inp.get("since_date", ""),
+                )
+            # GetRecentActivity
+            return self._commitments.recent_activity(
+                category=inp.get("category", ""),
+                since_date=inp.get("since_date", ""),
+                limit=int(inp.get("limit", 20) or 0),
+            )
+        except Exception as exc:
+            return f"Error: {exc}"

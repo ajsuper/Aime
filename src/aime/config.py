@@ -38,6 +38,9 @@ SCHEMA_FILES = [
     "../resources/tools/api_edit_topic_contents_schema.json",
     "../resources/tools/api_rename_folder_schema.json",
     "../resources/tools/api_list_folders_schema.json",
+    "../resources/tools/api_get_commitment_history_schema.json",
+    "../resources/tools/api_get_pattern_summary_schema.json",
+    "../resources/tools/api_get_recent_activity_schema.json",
 ]
 
 AGENT_MODEL = "claude-sonnet-4-6"

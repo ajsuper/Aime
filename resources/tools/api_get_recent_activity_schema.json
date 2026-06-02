@@ -1,0 +1,24 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "GetRecentActivity",
+  "description": "A flat, newest-first list of recent events (across all categories or one), each with its status, commitment_id, and cancel_reason. Use this for fuzzy behavioral questions like \"I haven't been to the gym in a while\" where you don't know the commitment_id up front — it's a status-aware version of an event filter.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "category": {
+      "type": "string",
+      "description": "Optional single category to restrict to. Omit for all categories."
+    },
+    "since_date": {
+      "type": "string",
+      "pattern": "^\\d{2}/\\d{2}/\\d{4}$",
+      "description": "Optional inclusive lower bound, DD/MM/YYYY. Omit for no lower bound."
+    },
+    "limit": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 20,
+      "description": "Max events to return; 0 = unlimited."
+    }
+  }
+}

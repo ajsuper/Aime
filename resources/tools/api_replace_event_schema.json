@@ -38,6 +38,24 @@
       "minimum": 0,
       "default": 0,
       "description": "ID of the event to replace."
+    },
+    "commitment_id": {
+      "type": "string",
+      "description": "Optional stable slug shared by every recurring instance of the same commitment (e.g. \"bouldering\"). Omit to keep the existing value; pass to set/change it. Reuse the exact slug across instances."
+    },
+    "status": {
+      "type": "string",
+      "enum": ["scheduled", "completed", "canceled", "rescheduled"],
+      "description": "Lifecycle state. Set 'completed' when it happened, 'canceled' (with cancel_reason) when dropped, 'rescheduled' (with rescheduled_from) when moved. Omit to keep the existing value."
+    },
+    "cancel_reason": {
+      "type": "string",
+      "description": "Short freeform reason, only when status is 'canceled' (e.g. \"tired\", \"conflict\", \"AiMe\"). Omit to keep the existing value."
+    },
+    "rescheduled_from": {
+      "type": "string",
+      "pattern": "^\\d{2}/\\d{2}/\\d{4}$",
+      "description": "Original DD/MM/YYYY this instance was moved from, only when status is 'rescheduled'. Omit to keep the existing value."
     }
   }
 }

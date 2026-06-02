@@ -1,0 +1,25 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "GetCommitmentHistory",
+  "description": "List every past/present instance of one commitment (by its commitment_id), newest first, each with its status, cancel_reason, and rescheduled_from. Call this before reacting to a cancellation or reschedule so you know the recent track record (e.g. how many times it's been canceled lately).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["commitment_id"],
+  "properties": {
+    "commitment_id": {
+      "type": "string",
+      "description": "The stable commitment slug to look up (e.g. \"bouldering\")."
+    },
+    "since_date": {
+      "type": "string",
+      "pattern": "^\\d{2}/\\d{2}/\\d{4}$",
+      "description": "Optional inclusive lower bound, DD/MM/YYYY. Omit for all of history."
+    },
+    "limit": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 0,
+      "description": "Max instances to return; 0 = unlimited."
+    }
+  }
+}
