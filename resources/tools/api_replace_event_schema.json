@@ -23,7 +23,7 @@
     "archived": {
       "type": "boolean",
       "default": false,
-      "description": "True = completed/past/not a concern. Archive instead of deleting."
+      "description": "Soft-delete flag — this is the delete button. True hides the event from the default view entirely, for things that no longer matter at all (mistakes, dismissed plans). Do NOT use it to mark an event done or called off — set `status` to completed/canceled for those; they stay visible. Leave false unless the user genuinely wants the event gone."
     },
     "summary": {
       "type": "string",

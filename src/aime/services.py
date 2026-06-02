@@ -71,12 +71,17 @@ class CalendarService:
     def replace_event(
         self, event_id: int, *, title: str, summary: str, category: str,
         date: str, time: str, archived: bool,
+        status: str | None = None, commitment_id: str | None = None,
+        cancel_reason: str | None = None, rescheduled_from: str | None = None,
     ) -> dict:
         """Edit / archive an existing event. Mirrors the backend's
         `replace_event` tool — caller supplies the full record so a partial
-        edit always sends the unchanged fields too."""
-        return self._gw.call(
-            "replace_event",
+        edit always sends the unchanged fields too.
+
+        The lifecycle-metadata kwargs (status, commitment_id, …) are optional:
+        only the ones passed are sent, and the backend preserves any field it
+        doesn't receive, so a plain title/summary edit never resets them."""
+        payload = dict(
             id=event_id,
             title=title,
             summary=summary,
@@ -85,6 +90,15 @@ class CalendarService:
             time=time,
             archived=archived,
         )
+        for key, value in (
+            ("status", status),
+            ("commitment_id", commitment_id),
+            ("cancel_reason", cancel_reason),
+            ("rescheduled_from", rescheduled_from),
+        ):
+            if value is not None:
+                payload[key] = value
+        return self._gw.call("replace_event", **payload)
 
 
 class TopicService:

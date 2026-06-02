@@ -57,7 +57,7 @@
       "type": "string",
       "enum": ["active_only", "archived_only", "all"],
       "default": "active_only",
-      "description": "Which events to include. If you can't find something, try 'all' — it may be mis-archived."
+      "description": "Filters on the soft-delete flag, NOT the lifecycle status. 'active_only' = not deleted (this still includes completed and canceled events — check their `status` field). 'archived_only' = only soft-deleted ones. 'all' = both; try it if you can't find something that may have been deleted."
     },
     "sort_order": {
       "type": "string",

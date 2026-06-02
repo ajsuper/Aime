@@ -1856,7 +1856,7 @@ def delete_all_sessions():
 @login_required
 def calendar_month(year: int, month: int):
     try:
-        events = _context_for(g.user_id).calendar_service.events_for_month(year, month, include_archived=True)
+        events = _context_for(g.user_id).calendar_service.events_for_month(year, month, include_archived=False)
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 500
     return jsonify({"events": events})
@@ -1867,7 +1867,7 @@ def calendar_month(year: int, month: int):
 def calendar_day(year: int, month: int, day: int):
     try:
         events = sort_events_by_date(
-            _context_for(g.user_id).calendar_service.events_for_day(year, month, day, include_archived=True)
+            _context_for(g.user_id).calendar_service.events_for_day(year, month, day, include_archived=False)
         )
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 500
@@ -1888,6 +1888,14 @@ def calendar_event_update(event_id: int):
     archived = data.get("archived", False)
     if not isinstance(title, str) or not isinstance(date, str):
         return jsonify({"ok": False, "error": "title and date are required"}), 400
+    # Lifecycle metadata is optional from the UI: only the fields actually sent
+    # are forwarded, so anything omitted is preserved by the backend's merge
+    # (e.g. saving a description edit never resets status or commitment_id).
+    extra = {
+        key: data[key]
+        for key in ("status", "commitment_id", "cancel_reason", "rescheduled_from")
+        if isinstance(data.get(key), str)
+    }
     ctx = _context_for(g.user_id)
     try:
         result = ctx.calendar_service.replace_event(
@@ -1898,6 +1906,7 @@ def calendar_event_update(event_id: int):
             date=date,
             time=time_ if isinstance(time_, str) else "",
             archived=bool(archived),
+            **extra,
         )
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 500

@@ -994,8 +994,8 @@
                                   text-overflow: ellipsis; white-space: nowrap; }
 
     /* To-do rows: all-day events render as checkable list items rather
-       than passive pills. The checkbox toggles archived (= done);
-       clicking the label still opens the event modal. */
+       than passive pills. The checkbox toggles completion status
+       (scheduled ⇄ completed); clicking the label opens the event modal. */
     .todo-item { display: flex; align-items: center; gap: 0.5rem;
                  min-width: 0; padding: 4px 8px;
                  background: rgba(124, 140, 255, 0.12);
@@ -1035,6 +1035,12 @@
     .todo-item.done .todo-label { text-decoration: line-through;
                                   text-decoration-thickness: 1px;
                                   color: var(--muted); }
+    /* Canceled = it didn't happen: dimmed and struck through like a done item,
+       but the checkbox stays empty (it was never completed). */
+    .todo-item.canceled { opacity: 0.55; }
+    .todo-item.canceled .todo-label { text-decoration: line-through;
+                                      text-decoration-thickness: 1px;
+                                      color: var(--muted); }
 
     /* Day view to-do strip: a clear stacked list spanning the full width
        so it reads as a single panel, not a row of pills. */
@@ -1354,6 +1360,22 @@
         accent-color: var(--cta); }
     .ev-modal-error { color: var(--warning, #e29a4a); font-size: 0.8rem;
                       margin: 0; }
+    /* Read-only lifecycle metadata in the event modal. */
+    .ev-meta { display: flex; flex-wrap: wrap; gap: 0.4rem 0.6rem;
+               align-items: center; font-size: 0.82rem; }
+    .ev-badge { display: inline-flex; align-items: center; gap: 0.3rem;
+                padding: 1px 8px; border-radius: 999px; font-weight: 600;
+                font-size: 0.75rem; text-transform: capitalize;
+                background: color-mix(in srgb, var(--accent) 18%, transparent);
+                color: var(--text); }
+    .ev-badge.status-completed {
+      background: color-mix(in srgb, #3fa65a 24%, transparent); }
+    .ev-badge.status-canceled {
+      background: color-mix(in srgb, var(--warning, #e29a4a) 26%, transparent); }
+    .ev-badge.status-rescheduled {
+      background: color-mix(in srgb, #6c8cff 22%, transparent); }
+    .ev-meta-item { color: var(--muted); }
+    .ev-meta-item b { color: var(--text); font-weight: 600; }
     /* Schedule and pill events should look interactive. */
     .cal-sched .ev-block, .cal-sched .ev-pill,
     .cal-cell .ev { cursor: pointer; }
@@ -1392,17 +1414,36 @@
                   0 1px 2px rgba(0,0,0,0.18);
     }
 
-    /* Archived events stay visible so users see their history, but are
-       desaturated and dimmed so active events read first. */
+    /* Resolved events (completed or canceled) stay visible so users see their
+       history, but are desaturated and dimmed so still-scheduled ones read
+       first. Archived (= deleted) events are normally filtered out entirely;
+       the .archived rule remains for any view that opts to show them. */
     .cal-cell .ev.archived,
     .cal-sched .ev-pill.archived,
-    .cal-sched .ev-block.archived {
+    .cal-sched .ev-block.archived,
+    .cal-cell .ev.completed,
+    .cal-sched .ev-pill.completed,
+    .cal-sched .ev-block.completed,
+    .cal-cell .ev.canceled,
+    .cal-sched .ev-pill.canceled,
+    .cal-sched .ev-block.canceled {
       opacity: 0.45;
       filter: grayscale(0.7);
     }
     .cal-sched .ev-block.archived:hover,
     .cal-sched .ev-pill.archived:hover,
-    .cal-cell .ev.archived:hover { opacity: 0.75; }
+    .cal-cell .ev.archived:hover,
+    .cal-sched .ev-block.completed:hover,
+    .cal-sched .ev-pill.completed:hover,
+    .cal-cell .ev.completed:hover,
+    .cal-sched .ev-block.canceled:hover,
+    .cal-sched .ev-pill.canceled:hover,
+    .cal-cell .ev.canceled:hover { opacity: 0.75; }
+    /* Canceled = it didn't happen: strike it through to distinguish from a
+       completed item at a glance. */
+    .cal-cell .ev.canceled,
+    .cal-sched .ev-pill.canceled,
+    .cal-sched .ev-block.canceled { text-decoration: line-through; }
 
     /* Settings modal: floating panel over a blurred chat backdrop. */
     #settings-backdrop {
@@ -1997,6 +2038,13 @@
           <span class="lbl">Category</span>
           <input type="text" id="ev-f-category" readonly>
         </label>
+        <!-- Read-only lifecycle metadata (status, commitment, cancel reason,
+             reschedule origin). Populated in openEventModal; the whole row
+             hides when there's nothing beyond a plain scheduled event. -->
+        <div class="ev-field stack" id="ev-f-meta-wrap">
+          <span class="lbl">Status</span>
+          <div id="ev-f-meta" class="ev-meta"></div>
+        </div>
         <!-- Not a <label>: the rendered markdown can contain its own
              form controls (task-list checkboxes), and a wrapping <label>
              would forward any stray click in the description to the first
@@ -4098,7 +4146,7 @@ async function renderMonthView(silent) {
         cell.appendChild(todo);
       } else {
         const e = document.createElement("div");
-        e.className = "ev" + (ev.archived ? " archived" : "");
+        e.className = "ev" + eventStateClasses(ev);
         e.textContent = "• " + (ev.title || ev.name || "(untitled)");
         applyCategoryColor(e, ev.category);
         cell.appendChild(e);
@@ -4150,6 +4198,28 @@ function eventKey(date) {
        + `${String(date.getDate()).padStart(2, "0")}`;
 }
 
+// An event's lifecycle status, defaulting to "scheduled" for records that
+// predate the field. (Archived is a separate, deleted-from-view flag.)
+function eventStatus(ev) {
+  return (ev && ev.status ? String(ev.status).trim() : "") || "scheduled";
+}
+// True when the event is resolved one way or the other — completed or canceled.
+// These render dimmed (a "done" look), same as deleted/archived ones used to.
+function isEventResolved(ev) {
+  const s = eventStatus(ev);
+  return s === "completed" || s === "canceled";
+}
+// Extra CSS classes for an event element based on its state. Archived is kept
+// for completeness even though such events are normally filtered out.
+function eventStateClasses(ev) {
+  let cls = "";
+  if (ev && ev.archived) cls += " archived";
+  const s = eventStatus(ev);
+  if (s === "completed") cls += " completed";
+  else if (s === "canceled") cls += " canceled";
+  return cls;
+}
+
 function hourLabel(h) {
   if (h === 0 || h === 24) return "12 AM";
   if (h < 12) return `${h} AM`;
@@ -4182,6 +4252,8 @@ const evFTitle = document.getElementById("ev-f-title");
 const evFDate = document.getElementById("ev-f-date");
 const evFTime = document.getElementById("ev-f-time");
 const evFCategory = document.getElementById("ev-f-category");
+const evFMetaWrap = document.getElementById("ev-f-meta-wrap");
+const evFMeta = document.getElementById("ev-f-meta");
 const evFSummary = document.getElementById("ev-f-summary");
 const evFSummaryRendered = document.getElementById("ev-f-summary-rendered");
 const evSaveBtn = document.getElementById("ev-save-btn");
@@ -4275,9 +4347,43 @@ function openEventModal(ev) {
   evFCategory.value = ev.category || "";
   evFSummary.value = ev.summary || "";
   renderEventSummary(ev.summary || "");
+  renderEventMeta(ev);
   evArchiveBtn.textContent = ev.archived ? "Unarchive" : "Archive";
   setEventEditMode(false);
   eventBackdrop.hidden = false;
+}
+
+// Read-only lifecycle metadata under the category field: a status badge plus
+// any populated commitment / cancel-reason / reschedule-origin detail. Hidden
+// entirely for a plain scheduled one-off so the modal stays uncluttered. Built
+// with DOM nodes + textContent so user/agent-supplied values can't inject HTML.
+function renderEventMeta(ev) {
+  const status = eventStatus(ev);
+  const cid = (ev.commitment_id || "").trim();
+  const reason = (ev.cancel_reason || "").trim();
+  const moved = (ev.rescheduled_from || "").trim();
+  const noteworthy = status !== "scheduled" || cid || reason || moved;
+  evFMeta.textContent = "";
+  evFMetaWrap.hidden = !noteworthy;
+  if (!noteworthy) return;
+
+  const badge = document.createElement("span");
+  badge.className = "ev-badge status-" + status;
+  badge.textContent = status;
+  evFMeta.appendChild(badge);
+
+  const detail = (prefix, value) => {
+    const span = document.createElement("span");
+    span.className = "ev-meta-item";
+    span.append(prefix);
+    const strong = document.createElement("b");
+    strong.textContent = value;
+    span.appendChild(strong);
+    evFMeta.appendChild(span);
+  };
+  if (cid) detail("recurring: ", cid);
+  if (reason) detail("reason: ", reason);
+  if (moved) detail("moved from ", moved);
 }
 
 function closeEventModal() {
@@ -4447,9 +4553,10 @@ function layoutOverlaps(items) {
   return out;
 }
 
-// Toggle an event's archived flag without going through the full modal.
-// Used by the to-do checkboxes on all-day items.
-async function setEventArchived(ev, archived) {
+// Set an event's lifecycle status without going through the full modal. Used
+// by the to-do checkboxes on all-day items. Other fields are sent unchanged;
+// omitted metadata (commitment_id, etc.) is preserved by the backend.
+async function setEventStatus(ev, status) {
   if (!ev || ev.id == null) return false;
   const payload = {
     title: ev.title || "",
@@ -4457,7 +4564,8 @@ async function setEventArchived(ev, archived) {
     category: ev.category || "",
     date: ev.date || "",
     time: ev.time || "",
-    archived: !!archived,
+    archived: !!ev.archived,
+    status: status,
   };
   try {
     const r = await fetch(
@@ -4467,42 +4575,46 @@ async function setEventArchived(ev, archived) {
     );
     const j = await r.json();
     if (!r.ok || !j.ok) return false;
-    ev.archived = !!archived;
+    ev.status = status;
     return true;
   } catch (_) { return false; }
 }
 
-// Render an all-day event as a to-do row: checkbox toggles archived
-// (= done); clicking the label opens the event modal as before.
+// Render an all-day event as a to-do row: the checkbox toggles completion
+// status (scheduled ⇄ completed); clicking the label opens the event modal as
+// before. Canceled events render struck-through but unchecked.
 function buildTodoItem(ev, { compact = false, interactive = true } = {}) {
+  const status = eventStatus(ev);
   const item = document.createElement("div");
   item.className = "todo-item" + (compact ? " compact" : "")
-                 + (ev.archived ? " done" : "")
+                 + (status === "completed" ? " done" : "")
+                 + (status === "canceled" ? " canceled" : "")
                  + (interactive ? "" : " static");
   applyCategoryColor(item, ev.category);
 
   if (interactive) {
+    const done = status === "completed";
     const box = document.createElement("button");
     box.type = "button";
     box.className = "todo-check";
     box.setAttribute("role", "checkbox");
-    box.setAttribute("aria-checked", ev.archived ? "true" : "false");
-    box.setAttribute("aria-label",
-      ev.archived ? "Mark not done" : "Mark done");
+    box.setAttribute("aria-checked", done ? "true" : "false");
+    box.setAttribute("aria-label", done ? "Mark not done" : "Mark done");
     box.innerHTML =
       '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" '
       + 'stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round">'
       + '<path d="M5 12l5 5L20 7"/></svg>';
     box.addEventListener("click", async (e) => {
       e.stopPropagation();
-      const next = !ev.archived;
-      item.classList.toggle("done", next);
-      box.setAttribute("aria-checked", next ? "true" : "false");
-      const ok = await setEventArchived(ev, next);
+      const wasDone = eventStatus(ev) === "completed";
+      const nextStatus = wasDone ? "scheduled" : "completed";
+      item.classList.toggle("done", !wasDone);
+      box.setAttribute("aria-checked", !wasDone ? "true" : "false");
+      const ok = await setEventStatus(ev, nextStatus);
       if (!ok) {
         // Roll back the optimistic flip so state stays truthful.
-        item.classList.toggle("done", !next);
-        box.setAttribute("aria-checked", !next ? "true" : "false");
+        item.classList.toggle("done", wasDone);
+        box.setAttribute("aria-checked", wasDone ? "true" : "false");
       }
     });
     item.appendChild(box);
@@ -4560,7 +4672,7 @@ function buildDayColumn(date, events, sched, allDayCol, hourPx, startHour, endHo
 
   placements.forEach(({ ev, start, colIdx, colCount }) => {
     const block = document.createElement("div");
-    block.className = "ev-block" + (ev.archived ? " archived" : "")
+    block.className = "ev-block" + eventStateClasses(ev)
                     + (colCount > 1 ? " is-overlap" : "");
     block.style.top = ((start - startMin) / 60 * hourPx) + "px";
     block.style.height = Math.max(18, DEFAULT_EV_MIN / 60 * hourPx) + "px";
