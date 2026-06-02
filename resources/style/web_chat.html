@@ -813,6 +813,32 @@
     .agent-status.error { color: var(--error); border-color: rgba(255,107,107,0.5); }
     .agent-status.max_turns, .agent-status.no_result {
         color: var(--warning, #e29a4a); border-color: rgba(226,154,74,0.5); }
+    .agent-status.running { color: var(--accent); border-color: var(--accent); }
+
+    /* Agents pane: a one-off launcher up top, then the runs list. */
+    .pane[data-pane="agents"] { flex-direction: column; }
+    .agents-launcher { display: flex; flex-direction: column; gap: 0.5rem;
+                       padding: 0.9rem 1rem; border-bottom: 1px solid var(--border); }
+    .agents-label { color: var(--muted); font-size: 0.7rem; font-weight: 600;
+                    text-transform: uppercase; letter-spacing: 0.06em; }
+    #agent-instructions { width: 100%; box-sizing: border-box; resize: vertical;
+                          background: var(--bg); color: var(--text);
+                          border: 1px solid var(--border); border-radius: 8px;
+                          padding: 0.55rem 0.65rem; font: inherit;
+                          font-size: 0.9rem; line-height: 1.45; min-height: 4.5em; }
+    #agent-instructions:focus { outline: none; border-color: var(--accent); }
+    .agents-check { display: flex; align-items: center; gap: 0.45rem;
+                    color: var(--muted); font-size: 0.85rem; cursor: pointer; }
+    .agents-check input { accent-color: var(--accent); }
+    #agent-run-btn { align-self: flex-start; background: var(--accent);
+                     border: 1px solid var(--accent); color: white;
+                     border-radius: 8px; padding: 0.4rem 0.9rem; cursor: pointer;
+                     font: inherit; font-weight: 600; font-size: 0.88rem;
+                     transition: background 0.15s, opacity 0.15s; }
+    #agent-run-btn:hover { background: var(--accent-hover, var(--accent)); }
+    #agent-run-btn:disabled { opacity: 0.55; cursor: default; }
+    .agents-hint { color: var(--muted); font-size: 0.8rem; margin: 0; }
+    .agents-hint.error { color: var(--error); }
 
     /* Calendar */
     .cal-toolbar { display: flex; align-items: center; gap: 0.5rem;
@@ -1908,6 +1934,16 @@
           <path d="M4 6h16M4 12h16M4 18h10"/>
         </svg>
       </button>
+      <button class="rail-btn pane-btn advanced-only" data-target="agents"
+              title="Agents" aria-label="Agents">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="4" y="8" width="16" height="12" rx="2"/>
+          <path d="M12 8V4M9 4h6"/>
+          <circle cx="9" cy="14" r="1"/>
+          <circle cx="15" cy="14" r="1"/>
+        </svg>
+      </button>
     </div>
     <div id="side-col" tabindex="-1">
       <div class="side-header">
@@ -2009,6 +2045,27 @@
               <div class="empty">select a topic</div>
             </div>
           </div>
+        </div>
+      </div>
+
+      <!-- Agents pane (Advanced only). Run a one-off background agent from a
+           system message and watch its runs land below. Nothing here is
+           persisted as a definition — it's a transient launcher. -->
+      <div class="pane" data-pane="agents">
+        <div class="agents-launcher">
+          <label class="agents-label" for="agent-instructions">System message</label>
+          <textarea id="agent-instructions" rows="5" spellcheck="false"
+                    placeholder="Describe the task for the agent to carry out against your data…"></textarea>
+          <label class="agents-check">
+            <input type="checkbox" id="agent-web-search">
+            <span>Allow web search</span>
+          </label>
+          <button id="agent-run-btn" class="primary">Run agent</button>
+          <p class="agents-hint" id="agent-run-hint" hidden></p>
+        </div>
+        <div class="side-section-head">Runs</div>
+        <div class="scroll" id="agent-runs-list">
+          <div class="empty">no runs yet</div>
         </div>
       </div>
     </div>
@@ -3306,6 +3363,12 @@ es.onmessage = (ev) => {
       // with no frontend changes needed.
       scheduleActivePaneRefresh();
       break;
+    case "agent_run_update":
+      // A background-agent run just started or finished. Refresh whichever
+      // pane is showing runs (the Agents pane, or the Verbose conversations
+      // section) so the new/updated run appears without a manual reload.
+      scheduleActivePaneRefresh();
+      break;
     case "turn_end":
       if (verbosity === "minimal") freezeWorkingIndicator();
       else clearWorkingIndicator();
@@ -3798,7 +3861,8 @@ window.addEventListener("paste", (e) => {
 
 const sideColEl = document.getElementById("side-col");
 const sideTitleEl = document.getElementById("side-title");
-const PANE_TITLES = { chats: "Conversations", calendar: "Calendar", topics: "Topics" };
+const PANE_TITLES = { chats: "Conversations", calendar: "Calendar",
+                      topics: "Topics", agents: "Agents" };
 let activePaneName = null;
 
 document.querySelectorAll(".pane-btn").forEach(btn => {
@@ -3820,6 +3884,7 @@ function refreshActivePane(silent) {
   if (activePaneName === "chats") loadChats(silent);
   else if (activePaneName === "calendar") renderCalendar(silent);
   else if (activePaneName === "topics") { loadTopics(silent); refreshOpenTopic(); }
+  else if (activePaneName === "agents") loadAgentsPane(silent);
 }
 
 // Re-fetch the currently-open topic's contents in place. Skipped when the
@@ -3886,6 +3951,7 @@ function activatePane(name) {
   if (name === "chats") loadChats();
   else if (name === "calendar") renderCalendar();
   else if (name === "topics") loadTopics();
+  else if (name === "agents") loadAgentsPane();
 }
 
 function closeSide() {
@@ -4023,21 +4089,102 @@ async function loadAgentRuns() {
   header.textContent = "Background agents";
   chatsList.appendChild(header);
 
-  runs.forEach(run => {
-    const item = document.createElement("div");
-    item.className = "session-item agent-run-item";
-    const summary = document.createElement("div");
-    summary.className = "summary";
-    summary.textContent = run.agent_name || run.run_id;
-    const badge = document.createElement("span");
-    badge.className = "agent-status " + (run.status || "");
-    badge.textContent = AGENT_STATUS_LABELS[run.status] || run.status || "";
-    item.appendChild(summary);
-    if (badge.textContent) item.appendChild(badge);
-    item.addEventListener("click", () => openAgentRun(run.run_id));
-    chatsList.appendChild(item);
-  });
+  runs.forEach(run => chatsList.appendChild(buildRunItem(run)));
 }
+
+// One row in a runs list: agent name + a status pill, clickable to open the
+// run's transcript. Shared by the Verbose conversations section and the
+// Advanced agents pane.
+function buildRunItem(run) {
+  const item = document.createElement("div");
+  item.className = "session-item agent-run-item";
+  const summary = document.createElement("div");
+  summary.className = "summary";
+  summary.textContent = run.agent_name || run.run_id;
+  const badge = document.createElement("span");
+  badge.className = "agent-status " + (run.status || "");
+  badge.textContent = AGENT_STATUS_LABELS[run.status] || run.status || "";
+  item.appendChild(summary);
+  if (badge.textContent) item.appendChild(badge);
+  item.addEventListener("click", () => openAgentRun(run.run_id));
+  return item;
+}
+
+// -- Agents pane (Advanced only) ----------------------------------------
+// A transient launcher: type a system message, run a one-off background
+// agent, and watch its run land in the list below. Agents aren't persisted
+// as definitions — only the encrypted run records are.
+
+const agentInstructionsEl = document.getElementById("agent-instructions");
+const agentWebSearchEl = document.getElementById("agent-web-search");
+const agentRunBtn = document.getElementById("agent-run-btn");
+const agentRunHint = document.getElementById("agent-run-hint");
+const agentRunsListEl = document.getElementById("agent-runs-list");
+
+async function loadAgentsPane(silent) {
+  if (!silent) agentRunsListEl.innerHTML = '<div class="empty">loading…</div>';
+  let runs = [];
+  try {
+    const r = await fetch("/agent-runs");
+    const data = await r.json();
+    runs = data.runs || [];
+  } catch (e) {
+    if (!silent) agentRunsListEl.innerHTML = '<div class="empty">error: ' + e + '</div>';
+    return;
+  }
+  agentRunsListEl.innerHTML = "";
+  if (!runs.length) {
+    agentRunsListEl.innerHTML = '<div class="empty">no runs yet</div>';
+    return;
+  }
+  runs.forEach(run => agentRunsListEl.appendChild(buildRunItem(run)));
+}
+
+function setAgentHint(text, isError) {
+  agentRunHint.textContent = text || "";
+  agentRunHint.classList.toggle("error", !!isError);
+  agentRunHint.hidden = !text;
+}
+
+async function runAdHocAgent() {
+  const instructions = agentInstructionsEl.value.trim();
+  if (!instructions) {
+    setAgentHint("Enter a system message first.", true);
+    agentInstructionsEl.focus();
+    return;
+  }
+  agentRunBtn.disabled = true;
+  setAgentHint("Starting agent…", false);
+  try {
+    const r = await fetch("/agents/run", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        instructions,
+        allow_web_search: agentWebSearchEl.checked,
+        tz: clientTimezone(),
+      }),
+    });
+    const data = await r.json();
+    if (!data.ok) throw new Error(data.message || data.error || "failed to start");
+    setAgentHint("Agent running — its result will appear below when it finishes.",
+                 false);
+    agentInstructionsEl.value = "";
+  } catch (e) {
+    setAgentHint("Couldn't start the agent — " + (e.message || e), true);
+  } finally {
+    agentRunBtn.disabled = false;
+  }
+}
+
+agentRunBtn.addEventListener("click", runAdHocAgent);
+// Ctrl/Cmd+Enter from the textarea runs the agent, mirroring the chat box.
+agentInstructionsEl.addEventListener("keydown", (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+    e.preventDefault();
+    runAdHocAgent();
+  }
+});
 
 // -- Calendar -----------------------------------------------------------
 
@@ -6013,6 +6160,9 @@ function applyUiMode(mode) {
       const userBtn = document.querySelector('.settings-tab-btn[data-tab="user"]');
       if (userBtn) userBtn.click();
     }
+    // The Agents pane is Advanced-only; its rail button just vanished, so
+    // close the pane if it was open rather than leaving it stranded.
+    if (activePaneName === "agents") closeSide();
   }
 }
 

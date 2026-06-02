@@ -91,6 +91,21 @@ opens a modal showing its status, summary, structured result, and a collapsible
 transcript — runs aren't conversations, so this never touches the live chat
 session or the `/load` path.
 
+### Running one ad-hoc (Advanced)
+
+**Advanced** users (the UI-mode toggle, distinct from Verbose) get a dedicated
+**Agents** pane in the left rail. It's a transient launcher, not a manager:
+type a system message, optionally allow web search, and hit *Run agent*. That
+posts to `POST /agents/run`, which builds a one-off `AgentSpec`, registers it
+in the in-memory registry under a unique `adhoc-…` name, and runs it on a
+daemon thread bound to the user's id/DEK. The agent *definition* is not
+persisted — it's gone on the next server restart — only the encrypted run
+record survives, and it shows up in the same pane's runs list (and the Verbose
+conversations section) when the run finishes. A `agent_run_update` SSE ping
+refreshes open panes when a run starts and finishes. This is still the only
+in-app path that calls `BackgroundAgentRunner.run(...)`; there is no scheduler
+or persistent agent collection yet.
+
 ## Building an agent
 
 Declare a spec and register it — no plumbing per agent:

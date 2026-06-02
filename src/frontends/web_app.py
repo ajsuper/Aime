@@ -64,7 +64,12 @@ from aime import (
     config as aime_config,
 )
 from aime.services import sort_events_by_date
-from aime.agents import AgentRunStore
+from aime.agents import (
+    AgentRunStore,
+    AgentSpec,
+    BackgroundAgentRunner,
+    register as _register_agent,
+)
 from aime import auth as _auth
 from aime import encryption as _enc
 from aime import backup as _backup
@@ -442,7 +447,7 @@ class UserContext:
             if payload.get("kind") not in (
                 "assistant_text_delta", "assistant_text_end",
                 "assistant_html_partial", "turn_end", "ready",
-                "remote_edit",
+                "remote_edit", "agent_run_update",
             ):
                 self._history.append(payload)
         with self._subscribers_lock:
@@ -461,6 +466,13 @@ class UserContext:
         funnel through here so the frontend only needs one handler to wire
         up. `source` is for debugging — it shows up in the SSE payload."""
         self._broadcast({"kind": "remote_edit", "source": source})
+
+    def notify_agent_run_update(self) -> None:
+        """Tell every connected session of this user that the set of stored
+        background-agent runs changed (a run just started or finished), so any
+        open agent/conversations pane re-fetches. Fired by the ad-hoc run
+        thread, which has no other path into the SSE fanout."""
+        self._broadcast({"kind": "agent_run_update"})
 
     def _on_backend_mutation(self, tool_name: str) -> None:
         # Fired by ToolGateway after any successful non-read tool call,
@@ -1888,6 +1900,73 @@ def agent_run(run_id: str):
     if record is None:
         return jsonify({"ok": False, "error": "run not found"}), 404
     return jsonify({"ok": True, "run": record})
+
+
+@app.route("/agents/run", methods=["POST"])
+@login_required
+@api_access_required
+def agents_run():
+    """Run an ad-hoc background agent: the caller supplies a system message
+    (the task brief) and we stand up a one-off, in-memory agent to carry it
+    out against this user's data. The agent is registered under a unique name
+    so it's a genuine registry-dispatched run, but nothing about it is
+    persisted as a definition — it's gone on the next server restart. Only the
+    encrypted *run record* survives (in agent_runs/), which the run viewer and
+    the agents pane read back. Gated like /send because a run spends tokens."""
+    data = request.get_json(silent=True) or {}
+    instructions = (data.get("instructions") or "").strip()
+    if not instructions:
+        return jsonify({"ok": False, "error": "a system message is required"}), 400
+    allow_web = bool(data.get("allow_web_search", False))
+    tz = data.get("tz")
+    client_tz = tz if isinstance(tz, str) and tz else None
+
+    user_id = g.user_id
+    ctx = _context_for(user_id)
+    username = ctx.username
+    dek = _auth_backend.get_dek(user_id)
+    runs_dir = _agent_runs_dir(user_id)
+
+    # Unique, registry-safe name for this one-off agent. The timestamp keeps
+    # runs listed in creation order; the random suffix avoids collisions.
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    name = f"adhoc-{stamp}-{base64.b16encode(os.urandom(3)).decode().lower()}"
+    spec = AgentSpec(
+        name=name,
+        description="Ad-hoc agent",
+        instructions=instructions,
+        allow_web_search=allow_web,
+    )
+    _register_agent(spec)
+
+    def _run() -> None:
+        try:
+            BackgroundAgentRunner().run(
+                spec,
+                user_id=user_id,
+                dek=dek,
+                runs_dir=runs_dir,
+                usage_label=username,
+                client_tz=client_tz,
+                api_url=aime_config.API_URL,
+            )
+        except Exception:
+            # The runner already converts its own failures into a persisted
+            # error run; a failure here means it never got that far. Nothing
+            # actionable to do but stop quietly — the pane refresh below still
+            # fires so the UI doesn't hang on "running…".
+            pass
+        finally:
+            ctx.notify_agent_run_update()
+
+    threading.Thread(
+        target=_run, name=f"adhoc-agent-{user_id}", daemon=True
+    ).start()
+    # Tell open panes a run is now in flight (so a "running…" state can show),
+    # then return immediately — the result lands via the run record + the
+    # finished fanout above.
+    ctx.notify_agent_run_update()
+    return jsonify({"ok": True, "agent_name": name})
 
 
 @app.route("/calendar/<int:year>/<int:month>")
