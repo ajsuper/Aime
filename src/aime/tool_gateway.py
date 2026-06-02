@@ -7,6 +7,8 @@ the rest of the codebase never imports `requests` and never references
 `API_URL` directly.
 """
 
+import datetime
+import zoneinfo
 from typing import Callable
 
 import requests
@@ -50,10 +52,36 @@ class ToolGateway:
         self._timeout = timeout
         self._user_id = user_id
         self._on_mutation = on_mutation
+        # IANA timezone of the user, set per session (see set_client_timezone).
+        # Drives the "now" stamped onto get_events so the backend reconciles
+        # stale past events against the user's local clock, not the server's.
+        self._client_tz: str | None = None
+
+    def set_client_timezone(self, tz: str | None) -> None:
+        """Record the user's IANA timezone (e.g. 'America/New_York'). Forwarded
+        here by the controller so reads can carry a user-local 'now'."""
+        self._client_tz = tz or None
+
+    def _now_local(self) -> datetime.datetime:
+        """Current time in the user's timezone, falling back to the server's
+        local time when no (or an invalid) timezone has been set."""
+        if self._client_tz:
+            try:
+                return datetime.datetime.now(zoneinfo.ZoneInfo(self._client_tz))
+            except Exception:
+                pass
+        return datetime.datetime.now()
 
     def _post(self, body: dict) -> dict:
         if self._user_id is not None:
             body["user_id"] = self._user_id
+        # Stamp every events read with the user-local date/time so the backend
+        # can sweep elapsed `scheduled` events to `unknown` (see serve.cpp's
+        # reconcileStalePastEvents). Callers may override by pre-setting these.
+        if body.get("tool_name") == "get_events" and "now_date" not in body:
+            now = self._now_local()
+            body["now_date"] = now.strftime("%d/%m/%Y")
+            body["now_time"] = now.strftime("%H:%M")
         try:
             response = requests.post(self._url, json=body, timeout=self._timeout)
         except Exception as exc:

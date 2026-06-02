@@ -1041,6 +1041,10 @@
     .todo-item.canceled .todo-label { text-decoration: line-through;
                                       text-decoration-thickness: 1px;
                                       color: var(--muted); }
+    /* Unknown = a past, unconfirmed event. Not struck through (we don't know
+       it didn't happen); an amber check outline invites the user to confirm. */
+    .todo-item.unknown .todo-check { border-color: var(--warning, #e29a4a);
+                                     border-style: dashed; }
 
     /* Day view to-do strip: a clear stacked list spanning the full width
        so it reads as a single panel, not a row of pills. */
@@ -1273,6 +1277,16 @@
                                   var(--warning, #e29a4a) 60%, var(--border)); }
     .modal-foot button.danger:hover { background:
         color-mix(in srgb, var(--warning, #e29a4a) 15%, transparent); }
+    /* Archive is a rare, secondary action — a quiet icon, not a labelled
+       button. Muted until hovered, where it warms to a delete-ish red. */
+    .modal-foot button.icon-ghost { border: 0; background: transparent;
+        color: var(--muted); padding: 0.3rem; width: 30px; height: 30px;
+        display: flex; align-items: center; justify-content: center;
+        border-radius: 6px; opacity: 0.7; }
+    .modal-foot button.icon-ghost:hover {
+        color: #d2554d; opacity: 1;
+        background: color-mix(in srgb, #d2554d 14%, transparent); }
+    .modal-foot button.icon-ghost svg { width: 16px; height: 16px; }
 
     /* Event modal field rows — compact, inline label + control on one
        line so the modal isn't dominated by uppercase tags. */
@@ -1305,8 +1319,9 @@
        more room than the 480px default. On mobile, fill the screen so the
        description has space to breathe. */
     #event-modal { max-width: 680px; }
-    #event-modal .modal-body { gap: 0.7rem; padding: 1rem 1.2rem;
-                               min-height: min(60vh, 460px); }
+    /* Let the card size to its content rather than reserving a tall fixed
+       body — short events shouldn't leave big empty gaps. */
+    #event-modal .modal-body { gap: 0.55rem; padding: 0.9rem 1.2rem; }
     @media (max-width: 768px) {
       #event-backdrop { padding: 0.75rem; }
       #event-modal { max-width: 100%; height: 100%; max-height: 100%; }
@@ -1317,7 +1332,7 @@
        the other ev-fields. */
     .ev-summary-rendered { background: transparent; color: var(--text);
                            border: 1px solid transparent; border-radius: 6px;
-                           padding: 0.5rem 0.6rem; min-height: 5em;
+                           padding: 0.4rem 0.6rem; min-height: 3.2em;
                            cursor: pointer; font-size: 0.95rem; line-height: 1.5;
                            overflow-wrap: anywhere;
                            transition: background 0.15s, border-color 0.15s; }
@@ -1360,20 +1375,35 @@
         accent-color: var(--cta); }
     .ev-modal-error { color: var(--warning, #e29a4a); font-size: 0.8rem;
                       margin: 0; }
-    /* Read-only lifecycle metadata in the event modal. */
-    .ev-meta { display: flex; flex-wrap: wrap; gap: 0.4rem 0.6rem;
-               align-items: center; font-size: 0.82rem; }
-    .ev-badge { display: inline-flex; align-items: center; gap: 0.3rem;
-                padding: 1px 8px; border-radius: 999px; font-weight: 600;
-                font-size: 0.75rem; text-transform: capitalize;
-                background: color-mix(in srgb, var(--accent) 18%, transparent);
-                color: var(--text); }
-    .ev-badge.status-completed {
-      background: color-mix(in srgb, #3fa65a 24%, transparent); }
-    .ev-badge.status-canceled {
-      background: color-mix(in srgb, var(--warning, #e29a4a) 26%, transparent); }
-    .ev-badge.status-rescheduled {
-      background: color-mix(in srgb, #6c8cff 22%, transparent); }
+    /* Lifecycle metadata in the event modal: a row of clickable status pills,
+       with commitment / reason / moved-from details underneath when present. */
+    .ev-meta { display: flex; flex-direction: column; align-items: stretch;
+               gap: 0.45rem; font-size: 0.82rem; }
+    .ev-status-pills { display: flex; flex-wrap: wrap; gap: 0.35rem; }
+    /* All four states are always shown; the inactive ones sit greyed and the
+       active one lights up in its colour. The whole row is a picker — click any
+       pill to switch the event to that status. */
+    .status-pill { cursor: pointer; font: inherit; font-size: 0.75rem;
+                   font-weight: 600; text-transform: capitalize;
+                   padding: 2px 11px; border-radius: 999px;
+                   border: 1px solid var(--border); background: transparent;
+                   color: var(--muted); opacity: 0.5;
+                   transition: opacity 0.15s, background 0.15s,
+                               color 0.15s, border-color 0.15s; }
+    .status-pill:hover { opacity: 0.85; border-color: var(--accent); }
+    .status-pill.active { opacity: 1; color: var(--text);
+                          border-color: transparent; cursor: default; }
+    .status-pill.active.s-scheduled {
+      background: color-mix(in srgb, var(--accent) 20%, transparent); }
+    .status-pill.active.s-completed {
+      background: color-mix(in srgb, #3fa65a 26%, transparent); }
+    .status-pill.active.s-canceled {
+      background: color-mix(in srgb, #d2554d 26%, transparent); }
+    .status-pill.active.s-unknown {
+      background: color-mix(in srgb, var(--warning, #e29a4a) 24%, transparent);
+      border: 1px dashed color-mix(in srgb, var(--warning, #e29a4a) 60%, transparent); }
+    .ev-meta-details { display: flex; flex-wrap: wrap; gap: 0.3rem 0.7rem;
+                       align-items: center; }
     .ev-meta-item { color: var(--muted); }
     .ev-meta-item b { color: var(--text); font-weight: 600; }
     /* Schedule and pill events should look interactive. */
@@ -1444,6 +1474,18 @@
     .cal-cell .ev.canceled,
     .cal-sched .ev-pill.canceled,
     .cal-sched .ev-block.canceled { text-decoration: line-through; }
+
+    /* Unknown = a past event the user never resolved. Unlike completed/canceled
+       it's not a settled outcome, so it isn't greyed out — instead it keeps an
+       amber dashed edge to read as "this still needs a yes/no". */
+    .cal-cell .ev.unknown,
+    .cal-sched .ev-pill.unknown,
+    .cal-sched .ev-block.unknown {
+      opacity: 0.8;
+      box-shadow: inset 3px 0 0 var(--warning, #e29a4a);
+      outline: 1px dashed color-mix(in srgb, var(--warning, #e29a4a) 70%, transparent);
+      outline-offset: -1px;
+    }
 
     /* Settings modal: floating panel over a blurred chat backdrop. */
     #settings-backdrop {
@@ -2059,7 +2101,13 @@
         <p class="ev-modal-error" id="ev-modal-error" hidden></p>
       </div>
       <div class="modal-foot">
-        <button id="ev-archive-btn" class="danger">Archive</button>
+        <button id="ev-archive-btn" class="icon-ghost" title="Archive"
+                aria-label="Archive">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6M10 11v5M14 11v5"/>
+          </svg>
+        </button>
         <span class="spacer"></span>
         <button id="ev-cancel-btn" hidden>Cancel</button>
         <button id="ev-save-btn" class="primary" hidden>Save</button>
@@ -4217,6 +4265,7 @@ function eventStateClasses(ev) {
   const s = eventStatus(ev);
   if (s === "completed") cls += " completed";
   else if (s === "canceled") cls += " canceled";
+  else if (s === "unknown") cls += " unknown";
   return cls;
 }
 
@@ -4348,42 +4397,80 @@ function openEventModal(ev) {
   evFSummary.value = ev.summary || "";
   renderEventSummary(ev.summary || "");
   renderEventMeta(ev);
-  evArchiveBtn.textContent = ev.archived ? "Unarchive" : "Archive";
+  // Archive is now an icon button; convey its action through the label only.
+  const archiveLabel = ev.archived ? "Unarchive" : "Archive";
+  evArchiveBtn.title = archiveLabel;
+  evArchiveBtn.setAttribute("aria-label", archiveLabel);
   setEventEditMode(false);
   eventBackdrop.hidden = false;
 }
 
-// Read-only lifecycle metadata under the category field: a status badge plus
-// any populated commitment / status-change-reason / reschedule-origin detail. Hidden
-// entirely for a plain scheduled one-off so the modal stays uncluttered. Built
-// with DOM nodes + textContent so user/agent-supplied values can't inject HTML.
+// The four lifecycle states the user can pick between in the modal. (`unknown`
+// is normally system-set, but it's a legitimate "I genuinely don't know" choice
+// too, so it's selectable like the rest.)
+const EVENT_STATUS_OPTIONS = ["scheduled", "completed", "canceled", "unknown"];
+
+// Lifecycle section under the category field: a row of status pills (active one
+// lit, the others greyed — click to switch) plus any populated commitment /
+// status-change-reason / reschedule-origin detail underneath. Built with DOM
+// nodes + textContent so user/agent-supplied values can't inject HTML.
 function renderEventMeta(ev) {
   const status = eventStatus(ev);
+  evFMeta.textContent = "";
+  evFMetaWrap.hidden = false;
+
+  const pills = document.createElement("div");
+  pills.className = "ev-status-pills";
+  EVENT_STATUS_OPTIONS.forEach((s) => {
+    const pill = document.createElement("button");
+    pill.type = "button";
+    pill.className = "status-pill s-" + s + (s === status ? " active" : "");
+    pill.textContent = s;
+    pill.setAttribute("aria-pressed", s === status ? "true" : "false");
+    pill.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      const prev = eventStatus(ev);
+      if (s === prev) return;
+      // Optimistic relight, then persist; roll back on failure.
+      ev.status = s;
+      if (activeEventRecord) activeEventRecord.status = s;
+      renderEventMeta(ev);
+      const ok = await setEventStatus(ev, s);
+      if (!ok) {
+        ev.status = prev;
+        if (activeEventRecord) activeEventRecord.status = prev;
+        renderEventMeta(ev);
+        evModalError.textContent = "Couldn't update status.";
+        evModalError.hidden = false;
+        return;
+      }
+      evModalError.hidden = true;
+      renderCalendar(true);  // reflect the change behind the modal, no flash
+    });
+    pills.appendChild(pill);
+  });
+  evFMeta.appendChild(pills);
+
   const cid = (ev.commitment_id || "").trim();
   const reason = (ev.status_change_reason || "").trim();
   const moved = (ev.rescheduled_from || "").trim();
-  const noteworthy = status !== "scheduled" || cid || reason || moved;
-  evFMeta.textContent = "";
-  evFMetaWrap.hidden = !noteworthy;
-  if (!noteworthy) return;
-
-  const badge = document.createElement("span");
-  badge.className = "ev-badge status-" + status;
-  badge.textContent = status;
-  evFMeta.appendChild(badge);
-
-  const detail = (prefix, value) => {
-    const span = document.createElement("span");
-    span.className = "ev-meta-item";
-    span.append(prefix);
-    const strong = document.createElement("b");
-    strong.textContent = value;
-    span.appendChild(strong);
-    evFMeta.appendChild(span);
-  };
-  if (cid) detail("recurring: ", cid);
-  if (reason) detail("reason: ", reason);
-  if (moved) detail("moved from ", moved);
+  if (cid || reason || moved) {
+    const details = document.createElement("div");
+    details.className = "ev-meta-details";
+    const detail = (prefix, value) => {
+      const span = document.createElement("span");
+      span.className = "ev-meta-item";
+      span.append(prefix);
+      const strong = document.createElement("b");
+      strong.textContent = value;
+      span.appendChild(strong);
+      details.appendChild(span);
+    };
+    if (cid) detail("recurring: ", cid);
+    if (reason) detail("reason: ", reason);
+    if (moved) detail("moved from ", moved);
+    evFMeta.appendChild(details);
+  }
 }
 
 function closeEventModal() {
@@ -4589,6 +4676,7 @@ function buildTodoItem(ev, { compact = false, interactive = true } = {}) {
   item.className = "todo-item" + (compact ? " compact" : "")
                  + (status === "completed" ? " done" : "")
                  + (status === "canceled" ? " canceled" : "")
+                 + (status === "unknown" ? " unknown" : "")
                  + (interactive ? "" : " static");
   applyCategoryColor(item, ev.category);
 

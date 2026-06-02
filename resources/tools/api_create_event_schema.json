@@ -39,18 +39,18 @@
     },
     "status": {
       "type": "string",
-      "enum": ["scheduled", "completed", "canceled", "rescheduled"],
+      "enum": ["scheduled", "completed", "canceled", "unknown"],
       "default": "scheduled",
-      "description": "Lifecycle state. New events are 'scheduled'."
+      "description": "Lifecycle state. New events are 'scheduled'. ('unknown' is set automatically by the system for past events left unresolved; don't set it yourself.)"
     },
     "status_change_reason": {
       "type": "string",
-      "description": "Short freeform reason for the current status, whenever one is worth recording — e.g. why it was canceled (\"tired\", \"conflict\", \"AiMe\"), why rescheduled, or a note on how it went when completed. Most useful for 'canceled'/'rescheduled'."
+      "description": "Short freeform reason for the current status, whenever one is worth recording — e.g. why it was canceled (\"tired\", \"conflict\", \"AiMe\"), why it was moved, or a note on how it went when completed. Most useful for cancellations and reschedules."
     },
     "rescheduled_from": {
       "type": "string",
       "pattern": "^\\d{2}/\\d{2}/\\d{4}$",
-      "description": "Original DD/MM/YYYY this instance was moved from, only when status is 'rescheduled'."
+      "description": "Original DD/MM/YYYY this instance was moved from. Set it (and use the new date) when an event is rescheduled; the status stays 'scheduled'."
     }
   }
 }

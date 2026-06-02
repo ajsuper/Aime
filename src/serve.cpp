@@ -51,7 +51,7 @@ struct CalenderEvent {
     bool eventArchived = false;
     // Commitment-tracking metadata (all additive; older rows default to these).
     std::string commitmentId;                 // stable slug linking recurring instances
-    std::string status = "scheduled";         // scheduled / completed / canceled / rescheduled
+    std::string status = "scheduled";         // scheduled / completed / canceled / unknown (unknown is system-set)
     std::string statusChangeReason;           // why the status is what it is (most often a cancel reason)
     std::string rescheduledFrom;              // original DD/MM/YYYY if moved
     std::string createdAt;                    // ISO timestamp, server-stamped on create
@@ -219,6 +219,25 @@ void createCalender(sqlite3* database) {
             sqlite3_free(alterErr);
         }
     }
+
+    // Status migration: 'rescheduled' was retired as a status. A moved event is
+    // just 'scheduled' again at its new date (the move is recorded in
+    // EVENT_RESCHEDULED_FROM), so fold any legacy 'rescheduled' rows back to
+    // 'scheduled'. Idempotent — once converted there's nothing left to match.
+    {
+        const char* fold =
+            "UPDATE EVENT SET EVENT_STATUS='scheduled' WHERE EVENT_STATUS='rescheduled'";
+        char* foldErr = nullptr;
+        if (sqlite3_exec(database, fold, NULL, 0, &foldErr) == SQLITE_OK) {
+            const int changed = sqlite3_changes(database);
+            if (changed > 0)
+                std::cout << "Migrated " << changed
+                          << " 'rescheduled' event(s) back to 'scheduled'." << std::endl;
+        } else if (foldErr) {
+            std::cout << "Note: rescheduled→scheduled migration — " << foldErr << std::endl;
+            sqlite3_free(foldErr);
+        }
+    }
 }
 
 void createTopics(sqlite3* database) {
@@ -350,6 +369,84 @@ static std::string isoTimestampNow() {
     char buf[32];
     std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &utc);
     return buf;
+}
+
+// The only lifecycle states an event may hold. `unknown` is included because
+// it's a legitimate stored value (the system sets it) and clients may echo it
+// back on an unrelated edit — but it's not something a client should set fresh;
+// that's enforced by guidance, not here. Anything outside this set is a bug
+// (a typo or a synonym like "done") and is rejected so it can't silently split
+// the data the pattern tools aggregate on.
+static bool isValidStatus(const std::string& status) {
+    return status == "scheduled" || status == "completed" ||
+           status == "canceled"  || status == "unknown";
+}
+
+// Sweep still-`scheduled` events whose moment has passed over to `unknown`.
+//
+// A `scheduled` event the user never resolved doesn't mean it didn't happen —
+// it means we don't *know*. Leaving it `scheduled` forever is misleading (it
+// reads as still-upcoming) and quietly corrupts streaks, so once its time is
+// past we flip it to `unknown`, which is an honest "needs a human to say."
+// Only `scheduled` is touched — completed / canceled are real outcomes and
+// stay put; an already-`unknown` event past won't re-match either.
+//
+// `nowDate`/`nowTime` come from the caller in the *user's* local time (the C++
+// side only knows UTC), so the boundary matches what the user sees as "now".
+// All-day events (blank time) only flip once their whole day has elapsed;
+// timed events flip the minute they're past. last_modified is intentionally
+// left untouched: this is a system reconciliation, not a user edit, and
+// bumping it would spam the frontend's "edited since you last looked" tagging.
+static void reconcileStalePastEvents(sqlite3* database,
+                                     const std::string& nowDate,
+                                     const std::string& nowTime) {
+    if (nowDate.empty()) return;  // no trustworthy "now" → don't guess
+    const int nowDatePacked = packDate(parseDate(nowDate));
+    const int nowTimePacked = packTime(parseTime(nowTime));
+
+    std::vector<int> staleIds;
+    sqlite3_stmt* sel = nullptr;
+    const std::string selSql =
+        "SELECT ID, EVENT_DATE, EVENT_TIME FROM EVENT "
+        "WHERE EVENT_STATUS='scheduled' AND EVENT_ARCHIVED='FALSE'";
+    if (sqlite3_prepare_v2(database, selSql.c_str(), -1, &sel, nullptr) != SQLITE_OK) {
+        std::cout << "reconcileStalePastEvents select failed: "
+                  << sqlite3_errmsg(database) << std::endl;
+        return;
+    }
+    while (sqlite3_step(sel) == SQLITE_ROW) {
+        const int id = sqlite3_column_int(sel, 0);
+        const std::string dateStr = columnTextOrEmpty(sel, 1);
+        const std::string timeStr = columnTextOrEmpty(sel, 2);
+        const int datePacked = packDate(parseDate(dateStr));
+
+        bool isPast;
+        if (timeStr.empty()) {
+            // All-day: past only once the whole day is behind us.
+            isPast = datePacked < nowDatePacked;
+        } else {
+            isPast = datePacked < nowDatePacked ||
+                     (datePacked == nowDatePacked &&
+                      packTime(parseTime(timeStr)) < nowTimePacked);
+        }
+        if (isPast) staleIds.push_back(id);
+    }
+    sqlite3_finalize(sel);
+    if (staleIds.empty()) return;
+
+    sqlite3_stmt* upd = nullptr;
+    const std::string updSql = "UPDATE EVENT SET EVENT_STATUS='unknown' WHERE ID=?";
+    if (sqlite3_prepare_v2(database, updSql.c_str(), -1, &upd, nullptr) != SQLITE_OK) {
+        std::cout << "reconcileStalePastEvents update failed: "
+                  << sqlite3_errmsg(database) << std::endl;
+        return;
+    }
+    for (const int id : staleIds) {
+        sqlite3_bind_int(upd, 1, id);
+        sqlite3_step(upd);
+        sqlite3_reset(upd);
+    }
+    sqlite3_finalize(upd);
 }
 
 void addEvent(sqlite3* database, CalenderEvent& event) {
@@ -1310,6 +1407,17 @@ int main(int argc, char* argv[]) {
         sqlite3* database = getUserDb(user_id);
 
         if (jsonData["tool_name"] == "get_events") {
+            // Reconcile stale past events before reading so every surface
+            // (calendar, model, pattern tools) sees a coherent, up-to-date
+            // store. `now_*` arrive in the user's local time; absent them we
+            // skip rather than guess with the server's UTC clock.
+            if (jsonData.has("now_date")) {
+                reconcileStalePastEvents(
+                    database,
+                    std::string(jsonData["now_date"].s()),
+                    jsonData.has("now_time") ? std::string(jsonData["now_time"].s())
+                                             : std::string());
+            }
             FilterOptions opts = parseFilterOptions(jsonData);
             std::vector<CalenderEvent> events = filterEvents(database, opts);
 
@@ -1325,6 +1433,16 @@ int main(int argc, char* argv[]) {
                 !jsonData.has("category") || !jsonData.has("date") ||
                 !jsonData.has("archived")) {
                 return crow::response(400, "replace_event missing required fields");
+            }
+            if (jsonData.has("status")) {
+                std::string st = std::string(jsonData["status"].s());
+                if (!st.empty() && !isValidStatus(st)) {
+                    return crow::response(400,
+                        "Invalid status \"" + st + "\". Valid statuses: "
+                        "scheduled, completed, canceled. ('unknown' is set "
+                        "automatically by the system for elapsed events — "
+                        "don't set it yourself.)");
+                }
             }
 
             int editId = static_cast<int>(jsonData["id"].i());
@@ -1356,6 +1474,16 @@ int main(int argc, char* argv[]) {
                 !jsonData.has("category") || !jsonData.has("date") ||
                 !jsonData.has("archived")) {
                 return crow::response(400, "create_event missing required fields");
+            }
+            if (jsonData.has("status")) {
+                std::string st = std::string(jsonData["status"].s());
+                if (!st.empty() && !isValidStatus(st)) {
+                    return crow::response(400,
+                        "Invalid status \"" + st + "\". Valid statuses: "
+                        "scheduled, completed, canceled. ('unknown' is set "
+                        "automatically by the system for elapsed events — "
+                        "don't set it yourself.)");
+                }
             }
 
             CalenderEvent event = parseEditEvent(jsonData);

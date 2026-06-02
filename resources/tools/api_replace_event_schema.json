@@ -45,17 +45,17 @@
     },
     "status": {
       "type": "string",
-      "enum": ["scheduled", "completed", "canceled", "rescheduled"],
-      "description": "Lifecycle state. Set 'completed' when it happened, 'canceled' (with status_change_reason) when dropped, 'rescheduled' (with rescheduled_from, plus status_change_reason if there's a why) when moved. Omit to keep the existing value."
+      "enum": ["scheduled", "completed", "canceled", "unknown"],
+      "description": "Lifecycle state. Set 'completed' when it happened, 'canceled' (with status_change_reason) when dropped. To move an event, change its date and set rescheduled_from to the old date — leave the status 'scheduled'. 'unknown' is set automatically by the system for past events you never resolved; don't set it yourself. Omit to keep the existing value."
     },
     "status_change_reason": {
       "type": "string",
-      "description": "Short freeform reason for the current status, whenever one is worth recording — e.g. why it was canceled (\"tired\", \"conflict\", \"AiMe\"), why rescheduled, or a note on how it went when completed. Most useful for 'canceled'/'rescheduled'. Omit to keep the existing value."
+      "description": "Short freeform reason for the current status, whenever one is worth recording — e.g. why it was canceled (\"tired\", \"conflict\", \"AiMe\"), why it was moved, or a note on how it went when completed. Most useful for cancellations and reschedules. Omit to keep the existing value."
     },
     "rescheduled_from": {
       "type": "string",
       "pattern": "^\\d{2}/\\d{2}/\\d{4}$",
-      "description": "Original DD/MM/YYYY this instance was moved from, only when status is 'rescheduled'. Omit to keep the existing value."
+      "description": "Original DD/MM/YYYY this instance was moved from. Set it (and update the date) when rescheduling an event; the status stays 'scheduled'. Omit to keep the existing value."
     }
   }
 }

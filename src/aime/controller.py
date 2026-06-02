@@ -314,8 +314,11 @@ class ConversationController:
 
     def set_client_timezone(self, tz: str) -> None:
         """Forward the client's IANA timezone to the backend so per-turn
-        timestamps reflect the user's local time rather than the server's."""
+        timestamps reflect the user's local time rather than the server's, and
+        to the tool gateway so events reads carry a user-local 'now' (used to
+        reconcile stale past events)."""
         self._backend.set_client_timezone(tz)
+        self._tools.set_client_timezone(tz)
 
     # --- session operations ---
 

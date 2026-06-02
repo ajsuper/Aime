@@ -17,14 +17,18 @@ from .tool_gateway import ToolGateway
 from .services import _events_from, sort_events_by_date
 
 # Status values that mean an instance actually resolved one way or the other —
-# the ones streaks and "last completed" reason about (vs. still-scheduled).
+# the ones streaks and "last completed" reason about. `unknown` is deliberately
+# excluded: a past event the user never resolved is exactly that — unknown — so
+# it neither extends a completed streak nor counts as a cancellation. It's a
+# prompt to ask, not an outcome.
 _TERMINAL_STATUSES = ("completed", "canceled")
 _FAR_FUTURE = "31/12/9999"
 
 
 def _status_of(ev: dict) -> str:
     """An event's status, defaulting to 'scheduled' for legacy rows that predate
-    the column (where it comes back blank)."""
+    the column (where it comes back blank). A past event left `scheduled` is
+    swept to `unknown` server-side, so that value flows through here unchanged."""
     return (ev.get("status") or "scheduled").strip() or "scheduled"
 
 
@@ -170,15 +174,21 @@ class CommitmentService:
             (e.get("date") for e in ordered if _status_of(e) == "completed"), None
         )
 
+        unknown = counts.get("unknown", 0)
         lines = [
             f"Pattern summary for {label} ({total} total):",
             f"• scheduled: {counts.get('scheduled', 0)}, "
             f"completed: {counts.get('completed', 0)}, "
             f"canceled: {counts.get('canceled', 0)}, "
-            f"rescheduled: {counts.get('rescheduled', 0)}",
+            f"unknown: {unknown}",
         ]
         if streak_status:
             lines.append(f"• current streak: {streak_len} {streak_status} in a row")
+        if unknown:
+            lines.append(
+                f"• {unknown} past instance(s) still unresolved (status 'unknown') "
+                "— ask the user how they went to keep this pattern accurate"
+            )
         if top_reason:
             lines.append(
                 f"• most common status-change reason: \"{top_reason[0]}\" ({top_reason[1]}x)"

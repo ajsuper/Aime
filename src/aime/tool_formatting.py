@@ -143,6 +143,14 @@ def _render_events(events: list) -> str:
         head = f"• #{eid} {title} | {when}"
         if ev.get("category"):
             head += f" | {ev['category']}"
+        # Show the status only when it's something other than a plain pending
+        # `scheduled` — keeps the common case terse while making completed,
+        # canceled, and `unknown` (a past event swept from `scheduled` because
+        # its date/time passed unresolved) visible so the model isn't blind to
+        # outcomes and knows when to ask the user how something went.
+        status = (ev.get("status") or "scheduled").strip() or "scheduled"
+        if status != "scheduled":
+            head += f" | {status}"
         if ev.get("archived"):
             head += " | [archived]"
         lines.append(head)
