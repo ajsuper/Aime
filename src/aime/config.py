@@ -66,9 +66,22 @@ WEB_SEARCH_TOOL_VERSION = "web_search_20250305"
 
 # Tool offered to the model only during first-time onboarding, so it can mark
 # the flow finished once it delivers its closing message. Presentation is gated
-# per-turn by the backend (see set_onboarding_tool_active); the schema just
-# loads here like any other.
+# per-turn by the backend (see set_terminal_tool_active); the schema just
+# loads here like any other. It is the "terminal tool" for the interactive
+# backend — see the background-agent framework for the other use of that slot.
 ONBOARDING_TOOL_SCHEMA = "../resources/tools/api_complete_onboarding_schema.json"
+
+# --- Background agents (aime.agents) -----------------------------------------
+# Headless workers that reuse the full Aime stack (backend + controller + tool
+# gateway) to carry out a task against a user's database and return a result.
+# The base system prompt frames the model as a headless worker; the per-agent
+# task arrives via system_send_message. SubmitResult is the terminal tool the
+# worker calls to deliver its result and end the run.
+AGENT_BASE_PROMPT_PATH = "../resources/prompts/agents/_base.md"
+SUBMIT_RESULT_SCHEMA = "../resources/tools/api_submit_result_schema.json"
+# Per-user directory (sibling of conversations/, under users/<id>/) where
+# background-agent run records are persisted, encrypted with the user's DEK.
+AGENT_RUNS_DIRNAME = "agent_runs"
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -89,5 +102,11 @@ WEB_SEARCH_ENABLED = _env_flag("AIME_WEB_SEARCH", True)
 
 
 def load_system_prompt(path: str = SYSTEM_PROMPT_PATH) -> str:
+    with open(path) as f:
+        return f.read()
+
+
+def load_agent_base_prompt(path: str = AGENT_BASE_PROMPT_PATH) -> str:
+    """The headless background-worker system prompt (see aime.agents)."""
     with open(path) as f:
         return f.read()

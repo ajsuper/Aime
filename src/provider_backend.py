@@ -310,7 +310,8 @@ class AnthropicMessagesBackend:
         usage_label: str | None = None,
         router=None,
         web_search_schema: str | None = None,
-        onboarding_tool_schema: str | None = None,
+        terminal_tool_schema: "str | dict | None" = None,
+        persist_enabled: bool = True,
     ):
         self._client = Anthropic(max_retries=3)
         self._system_prompt = system_prompt
@@ -358,16 +359,26 @@ class AnthropicMessagesBackend:
                 **self._tools[-1],
                 "cache_control": {"type": "ephemeral", "ttl": "1h"},
             }
-        # The onboarding-completion tool is special: it's only offered to the
-        # model *during* first-time onboarding (see set_onboarding_tool_active).
-        # It is deliberately NOT part of self._tools / the cached prefix —
-        # _tools_for_turn appends it AFTER the cache breakpoint, so toggling it
-        # on and off never invalidates the cached tool prefix.
-        self._onboarding_tool = (
-            self._load_schema(onboarding_tool_schema)
-            if onboarding_tool_schema else None
-        )
-        self._onboarding_tool_active = False
+        # The "terminal tool" is special: it is offered to the model only while
+        # a particular flow is active (CompleteOnboarding during first-time
+        # onboarding; SubmitResult for the whole life of a background-agent run
+        # — see set_terminal_tool_active). It is deliberately NOT part of
+        # self._tools / the cached prefix — _tools_for_turn appends it AFTER the
+        # cache breakpoint, so toggling it never invalidates the cached prefix.
+        # Accepts a schema *path* (loaded here) or a pre-built raw schema dict
+        # (e.g. a per-agent SubmitResult whose `result` shape varies by task).
+        if terminal_tool_schema is None:
+            self._terminal_tool = None
+        elif isinstance(terminal_tool_schema, str):
+            self._terminal_tool = self._load_schema(terminal_tool_schema)
+        else:
+            self._terminal_tool = self._schema_to_tool(terminal_tool_schema)
+        self._terminal_tool_active = False
+        # When False, _persist() is a no-op: the conversation lives only in
+        # memory for the life of the process. Background-agent runs use this so
+        # they never litter the user's saved-conversation list; their audit
+        # trail is the separate run record (see aime.agents.store).
+        self._persist_enabled = persist_enabled
         # Per-session dynamic context (e.g. bootstrapped topic contents). Lives
         # in the system array rather than the message history so it stays out
         # of compaction and doesn't get replayed inside user turns.
@@ -432,22 +443,25 @@ class AnthropicMessagesBackend:
         onboarding-complete flag)."""
         return self._conversations_dir
 
-    def set_onboarding_tool_active(self, active: bool) -> None:
-        """Offer (or withdraw) the CompleteOnboarding tool to the model. The
-        controller turns it on while first-time onboarding is in flight and off
-        once the model has called it (or on reset/load). No-op if no onboarding
+    def set_terminal_tool_active(self, active: bool) -> None:
+        """Offer (or withdraw) the configured terminal tool to the model.
+
+        For the interactive backend this is CompleteOnboarding: the controller
+        turns it on while first-time onboarding is in flight and off once the
+        model has called it (or on reset/load). For a background-agent backend
+        it is SubmitResult, turned on for the whole run. No-op if no terminal
         tool schema was configured."""
         with self._lock:
-            self._onboarding_tool_active = bool(active) and self._onboarding_tool is not None
+            self._terminal_tool_active = bool(active) and self._terminal_tool is not None
 
     def _tools_for_turn(self) -> list[dict]:
-        """The cached base tools, plus the onboarding tool appended after the
-        cache breakpoint while onboarding is active. Appending (rather than
-        rebuilding) keeps the cached tool prefix byte-stable."""
+        """The cached base tools, plus the terminal tool appended after the
+        cache breakpoint while it is active. Appending (rather than rebuilding)
+        keeps the cached tool prefix byte-stable."""
         with self._lock:
-            active = self._onboarding_tool_active
-        if active and self._onboarding_tool is not None:
-            return [*self._tools, self._onboarding_tool]
+            active = self._terminal_tool_active
+        if active and self._terminal_tool is not None:
+            return [*self._tools, self._terminal_tool]
         return self._tools
 
     def set_session_context(self, text: str) -> None:
@@ -610,7 +624,7 @@ class AnthropicMessagesBackend:
         return sessions
 
     def _persist(self) -> None:
-        if not self._session_id:
+        if not self._session_id or not self._persist_enabled:
             return
         # Hold _persist_lock across the snapshot *and* the file write, so a
         # slow writer can't os.replace() a stale snapshot over a newer one
@@ -1673,7 +1687,14 @@ class AnthropicMessagesBackend:
 
     def _load_schema(self, schema_path: str) -> dict:
         with open(schema_path, "r") as f:
-            schema = json.load(f)
+            return self._schema_to_tool(json.load(f))
+
+    @staticmethod
+    def _schema_to_tool(schema: dict) -> dict:
+        """Translate a JSON-schema tool definition ({title, description, type,
+        properties, [required]}) into the Anthropic tool shape ({name,
+        description, input_schema}). Shared by the file loader and by callers
+        that build a schema in memory (e.g. a per-agent SubmitResult)."""
         input_schema = {"type": schema["type"], "properties": schema["properties"]}
         if "required" in schema:
             input_schema["required"] = schema["required"]

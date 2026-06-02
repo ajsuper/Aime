@@ -63,6 +63,8 @@ CoreEventKind = Literal[
     "error",                    # unrecoverable controller/backend error
     "turn_routing",             # router picked a model for the next turn
                                 # (emitted only when verbose mode is on)
+    "agent_result",             # headless background agent called SubmitResult;
+                                # carries the structured result in `payload`
 ]
 
 
@@ -95,6 +97,10 @@ class CoreEvent:
     # Text files are still embedded in `text` via <aime:file> sentinels; the
     # frontend extracts and renders them alongside these.
     attachments: list[dict] = field(default_factory=list)
+    # Structured payload for events that carry one. Currently only set on
+    # `agent_result`, where it holds the SubmitResult tool input
+    # ({"summary": str, "result": ...}). None for ordinary events.
+    payload: dict | None = None
 
 
 Subscriber = Callable[[CoreEvent], None]
@@ -126,10 +132,18 @@ class ConversationController:
         tool_gateway: ToolGateway,
         worker_spawner: WorkerSpawner,
         web_search_agent=None,
+        headless: bool = False,
     ):
         self._backend = backend
         self._tools = tool_gateway
         self._spawn_worker = worker_spawner
+        # Headless mode drives a background-agent run rather than an interactive
+        # chat: start() skips the onboarding bootstrap and instead arms the
+        # SubmitResult terminal tool, and the SubmitResult call is surfaced as
+        # an `agent_result` CoreEvent (see _handle_tool_use). The full tool
+        # dispatch path is otherwise identical, so background agents inherit
+        # web search, commitment tools, and result formatting unchanged.
+        self._headless = headless
         # Commitment-pattern tools (GetCommitmentHistory / GetPatternSummary /
         # GetRecentActivity) are computed in Python over `get_events` rather than
         # forwarded to the backend; handled in _handle_tool_use like WebSearch.
@@ -177,6 +191,12 @@ class ConversationController:
         will retire when sessions change), but it's intended to be called
         once at app boot."""
         self._spawn_worker(self.run_stream_loop)
+        if self._headless:
+            # Background-agent run: no onboarding. Arm SubmitResult for the
+            # whole run so the worker can deliver its result and terminate.
+            # The kickoff task message is submitted by the runner, not here.
+            self._set_terminal_tool(True)
+            return
         self._maybe_start_onboarding()
 
     def _maybe_start_onboarding(self) -> None:
@@ -192,7 +212,7 @@ class ConversationController:
         # bootstrap already ran — don't repeat on first user message
         self._user_first_interaction = False
         # Offer the CompleteOnboarding tool for the duration of the flow.
-        self._set_onboarding_tool(True)
+        self._set_terminal_tool(True)
         try:
             self._backend.submit(BackendEvent(
                 kind="system_send_message", text=ONBOARDING_PROMPT
@@ -201,11 +221,12 @@ class ConversationController:
         except Exception as exc:
             self._emit(CoreEvent(kind="error", text=f"onboarding send failed: {exc}"))
 
-    def _set_onboarding_tool(self, active: bool) -> None:
-        """Toggle the model-facing CompleteOnboarding tool. Guarded so backends
-        that don't support it (e.g. the legacy Sessions backend) degrade to the
-        flag/backfill path rather than erroring."""
-        setter = getattr(self._backend, "set_onboarding_tool_active", None)
+    def _set_terminal_tool(self, active: bool) -> None:
+        """Toggle the model-facing terminal tool (CompleteOnboarding in an
+        interactive session, SubmitResult in a headless agent run). Guarded so
+        backends that don't support it (e.g. the legacy Sessions backend)
+        degrade to the flag/backfill path rather than erroring."""
+        setter = getattr(self._backend, "set_terminal_tool_active", None)
         if setter is not None:
             setter(active)
 
@@ -411,7 +432,7 @@ class ConversationController:
         self._user_first_interaction = True
         # Withdraw the onboarding tool when leaving a conversation (reset/load).
         # reset() re-arms it via _maybe_start_onboarding if onboarding is due.
-        self._set_onboarding_tool(False)
+        self._set_terminal_tool(False)
         self._is_idle = True
         self._idle_event.set()
         self._pending_user_messages = []
@@ -527,7 +548,7 @@ class ConversationController:
         # backend data mutation.
         if tool_name == "CompleteOnboarding":
             self._onboarding.mark_complete()
-            self._set_onboarding_tool(False)
+            self._set_terminal_tool(False)
             self._emit(CoreEvent(
                 kind="tool_result",
                 tool_name=tool_name,
@@ -541,6 +562,27 @@ class ConversationController:
                 ))
             except Exception as exc:
                 self._emit(CoreEvent(kind="error", text=f"tool result send failed: {exc}"))
+            return
+        # SubmitResult is the terminal tool of a headless background-agent run:
+        # the worker calls it once to deliver its result and finish. We surface
+        # the structured payload as an `agent_result` CoreEvent for the runner's
+        # collector and deliberately do NOT submit a tool response — there is
+        # nothing for the worker to do next, so the runner tears the session
+        # down rather than paying for a dangling continuation turn.
+        if tool_name == "SubmitResult":
+            payload = tool_input if isinstance(tool_input, dict) else {}
+            summary = (payload.get("summary") or "").strip()
+            self._emit(CoreEvent(
+                kind="tool_result",
+                tool_name=tool_name,
+                tool_result_summary="submitted result",
+                tool_detail_full=_full_detail_text(payload),
+            ))
+            self._emit(CoreEvent(
+                kind="agent_result",
+                text=summary,
+                payload=payload,
+            ))
             return
         # WebSearch is a client tool backed by the Haiku sub-agent rather than
         # the HTTP gateway: hand it the request, get back a compact digest +
