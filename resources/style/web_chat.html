@@ -799,6 +799,21 @@
     .session-item .del-btn svg { width: 15px; height: 15px; }
     .empty { color: var(--muted); font-size: 0.85rem; padding: 1rem; text-align: center; }
 
+    /* Section header inside the side panel / run modal — a small uppercase
+       label that separates conversations from background-agent runs. */
+    .side-section-head { color: var(--muted); font-size: 0.7rem;
+                         text-transform: uppercase; letter-spacing: 0.06em;
+                         padding: 0.7rem 1rem 0.35rem; font-weight: 600; }
+    /* Status pill shown on a run row and in the run modal's meta line. */
+    .agent-status { flex-shrink: 0; font-size: 0.68rem; font-weight: 600;
+                    text-transform: uppercase; letter-spacing: 0.04em;
+                    padding: 0.1rem 0.4rem; border-radius: 999px;
+                    color: var(--muted); border: 1px solid var(--border); }
+    .agent-status.completed { color: #4caf7e; border-color: rgba(76,175,126,0.5); }
+    .agent-status.error { color: var(--error); border-color: rgba(255,107,107,0.5); }
+    .agent-status.max_turns, .agent-status.no_result {
+        color: var(--warning, #e29a4a); border-color: rgba(226,154,74,0.5); }
+
     /* Calendar */
     .cal-toolbar { display: flex; align-items: center; gap: 0.5rem;
                    padding: 0.5rem 1rem; border-bottom: 1px solid var(--border);
@@ -1326,6 +1341,38 @@
       #event-backdrop { padding: 0.75rem; }
       #event-modal { max-width: 100%; height: 100%; max-height: 100%; }
       #event-modal .modal-body { flex: 1; min-height: 0; }
+    }
+
+    /* Background-agent run viewer (Verbose only). A read-only report: a
+       summary, an optional structured result, and a collapsible transcript. */
+    #agent-run-modal { max-width: 680px; }
+    #agent-run-modal .modal-body { gap: 0.4rem; }
+    .agent-run-meta { display: flex; flex-wrap: wrap; align-items: center;
+                      gap: 0.5rem; color: var(--muted); font-size: 0.78rem;
+                      padding-bottom: 0.3rem; }
+    .agent-run-section { display: flex; flex-direction: column; }
+    .agent-run-section .side-section-head { padding: 0.5rem 0 0.25rem; }
+    .agent-run-summary { color: var(--text); font-size: 0.92rem;
+                         line-height: 1.5; overflow-wrap: anywhere; }
+    .agent-run-summary .muted-line { color: var(--muted); font-style: italic; }
+    .agent-run-json { background: var(--bg); border: 1px solid var(--border);
+                      border-radius: 8px; padding: 0.6rem 0.7rem; margin: 0;
+                      font-size: 0.78rem; line-height: 1.45; overflow-x: auto;
+                      white-space: pre; color: var(--text); }
+    .agent-run-transcript { margin-top: 0.5rem; border-top: 1px solid var(--border);
+                            padding-top: 0.5rem; }
+    .agent-run-transcript > summary { cursor: pointer; color: var(--muted);
+                            font-size: 0.7rem; text-transform: uppercase;
+                            letter-spacing: 0.06em; font-weight: 600;
+                            list-style: none; padding: 0.2rem 0; }
+    .agent-run-transcript > summary::-webkit-details-marker { display: none; }
+    .agent-run-transcript[open] > summary { margin-bottom: 0.4rem; }
+    .agent-run-assistant { color: var(--text); font-size: 0.9rem;
+                           line-height: 1.5; overflow-wrap: anywhere;
+                           padding: 0.3rem 0; }
+    @media (max-width: 768px) {
+      #agent-run-modal { max-width: 100%; height: 100%; max-height: 100%; }
+      #agent-run-modal .modal-body { flex: 1; min-height: 0; }
     }
     /* Read-only description renders as markdown; the textarea takes over in
        edit mode. Clicking the rendered block swaps into edit mode just like
@@ -2112,6 +2159,25 @@
         <button id="ev-cancel-btn" hidden>Cancel</button>
         <button id="ev-save-btn" class="primary" hidden>Save</button>
       </div>
+    </div>
+  </div>
+
+  <!-- Background-agent run viewer (Verbose only). Read-only: shows what a
+       headless agent did — its result and full transcript. -->
+  <div id="agent-run-backdrop" class="modal-backdrop" role="dialog"
+       aria-modal="true" aria-labelledby="agent-run-title" hidden>
+    <div id="agent-run-modal" class="modal-card">
+      <div class="modal-head">
+        <span class="title" id="agent-run-title">Agent run</span>
+        <button class="modal-close" id="agent-run-close" title="Close"
+                aria-label="Close">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M6 6l12 12M18 6L6 18"/>
+          </svg>
+        </button>
+      </div>
+      <div class="modal-body" id="agent-run-body"></div>
     </div>
   </div>
 
@@ -3850,11 +3916,13 @@ async function loadChats(silent) {
     const r = await fetch("/sessions");
     const data = await r.json();
     const sessions = data.sessions || [];
-    if (!sessions.length) {
-      chatsList.innerHTML = '<div class="empty">no saved conversations</div>';
-      return;
-    }
     chatsList.innerHTML = "";
+    if (!sessions.length) {
+      const empty = document.createElement("div");
+      empty.className = "empty";
+      empty.textContent = "no saved conversations";
+      chatsList.appendChild(empty);
+    }
     sessions.forEach(s => {
       const item = document.createElement("div");
       item.className = "session-item";
@@ -3919,11 +3987,56 @@ async function loadChats(silent) {
       item.addEventListener("click", openSession);
       chatsList.appendChild(item);
     });
+    // Verbose users also see background-agent runs, folded into this same
+    // menu beneath their conversations. Other tiers never fetch them.
+    if (verbosity === "verbose") await loadAgentRuns();
   } catch (e) {
     // Keep the prior list visible on a silent refresh failure rather than
     // flashing an error over content the user is reading.
     if (!silent) chatsList.innerHTML = '<div class="empty">error: ' + e + '</div>';
   }
+}
+
+// -- Background-agent runs (Verbose only) -------------------------------
+// A read-only audit trail of what each headless agent did, folded into the
+// Conversations menu for the Verbose tier. Runs aren't conversations, so a
+// click opens the run's transcript in a modal rather than loading it as chat.
+
+const AGENT_STATUS_LABELS = {
+  completed: "done", error: "error", no_result: "no result",
+  max_turns: "incomplete",
+};
+
+async function loadAgentRuns() {
+  let runs = [];
+  try {
+    const r = await fetch("/agent-runs");
+    const data = await r.json();
+    runs = data.runs || [];
+  } catch (e) {
+    return;  // a runs-fetch failure must never blank the conversations list
+  }
+  if (!runs.length) return;  // nothing yet — don't clutter the menu
+
+  const header = document.createElement("div");
+  header.className = "side-section-head";
+  header.textContent = "Background agents";
+  chatsList.appendChild(header);
+
+  runs.forEach(run => {
+    const item = document.createElement("div");
+    item.className = "session-item agent-run-item";
+    const summary = document.createElement("div");
+    summary.className = "summary";
+    summary.textContent = run.agent_name || run.run_id;
+    const badge = document.createElement("span");
+    badge.className = "agent-status " + (run.status || "");
+    badge.textContent = AGENT_STATUS_LABELS[run.status] || run.status || "";
+    item.appendChild(summary);
+    if (badge.textContent) item.appendChild(badge);
+    item.addEventListener("click", () => openAgentRun(run.run_id));
+    chatsList.appendChild(item);
+  });
 }
 
 // -- Calendar -----------------------------------------------------------
@@ -4611,6 +4724,209 @@ eventBackdrop.addEventListener("click", (e) => {
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && !eventBackdrop.hidden) closeEventModal();
 });
+
+// -- Agent-run viewer modal ---------------------------------------------
+
+const agentRunBackdrop = document.getElementById("agent-run-backdrop");
+const agentRunBody = document.getElementById("agent-run-body");
+const agentRunTitle = document.getElementById("agent-run-title");
+
+function closeAgentRunModal() {
+  agentRunBackdrop.hidden = true;
+  agentRunBody.innerHTML = "";
+}
+
+document.getElementById("agent-run-close")
+  .addEventListener("click", closeAgentRunModal);
+agentRunBackdrop.addEventListener("click", (e) => {
+  if (e.target === agentRunBackdrop) closeAgentRunModal();
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !agentRunBackdrop.hidden) closeAgentRunModal();
+});
+
+// Render trusted-ish markdown (the agent's own text) to sanitized HTML, the
+// same way event descriptions are rendered.
+function agentMarkdown(text) {
+  const raw = (text || "").trim();
+  if (!raw) return "";
+  if (!window.marked) return raw;
+  const html = window.marked.parse(raw);
+  return window.DOMPurify ? window.DOMPurify.sanitize(html) : html;
+}
+
+async function openAgentRun(runId) {
+  agentRunTitle.textContent = "Agent run";
+  agentRunBody.innerHTML = '<div class="empty">loading…</div>';
+  agentRunBackdrop.hidden = false;
+  try {
+    const r = await fetch("/agent-runs/" + encodeURIComponent(runId));
+    const data = await r.json();
+    if (!data.ok) throw new Error(data.error || "not found");
+    renderAgentRun(data.run);
+  } catch (e) {
+    agentRunBody.innerHTML = "";
+    const err = document.createElement("div");
+    err.className = "empty";
+    err.textContent = "Couldn't open this run — " + (e.message || e);
+    agentRunBody.appendChild(err);
+  }
+}
+
+function renderAgentRun(run) {
+  agentRunTitle.textContent = run.agent_name || "Agent run";
+  agentRunBody.innerHTML = "";
+
+  // Meta line: status badge + timing + turn count.
+  const meta = document.createElement("div");
+  meta.className = "agent-run-meta";
+  const badge = document.createElement("span");
+  badge.className = "agent-status " + (run.status || "");
+  badge.textContent = AGENT_STATUS_LABELS[run.status] || run.status || "";
+  meta.appendChild(badge);
+  const when = [run.started_at, run.ended_at].filter(Boolean).join(" → ");
+  if (when) {
+    const t = document.createElement("span");
+    t.textContent = when;
+    meta.appendChild(t);
+  }
+  if (run.turns) {
+    const turns = document.createElement("span");
+    turns.textContent = run.turns + (run.turns === 1 ? " turn" : " turns");
+    meta.appendChild(turns);
+  }
+  agentRunBody.appendChild(meta);
+
+  // If the run errored, surface that up top.
+  if (run.error) {
+    const err = document.createElement("div");
+    err.className = "msg notice error";
+    err.textContent = run.error;
+    agentRunBody.appendChild(err);
+  }
+
+  // The headline result: the SubmitResult summary, rendered as markdown.
+  agentRunSection("Summary", () => {
+    const sum = document.createElement("div");
+    sum.className = "agent-run-summary";
+    const html = agentMarkdown(run.summary);
+    if (html) sum.innerHTML = html;
+    else sum.innerHTML = '<span class="muted-line">No summary was returned.</span>';
+    return sum;
+  });
+
+  // The structured payload, if the agent returned one.
+  if (run.result != null && !(typeof run.result === "object"
+      && !Array.isArray(run.result) && Object.keys(run.result).length === 0)) {
+    agentRunSection("Result", () => {
+      const pre = document.createElement("pre");
+      pre.className = "agent-run-json";
+      pre.textContent = JSON.stringify(run.result, null, 2);
+      return pre;
+    });
+  }
+
+  // The full transcript, collapsed by default — the detailed audit trail.
+  const events = Array.isArray(run.transcript) ? run.transcript : [];
+  if (events.length) {
+    const det = document.createElement("details");
+    det.className = "agent-run-transcript";
+    const sum = document.createElement("summary");
+    sum.textContent = "Transcript";
+    det.appendChild(sum);
+    events.forEach(ev => {
+      const node = renderTranscriptEvent(ev);
+      if (node) det.appendChild(node);
+    });
+    agentRunBody.appendChild(det);
+  }
+}
+
+// A labelled block inside the run modal.
+function agentRunSection(label, buildBody) {
+  const wrap = document.createElement("div");
+  wrap.className = "agent-run-section";
+  const head = document.createElement("div");
+  head.className = "side-section-head";
+  head.textContent = label;
+  wrap.appendChild(head);
+  wrap.appendChild(buildBody());
+  agentRunBody.appendChild(wrap);
+}
+
+// Render one transcript event (the same shape the live chat consumes over
+// SSE) into a compact, read-only line. Mirrors the SSE handler's tiers but
+// without any of its live-session side effects.
+function renderTranscriptEvent(ev) {
+  switch (ev.kind) {
+    case "assistant_text_end": {
+      const text = (ev.text || "").trim();
+      if (!text) return null;
+      const div = document.createElement("div");
+      div.className = "agent-run-assistant";
+      div.innerHTML = agentMarkdown(text) || "";
+      return div;
+    }
+    case "tool_call": {
+      const label = "· tool: " + (ev.tool_name || "") +
+        (ev.tool_details ? " — " + ev.tool_details : "");
+      return transcriptNotice(label, ev.tool_detail_full);
+    }
+    case "tool_result": {
+      const label = "· tool done: " + (ev.tool_name || "") +
+        (ev.tool_result_summary ? " — " + ev.tool_result_summary : "");
+      return transcriptNotice(label, ev.tool_detail_full);
+    }
+    case "agent_result": {
+      const div = document.createElement("div");
+      div.className = "msg notice info";
+      div.textContent = "✓ submitted result";
+      return div;
+    }
+    case "error": {
+      const div = document.createElement("div");
+      div.className = "msg notice error";
+      div.textContent = "error: " + (ev.text || "");
+      return div;
+    }
+    case "notice": {
+      const text = (ev.text || "").trim();
+      if (!text) return null;
+      const div = document.createElement("div");
+      div.className = "msg notice " + (ev.severity || "info");
+      div.textContent = text;
+      return div;
+    }
+    default:
+      return null;  // assistant_text deltas, turn_end, ready, etc. — skip
+  }
+}
+
+// A transcript line with an optional collapsible detail, mirroring the live
+// chat's appendToolNotice but as a returned node rather than a log append.
+function transcriptNotice(summaryText, detailText) {
+  if (!detailText) {
+    const div = document.createElement("div");
+    div.className = "msg notice info";
+    div.textContent = summaryText;
+    return div;
+  }
+  const det = document.createElement("details");
+  det.className = "msg notice tool-notice info";
+  const sum = document.createElement("summary");
+  const caret = document.createElement("span");
+  caret.className = "caret";
+  caret.setAttribute("aria-hidden", "true");
+  caret.textContent = "▸";
+  sum.appendChild(caret);
+  sum.appendChild(document.createTextNode(summaryText));
+  det.appendChild(sum);
+  const pre = document.createElement("pre");
+  pre.className = "tool-detail";
+  pre.textContent = detailText;  // textContent: tool I/O is untrusted
+  det.appendChild(pre);
+  return det;
+}
 
 // Greedy column packing for overlapping events. `items` is pre-sorted by
 // start. Returns one entry per item with its column index and the cluster's
@@ -5674,6 +5990,9 @@ verbositySelect.value = verbosity;
 verbositySelect.addEventListener("change", () => {
   verbosity = verbositySelect.value;
   localStorage.setItem(VERBOSITY_KEY, verbosity);
+  // Background-agent runs are a Verbose-only addition to the Conversations
+  // menu, so re-render it when the tier changes while it's open.
+  if (activePaneName === "chats") loadChats(true);
 });
 
 // -- UI mode (Simple / Advanced) ----------------------------------------

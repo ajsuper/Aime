@@ -80,6 +80,17 @@ inputs, status, summary, structured result, timing, and the full transcript —
 an auditable trail of what every agent did. Persistence is best-effort: a failed
 write never breaks the run, whose result is still returned in memory.
 
+### Viewing runs
+
+The web frontend surfaces these records to **Verbose** users only (the same
+tier that already sees per-turn tool chatter), folded into the Conversations
+menu beneath the user's chats. Calmer tiers never fetch them and never see the
+section. Two read-only routes back it: `GET /agent-runs` (decrypted metadata,
+newest first) and `GET /agent-runs/<run_id>` (the full record). Clicking a run
+opens a modal showing its status, summary, structured result, and a collapsible
+transcript — runs aren't conversations, so this never touches the live chat
+session or the `/load` path.
+
 ## Building an agent
 
 Declare a spec and register it — no plumbing per agent:

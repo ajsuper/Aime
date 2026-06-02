@@ -64,6 +64,7 @@ from aime import (
     config as aime_config,
 )
 from aime.services import sort_events_by_date
+from aime.agents import AgentRunStore
 from aime import auth as _auth
 from aime import encryption as _enc
 from aime import backup as _backup
@@ -115,6 +116,13 @@ def _user_dir(user_id: int) -> str:
 
 def _conversations_dir(user_id: int) -> str:
     return os.path.join(_user_dir(user_id), "conversations")
+
+
+def _agent_runs_dir(user_id: int) -> str:
+    """Where ``AgentRunStore`` keeps this user's encrypted background-agent run
+    records — the same path the runner writes to. Mirrors the conversations
+    directory but kept separate (runs never appear in the chat /load list)."""
+    return os.path.join(_user_dir(user_id), "agent_runs")
 
 
 # LEGACY MIGRATION — pre-multi-user installs kept all conversations in a
@@ -1850,6 +1858,36 @@ def delete_session(session_id: str):
 def delete_all_sessions():
     _context_for(g.user_id).controller.delete_all_sessions()
     return jsonify({"ok": True})
+
+
+# --- Background-agent runs -------------------------------------------------
+# Read-only audit trail of what every background agent did for this user. The
+# frontend only surfaces these to Verbose users (the same tier that sees tool
+# chatter), folding them into the Conversations menu. Runs are encrypted with
+# the user's DEK, exactly like conversations, so we decrypt on demand here.
+
+
+def _agent_run_store(user_id: int) -> AgentRunStore:
+    return AgentRunStore(_agent_runs_dir(user_id), _auth_backend.get_dek(user_id))
+
+
+@app.route("/agent-runs")
+@login_required
+def agent_runs():
+    """Lightweight metadata for every stored run, newest first — enough to
+    list them without pulling full transcripts into the listing."""
+    return jsonify({"runs": _agent_run_store(g.user_id).list_runs()})
+
+
+@app.route("/agent-runs/<run_id>")
+@login_required
+def agent_run(run_id: str):
+    """A single run record: status, summary, structured result, and the full
+    transcript, so the frontend can show what the agent actually did."""
+    record = _agent_run_store(g.user_id).load(run_id)
+    if record is None:
+        return jsonify({"ok": False, "error": "run not found"}), 404
+    return jsonify({"ok": True, "run": record})
 
 
 @app.route("/calendar/<int:year>/<int:month>")
