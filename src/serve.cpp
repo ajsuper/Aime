@@ -598,9 +598,10 @@ std::vector<CalenderEvent> filterEvents(sqlite3* database, const FilterOptions& 
         conditions.push_back("EVENT_ARCHIVED = 'TRUE'");
     }
 
-    // Single category
+    // Single category — COLLATE NOCASE so category names match regardless of
+    // case (ASCII), the same case-insensitivity the keyword LIKE below gets.
     if (!opts.category.empty()) {
-        conditions.push_back("EVENT_CATEGORY = ?");
+        conditions.push_back("EVENT_CATEGORY = ? COLLATE NOCASE");
         params.push_back(opts.category);
     } else if (!opts.categories.empty()) {
         // Multi-category OR
@@ -609,7 +610,7 @@ std::vector<CalenderEvent> filterEvents(sqlite3* database, const FilterOptions& 
             inClause += (i == 0 ? "?" : ",?");
             params.push_back(opts.categories[i]);
         }
-        inClause += ")";
+        inClause += ") COLLATE NOCASE";
         conditions.push_back(inClause);
     }
 
@@ -990,8 +991,10 @@ std::vector<Topic> filterTopics(sqlite3* database, const TopicFilterOptions& opt
     std::vector<std::string> conditions;
     std::vector<std::string> params;
 
+    // Category match is case-insensitive (ASCII) via COLLATE NOCASE, mirroring
+    // the event filter.
     if (!opts.category.empty()) {
-        conditions.push_back("TOPIC_CATEGORY = ?");
+        conditions.push_back("TOPIC_CATEGORY = ? COLLATE NOCASE");
         params.push_back(opts.category);
     } else if (!opts.categories.empty()) {
         std::string inClause = "TOPIC_CATEGORY IN (";
@@ -999,7 +1002,7 @@ std::vector<Topic> filterTopics(sqlite3* database, const TopicFilterOptions& opt
             inClause += (i == 0 ? "?" : ",?");
             params.push_back(opts.categories[i]);
         }
-        inClause += ")";
+        inClause += ") COLLATE NOCASE";
         conditions.push_back(inClause);
     }
 
