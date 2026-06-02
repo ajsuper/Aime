@@ -66,6 +66,33 @@ class CommitmentService:
         events = self._fetch(since_date=since_date)
         if isinstance(events, str):
             return events
+        return self._render_history(commitment_id, events, limit=limit)
+
+    def histories_for(
+        self, commitment_ids, since_date: str = "", limit: int = 0
+    ) -> dict[str, str]:
+        """Build a `commitment_history` digest for each id from a *single* fetch.
+
+        Used to auto-attach history to FilterUsersEvents results so the model
+        doesn't have to follow up with one GetCommitmentHistory call per id.
+        Dedupes and preserves first-seen order. On a fetch error (or no ids)
+        returns an empty dict — enrichment is best-effort and silently skipped
+        rather than surfacing an error on an otherwise-successful events read."""
+        ids = list(dict.fromkeys(
+            c.strip() for c in (commitment_ids or []) if c and c.strip()
+        ))
+        if not ids:
+            return {}
+        events = self._fetch(since_date=since_date)
+        if isinstance(events, str):
+            return {}
+        return {cid: self._render_history(cid, events, limit=limit) for cid in ids}
+
+    def _render_history(
+        self, commitment_id: str, events: list[dict], limit: int = 0
+    ) -> str:
+        """Render the history digest for one commitment from a pre-fetched
+        events list. Shared by commitment_history and histories_for."""
         matches = [
             e for e in events
             if (e.get("commitment_id") or "").strip() == commitment_id

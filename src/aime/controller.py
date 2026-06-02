@@ -26,6 +26,7 @@ from provider_backend import AgentBackend, BackendEvent, SessionInfo
 
 from .tool_gateway import ToolGateway
 from .commitments import CommitmentService
+from .services import _events_from
 from .tool_formatting import (
     format_tool_details,
     format_tool_response,
@@ -37,6 +38,12 @@ from .onboarding import (
     OnboardingState,
     ONBOARDING_PROMPT,
 )
+
+
+# Cap on instances per commitment when auto-attaching history to a
+# FilterUsersEvents result — keeps the enrichment bounded for commitments with
+# long histories. The model can still call GetCommitmentHistory for the full set.
+_AUTO_HISTORY_LIMIT = 10
 
 
 CoreEventKind = Literal[
@@ -589,6 +596,11 @@ class ConversationController:
         # every subsequent turn. Other tools (and the UI summary above) keep
         # the raw result. A string result is forwarded verbatim by the backend.
         model_result = format_tool_result_for_model(tool_name, result)
+        # Auto-attach commitment history for any returned events that belong to
+        # a commitment, so the model already has the pattern context instead of
+        # firing a follow-up GetCommitmentHistory per id (slow back-and-forth).
+        if tool_name == "FilterUsersEvents" and isinstance(model_result, str):
+            model_result = self._attach_commitment_histories(result, model_result)
         try:
             self._backend.submit(BackendEvent(
                 kind="tool_send_response",
@@ -597,6 +609,33 @@ class ConversationController:
             ))
         except Exception as exc:
             self._emit(CoreEvent(kind="error", text=f"tool result send failed: {exc}"))
+
+    def _attach_commitment_histories(self, result, model_result: str) -> str:
+        """Append a commitment-history digest for each commitment_id present in a
+        FilterUsersEvents result. Best-effort: any failure (or no commitments in
+        the result) returns the unmodified text so the events read still lands.
+
+        The digests are dense one-line-per-instance text and share the single
+        fetch CommitmentService already does, so this adds the pattern context
+        the model usually needs next without a per-id round-trip or much context."""
+        try:
+            events = _events_from(result)
+            ids = [
+                (e.get("commitment_id") or "").strip()
+                for e in events if isinstance(e, dict)
+            ]
+            histories = self._commitments.histories_for(
+                ids, limit=_AUTO_HISTORY_LIMIT
+            )
+        except Exception:
+            return model_result
+        if not histories:
+            return model_result
+        sections = [model_result, "", "Commitment history (auto-attached):"]
+        for digest in histories.values():
+            sections.append("")
+            sections.append(digest)
+        return "\n".join(sections)
 
     def _run_commitment_tool(self, tool_name: str, tool_input: dict) -> str:
         """Dispatch a commitment-pattern tool to CommitmentService and return its
