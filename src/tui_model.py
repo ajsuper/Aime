@@ -525,6 +525,13 @@ class Aime(App):
         from aime.model_router import ModelRouter
         from aime.web_search_agent import WebSearchAgent
         from aime import usage as _aime_usage
+        from aime import messaging as _aime_messaging
+
+        # The local TUI has no accounts DB, so its messaging destination comes
+        # from AIME_MESSAGING_CONTACT in the environment rather than a stored
+        # per-account contact (which is the web app's path).
+        messaging_contact = _aime_messaging.env_recipient()
+        messenger = _aime_messaging.get_messenger() if messaging_contact else None
         router = ModelRouter(
             haiku_model=aime_config.HAIKU_MODEL,
             sonnet_model=aime_config.SONNET_MODEL,
@@ -560,6 +567,8 @@ class Aime(App):
             tool_gateway=gateway,
             worker_spawner=self._spawn_stream_worker,
             web_search_agent=web_search_agent,
+            messenger=messenger,
+            message_recipient=messaging_contact,
         )
 
     def _spawn_stream_worker(self, fn) -> None:

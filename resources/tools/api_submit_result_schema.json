@@ -13,6 +13,10 @@
     "result": {
       "type": "object",
       "description": "Optional structured result payload. Its shape is defined by the task; omit it when a text summary is enough."
+    },
+    "message_to_user": {
+      "type": "string",
+      "description": "Optional. A short message to deliver directly to the user's phone / messaging app when your result is something they should be told about proactively (e.g. a reminder you were dispatched to surface, or a notable finding). Write it as a self-contained text to the user, not a report to your dispatcher. Omit it when the run does not need to reach the user — most don't."
     }
   }
 }

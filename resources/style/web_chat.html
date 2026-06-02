@@ -2375,6 +2375,26 @@
             <p class="desc" id="account-redeem-msg" style="display:none;margin-top:0.4rem"></p>
           </div>
           <div class="settings-section advanced-only">
+            <h3>Messaging</h3>
+            <p class="desc">Let Aime text you outside the chat — reminders, or
+              results from background tasks. Paste your Telegram chat ID (message
+              the bot, then open <code>/getUpdates</code> to find it). Leave
+              blank to turn off.</p>
+            <div class="settings-row">
+              <input id="account-contact-input" type="text" autocomplete="off"
+                     placeholder="Messaging contact (e.g. Telegram chat ID)"
+                     style="flex:1;min-width:0;margin-right:0.5rem;background:var(--bg-input);
+                            color:var(--text);border:1px solid var(--border);
+                            border-radius:8px;padding:0.4rem 0.6rem;font-size:0.85rem">
+              <button class="btn-primary" id="account-contact-btn"
+                      style="background:var(--accent);color:#fff;border:0;border-radius:8px;
+                             padding:0.4rem 0.9rem;cursor:pointer;font-size:0.85rem">
+                Save
+              </button>
+            </div>
+            <p class="desc" id="account-contact-msg" style="display:none;margin-top:0.4rem"></p>
+          </div>
+          <div class="settings-section advanced-only">
             <h3>Data</h3>
             <p class="desc">Download your full data set as a zip, restore one,
               or delete saved conversations.</p>
@@ -6392,6 +6412,9 @@ const redeemRow = document.getElementById("account-redeem-row");
 const keyInput = document.getElementById("account-key-input");
 const redeemBtn = document.getElementById("account-redeem-btn");
 const redeemMsg = document.getElementById("account-redeem-msg");
+const contactInput = document.getElementById("account-contact-input");
+const contactBtn = document.getElementById("account-contact-btn");
+const contactMsg = document.getElementById("account-contact-msg");
 
 // Reflect access state into the composer and the Account modal. Sending is
 // locked only in "keys" mode for a user without api_access — login and all
@@ -6428,6 +6451,7 @@ async function refreshMe() {
     const data = await r.json();
     accountUsernameEl.textContent = data.username || "—";
     accountEmailEl.textContent = data.email || "—";
+    if (contactInput) contactInput.value = data.messaging_contact || "";
     __accessMode = data.access_mode || "open";
     __apiAccess = !!data.api_access;
   } catch {
@@ -6469,6 +6493,39 @@ redeemBtn.addEventListener("click", async () => {
 });
 keyInput.addEventListener("keydown", (e) => {
   if (e.key === "Enter") { e.preventDefault(); redeemBtn.click(); }
+});
+
+// Save (or clear, when blank) the account's outbound-messaging contact.
+contactBtn.addEventListener("click", async () => {
+  contactMsg.style.display = "none";
+  contactBtn.disabled = true;
+  try {
+    const r = await fetch("/messaging-contact", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      credentials: "same-origin",
+      body: JSON.stringify({contact: contactInput.value.trim()}),
+    });
+    const data = await r.json();
+    if (data.ok) {
+      contactInput.value = data.messaging_contact || "";
+      contactMsg.textContent = data.messaging_contact
+        ? "Saved — Aime can now text you here."
+        : "Cleared — Aime won't text you.";
+      contactMsg.style.color = "var(--muted)";
+    } else {
+      contactMsg.textContent = data.message || "Couldn't save that.";
+      contactMsg.style.color = "var(--error)";
+    }
+  } catch {
+    contactMsg.textContent = "Network error — try again.";
+    contactMsg.style.color = "var(--error)";
+  }
+  contactMsg.style.display = "";
+  contactBtn.disabled = false;
+});
+contactInput.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); contactBtn.click(); }
 });
 
 document.getElementById("account-logout-btn").addEventListener("click", logout);

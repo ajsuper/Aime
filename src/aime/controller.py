@@ -133,10 +133,19 @@ class ConversationController:
         worker_spawner: WorkerSpawner,
         web_search_agent=None,
         headless: bool = False,
+        messenger=None,
+        message_recipient: str | None = None,
     ):
         self._backend = backend
         self._tools = tool_gateway
         self._spawn_worker = worker_spawner
+        # Optional outbound messaging (see aime.messaging). `messenger` is a
+        # MessageChannel; `message_recipient` is this user's opaque destination
+        # (UserRecord.messaging_contact). When either is missing, SendMessage
+        # and the SubmitResult `message_to_user` field degrade gracefully — the
+        # tool returns a friendly "not set up" result and the field is ignored.
+        self._messenger = messenger
+        self._message_recipient = (message_recipient or "").strip() or None
         # Headless mode drives a background-agent run rather than an interactive
         # chat: start() skips the onboarding bootstrap and instead arms the
         # SubmitResult terminal tool, and the SubmitResult call is surfaced as
@@ -528,6 +537,32 @@ class ConversationController:
         elif kind == "error":
             self._emit(CoreEvent(kind="error", text=event.error or ""))
 
+    def set_messaging_target(self, messenger, recipient: str | None) -> None:
+        """Update the outbound-messaging destination for the live session, so a
+        contact connected in settings takes effect without rebuilding the
+        controller. Passing a falsy recipient (or None messenger) disables
+        sending until one is set again."""
+        self._messenger = messenger
+        self._message_recipient = (recipient or "").strip() or None
+
+    def _deliver_message(self, text: str, subject: str | None = None) -> tuple[bool, str]:
+        """Send an outbound text to the user via the wired messenger. Returns
+        (ok, human_note). Never raises — a missing messenger/recipient or a
+        transport failure comes back as (False, friendly reason) so callers can
+        report it to the model or surface it in the UI without crashing a run."""
+        body = (text or "").strip()
+        if not body:
+            return False, "no message text to send"
+        if self._messenger is None:
+            return False, "messaging isn't set up on this server"
+        if not self._message_recipient:
+            return False, "no messaging contact is connected for this user"
+        try:
+            self._messenger.send(self._message_recipient, body, subject=subject)
+        except Exception as exc:
+            return False, str(exc)
+        return True, "message sent to the user"
+
     def _handle_tool_use(self, event: BackendEvent) -> None:
         tool_name = event.tool_name or "tool"
         tool_input = event.tool_input or {}
@@ -572,10 +607,21 @@ class ConversationController:
         if tool_name == "SubmitResult":
             payload = tool_input if isinstance(tool_input, dict) else {}
             summary = (payload.get("summary") or "").strip()
+            # If the worker chose to notify the user, deliver it now. The send
+            # result is recorded on the event (and so the run transcript) but
+            # never blocks teardown — a failed notification doesn't fail the run.
+            message = (payload.get("message_to_user") or "").strip()
+            message_status = None
+            if message:
+                ok, note = self._deliver_message(message)
+                message_status = "sent" if ok else f"not sent: {note}"
             self._emit(CoreEvent(
                 kind="tool_result",
                 tool_name=tool_name,
-                tool_result_summary="submitted result",
+                tool_result_summary=(
+                    f"submitted result (message {message_status})"
+                    if message_status else "submitted result"
+                ),
                 tool_detail_full=_full_detail_text(payload),
             ))
             self._emit(CoreEvent(
@@ -604,6 +650,36 @@ class ConversationController:
                     kind="tool_send_response",
                     tool_use_id=event.tool_use_id,
                     tool_result=digest,
+                ))
+            except Exception as exc:
+                self._emit(CoreEvent(kind="error", text=f"tool result send failed: {exc}"))
+            return
+        # SendMessage is a client tool (like WebSearch) handled here rather than
+        # forwarded to the data backend: it pushes a short text to the user's
+        # phone / messaging app via the wired messenger. Available to both
+        # interactive Aime and background agents; when no messenger/recipient is
+        # wired in it returns a friendly result so the model can fall back to
+        # telling the user in chat instead.
+        if tool_name == "SendMessage":
+            ok, note = self._deliver_message(
+                tool_input.get("text") or "", tool_input.get("subject"),
+            )
+            self._emit(CoreEvent(
+                kind="tool_result",
+                tool_name=tool_name,
+                tool_result_summary=note,
+                tool_detail_full=_full_detail_text(tool_input),
+            ))
+            result_text = (
+                "Message delivered to the user."
+                if ok else
+                f"Message NOT delivered ({note}). Tell the user in this chat instead."
+            )
+            try:
+                self._backend.submit(BackendEvent(
+                    kind="tool_send_response",
+                    tool_use_id=event.tool_use_id,
+                    tool_result=result_text,
                 ))
             except Exception as exc:
                 self._emit(CoreEvent(kind="error", text=f"tool result send failed: {exc}"))

@@ -314,6 +314,14 @@ class UserContext:
         from aime.model_router import ModelRouter
         from aime.web_search_agent import WebSearchAgent
         from aime import usage as _aime_usage
+        from aime import messaging as _aime_messaging
+
+        # Outbound messaging destination for this user, if they've connected one.
+        # Looked up here (the auth backend is the source of truth) and handed to
+        # the controller so Aime's SendMessage tool can reach the user's phone.
+        _user_rec = _auth_backend.lookup(user_id)
+        messaging_contact = _user_rec.messaging_contact if _user_rec else None
+        messenger = _aime_messaging.get_messenger() if messaging_contact else None
         router = ModelRouter(
             haiku_model=aime_config.HAIKU_MODEL,
             sonnet_model=aime_config.SONNET_MODEL,
@@ -376,6 +384,8 @@ class UserContext:
             tool_gateway=gateway,
             worker_spawner=spawn_worker,
             web_search_agent=web_search_agent,
+            messenger=messenger,
+            message_recipient=messaging_contact,
         )
 
         self.controller.subscribe(self._fanout)
@@ -1328,9 +1338,31 @@ def me():
         "id": g.user_id,
         "username": g.username,
         "email": user.email if user else None,
+        "messaging_contact": user.messaging_contact if user else None,
         "access_mode": _ACCESS_MODE,
         "api_access": g.api_access,
     })
+
+
+@app.route("/messaging-contact", methods=["POST"])
+@login_required
+def messaging_contact():
+    """Connect (or clear, with an empty value) the account's outbound-messaging
+    destination — the chat id / number Aime and background agents text via
+    aime.messaging. An advanced-settings convenience; the value is opaque to the
+    server and just stored. Takes effect on the user's next session (the live
+    controller reads its recipient at construction)."""
+    data = request.get_json(silent=True) or {}
+    contact = (data.get("contact") or "").strip() or None
+    _auth_backend.set_messaging_contact(g.user_id, contact)
+    # Push it into the live session too (if one is cached) so it works right
+    # away rather than only after the next login rebuilds the controller.
+    ctx = _user_contexts.get(g.user_id)
+    if ctx is not None:
+        from aime import messaging as _aime_messaging
+        messenger = _aime_messaging.get_messenger() if contact else None
+        ctx.controller.set_messaging_target(messenger, contact)
+    return jsonify({"ok": True, "messaging_contact": contact})
 
 
 @app.route("/redeem", methods=["POST"])

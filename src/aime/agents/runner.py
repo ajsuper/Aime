@@ -24,6 +24,7 @@ import threading
 from provider_backend import AnthropicMessagesBackend, BackendEvent
 
 from .. import config
+from .. import messaging as _messaging
 from .. import usage as _usage
 from ..controller import ConversationController
 from ..tool_gateway import ToolGateway
@@ -72,6 +73,7 @@ class BackgroundAgentRunner:
         runs_dir: str,
         usage_label: str | None = None,
         client_tz: str | None = None,
+        messaging_contact: str | None = None,
         api_url: str = config.API_URL,
     ) -> AgentResult:
         """Execute ``spec`` against ``user_id``'s database and return the result.
@@ -79,6 +81,12 @@ class BackgroundAgentRunner:
         ``runs_dir`` is the user's agent-runs directory (where the encrypted run
         record is written); ``dek`` is the user's data key, used both for that
         record and as the backend's (unused, since persistence is off) key.
+
+        ``messaging_contact`` is the user's outbound-message destination
+        (``UserRecord.messaging_contact``); when set, the worker can reach the
+        user via the SendMessage tool or SubmitResult's ``message_to_user``
+        field. The caller supplies it (the runner has no auth access of its own),
+        which keeps contact resolution out of this layer.
         """
         run_id = new_run_id(spec.name)
         started_at = _utc_now_iso()
@@ -86,6 +94,7 @@ class BackgroundAgentRunner:
         backend, controller, collector = self._build(
             spec, user_id=user_id, dek=dek, runs_dir=runs_dir,
             usage_label=usage_label, api_url=api_url, client_tz=client_tz,
+            messaging_contact=messaging_contact,
         )
 
         status = ""
@@ -128,6 +137,7 @@ class BackgroundAgentRunner:
 
     def _build(
         self, spec, *, user_id, dek, runs_dir, usage_label, api_url, client_tz,
+        messaging_contact=None,
     ):
         web_search_agent = None
         web_search_schema = None
@@ -164,12 +174,19 @@ class BackgroundAgentRunner:
                 target=fn, name=f"agent-run-{spec.name}", daemon=True
             ).start()
 
+        # Only wire a messenger when this user actually has a contact connected,
+        # so a worker that calls SendMessage / sets message_to_user without a
+        # destination gets a clean "not connected" result rather than a misfire.
+        messenger = _messaging.get_messenger() if messaging_contact else None
+
         controller = ConversationController(
             backend=backend,
             tool_gateway=gateway,
             worker_spawner=spawn_worker,
             web_search_agent=web_search_agent,
             headless=True,
+            messenger=messenger,
+            message_recipient=messaging_contact,
         )
         if client_tz:
             controller.set_client_timezone(client_tz)

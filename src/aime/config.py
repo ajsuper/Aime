@@ -41,6 +41,7 @@ SCHEMA_FILES = [
     "../resources/tools/api_get_commitment_history_schema.json",
     "../resources/tools/api_get_pattern_summary_schema.json",
     "../resources/tools/api_get_recent_activity_schema.json",
+    "../resources/tools/api_send_message_schema.json",
 ]
 
 AGENT_MODEL = "claude-sonnet-4-6"
@@ -99,6 +100,15 @@ MODEL_ROUTING_ENABLED = _env_flag("AIME_MODEL_ROUTING", True)
 
 # AIME_WEB_SEARCH=0 drops the WebSearch tool entirely (no web access).
 WEB_SEARCH_ENABLED = _env_flag("AIME_WEB_SEARCH", True)
+
+# Outbound messaging (see aime.messaging): the SendMessage tool and the agent
+# SubmitResult `message_to_user` field deliver short texts to the user's phone /
+# messaging app. AIME_MESSAGING=0 disables sending; AIME_MESSAGING_CHANNEL picks
+# the transport ("telegram" default, "email" to reuse SMTP). The SendMessage
+# tool schema is offered to every session/agent; the controller only acts on it
+# when a messenger is wired in, so disabling messaging makes the tool inert
+# rather than absent.
+SEND_MESSAGE_SCHEMA = "../resources/tools/api_send_message_schema.json"
 
 
 def load_system_prompt(path: str = SYSTEM_PROMPT_PATH) -> str:

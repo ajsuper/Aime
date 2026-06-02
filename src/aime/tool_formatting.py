@@ -94,6 +94,10 @@ def format_tool_details(name: str, inp: dict) -> str:
         q = _truncate_for_log(inp.get("request"), 60)
         if q:
             parts.append(f"\"{q}\"")
+    elif name == "SendMessage":
+        body = _truncate_for_log(inp.get("text"), 50)
+        if body:
+            parts.append(f"\"{body}\"")
     elif name in ("GetCommitmentHistory", "GetPatternSummary", "GetRecentActivity"):
         if inp.get("commitment_id"):
             parts.append(f"commitment={inp['commitment_id']}")

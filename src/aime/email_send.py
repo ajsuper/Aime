@@ -36,12 +36,14 @@ def is_valid_email(email: str) -> bool:
     return isinstance(email, str) and bool(_EMAIL_RE.match(email.strip()))
 
 
-def send_verification_code(to_email: str, code: str) -> None:
-    """Send a one-time 6-digit verification code to `to_email`.
+def send_email(to_email: str, subject: str, body: str) -> None:
+    """Send a plain-text email to `to_email` over the configured SMTP account.
 
+    The transport half of email sending, factored out so any caller (2FA codes,
+    the messaging layer's EmailChannel, future notifications) can reuse it.
     Raises EmailSendError on any failure — missing config, login refused, or
-    network error. The caller is expected to show a soft, user-facing message
-    rather than a stack trace.
+    network error — so the caller can show a soft, user-facing message rather
+    than a stack trace.
     """
     address = os.environ.get("EMAIL_ADDRESS", "").strip()
     password = os.environ.get("EMAIL_PASSWORD", "").strip()
@@ -57,16 +59,10 @@ def send_verification_code(to_email: str, code: str) -> None:
         port = _DEFAULT_SMTP_PORT
 
     msg = EmailMessage()
-    msg["Subject"] = "Your Aime verification code"
+    msg["Subject"] = subject
     msg["From"] = address
     msg["To"] = to_email
-    msg.set_content(
-        f"Hi there,\n\n"
-        f"Your Aime verification code is: {code}\n\n"
-        f"It will expire in 10 minutes.\n\n"
-        f"If you didn't ask for this, you can safely ignore this email — "
-        f"no changes will be made to any account.\n"
-    )
+    msg.set_content(body)
 
     try:
         context = ssl.create_default_context()
@@ -78,6 +74,23 @@ def send_verification_code(to_email: str, code: str) -> None:
             server.send_message(msg)
     except (smtplib.SMTPException, OSError) as exc:
         raise EmailSendError(
-            "We couldn't send the verification email right now. "
-            "Please try again in a moment."
+            "We couldn't send the email right now. Please try again in a moment."
         ) from exc
+
+
+def send_verification_code(to_email: str, code: str) -> None:
+    """Send a one-time 6-digit verification code to `to_email`.
+
+    Raises EmailSendError on any failure — missing config, login refused, or
+    network error. The caller is expected to show a soft, user-facing message
+    rather than a stack trace.
+    """
+    send_email(
+        to_email,
+        "Your Aime verification code",
+        f"Hi there,\n\n"
+        f"Your Aime verification code is: {code}\n\n"
+        f"It will expire in 10 minutes.\n\n"
+        f"If you didn't ask for this, you can safely ignore this email — "
+        f"no changes will be made to any account.\n",
+    )

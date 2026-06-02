@@ -1,0 +1,18 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SendMessage",
+  "description": "Send a short text message straight to the user's phone / messaging app, reaching them outside this conversation. Use it when something genuinely warrants their attention now — a reminder coming due, a finished background task, an answer they asked you to follow up with later. Keep it brief and self-contained, like a text message. Do not use it to reply to something they just said in chat (just reply normally), and don't send more than necessary. If the user hasn't connected a messaging contact, the send will fail gracefully and you should tell them in chat instead.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["text"],
+  "properties": {
+    "text": {
+      "type": "string",
+      "description": "The message body. Short, plain, and self-contained — assume the user sees it with no surrounding context."
+    },
+    "subject": {
+      "type": "string",
+      "description": "Optional one-line title. Shown as a heading on channels that support one (email) and folded into the first line elsewhere (SMS, Telegram). Omit for a plain text."
+    }
+  }
+}
