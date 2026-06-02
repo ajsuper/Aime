@@ -79,7 +79,7 @@ class CommitmentService:
         lines = [f"{len(matches)} instance(s) of '{commitment_id}' (newest first):"]
         for e in matches:
             line = f"• {e.get('date', '?')} {_status_of(e)} — {(e.get('title') or '(untitled)').strip()}"
-            reason = (e.get("cancel_reason") or "").strip()
+            reason = (e.get("status_change_reason") or "").strip()
             if reason:
                 line += f" | reason: {reason}"
             moved = (e.get("rescheduled_from") or "").strip()
@@ -119,11 +119,11 @@ class CommitmentService:
         counts = Counter(_status_of(e) for e in ordered)
         total = len(ordered)
 
-        # Most common cancel reason among canceled instances.
+        # Most common status-change reason among canceled instances.
         reasons = Counter(
-            (e.get("cancel_reason") or "").strip()
+            (e.get("status_change_reason") or "").strip()
             for e in ordered
-            if _status_of(e) == "canceled" and (e.get("cancel_reason") or "").strip()
+            if _status_of(e) == "canceled" and (e.get("status_change_reason") or "").strip()
         )
         top_reason = reasons.most_common(1)[0] if reasons else None
 
@@ -154,7 +154,7 @@ class CommitmentService:
             lines.append(f"• current streak: {streak_len} {streak_status} in a row")
         if top_reason:
             lines.append(
-                f"• most common cancel reason: \"{top_reason[0]}\" ({top_reason[1]}x)"
+                f"• most common status-change reason: \"{top_reason[0]}\" ({top_reason[1]}x)"
             )
         lines.append(f"• last completed: {last_completed or 'never'}")
         return "\n".join(lines)
@@ -186,7 +186,7 @@ class CommitmentService:
             cid = (e.get("commitment_id") or "").strip()
             if cid:
                 line += f" | id: {cid}"
-            reason = (e.get("cancel_reason") or "").strip()
+            reason = (e.get("status_change_reason") or "").strip()
             if reason:
                 line += f" | reason: {reason}"
             lines.append(line)

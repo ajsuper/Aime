@@ -72,7 +72,7 @@ class CalendarService:
         self, event_id: int, *, title: str, summary: str, category: str,
         date: str, time: str, archived: bool,
         status: str | None = None, commitment_id: str | None = None,
-        cancel_reason: str | None = None, rescheduled_from: str | None = None,
+        status_change_reason: str | None = None, rescheduled_from: str | None = None,
     ) -> dict:
         """Edit / archive an existing event. Mirrors the backend's
         `replace_event` tool — caller supplies the full record so a partial
@@ -93,7 +93,7 @@ class CalendarService:
         for key, value in (
             ("status", status),
             ("commitment_id", commitment_id),
-            ("cancel_reason", cancel_reason),
+            ("status_change_reason", status_change_reason),
             ("rescheduled_from", rescheduled_from),
         ):
             if value is not None:

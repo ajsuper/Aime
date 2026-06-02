@@ -60,6 +60,76 @@ def _jsonable(obj):
         return str(obj)
 
 
+class _ClockTagStripper:
+    """Removes ``<clock ...>...</clock>`` spans from a streamed text block.
+
+    The backend appends a volatile ``<clock silent>…</clock>`` block after the
+    cache breakpoint each turn (see ``_date_block``). The model occasionally
+    parrots that exact tag back into its reply. The tag is system plumbing the
+    user must never see, so we filter it out of the assistant text.
+
+    Because text arrives as deltas, the tag can be split across chunks. This
+    runs a tiny state machine that holds back only the minimal tail that could
+    still be the start of an opening tag (or a partial closing tag while inside
+    one), so ordinary text — including unrelated ``<`` characters — flows
+    through with at most a few characters of latency. Call ``feed`` per delta
+    and ``flush`` once at block end."""
+
+    _OPEN = "<clock"
+    _CLOSE = "</clock>"
+
+    def __init__(self) -> None:
+        self._buf = ""
+        self._in_tag = False  # seen <clock, waiting for </clock>
+
+    @staticmethod
+    def _suffix_prefix_len(s: str, target: str) -> int:
+        """Longest k where the last k chars of s equal the first k of target."""
+        for k in range(min(len(s), len(target)), 0, -1):
+            if s[-k:] == target[:k]:
+                return k
+        return 0
+
+    def feed(self, text: str) -> str:
+        self._buf += text
+        out: list[str] = []
+        while self._buf:
+            if self._in_tag:
+                idx = self._buf.find(self._CLOSE)
+                if idx == -1:
+                    # No close yet: discard the body, but keep a tail that
+                    # could be a partial </clock> spanning the next delta.
+                    keep = self._suffix_prefix_len(self._buf, self._CLOSE)
+                    self._buf = self._buf[len(self._buf) - keep:] if keep else ""
+                    break
+                self._buf = self._buf[idx + len(self._CLOSE):]
+                self._in_tag = False
+                continue
+            idx = self._buf.find(self._OPEN)
+            if idx == -1:
+                # No open tag: emit everything except a tail that could be a
+                # partial <clock spanning the next delta.
+                keep = self._suffix_prefix_len(self._buf, self._OPEN)
+                cut = len(self._buf) - keep
+                out.append(self._buf[:cut])
+                self._buf = self._buf[cut:]
+                break
+            out.append(self._buf[:idx])
+            self._buf = self._buf[idx:]  # now starts with <clock…
+            self._in_tag = True
+        return "".join(out)
+
+    def flush(self) -> str:
+        """Drain held-back text at block end. A buffer that's still mid-tag was
+        an unterminated <clock and is dropped; anything else was a false alarm
+        (a real ``<`` that never became a tag) and is emitted."""
+        if self._in_tag:
+            self._buf = ""
+            return ""
+        tail, self._buf = self._buf, ""
+        return tail
+
+
 # ============================================================================
 # Provider-agnostic agent backend
 # ============================================================================
@@ -1039,6 +1109,7 @@ class AnthropicMessagesBackend:
             max_tokens=self._max_tokens,
         ) as stream:
             current_text: list[str] = []
+            text_stripper = _ClockTagStripper()
             current_tool: dict | None = None
             partial_json = ""
 
@@ -1092,12 +1163,15 @@ class AnthropicMessagesBackend:
                         )
                     elif block.type == "text":
                         current_text = []
+                        text_stripper = _ClockTagStripper()
                 elif etype == "content_block_delta":
                     delta = event.delta
                     dtype = getattr(delta, "type", None)
                     if dtype == "text_delta":
-                        current_text.append(delta.text)
-                        yield BackendEvent(kind="assistant_text_delta", text=delta.text)
+                        clean = text_stripper.feed(delta.text)
+                        if clean:
+                            current_text.append(clean)
+                            yield BackendEvent(kind="assistant_text_delta", text=clean)
                     elif dtype == "input_json_delta":
                         partial_json += delta.partial_json
                 elif etype == "content_block_stop":
@@ -1132,12 +1206,17 @@ class AnthropicMessagesBackend:
                         )
                         current_tool = None
                         partial_json = ""
-                    elif current_text:
-                        text = "".join(current_text)
-                        with self._lock:
-                            assistant_blocks.append({"type": "text", "text": text})
-                        yield BackendEvent(kind="assistant_text_end", text=text)
-                        current_text = []
+                    else:
+                        tail = text_stripper.flush()
+                        if tail:
+                            current_text.append(tail)
+                            yield BackendEvent(kind="assistant_text_delta", text=tail)
+                        if current_text:
+                            text = "".join(current_text)
+                            with self._lock:
+                                assistant_blocks.append({"type": "text", "text": text})
+                            yield BackendEvent(kind="assistant_text_end", text=text)
+                            current_text = []
 
             if self._interrupted.is_set():
                 # Mid-stream interrupt. Leave _messages in a state that's

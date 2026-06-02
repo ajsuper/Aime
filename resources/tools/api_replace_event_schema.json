@@ -46,11 +46,11 @@
     "status": {
       "type": "string",
       "enum": ["scheduled", "completed", "canceled", "rescheduled"],
-      "description": "Lifecycle state. Set 'completed' when it happened, 'canceled' (with cancel_reason) when dropped, 'rescheduled' (with rescheduled_from) when moved. Omit to keep the existing value."
+      "description": "Lifecycle state. Set 'completed' when it happened, 'canceled' (with status_change_reason) when dropped, 'rescheduled' (with rescheduled_from, plus status_change_reason if there's a why) when moved. Omit to keep the existing value."
     },
-    "cancel_reason": {
+    "status_change_reason": {
       "type": "string",
-      "description": "Short freeform reason, only when status is 'canceled' (e.g. \"tired\", \"conflict\", \"AiMe\"). Omit to keep the existing value."
+      "description": "Short freeform reason for the current status, whenever one is worth recording — e.g. why it was canceled (\"tired\", \"conflict\", \"AiMe\"), why rescheduled, or a note on how it went when completed. Most useful for 'canceled'/'rescheduled'. Omit to keep the existing value."
     },
     "rescheduled_from": {
       "type": "string",

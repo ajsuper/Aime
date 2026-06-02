@@ -4354,13 +4354,13 @@ function openEventModal(ev) {
 }
 
 // Read-only lifecycle metadata under the category field: a status badge plus
-// any populated commitment / cancel-reason / reschedule-origin detail. Hidden
+// any populated commitment / status-change-reason / reschedule-origin detail. Hidden
 // entirely for a plain scheduled one-off so the modal stays uncluttered. Built
 // with DOM nodes + textContent so user/agent-supplied values can't inject HTML.
 function renderEventMeta(ev) {
   const status = eventStatus(ev);
   const cid = (ev.commitment_id || "").trim();
-  const reason = (ev.cancel_reason || "").trim();
+  const reason = (ev.status_change_reason || "").trim();
   const moved = (ev.rescheduled_from || "").trim();
   const noteworthy = status !== "scheduled" || cid || reason || moved;
   evFMeta.textContent = "";

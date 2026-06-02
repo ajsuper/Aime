@@ -1893,7 +1893,7 @@ def calendar_event_update(event_id: int):
     # (e.g. saving a description edit never resets status or commitment_id).
     extra = {
         key: data[key]
-        for key in ("status", "commitment_id", "cancel_reason", "rescheduled_from")
+        for key in ("status", "commitment_id", "status_change_reason", "rescheduled_from")
         if isinstance(data.get(key), str)
     }
     ctx = _context_for(g.user_id)

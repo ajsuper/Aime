@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "GetRecentActivity",
-  "description": "A flat, newest-first list of recent events (across all categories or one), each with its status, commitment_id, and cancel_reason. Use this for fuzzy behavioral questions like \"I haven't been to the gym in a while\" where you don't know the commitment_id up front — it's a status-aware version of an event filter.",
+  "description": "A flat, newest-first list of recent events (across all categories or one), each with its status, commitment_id, and status_change_reason. Use this for fuzzy behavioral questions like \"I haven't been to the gym in a while\" where you don't know the commitment_id up front — it's a status-aware version of an event filter.",
   "type": "object",
   "additionalProperties": false,
   "properties": {
