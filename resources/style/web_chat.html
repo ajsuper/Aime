@@ -926,6 +926,10 @@
     .seg button:last-child { border-right: none; }
     .seg button.active { background: var(--accent); color: #fff; }
     .sched-row { display: flex; align-items: center; gap: 0.5rem; }
+    /* An explicit display: flex above beats the UA [hidden]{display:none}, so
+       re-assert it or the conditional weekday/day rows (and the whole config
+       block when the toggle is off) never actually hide. */
+    .sched-config[hidden], .sched-row[hidden] { display: none; }
     .sched-row label { font-size: 0.85rem; color: var(--muted); min-width: 5.5em; }
     .sched-config input[type="time"], .sched-config select {
                   background: var(--bg); color: var(--text);
