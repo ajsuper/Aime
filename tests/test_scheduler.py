@@ -76,10 +76,10 @@ def harness(tmp_path):
     return sched, ctx
 
 
-def at(y, mo, d, h=0, mi=0):
+def at(y, mo, d, h=0, mi=0, s=0):
     """An aware UTC 'now' built from EST wall-clock — keeps the test cases easy
     to read against America/New_York schedules."""
-    return datetime.datetime(y, mo, d, h, mi, tzinfo=ZONE).astimezone(UTC)
+    return datetime.datetime(y, mo, d, h, mi, s, tzinfo=ZONE).astimezone(UTC)
 
 
 def recurring_agent():
@@ -114,6 +114,26 @@ def test_recurring_fires_in_window_and_advances(harness):
     # last_run_at advanced to the scheduled instant (07:00), not now (07:01).
     assert datetime.datetime.fromisoformat(
         reloaded["state"]["last_run_at"]) == at(2026, 6, 3, 7, 0)
+
+
+def test_fresh_schedule_fires_first_occurrence(harness, monkeypatch):
+    # Regression: a brand-new schedule (last_run_at is None) created shortly
+    # before its first slot must still fire when that slot arrives. Anchoring to
+    # `now` instead of created/updated_at made `due` roll to tomorrow the moment
+    # the slot passed, so the first fire was silently skipped forever.
+    sched, ctx = harness
+    # Pin the store's clock so the record's created/updated stamps sit at 06:50,
+    # ten minutes before the daily 07:00 slot — exactly the reported scenario.
+    monkeypatch.setattr(s, "_utc_now_iso", lambda: at(2026, 6, 3, 6, 50).isoformat())
+    rec = recurring_agent()
+    ctx["store"].save(rec)
+    assert rec["state"]["last_run_at"] is None
+
+    sched.tick(at(2026, 6, 3, 6, 55))     # before the slot: nothing yet
+    assert ctx["runs"] == []
+
+    sched.tick(at(2026, 6, 3, 7, 0, 20))  # 20s after the 07:00 slot
+    assert ctx["runs"] == [("agent-brief-1", 1, TZ)]
 
 
 def test_recurring_not_yet_does_not_fire(harness):

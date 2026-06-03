@@ -75,6 +75,7 @@ class BackgroundAgentRunner:
         client_tz: str | None = None,
         messaging_contact: str | None = None,
         api_url: str = config.API_URL,
+        agent_id: str | None = None,
     ) -> AgentResult:
         """Execute ``spec`` against ``user_id``'s database and return the result.
 
@@ -130,6 +131,7 @@ class BackgroundAgentRunner:
         self._persist(
             run_id, spec, inputs, result, collector,
             started_at=started_at, dek=dek, runs_dir=runs_dir, user_id=user_id,
+            agent_id=agent_id,
         )
         return result
 
@@ -242,11 +244,14 @@ class BackgroundAgentRunner:
 
     def _persist(
         self, run_id, spec, inputs, result, collector, *,
-        started_at, dek, runs_dir, user_id,
+        started_at, dek, runs_dir, user_id, agent_id=None,
     ) -> None:
         record = {
             "run_id": run_id,
             "agent_name": spec.name,
+            # The saved agent this run came from (None for ad-hoc runs), so the
+            # dashboard can group a run under its agent's card.
+            "agent_id": agent_id,
             "user_id": user_id,
             "status": result.status,
             "inputs": inputs or {},

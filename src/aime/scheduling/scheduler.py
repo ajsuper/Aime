@@ -181,7 +181,14 @@ class Scheduler:
         state = sched.setdefault("state", {})
 
         if kind == "recurring":
-            due = next_occurrence(trigger, after=state.get("last_run_at"), tz=tz)
+            # `after` must be a FIXED past anchor, never `now`: next_occurrence
+            # returns the next slot strictly after it, so anchoring to now would
+            # make `due` jump to tomorrow the instant today's slot passes — the
+            # schedule would never catch its own first fire. Before the first run
+            # we anchor to when the schedule was last (re)configured (updated_at,
+            # falling back to created_at); after that, to the real last run.
+            anchor = state.get("last_run_at") or sched.get("updated_at") or sched.get("created_at")
+            due = next_occurrence(trigger, after=anchor, tz=tz)
             if due > now:
                 return                                  # not yet
             if now - due > self._grace:                 # missed (downtime)

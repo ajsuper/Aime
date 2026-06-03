@@ -97,6 +97,7 @@ class AgentRunStore:
             out.append({
                 "run_id": record.get("run_id", ""),
                 "agent_name": record.get("agent_name", ""),
+                "agent_id": record.get("agent_id"),
                 "status": record.get("status", ""),
                 "started_at": record.get("started_at", ""),
                 "ended_at": record.get("ended_at", ""),

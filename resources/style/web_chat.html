@@ -838,10 +838,22 @@
                      font-size: 0.88rem; transition: background 0.15s, opacity 0.15s; }
     #agent-new-btn:hover { background: var(--accent-hover, var(--accent)); }
 
-    /* Saved-agent cards. */
+    /* Saved-agent cards — each is a distinct elevated card, not a flat row, so
+       it reads as its own object against the pane. */
+    #saved-agents-list { display: flex; flex-direction: column; gap: 0.6rem;
+                  padding: 0.7rem 0.8rem; }
     .agent-card { display: flex; flex-direction: column; gap: 0.3rem;
-                  padding: 0.6rem 1rem; border-bottom: 1px solid var(--border); }
-    .agent-card-name { color: var(--text); font-weight: 600; font-size: 0.92rem; }
+                  padding: 0.7rem 0.85rem; background: var(--bg-elev);
+                  border: 1px solid var(--border); border-radius: 12px;
+                  box-shadow: 0 1px 2px rgba(0,0,0,0.06); }
+    .agent-card-head { display: flex; align-items: center; gap: 0.5rem; }
+    .agent-card-name { color: var(--text); font-weight: 600; font-size: 0.92rem;
+                  flex: 1; min-width: 0; }
+    /* "running…" pill on the card itself (not just the Run button). */
+    .agent-card-running { flex-shrink: 0; display: inline-flex; align-items: center;
+                  gap: 0.35rem; font-size: 0.7rem; font-weight: 600; color: var(--accent);
+                  border: 1px solid var(--accent); border-radius: 999px;
+                  padding: 0.1rem 0.5rem; }
     .agent-card-desc { color: var(--muted); font-size: 0.82rem; line-height: 1.35; }
     .agent-card-meta { color: var(--muted); font-size: 0.74rem; display: flex;
                        flex-wrap: wrap; gap: 0.5rem; align-items: center; }
@@ -858,9 +870,26 @@
                        border-color: var(--border); color: var(--muted); }
     /* Running state: a card with a run in flight gets an accent edge, and its
        Run button shows a live spinner. */
-    .agent-card.is-running { border-left: 2px solid var(--accent); }
+    .agent-card.is-running { border-color: var(--accent);
+                       box-shadow: 0 0 0 1px var(--accent), 0 1px 3px rgba(0,0,0,0.08); }
     .agent-card-actions .run-btn:disabled { opacity: 1; color: var(--accent);
                        border-color: var(--accent); }
+
+    /* Per-agent runs, collapsed into a disclosure on the card so the pane isn't
+       one long flat list of every run. */
+    .agent-runs-disclosure { margin-top: 0.15rem; }
+    .agent-runs-disclosure > summary { cursor: pointer; list-style: none;
+                       color: var(--muted); font-size: 0.78rem; font-weight: 600;
+                       display: flex; align-items: center; gap: 0.35rem;
+                       padding: 0.15rem 0; user-select: none; }
+    .agent-runs-disclosure > summary::-webkit-details-marker { display: none; }
+    .agent-runs-disclosure > summary .caret { transition: transform 0.15s ease; }
+    .agent-runs-disclosure[open] > summary .caret { transform: rotate(90deg); }
+    .agent-runs-disclosure > summary:hover { color: var(--text); }
+    .agent-runs-list { display: flex; flex-direction: column; gap: 0.1rem;
+                       margin-top: 0.2rem; }
+    .agent-runs-list .agent-run-item { padding-left: 0.2rem; }
+    .side-section-head.other-runs { margin-top: 0.4rem; }
     .agent-run-item.is-active { cursor: default; }
     .agent-run-item.is-active .summary { color: var(--text); }
     .agent-status.running .run-spinner, .run-btn .run-spinner {
@@ -2153,8 +2182,10 @@
       </div>
 
       <!-- Agents pane (Advanced only). A small management dashboard: create,
-           edit, delete and run saved background agents, with each agent's runs
-           landing in the list below. Agent definitions persist per-user. -->
+           edit, delete and run saved background agents. Each agent is a card
+           that owns its own runs (in a click-to-open disclosure); runs with no
+           current agent fall to an "Other runs" section. Definitions persist
+           per-user. -->
       <div class="pane" data-pane="agents">
         <div class="agents-toolbar">
           <button id="agent-new-btn" class="primary">+ New agent</button>
@@ -2164,10 +2195,10 @@
           <div id="saved-agents-list">
             <div class="empty">loading…</div>
           </div>
-          <div class="side-section-head">Recent runs</div>
-          <div id="agent-runs-list">
-            <div class="empty">no runs yet</div>
-          </div>
+          <!-- Runs that don't belong to a current agent (ad-hoc, or a since-
+               deleted agent). Hidden entirely when there are none. -->
+          <div class="side-section-head other-runs" id="other-runs-head" hidden>Other runs</div>
+          <div id="agent-runs-list"></div>
         </div>
       </div>
     </div>
@@ -4296,19 +4327,19 @@ function buildRunItem(run) {
 
 // -- Agents pane (Advanced only) ----------------------------------------
 // A management dashboard: create, edit, delete and run saved background
-// agents. Definitions persist per-user (CRUD via /agents); each agent's runs
-// land in the recent-runs list below, fed by the same /agent-runs records the
-// Verbose conversations section uses.
+// agents. Definitions persist per-user (CRUD via /agents). Each card owns its
+// own runs (grouped from /agent-runs by agent_id) in a disclosure; runs with no
+// current agent go to an "Other runs" section.
 
 const savedAgentsListEl = document.getElementById("saved-agents-list");
 const agentRunsListEl = document.getElementById("agent-runs-list");
+const otherRunsHeadEl = document.getElementById("other-runs-head");
 
 async function loadAgentsPane(silent) {
-  // Fetch saved agents and runs (which include the in-flight ones) together so
-  // the "running" state is consistent across the cards and the runs list.
+  // Fetch saved agents, runs (incl. in-flight), and schedules together so each
+  // card can show its own running state, runs, and schedule consistently.
   if (!silent) {
     savedAgentsListEl.innerHTML = '<div class="empty">loading…</div>';
-    agentRunsListEl.innerHTML = '<div class="empty">loading…</div>';
   }
   let agents = null, runData = null, schedules = [];
   try {
@@ -4318,49 +4349,59 @@ async function loadAgentsPane(silent) {
     runData = await rr.json();
     schedules = (await sr.json()).schedules || [];
   } catch (e) {
-    if (!silent) {
-      const msg = '<div class="empty">error: ' + e + '</div>';
-      savedAgentsListEl.innerHTML = msg;
-      agentRunsListEl.innerHTML = msg;
-    }
+    if (!silent) savedAgentsListEl.innerHTML = '<div class="empty">error: ' + e + '</div>';
     return;
   }
-  // Attach each agent's run_agent schedule (at most one per agent) to its card
-  // data, so the card can show the toggle and the editor can prefill it.
   const schedByAgent = {};
   schedules.forEach(s => {
     if (s.action && s.action.kind === "run_agent" && s.action.agent_id) {
       schedByAgent[s.action.agent_id] = s;
     }
   });
-  agents.forEach(a => { a._schedule = schedByAgent[a.agent_id] || null; });
+
+  const agentIds = new Set(agents.map(a => a.agent_id));
   const active = runData.active || [];
-  // Agent ids with a run in flight, so their cards show a running state.
-  const activeAgentIds = new Set(active.map(a => a.agent_id).filter(Boolean));
-  renderSavedAgents(agents, activeAgentIds);
-  renderAgentRuns(runData.runs || [], active);
+  const finished = runData.runs || [];
+  // Group both in-flight and finished runs under their agent so each card owns
+  // its results (rather than one big flat list).
+  const activeByAgent = {}, finishedByAgent = {};
+  active.forEach(a => {
+    if (a.agent_id) (activeByAgent[a.agent_id] ||= []).push(a);
+  });
+  finished.forEach(r => {
+    if (r.agent_id && agentIds.has(r.agent_id)) (finishedByAgent[r.agent_id] ||= []).push(r);
+  });
+  agents.forEach(a => {
+    a._schedule = schedByAgent[a.agent_id] || null;
+    a._active = activeByAgent[a.agent_id] || [];
+    a._runs = finishedByAgent[a.agent_id] || [];
+  });
+  renderSavedAgents(agents);
+
+  // Anything not tied to a current agent (ad-hoc runs, or a since-deleted
+  // agent's runs) keeps a home in an "Other runs" section, hidden when empty.
+  const otherActive = active.filter(a => !a.agent_id || !agentIds.has(a.agent_id));
+  const otherFinished = finished.filter(r => !r.agent_id || !agentIds.has(r.agent_id));
+  renderOtherRuns(otherFinished, otherActive);
 }
 
-function renderSavedAgents(agents, activeAgentIds) {
+function renderSavedAgents(agents) {
   savedAgentsListEl.innerHTML = "";
   if (!agents.length) {
     savedAgentsListEl.innerHTML =
       '<div class="empty">No agents yet — create one to get started.</div>';
     return;
   }
-  agents.forEach(a =>
-    savedAgentsListEl.appendChild(buildAgentCard(a, activeAgentIds.has(a.agent_id))));
+  agents.forEach(a => savedAgentsListEl.appendChild(buildAgentCard(a)));
 }
 
-function renderAgentRuns(runs, active) {
+function renderOtherRuns(finished, active) {
   agentRunsListEl.innerHTML = "";
-  if (!active.length && !runs.length) {
-    agentRunsListEl.innerHTML = '<div class="empty">no runs yet</div>';
-    return;
-  }
-  // In-flight runs first (they have no record yet), then finished runs.
+  const has = finished.length || active.length;
+  otherRunsHeadEl.hidden = !has;
+  if (!has) return;
   active.forEach(a => agentRunsListEl.appendChild(buildActiveRunItem(a)));
-  runs.forEach(run => agentRunsListEl.appendChild(buildRunItem(run)));
+  finished.forEach(run => agentRunsListEl.appendChild(buildRunItem(run)));
 }
 
 // A run that's executing right now: name + a live "running" badge with a
@@ -4379,17 +4420,27 @@ function buildActiveRunItem(active) {
   return item;
 }
 
-// One saved-agent card: name, optional description, a web-search/schedule meta
-// line, and Run / Edit / Delete actions. When ``running`` the Run button shows
-// a live spinner and is disabled until the run lands.
-function buildAgentCard(agent, running) {
+// One saved-agent card: a header (name + a "running…" pill when a run is in
+// flight), optional description, a web-search/schedule meta line, Run / Edit /
+// Delete actions, and a collapsible list of this agent's runs.
+function buildAgentCard(agent) {
+  const running = (agent._active || []).length > 0;
   const card = document.createElement("div");
   card.className = "agent-card" + (running ? " is-running" : "");
 
+  const head = document.createElement("div");
+  head.className = "agent-card-head";
   const name = document.createElement("div");
   name.className = "agent-card-name";
   name.textContent = agent.name || agent.agent_id;
-  card.appendChild(name);
+  head.appendChild(name);
+  if (running) {
+    const pill = document.createElement("span");
+    pill.className = "agent-card-running";
+    pill.innerHTML = '<span class="run-spinner"></span>running…';
+    head.appendChild(pill);
+  }
+  card.appendChild(head);
 
   if (agent.description) {
     const desc = document.createElement("div");
@@ -4457,6 +4508,28 @@ function buildAgentCard(agent, running) {
   actions.appendChild(delBtn);
 
   card.appendChild(actions);
+
+  // This agent's runs, tucked into a click-to-open disclosure: in-flight ones
+  // first, then finished records (clickable to open the transcript).
+  const activeRuns = agent._active || [];
+  const finishedRuns = agent._runs || [];
+  if (activeRuns.length || finishedRuns.length) {
+    const det = document.createElement("details");
+    det.className = "agent-runs-disclosure";
+    const sum = document.createElement("summary");
+    sum.innerHTML = '<span class="caret">▸</span>';
+    const label = document.createElement("span");
+    label.textContent = "Runs (" + (activeRuns.length + finishedRuns.length) + ")";
+    sum.appendChild(label);
+    det.appendChild(sum);
+    const list = document.createElement("div");
+    list.className = "agent-runs-list";
+    activeRuns.forEach(a => list.appendChild(buildActiveRunItem(a)));
+    finishedRuns.forEach(r => list.appendChild(buildRunItem(r)));
+    det.appendChild(list);
+    card.appendChild(det);
+  }
+
   return card;
 }
 

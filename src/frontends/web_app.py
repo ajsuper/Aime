@@ -2121,6 +2121,7 @@ def _launch_agent_run(
                 client_tz=client_tz,
                 messaging_contact=messaging_contact,
                 api_url=aime_config.API_URL,
+                agent_id=agent_id,
             )
         except Exception:
             # The runner already converts its own failures into a persisted
