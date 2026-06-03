@@ -815,30 +815,70 @@
         color: var(--warning, #e29a4a); border-color: rgba(226,154,74,0.5); }
     .agent-status.running { color: var(--accent); border-color: var(--accent); }
 
-    /* Agents pane: a one-off launcher up top, then the runs list. */
+    /* Agents pane: a "new agent" toolbar, then the saved-agents dashboard and
+       the recent-runs list, all in one scroll region. */
     .pane[data-pane="agents"] { flex-direction: column; }
-    .agents-launcher { display: flex; flex-direction: column; gap: 0.5rem;
-                       padding: 0.9rem 1rem; border-bottom: 1px solid var(--border); }
-    .agents-label { color: var(--muted); font-size: 0.7rem; font-weight: 600;
-                    text-transform: uppercase; letter-spacing: 0.06em; }
-    #agent-instructions { width: 100%; box-sizing: border-box; resize: vertical;
-                          background: var(--bg); color: var(--text);
-                          border: 1px solid var(--border); border-radius: 8px;
-                          padding: 0.55rem 0.65rem; font: inherit;
-                          font-size: 0.9rem; line-height: 1.45; min-height: 4.5em; }
-    #agent-instructions:focus { outline: none; border-color: var(--accent); }
+    .agents-toolbar { display: flex; padding: 0.7rem 1rem;
+                      border-bottom: 1px solid var(--border); flex-shrink: 0; }
+    #agents-pane-scroll { flex: 1; min-height: 0; overflow-y: auto; }
+    .agents-label { display: block; color: var(--muted); font-size: 0.7rem;
+                    font-weight: 600; text-transform: uppercase;
+                    letter-spacing: 0.06em; margin-top: 0.3rem; }
+    .agents-optional { text-transform: none; letter-spacing: 0;
+                       font-weight: 400; opacity: 0.7; }
     .agents-check { display: flex; align-items: center; gap: 0.45rem;
-                    color: var(--muted); font-size: 0.85rem; cursor: pointer; }
+                    color: var(--muted); font-size: 0.85rem; cursor: pointer;
+                    margin-top: 0.2rem; }
     .agents-check input { accent-color: var(--accent); }
-    #agent-run-btn { align-self: flex-start; background: var(--accent);
-                     border: 1px solid var(--accent); color: white;
-                     border-radius: 8px; padding: 0.4rem 0.9rem; cursor: pointer;
-                     font: inherit; font-weight: 600; font-size: 0.88rem;
-                     transition: background 0.15s, opacity 0.15s; }
-    #agent-run-btn:hover { background: var(--accent-hover, var(--accent)); }
-    #agent-run-btn:disabled { opacity: 0.55; cursor: default; }
     .agents-hint { color: var(--muted); font-size: 0.8rem; margin: 0; }
     .agents-hint.error { color: var(--error); }
+    #agent-new-btn { background: var(--accent); border: 1px solid var(--accent);
+                     color: white; border-radius: 8px; padding: 0.4rem 0.9rem;
+                     cursor: pointer; font: inherit; font-weight: 600;
+                     font-size: 0.88rem; transition: background 0.15s, opacity 0.15s; }
+    #agent-new-btn:hover { background: var(--accent-hover, var(--accent)); }
+
+    /* Saved-agent cards. */
+    .agent-card { display: flex; flex-direction: column; gap: 0.3rem;
+                  padding: 0.6rem 1rem; border-bottom: 1px solid var(--border); }
+    .agent-card-name { color: var(--text); font-weight: 600; font-size: 0.92rem; }
+    .agent-card-desc { color: var(--muted); font-size: 0.82rem; line-height: 1.35; }
+    .agent-card-meta { color: var(--muted); font-size: 0.74rem; display: flex;
+                       flex-wrap: wrap; gap: 0.5rem; align-items: center; }
+    .agent-card-actions { display: flex; gap: 0.4rem; margin-top: 0.25rem; }
+    .agent-card-actions button { background: transparent; color: var(--text);
+                       border: 1px solid var(--border); border-radius: 6px;
+                       padding: 0.22rem 0.6rem; cursor: pointer; font: inherit;
+                       font-size: 0.82rem; transition: border-color 0.15s, opacity 0.15s; }
+    .agent-card-actions button:hover { border-color: var(--accent); }
+    .agent-card-actions .run-btn { color: var(--accent); border-color: var(--accent); }
+    .agent-card-actions .del-btn:hover { border-color: var(--error);
+                       color: var(--error); }
+    .agent-card-actions button:disabled { opacity: 0.5; cursor: default;
+                       border-color: var(--border); color: var(--muted); }
+
+    /* Create/edit modal inputs. */
+    #agent-edit-modal { max-width: 560px; }
+    #agent-edit-body { display: flex; flex-direction: column; gap: 0.25rem; }
+    #agent-edit-body input[type="text"], #agent-edit-body textarea {
+        width: 100%; box-sizing: border-box; background: var(--bg);
+        color: var(--text); border: 1px solid var(--border); border-radius: 8px;
+        padding: 0.5rem 0.65rem; font: inherit; font-size: 0.9rem;
+        line-height: 1.45; margin-top: 0.15rem; }
+    #agent-edit-body textarea { resize: vertical; min-height: 5em; }
+    #agent-edit-body input:focus, #agent-edit-body textarea:focus {
+        outline: none; border-color: var(--accent); }
+    #agent-edit-body input:disabled { opacity: 0.6; cursor: not-allowed; }
+    .agent-edit-actions { display: flex; justify-content: flex-end; gap: 0.5rem;
+                          margin-top: 0.8rem; }
+    .agent-edit-actions button { border-radius: 8px; padding: 0.45rem 1rem;
+                          cursor: pointer; font: inherit; font-weight: 600;
+                          font-size: 0.88rem; border: 1px solid var(--border); }
+    .agent-edit-actions .primary { background: var(--accent);
+                          border-color: var(--accent); color: white; }
+    .agent-edit-actions .primary:disabled { opacity: 0.55; cursor: default; }
+    .agent-edit-actions .ghost { background: transparent; color: var(--text); }
+    .agent-edit-actions .ghost:hover { border-color: var(--accent); }
 
     /* Calendar */
     .cal-toolbar { display: flex; align-items: center; gap: 0.5rem;
@@ -2048,24 +2088,22 @@
         </div>
       </div>
 
-      <!-- Agents pane (Advanced only). Run a one-off background agent from a
-           system message and watch its runs land below. Nothing here is
-           persisted as a definition — it's a transient launcher. -->
+      <!-- Agents pane (Advanced only). A small management dashboard: create,
+           edit, delete and run saved background agents, with each agent's runs
+           landing in the list below. Agent definitions persist per-user. -->
       <div class="pane" data-pane="agents">
-        <div class="agents-launcher">
-          <label class="agents-label" for="agent-instructions">System message</label>
-          <textarea id="agent-instructions" rows="5" spellcheck="false"
-                    placeholder="Describe the task for the agent to carry out against your data…"></textarea>
-          <label class="agents-check">
-            <input type="checkbox" id="agent-web-search">
-            <span>Allow web search</span>
-          </label>
-          <button id="agent-run-btn" class="primary">Run agent</button>
-          <p class="agents-hint" id="agent-run-hint" hidden></p>
+        <div class="agents-toolbar">
+          <button id="agent-new-btn" class="primary">+ New agent</button>
         </div>
-        <div class="side-section-head">Runs</div>
-        <div class="scroll" id="agent-runs-list">
-          <div class="empty">no runs yet</div>
+        <div class="scroll" id="agents-pane-scroll">
+          <div class="side-section-head">Your agents</div>
+          <div id="saved-agents-list">
+            <div class="empty">loading…</div>
+          </div>
+          <div class="side-section-head">Recent runs</div>
+          <div id="agent-runs-list">
+            <div class="empty">no runs yet</div>
+          </div>
         </div>
       </div>
     </div>
@@ -2235,6 +2273,47 @@
         </button>
       </div>
       <div class="modal-body" id="agent-run-body"></div>
+    </div>
+  </div>
+
+  <!-- Create / edit a saved agent (Advanced only). -->
+  <div id="agent-edit-backdrop" class="modal-backdrop" role="dialog"
+       aria-modal="true" aria-labelledby="agent-edit-title" hidden>
+    <div id="agent-edit-modal" class="modal-card">
+      <div class="modal-head">
+        <span class="title" id="agent-edit-title">New agent</span>
+        <button class="modal-close" id="agent-edit-close" title="Close"
+                aria-label="Close">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M6 6l12 12M18 6L6 18"/>
+          </svg>
+        </button>
+      </div>
+      <div class="modal-body" id="agent-edit-body">
+        <label class="agents-label" for="agent-name">Name</label>
+        <input id="agent-name" type="text" spellcheck="false" maxlength="80"
+               placeholder="e.g. Weekly calendar audit">
+        <label class="agents-label" for="agent-desc">Description <span class="agents-optional">(optional)</span></label>
+        <input id="agent-desc" type="text" spellcheck="false" maxlength="160"
+               placeholder="A short note about what this agent does">
+        <label class="agents-label" for="agent-edit-instructions">Instructions</label>
+        <textarea id="agent-edit-instructions" rows="6" spellcheck="false"
+                  placeholder="Describe the task for the agent to carry out against your data…"></textarea>
+        <label class="agents-check">
+          <input type="checkbox" id="agent-edit-web-search">
+          <span>Allow web search</span>
+        </label>
+        <label class="agents-label" for="agent-schedule">Schedule <span class="agents-optional">(coming soon)</span></label>
+        <input id="agent-schedule" type="text" spellcheck="false" maxlength="120"
+               placeholder="e.g. every Monday at 9am" disabled>
+        <p class="agents-hint">Scheduling isn't active yet — saved here for when it lands.</p>
+        <p class="agents-hint error" id="agent-edit-hint" hidden></p>
+        <div class="agent-edit-actions">
+          <button id="agent-edit-cancel" class="ghost">Cancel</button>
+          <button id="agent-edit-save" class="primary">Save agent</button>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -4131,17 +4210,39 @@ function buildRunItem(run) {
 }
 
 // -- Agents pane (Advanced only) ----------------------------------------
-// A transient launcher: type a system message, run a one-off background
-// agent, and watch its run land in the list below. Agents aren't persisted
-// as definitions — only the encrypted run records are.
+// A management dashboard: create, edit, delete and run saved background
+// agents. Definitions persist per-user (CRUD via /agents); each agent's runs
+// land in the recent-runs list below, fed by the same /agent-runs records the
+// Verbose conversations section uses.
 
-const agentInstructionsEl = document.getElementById("agent-instructions");
-const agentWebSearchEl = document.getElementById("agent-web-search");
-const agentRunBtn = document.getElementById("agent-run-btn");
-const agentRunHint = document.getElementById("agent-run-hint");
+const savedAgentsListEl = document.getElementById("saved-agents-list");
 const agentRunsListEl = document.getElementById("agent-runs-list");
 
 async function loadAgentsPane(silent) {
+  await Promise.all([loadSavedAgents(silent), loadAgentRunsList(silent)]);
+}
+
+async function loadSavedAgents(silent) {
+  if (!silent) savedAgentsListEl.innerHTML = '<div class="empty">loading…</div>';
+  let agents = [];
+  try {
+    const r = await fetch("/agents");
+    const data = await r.json();
+    agents = data.agents || [];
+  } catch (e) {
+    if (!silent) savedAgentsListEl.innerHTML = '<div class="empty">error: ' + e + '</div>';
+    return;
+  }
+  savedAgentsListEl.innerHTML = "";
+  if (!agents.length) {
+    savedAgentsListEl.innerHTML =
+      '<div class="empty">No agents yet — create one to get started.</div>';
+    return;
+  }
+  agents.forEach(a => savedAgentsListEl.appendChild(buildAgentCard(a)));
+}
+
+async function loadAgentRunsList(silent) {
   if (!silent) agentRunsListEl.innerHTML = '<div class="empty">loading…</div>';
   let runs = [];
   try {
@@ -4160,49 +4261,186 @@ async function loadAgentsPane(silent) {
   runs.forEach(run => agentRunsListEl.appendChild(buildRunItem(run)));
 }
 
-function setAgentHint(text, isError) {
-  agentRunHint.textContent = text || "";
-  agentRunHint.classList.toggle("error", !!isError);
-  agentRunHint.hidden = !text;
+// One saved-agent card: name, optional description, a web-search/schedule meta
+// line, and Run / Edit / Delete actions.
+function buildAgentCard(agent) {
+  const card = document.createElement("div");
+  card.className = "agent-card";
+
+  const name = document.createElement("div");
+  name.className = "agent-card-name";
+  name.textContent = agent.name || agent.agent_id;
+  card.appendChild(name);
+
+  if (agent.description) {
+    const desc = document.createElement("div");
+    desc.className = "agent-card-desc";
+    desc.textContent = agent.description;
+    card.appendChild(desc);
+  }
+
+  const meta = document.createElement("div");
+  meta.className = "agent-card-meta";
+  if (agent.allow_web_search) {
+    const w = document.createElement("span");
+    w.textContent = "🌐 web search";
+    meta.appendChild(w);
+  }
+  if (agent.schedule) {
+    const s = document.createElement("span");
+    s.textContent = "🕑 " + agent.schedule;
+    meta.appendChild(s);
+  }
+  if (meta.childNodes.length) card.appendChild(meta);
+
+  const actions = document.createElement("div");
+  actions.className = "agent-card-actions";
+
+  const runBtn = document.createElement("button");
+  runBtn.className = "run-btn";
+  runBtn.textContent = "Run";
+  runBtn.addEventListener("click", () => runSavedAgent(agent, runBtn));
+  actions.appendChild(runBtn);
+
+  const editBtn = document.createElement("button");
+  editBtn.textContent = "Edit";
+  editBtn.addEventListener("click", () => openAgentEditor(agent));
+  actions.appendChild(editBtn);
+
+  const delBtn = document.createElement("button");
+  delBtn.className = "del-btn";
+  delBtn.textContent = "Delete";
+  delBtn.addEventListener("click", () => deleteSavedAgent(agent));
+  actions.appendChild(delBtn);
+
+  card.appendChild(actions);
+  return card;
 }
 
-async function runAdHocAgent() {
-  const instructions = agentInstructionsEl.value.trim();
-  if (!instructions) {
-    setAgentHint("Enter a system message first.", true);
-    agentInstructionsEl.focus();
-    return;
-  }
-  agentRunBtn.disabled = true;
-  setAgentHint("Starting agent…", false);
+async function runSavedAgent(agent, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = "Starting…"; }
   try {
-    const r = await fetch("/agents/run", {
+    const r = await fetch("/agents/" + encodeURIComponent(agent.agent_id) + "/run", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({
-        instructions,
-        allow_web_search: agentWebSearchEl.checked,
-        tz: clientTimezone(),
-      }),
+      body: JSON.stringify({ tz: clientTimezone() }),
     });
     const data = await r.json();
     if (!data.ok) throw new Error(data.message || data.error || "failed to start");
-    setAgentHint("Agent running — its result will appear below when it finishes.",
-                 false);
-    agentInstructionsEl.value = "";
+    // The run-update fanout refreshes the runs list when it lands; nothing else
+    // to do but reset the button.
   } catch (e) {
-    setAgentHint("Couldn't start the agent — " + (e.message || e), true);
+    alert("Couldn't run this agent — " + (e.message || e));
   } finally {
-    agentRunBtn.disabled = false;
+    if (btn) { btn.disabled = false; btn.textContent = "Run"; }
   }
 }
 
-agentRunBtn.addEventListener("click", runAdHocAgent);
-// Ctrl/Cmd+Enter from the textarea runs the agent, mirroring the chat box.
-agentInstructionsEl.addEventListener("keydown", (e) => {
+function deleteSavedAgent(agent) {
+  confirmAction({
+    title: "Delete agent",
+    message: "Delete “" + (agent.name || agent.agent_id) + "”? Its past run "
+           + "records are kept; only the saved agent is removed.",
+    confirmLabel: "Delete",
+    onConfirm: async () => {
+      try {
+        await fetch("/agents/" + encodeURIComponent(agent.agent_id),
+                    { method: "DELETE" });
+      } catch (e) { /* a failed delete just leaves the card; reload shows truth */ }
+      loadSavedAgents(true);
+    },
+  });
+}
+
+// -- Create / edit modal ------------------------------------------------
+
+const agentEditBackdrop = document.getElementById("agent-edit-backdrop");
+const agentEditTitle = document.getElementById("agent-edit-title");
+const agentNameEl = document.getElementById("agent-name");
+const agentDescEl = document.getElementById("agent-desc");
+const agentEditInstructionsEl = document.getElementById("agent-edit-instructions");
+const agentEditWebSearchEl = document.getElementById("agent-edit-web-search");
+const agentScheduleEl = document.getElementById("agent-schedule");
+const agentEditHint = document.getElementById("agent-edit-hint");
+const agentEditSaveBtn = document.getElementById("agent-edit-save");
+
+// The agent currently being edited (null => creating a new one).
+let editingAgentId = null;
+
+function openAgentEditor(agent) {
+  editingAgentId = agent ? agent.agent_id : null;
+  agentEditTitle.textContent = agent ? "Edit agent" : "New agent";
+  agentNameEl.value = agent ? (agent.name || "") : "";
+  agentDescEl.value = agent ? (agent.description || "") : "";
+  agentEditInstructionsEl.value = agent ? (agent.instructions || "") : "";
+  agentEditWebSearchEl.checked = agent ? !!agent.allow_web_search : false;
+  agentScheduleEl.value = agent ? (agent.schedule || "") : "";
+  setAgentEditHint("");
+  agentEditBackdrop.hidden = false;
+  agentNameEl.focus();
+}
+
+function closeAgentEditor() {
+  agentEditBackdrop.hidden = true;
+  editingAgentId = null;
+}
+
+function setAgentEditHint(text) {
+  agentEditHint.textContent = text || "";
+  agentEditHint.hidden = !text;
+}
+
+async function saveAgentEditor() {
+  const name = agentNameEl.value.trim();
+  const instructions = agentEditInstructionsEl.value.trim();
+  if (!name) { setAgentEditHint("Give your agent a name."); agentNameEl.focus(); return; }
+  if (!instructions) {
+    setAgentEditHint("Add instructions describing the task.");
+    agentEditInstructionsEl.focus();
+    return;
+  }
+  const payload = {
+    name,
+    instructions,
+    description: agentDescEl.value.trim(),
+    allow_web_search: agentEditWebSearchEl.checked,
+    schedule: agentScheduleEl.value.trim(),
+  };
+  const editing = editingAgentId;
+  agentEditSaveBtn.disabled = true;
+  try {
+    const r = await fetch(editing ? "/agents/" + encodeURIComponent(editing) : "/agents", {
+      method: editing ? "PUT" : "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(payload),
+    });
+    const data = await r.json();
+    if (!data.ok) throw new Error(data.message || data.error || "failed to save");
+    closeAgentEditor();
+    loadSavedAgents(true);
+  } catch (e) {
+    setAgentEditHint("Couldn't save — " + (e.message || e));
+  } finally {
+    agentEditSaveBtn.disabled = false;
+  }
+}
+
+document.getElementById("agent-new-btn")
+  .addEventListener("click", () => openAgentEditor(null));
+agentEditSaveBtn.addEventListener("click", saveAgentEditor);
+document.getElementById("agent-edit-cancel").addEventListener("click", closeAgentEditor);
+document.getElementById("agent-edit-close").addEventListener("click", closeAgentEditor);
+agentEditBackdrop.addEventListener("click", (e) => {
+  if (e.target === agentEditBackdrop) closeAgentEditor();
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !agentEditBackdrop.hidden) closeAgentEditor();
+});
+// Ctrl/Cmd+Enter from anywhere in the form saves, mirroring the chat box.
+agentEditBackdrop.addEventListener("keydown", (e) => {
   if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
     e.preventDefault();
-    runAdHocAgent();
+    saveAgentEditor();
   }
 });
 

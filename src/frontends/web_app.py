@@ -65,9 +65,12 @@ from aime import (
 )
 from aime.services import sort_events_by_date
 from aime.agents import (
+    AgentDefinitionStore,
     AgentRunStore,
     AgentSpec,
     BackgroundAgentRunner,
+    definition_to_spec,
+    make_definition,
     register as _register_agent,
 )
 from aime import auth as _auth
@@ -128,6 +131,13 @@ def _agent_runs_dir(user_id: int) -> str:
     records — the same path the runner writes to. Mirrors the conversations
     directory but kept separate (runs never appear in the chat /load list)."""
     return os.path.join(_user_dir(user_id), "agent_runs")
+
+
+def _agents_dir(user_id: int) -> str:
+    """Where ``AgentDefinitionStore`` keeps this user's saved-agent definitions.
+    Sibling of ``agent_runs/``: the agent's *definition* lives here, the records
+    of what it did live there."""
+    return os.path.join(_user_dir(user_id), "agents")
 
 
 # LEGACY MIGRATION — pre-multi-user installs kept all conversations in a
@@ -1917,6 +1927,56 @@ def _agent_run_store(user_id: int) -> AgentRunStore:
     return AgentRunStore(_agent_runs_dir(user_id), _auth_backend.get_dek(user_id))
 
 
+def _agent_def_store(user_id: int) -> AgentDefinitionStore:
+    return AgentDefinitionStore(_agents_dir(user_id), _auth_backend.get_dek(user_id))
+
+
+def _launch_agent_run(spec: AgentSpec, user_id: int, client_tz: str | None) -> None:
+    """Start a background-agent run for ``spec`` against ``user_id``'s data on a
+    daemon thread and return immediately. The run persists its own encrypted run
+    record (and converts its own failures into an ``error`` record), so there is
+    nothing to await here — open panes learn the outcome via the run-update
+    fanout fired when the thread finishes. Shared by the ad-hoc launcher and the
+    saved-agent run button so both behave identically."""
+    ctx = _context_for(user_id)
+    username = ctx.username
+    dek = _auth_backend.get_dek(user_id)
+    runs_dir = _agent_runs_dir(user_id)
+    # Outbound-messaging destination, read fresh from auth (the source of truth —
+    # it may have changed since the session was built). None => the agent gets a
+    # graceful "no contact connected" result instead of a misfire.
+    _rec = _auth_backend.lookup(user_id)
+    messaging_contact = _rec.messaging_contact if _rec else None
+
+    def _run() -> None:
+        try:
+            BackgroundAgentRunner().run(
+                spec,
+                user_id=user_id,
+                dek=dek,
+                runs_dir=runs_dir,
+                usage_label=username,
+                client_tz=client_tz,
+                messaging_contact=messaging_contact,
+                api_url=aime_config.API_URL,
+            )
+        except Exception:
+            # The runner already converts its own failures into a persisted
+            # error run; a failure here means it never got that far. Nothing
+            # actionable to do but stop quietly — the pane refresh below still
+            # fires so the UI doesn't hang on "running…".
+            pass
+        finally:
+            ctx.notify_agent_run_update()
+
+    threading.Thread(
+        target=_run, name=f"agent-run-{user_id}", daemon=True
+    ).start()
+    # Tell open panes a run is now in flight (so a "running…" state can show);
+    # the result lands via the run record + the finished fanout above.
+    ctx.notify_agent_run_update()
+
+
 @app.route("/agent-runs")
 @login_required
 def agent_runs():
@@ -1955,19 +2015,6 @@ def agents_run():
     tz = data.get("tz")
     client_tz = tz if isinstance(tz, str) and tz else None
 
-    user_id = g.user_id
-    ctx = _context_for(user_id)
-    username = ctx.username
-    dek = _auth_backend.get_dek(user_id)
-    runs_dir = _agent_runs_dir(user_id)
-    # Outbound-messaging destination for this user, read fresh from auth (the
-    # source of truth — it may have changed since the session was built). Passed
-    # to the runner so the agent's SendMessage tool / SubmitResult
-    # `message_to_user` can actually reach the user. None => the agent gets a
-    # graceful "no contact connected" result instead of a misfire.
-    _rec = _auth_backend.lookup(user_id)
-    messaging_contact = _rec.messaging_contact if _rec else None
-
     # Unique, registry-safe name for this one-off agent. The timestamp keeps
     # runs listed in creation order; the random suffix avoids collisions.
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -1979,36 +2026,122 @@ def agents_run():
         allow_web_search=allow_web,
     )
     _register_agent(spec)
-
-    def _run() -> None:
-        try:
-            BackgroundAgentRunner().run(
-                spec,
-                user_id=user_id,
-                dek=dek,
-                runs_dir=runs_dir,
-                usage_label=username,
-                client_tz=client_tz,
-                messaging_contact=messaging_contact,
-                api_url=aime_config.API_URL,
-            )
-        except Exception:
-            # The runner already converts its own failures into a persisted
-            # error run; a failure here means it never got that far. Nothing
-            # actionable to do but stop quietly — the pane refresh below still
-            # fires so the UI doesn't hang on "running…".
-            pass
-        finally:
-            ctx.notify_agent_run_update()
-
-    threading.Thread(
-        target=_run, name=f"adhoc-agent-{user_id}", daemon=True
-    ).start()
-    # Tell open panes a run is now in flight (so a "running…" state can show),
-    # then return immediately — the result lands via the run record + the
-    # finished fanout above.
-    ctx.notify_agent_run_update()
+    _launch_agent_run(spec, g.user_id, client_tz)
     return jsonify({"ok": True, "agent_name": name})
+
+
+# --- Saved agents ----------------------------------------------------------
+# A per-user library of agent definitions the user created in the UI. Unlike
+# ad-hoc runs (which vanish on restart), these persist as encrypted records in
+# the user's agents/ directory, so an agent can be re-run, edited, or deleted —
+# and, later, run on a schedule. CRUD here; the actual run reuses the same
+# launcher the ad-hoc path does.
+
+
+def _agent_def_public(record: dict) -> dict:
+    """Project a stored definition to the fields the frontend needs. (Currently
+    the whole record is safe to expose, but going through a projection keeps the
+    wire shape decoupled from on-disk additions.)"""
+    return {
+        "agent_id": record.get("agent_id", ""),
+        "name": record.get("name", ""),
+        "description": record.get("description", ""),
+        "instructions": record.get("instructions", ""),
+        "allow_web_search": bool(record.get("allow_web_search", False)),
+        "schedule": record.get("schedule") or None,
+        "created_at": record.get("created_at", ""),
+        "updated_at": record.get("updated_at", ""),
+    }
+
+
+@app.route("/agents", methods=["GET"])
+@login_required
+def agents_list():
+    """Every saved agent this user has defined, newest first."""
+    agents = _agent_def_store(g.user_id).list_agents()
+    return jsonify({"agents": [_agent_def_public(a) for a in agents]})
+
+
+@app.route("/agents", methods=["POST"])
+@login_required
+def agents_create():
+    """Create and persist a new saved agent. A name and instructions are
+    required; ``schedule`` is accepted and stored but not yet acted on."""
+    data = request.get_json(silent=True) or {}
+    name = (data.get("name") or "").strip()
+    instructions = (data.get("instructions") or "").strip()
+    if not name:
+        return jsonify({"ok": False, "error": "a name is required"}), 400
+    if not instructions:
+        return jsonify({"ok": False, "error": "instructions are required"}), 400
+    record = make_definition(
+        name=name,
+        instructions=instructions,
+        description=(data.get("description") or "").strip(),
+        allow_web_search=bool(data.get("allow_web_search", False)),
+        schedule=(data.get("schedule") or "").strip() or None,
+    )
+    if not _agent_def_store(g.user_id).save(record):
+        return jsonify({"ok": False, "error": "couldn't save the agent"}), 500
+    return jsonify({"ok": True, "agent": _agent_def_public(record)})
+
+
+@app.route("/agents/<agent_id>", methods=["PUT"])
+@login_required
+def agents_update(agent_id: str):
+    """Update an existing saved agent. Only the fields present in the request
+    are changed; the id and creation time are preserved."""
+    store = _agent_def_store(g.user_id)
+    record = store.load(agent_id)
+    if record is None:
+        return jsonify({"ok": False, "error": "agent not found"}), 404
+    data = request.get_json(silent=True) or {}
+    if "name" in data:
+        name = (data.get("name") or "").strip()
+        if not name:
+            return jsonify({"ok": False, "error": "a name is required"}), 400
+        record["name"] = name
+    if "instructions" in data:
+        instructions = (data.get("instructions") or "").strip()
+        if not instructions:
+            return jsonify({"ok": False, "error": "instructions are required"}), 400
+        record["instructions"] = instructions
+    if "description" in data:
+        record["description"] = (data.get("description") or "").strip()
+    if "allow_web_search" in data:
+        record["allow_web_search"] = bool(data.get("allow_web_search"))
+    if "schedule" in data:
+        record["schedule"] = (data.get("schedule") or "").strip() or None
+    if not store.save(record):
+        return jsonify({"ok": False, "error": "couldn't save the agent"}), 500
+    return jsonify({"ok": True, "agent": _agent_def_public(record)})
+
+
+@app.route("/agents/<agent_id>", methods=["DELETE"])
+@login_required
+def agents_delete(agent_id: str):
+    """Delete a saved agent definition. The run records it already produced are
+    left in place — they're a separate, immutable audit trail."""
+    _agent_def_store(g.user_id).delete(agent_id)
+    return jsonify({"ok": True})
+
+
+@app.route("/agents/<agent_id>/run", methods=["POST"])
+@login_required
+@api_access_required
+def agents_run_saved(agent_id: str):
+    """Run a saved agent now. Builds the spec from the stored definition and
+    hands it to the same launcher the ad-hoc path uses. Gated like /send
+    because a run spends tokens."""
+    record = _agent_def_store(g.user_id).load(agent_id)
+    if record is None:
+        return jsonify({"ok": False, "error": "agent not found"}), 404
+    data = request.get_json(silent=True) or {}
+    tz = data.get("tz")
+    client_tz = tz if isinstance(tz, str) and tz else None
+    spec = definition_to_spec(record)
+    _launch_agent_run(spec, g.user_id, client_tz)
+    return jsonify({"ok": True, "agent_name": spec.name})
 
 
 @app.route("/calendar/<int:year>/<int:month>")

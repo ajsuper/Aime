@@ -31,6 +31,12 @@ from .spec import AgentSpec, AgentResult, RunStatus
 from .registry import register, get, all_specs
 from .runner import BackgroundAgentRunner
 from .store import AgentRunStore, new_run_id
+from .definitions import (
+    AgentDefinitionStore,
+    definition_to_spec,
+    make_definition,
+    new_agent_id,
+)
 from .collector import ResultCollector
 
 __all__ = [
@@ -43,5 +49,9 @@ __all__ = [
     "BackgroundAgentRunner",
     "AgentRunStore",
     "new_run_id",
+    "AgentDefinitionStore",
+    "definition_to_spec",
+    "make_definition",
+    "new_agent_id",
     "ResultCollector",
 ]
