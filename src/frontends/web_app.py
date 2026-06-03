@@ -74,6 +74,7 @@ from aime.agents import (
     register as _register_agent,
 )
 from aime.scheduling import (
+    ReminderService,
     ScheduleStore,
     Scheduler,
     make_schedule,
@@ -365,7 +366,10 @@ class UserContext:
         backend = AnthropicMessagesBackend(
             system_prompt=aime_config.load_system_prompt(),
             model=aime_config.AGENT_MODEL,
-            schema_files=aime_config.SCHEMA_FILES,
+            # Reminder tools are client-side (handled in the controller against
+            # the ScheduleStore), so they ride alongside the gateway-backed data
+            # tools in the model's tool list but are never forwarded to serve.cpp.
+            schema_files=aime_config.SCHEMA_FILES + aime_config.REMINDER_SCHEMA_FILES,
             conversations_dir=conv_dir,
             dek=dek,
             usage_label=username,
@@ -405,6 +409,15 @@ class UserContext:
                 target=fn, name=f"agent-{user_id}", daemon=True
             ).start()
 
+        # Event reminders the model sets go through the same ScheduleStore the
+        # event-modal UI and the scheduler loop use, linked to events by id.
+        # Events are looked up via the shared horizon helper so a reminder can be
+        # set against anything the user has coming up.
+        reminder_service = ReminderService(
+            ScheduleStore(_schedules_dir(user_id), dek),
+            lambda: _scheduler_upcoming_events(user_id),
+        )
+
         self.controller = ConversationController(
             backend=backend,
             tool_gateway=gateway,
@@ -412,6 +425,7 @@ class UserContext:
             web_search_agent=web_search_agent,
             messenger=messenger,
             message_recipient=messaging_contact,
+            reminder_service=reminder_service,
         )
 
         self.controller.subscribe(self._fanout)

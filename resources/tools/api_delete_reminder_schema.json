@@ -1,0 +1,14 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "DeleteReminder",
+  "description": "Remove an event reminder by its reminder id (the `reminder_id` returned by ListReminders or CreateReminder). This deletes only the reminder; the event itself is untouched.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["reminder_id"],
+  "properties": {
+    "reminder_id": {
+      "type": "string",
+      "description": "The id of the reminder to delete, as shown by ListReminders."
+    }
+  }
+}

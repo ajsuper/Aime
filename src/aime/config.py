@@ -72,6 +72,18 @@ WEB_SEARCH_TOOL_VERSION = "web_search_20250305"
 # backend — see the background-agent framework for the other use of that slot.
 ONBOARDING_TOOL_SCHEMA = "../resources/tools/api_complete_onboarding_schema.json"
 
+# Event-reminder tools. Like WebSearch/SendMessage these are *client* tools: the
+# controller handles them in-process against the user's ScheduleStore (see
+# aime.scheduling.reminders) rather than forwarding to the data backend, so they
+# live in their own list and are appended to the interactive backend's schemas
+# only — never sent to the gateway. Background agents don't get them by default
+# (they build their tool set from SCHEMA_FILES alone).
+REMINDER_SCHEMA_FILES = [
+    "../resources/tools/api_create_reminder_schema.json",
+    "../resources/tools/api_list_reminders_schema.json",
+    "../resources/tools/api_delete_reminder_schema.json",
+]
+
 # --- Background agents (aime.agents) -----------------------------------------
 # Headless workers that reuse the full Aime stack (backend + controller + tool
 # gateway) to carry out a task against a user's database and return a result.

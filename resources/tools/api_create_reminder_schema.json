@@ -1,0 +1,25 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "CreateReminder",
+  "description": "Set a reminder that texts the user about one of their events ahead of time, reaching them on their connected messaging app (the same channel SendMessage uses). The reminder links to the event by id, so if the event is later moved the reminder automatically moves with it. Look the event up first (e.g. with FilterUsersEvents) to get its `id`. Call ListReminders first if you might be duplicating one the user already has. If no messaging contact is connected the reminder is still saved but can't be delivered — mention that to the user.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["event_id", "days_before"],
+  "properties": {
+    "event_id": {
+      "type": "integer",
+      "description": "The `id` of the event to remind about, taken from the event-reading tools."
+    },
+    "days_before": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 366,
+      "description": "How many days ahead of the event the reminder fires. 0 = on the event's own day."
+    },
+    "at_time": {
+      "type": "string",
+      "pattern": "^([01]\\d|2[0-3]):[0-5]\\d$",
+      "description": "Wall-clock time to send it, HH:MM 24-hour, in the user's timezone. Omit to inherit the event's own start time."
+    }
+  }
+}

@@ -98,6 +98,19 @@ def format_tool_details(name: str, inp: dict) -> str:
         body = _truncate_for_log(inp.get("text"), 50)
         if body:
             parts.append(f"\"{body}\"")
+    elif name == "CreateReminder":
+        parts.append(f"event #{inp.get('event_id', '?')}")
+        days = inp.get("days_before")
+        if days is not None:
+            parts.append("on the day" if days == 0
+                         else f"{days} day{'s' if days != 1 else ''} before")
+        if inp.get("at_time"):
+            parts.append(f"at {inp['at_time']}")
+    elif name == "ListReminders":
+        parts.append(f"event #{inp['event_id']}" if inp.get("event_id") is not None
+                     else "all events")
+    elif name == "DeleteReminder":
+        parts.append(f"id={inp.get('reminder_id', '?')}")
     elif name in ("GetCommitmentHistory", "GetPatternSummary", "GetRecentActivity"):
         if inp.get("commitment_id"):
             parts.append(f"commitment={inp['commitment_id']}")

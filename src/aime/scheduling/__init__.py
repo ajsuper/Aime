@@ -25,6 +25,7 @@ from .store import (
     validate_schedule,
 )
 from .scheduler import Scheduler, render_message
+from .reminders import ReminderService
 
 __all__ = [
     "combine_local",
@@ -38,4 +39,5 @@ __all__ = [
     "validate_schedule",
     "Scheduler",
     "render_message",
+    "ReminderService",
 ]

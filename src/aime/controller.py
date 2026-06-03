@@ -135,10 +135,21 @@ class ConversationController:
         headless: bool = False,
         messenger=None,
         message_recipient: str | None = None,
+        reminder_service=None,
     ):
         self._backend = backend
         self._tools = tool_gateway
         self._spawn_worker = worker_spawner
+        # Optional event-reminder engine (aime.scheduling.ReminderService). When
+        # set, the CreateReminder / ListReminders / DeleteReminder client tools
+        # are handled here against the user's ScheduleStore; when None they
+        # degrade gracefully (a "not available" result), so a backend that
+        # doesn't offer the schemas — or a misfire — can never reach the gateway.
+        self._reminder_service = reminder_service
+        # The user's IANA timezone, set per session via set_client_timezone, so a
+        # model-created reminder fires in their local time. None until the first
+        # turn carries it (the frontend sends it on every /send).
+        self._client_tz: str | None = None
         # Optional outbound messaging (see aime.messaging). `messenger` is a
         # MessageChannel; `message_recipient` is this user's opaque destination
         # (UserRecord.messaging_contact). When either is missing, SendMessage
@@ -346,7 +357,9 @@ class ConversationController:
         """Forward the client's IANA timezone to the backend so per-turn
         timestamps reflect the user's local time rather than the server's, and
         to the tool gateway so events reads carry a user-local 'now' (used to
-        reconcile stale past events)."""
+        reconcile stale past events). Also kept here so a reminder the model
+        creates is interpreted in the user's timezone, not the server's."""
+        self._client_tz = (tz or "").strip() or None
         self._backend.set_client_timezone(tz)
         self._tools.set_client_timezone(tz)
 
@@ -704,6 +717,26 @@ class ConversationController:
             except Exception as exc:
                 self._emit(CoreEvent(kind="error", text=f"tool result send failed: {exc}"))
             return
+        # Event reminders are client tools too: handled in-process against the
+        # user's ScheduleStore via the injected ReminderService, never forwarded
+        # to the data backend. Same shape as the WebSearch/SendMessage branches.
+        if tool_name in ("CreateReminder", "ListReminders", "DeleteReminder"):
+            ui_summary, model_text = self._run_reminder_tool(tool_name, tool_input)
+            self._emit(CoreEvent(
+                kind="tool_result",
+                tool_name=tool_name,
+                tool_result_summary=ui_summary,
+                tool_detail_full=_full_detail_text(model_text),
+            ))
+            try:
+                self._backend.submit(BackendEvent(
+                    kind="tool_send_response",
+                    tool_use_id=event.tool_use_id,
+                    tool_result=model_text,
+                ))
+            except Exception as exc:
+                self._emit(CoreEvent(kind="error", text=f"tool result send failed: {exc}"))
+            return
         result = self._tools.execute(tool_name, tool_input)
         summary = format_tool_response(tool_name, result)
         self._emit(CoreEvent(
@@ -784,3 +817,51 @@ class ConversationController:
             )
         except Exception as exc:
             return f"Error: {exc}"
+
+    def _run_reminder_tool(self, tool_name: str, tool_input: dict) -> tuple[str, str]:
+        """Run a reminder client tool against the user's ScheduleStore. Returns
+        ``(ui_summary, model_text)`` — a one-line summary for the activity feed
+        and the text result handed back to the model. Every failure becomes a
+        clean string the model can relay, never an exception that breaks the
+        turn."""
+        if self._reminder_service is None:
+            return ("reminders unavailable",
+                    "Reminders aren't available in this session.")
+        inp = tool_input or {}
+        try:
+            if tool_name == "CreateReminder":
+                res = self._reminder_service.create(
+                    event_id=inp.get("event_id"),
+                    days_before=inp.get("days_before", 0),
+                    at_time=(inp.get("at_time") or None),
+                    tz=self._client_tz,
+                )
+                if not res.get("ok"):
+                    return ("reminder not set", f"Error: {res.get('error')}")
+                title = res.get("event_title") or "the event"
+                return (f"reminder set · {res.get('lead')}",
+                        f"Reminder set for \"{title}\" — {res.get('lead')}. "
+                        f"(reminder_id: {res.get('reminder_id')})")
+
+            if tool_name == "ListReminders":
+                event_id = inp.get("event_id")
+                items = self._reminder_service.list(event_id=event_id)
+                if not items:
+                    return ("0 reminders", "No reminders set.")
+                lines = [f"{len(items)} reminder{'s' if len(items) != 1 else ''}:"]
+                for it in items:
+                    title = it.get("event_title") or f"event #{it.get('event_id')}"
+                    off = "" if it.get("enabled", True) else " [disabled]"
+                    lines.append(
+                        f"• {it.get('reminder_id')} — \"{title}\" "
+                        f"(event #{it.get('event_id')}): {it.get('lead')}{off}")
+                return (f"{len(items)} reminder{'s' if len(items) != 1 else ''}",
+                        "\n".join(lines))
+
+            # DeleteReminder
+            res = self._reminder_service.delete(inp.get("reminder_id", ""))
+            if not res.get("ok"):
+                return ("reminder not removed", f"Error: {res.get('error')}")
+            return ("reminder removed", "Reminder deleted.")
+        except Exception as exc:
+            return ("reminder error", f"Error: {exc}")
