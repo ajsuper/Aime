@@ -889,7 +889,9 @@
     .agent-runs-list { display: flex; flex-direction: column; gap: 0.1rem;
                        margin-top: 0.2rem; }
     .agent-runs-list .agent-run-item { padding-left: 0.2rem; }
-    .side-section-head.other-runs { margin-top: 0.4rem; }
+    /* The "Other runs" disclosure is a top-level section, so it needs the pane's
+       horizontal padding (card disclosures inherit theirs from the card). */
+    .other-runs-disclosure { padding: 0 1rem; margin-top: 0.3rem; }
     .agent-run-item.is-active { cursor: default; }
     .agent-run-item.is-active .summary { color: var(--text); }
     .agent-status.running .run-spinner, .run-btn .run-spinner {
@@ -1612,6 +1614,34 @@
                        align-items: center; }
     .ev-meta-item { color: var(--muted); }
     .ev-meta-item b { color: var(--text); font-weight: 600; }
+    /* Reminders in the event modal: each row is a `relative` send_message
+       schedule linked to this event by id. Rows save the moment they change
+       (like the status pills), so they work regardless of the event's own
+       read-only/edit mode. */
+    .ev-reminders { display: flex; flex-direction: column; gap: 0.4rem; }
+    .ev-reminder-row { display: flex; align-items: center; gap: 0.5rem;
+                       flex-wrap: wrap; }
+    .ev-reminder-row select, .ev-reminder-row input[type="time"] {
+                       background: var(--bg); color: var(--text);
+                       border: 1px solid var(--border); border-radius: 8px;
+                       padding: 0.3rem 0.45rem; font: inherit; font-size: 0.85rem; }
+    .ev-reminder-row select:focus,
+    .ev-reminder-row input[type="time"]:focus {
+                       outline: none; border-color: var(--accent); }
+    .ev-reminder-sep { font-size: 0.82rem; color: var(--muted); }
+    .ev-reminder-del { margin-left: auto; background: transparent; border: none;
+                       color: var(--muted); cursor: pointer; font-size: 1.2rem;
+                       line-height: 1; padding: 0.1rem 0.4rem; border-radius: 6px; }
+    .ev-reminder-del:hover { color: var(--warning, #e29a4a);
+                             background: var(--bg-input); }
+    .ev-reminders-empty { font-size: 0.82rem; color: var(--muted);
+                          font-style: italic; }
+    .ev-reminder-add { align-self: flex-start; background: transparent;
+                       color: var(--accent); border: 1px dashed var(--border);
+                       border-radius: 8px; padding: 0.3rem 0.7rem; cursor: pointer;
+                       font: inherit; font-size: 0.82rem; font-weight: 600; }
+    .ev-reminder-add:hover { border-color: var(--accent); }
+    .ev-reminder-add[disabled] { opacity: 0.5; cursor: default; }
     /* Schedule and pill events should look interactive. */
     .cal-sched .ev-block, .cal-sched .ev-pill,
     .cal-cell .ev { cursor: pointer; }
@@ -2196,9 +2226,11 @@
             <div class="empty">loading…</div>
           </div>
           <!-- Runs that don't belong to a current agent (ad-hoc, or a since-
-               deleted agent). Hidden entirely when there are none. -->
-          <div class="side-section-head other-runs" id="other-runs-head" hidden>Other runs</div>
-          <div id="agent-runs-list"></div>
+               deleted agent), in a collapsible disclosure. Hidden when empty. -->
+          <details class="agent-runs-disclosure other-runs-disclosure" id="other-runs" hidden>
+            <summary><span class="caret">▸</span><span id="other-runs-label">Other runs</span></summary>
+            <div class="agent-runs-list" id="agent-runs-list"></div>
+          </details>
         </div>
       </div>
     </div>
@@ -2334,6 +2366,17 @@
                role="button" tabindex="0"
                aria-label="Edit description"></div>
           <textarea id="ev-f-summary" rows="6" hidden></textarea>
+        </div>
+        <!-- Reminders: each row is a `relative` + `send_message` schedule record
+             linked to this event by id (see docs/scheduling.md §7). They save
+             immediately on add/change/remove — like the status pills — so they
+             work whether or not the event is in edit mode. Hidden until the
+             modal is opened for a saved event. -->
+        <div class="ev-field stack" id="ev-f-reminders-wrap" hidden>
+          <span class="lbl">Reminders</span>
+          <div id="ev-f-reminders" class="ev-reminders"></div>
+          <button type="button" id="ev-add-reminder" class="ev-reminder-add">
+            + Add reminder</button>
         </div>
         <p class="ev-modal-error" id="ev-modal-error" hidden></p>
       </div>
@@ -4333,7 +4376,8 @@ function buildRunItem(run) {
 
 const savedAgentsListEl = document.getElementById("saved-agents-list");
 const agentRunsListEl = document.getElementById("agent-runs-list");
-const otherRunsHeadEl = document.getElementById("other-runs-head");
+const otherRunsEl = document.getElementById("other-runs");
+const otherRunsLabelEl = document.getElementById("other-runs-label");
 
 async function loadAgentsPane(silent) {
   // Fetch saved agents, runs (incl. in-flight), and schedules together so each
@@ -4397,9 +4441,10 @@ function renderSavedAgents(agents) {
 
 function renderOtherRuns(finished, active) {
   agentRunsListEl.innerHTML = "";
-  const has = finished.length || active.length;
-  otherRunsHeadEl.hidden = !has;
-  if (!has) return;
+  const total = finished.length + active.length;
+  otherRunsEl.hidden = total === 0;
+  if (!total) return;
+  otherRunsLabelEl.textContent = "Other runs (" + total + ")";
   active.forEach(a => agentRunsListEl.appendChild(buildActiveRunItem(a)));
   finished.forEach(run => agentRunsListEl.appendChild(buildRunItem(run)));
 }
@@ -5196,6 +5241,21 @@ const evCancelBtn = document.getElementById("ev-cancel-btn");
 const evArchiveBtn = document.getElementById("ev-archive-btn");
 const evCloseBtn = document.getElementById("event-close");
 const evModalError = document.getElementById("ev-modal-error");
+const evRemindersWrap = document.getElementById("ev-f-reminders-wrap");
+const evRemindersEl = document.getElementById("ev-f-reminders");
+const evAddReminderBtn = document.getElementById("ev-add-reminder");
+
+// The reminder schedule records linked to the event currently in the modal.
+let activeEventReminders = [];
+
+// Friendly presets for "how far ahead". The stored value is days_before; an
+// off-preset value loaded from the server gets its own option appended so it
+// still round-trips.
+const REMINDER_DAY_OPTIONS = [
+  [0, "On the day"], [1, "1 day before"], [2, "2 days before"],
+  [3, "3 days before"], [7, "1 week before"], [14, "2 weeks before"],
+  [30, "1 month before"],
+];
 
 function backendDateToInput(d) {
   const m = /^(\d{2})\/(\d{2})\/(\d{4})/.exec(d || "");
@@ -5288,8 +5348,178 @@ function openEventModal(ev) {
   evArchiveBtn.title = archiveLabel;
   evArchiveBtn.setAttribute("aria-label", archiveLabel);
   setEventEditMode(false);
+  loadEventReminders(ev.id);
   eventBackdrop.hidden = false;
 }
+
+// -- Event reminders ----------------------------------------------------
+// Each reminder is its own schedule record (relative trigger + send_message),
+// linked to the event by id. We fetch the user's schedules and keep only the
+// ones pointing at this event. Saving/removing happens immediately, so there's
+// no "unsaved reminder" state to reconcile with the event's Save button.
+
+function reminderMessageFor(ev) {
+  // Tokens are rendered against the *live* event at fire time, so moving the
+  // event keeps the message accurate without rewriting the record.
+  return (ev && (ev.time || "").trim())
+    ? "Reminder: {event_title} on {event_date} at {event_time}"
+    : "Reminder: {event_title} on {event_date}";
+}
+
+async function loadEventReminders(eventId) {
+  activeEventReminders = [];
+  if (eventId == null) { evRemindersWrap.hidden = true; return; }
+  evRemindersWrap.hidden = false;
+  renderEventReminders();  // show the empty state instantly while we fetch
+  try {
+    const r = await fetch("/schedules");
+    const data = await r.json();
+    activeEventReminders = (data.schedules || []).filter(s =>
+      s.trigger && s.trigger.kind === "relative" &&
+      String(s.trigger.event_id) === String(eventId));
+  } catch (e) {
+    activeEventReminders = [];
+  }
+  renderEventReminders();
+}
+
+function renderEventReminders() {
+  evRemindersEl.innerHTML = "";
+  if (!activeEventReminders.length) {
+    const empty = document.createElement("div");
+    empty.className = "ev-reminders-empty";
+    empty.textContent = "No reminders yet.";
+    evRemindersEl.appendChild(empty);
+    return;
+  }
+  activeEventReminders.forEach(s =>
+    evRemindersEl.appendChild(buildReminderRow(s)));
+}
+
+function buildReminderRow(sched) {
+  const t = sched.trigger || {};
+  const row = document.createElement("div");
+  row.className = "ev-reminder-row";
+
+  const daySel = document.createElement("select");
+  REMINDER_DAY_OPTIONS.forEach(([v, label]) => {
+    const o = document.createElement("option");
+    o.value = String(v); o.textContent = label;
+    daySel.appendChild(o);
+  });
+  const days = parseInt(t.days_before, 10) || 0;
+  if (!REMINDER_DAY_OPTIONS.some(([v]) => v === days)) {
+    const o = document.createElement("option");
+    o.value = String(days);
+    o.textContent = days + " day" + (days === 1 ? "" : "s") + " before";
+    daySel.appendChild(o);
+  }
+  daySel.value = String(days);
+
+  const sep = document.createElement("span");
+  sep.className = "ev-reminder-sep";
+  sep.textContent = "at";
+
+  const timeInput = document.createElement("input");
+  timeInput.type = "time";
+  timeInput.value = t.at_time || "";
+  timeInput.title = "Leave blank to use the event's own time";
+
+  const del = document.createElement("button");
+  del.type = "button";
+  del.className = "ev-reminder-del";
+  del.title = "Remove reminder";
+  del.setAttribute("aria-label", "Remove reminder");
+  del.textContent = "×";
+
+  const onChange = () =>
+    updateReminder(sched, parseInt(daySel.value, 10), timeInput.value);
+  daySel.addEventListener("change", onChange);
+  timeInput.addEventListener("change", onChange);
+  del.addEventListener("click", () => deleteReminder(sched));
+
+  row.append(daySel, sep, timeInput, del);
+  return row;
+}
+
+async function addReminder() {
+  if (!activeEventRecord || activeEventRecord.id == null) return;
+  evModalError.hidden = true;
+  evAddReminderBtn.disabled = true;
+  const trigger = {
+    kind: "relative",
+    event_id: activeEventRecord.id,
+    days_before: 1,
+    at_time: "09:00",
+    minutes_before: 0,
+  };
+  try {
+    const r = await fetch("/schedules", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        enabled: true,
+        tz: clientTimezone(),
+        trigger,
+        action: { kind: "send_message",
+                  message: reminderMessageFor(activeEventRecord) },
+      }),
+    });
+    const data = await r.json();
+    if (!data.ok) throw new Error(data.error || data.message || "failed");
+    activeEventReminders.push(data.schedule);
+    renderEventReminders();
+  } catch (e) {
+    evModalError.textContent = "Couldn't add reminder — " + (e.message || e);
+    evModalError.hidden = false;
+  } finally {
+    evAddReminderBtn.disabled = false;
+  }
+}
+
+async function updateReminder(sched, days, atTime) {
+  // Rebuild the whole trigger; the server re-arms fire-state on a trigger
+  // change, so an edited reminder always evaluates from scratch.
+  const trigger = {
+    kind: "relative",
+    event_id: sched.trigger.event_id,
+    days_before: isNaN(days) ? 0 : days,
+    at_time: atTime ? atTime : null,
+    minutes_before: 0,
+  };
+  try {
+    const r = await fetch("/schedules/" + encodeURIComponent(sched.schedule_id), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ trigger }),
+    });
+    const data = await r.json();
+    if (!data.ok) throw new Error(data.error || data.message || "failed");
+    sched.trigger = data.schedule.trigger;
+    evModalError.hidden = true;
+  } catch (e) {
+    evModalError.textContent = "Couldn't update reminder — " + (e.message || e);
+    evModalError.hidden = false;
+  }
+}
+
+async function deleteReminder(sched) {
+  try {
+    const r = await fetch("/schedules/" + encodeURIComponent(sched.schedule_id),
+                          { method: "DELETE" });
+    const data = await r.json();
+    if (!data.ok) throw new Error("failed");
+    activeEventReminders = activeEventReminders.filter(
+      s => s.schedule_id !== sched.schedule_id);
+    renderEventReminders();
+    evModalError.hidden = true;
+  } catch (e) {
+    evModalError.textContent = "Couldn't remove reminder — " + (e.message || e);
+    evModalError.hidden = false;
+  }
+}
+
+evAddReminderBtn.addEventListener("click", addReminder);
 
 // The four lifecycle states the user can pick between in the modal. (`unknown`
 // is normally system-set, but it's a legitimate "I genuinely don't know" choice
