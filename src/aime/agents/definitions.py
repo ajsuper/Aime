@@ -13,16 +13,18 @@ agent id bound in as the AEAD associated data. Keeping definitions beside runs �
 rather than in a shared SQL table — means an agent's whole footprint (its
 definition and every run it produced) lives inside that one user's directory.
 
-A definition is intentionally close to an ``AgentSpec``: ``to_spec`` builds the
-spec the runner executes. The one extra field is ``schedule`` — reserved for a
-future scheduler and stored but *not* acted on here; persisting it now means the
-data model is ready when scheduled runs are wired up.
+A definition is intentionally close to an ``AgentSpec``: ``definition_to_spec``
+builds the spec the runner executes. Scheduling lives elsewhere now — a scheduled
+run is a ``run_agent`` record in the schedule store (``aime.scheduling``) keyed by
+this agent's id — so a definition holds only the agent's identity and behavior.
 """
 
 import datetime
 import hashlib
 import json
 import os
+
+from cryptography.exceptions import InvalidTag
 
 from .. import encryption as _enc
 from .spec import AgentSpec
@@ -52,11 +54,13 @@ def make_definition(
     instructions: str,
     description: str = "",
     allow_web_search: bool = False,
-    schedule: str | None = None,
     agent_id: str | None = None,
 ) -> dict:
     """Build a fresh definition record from user-supplied fields, stamping the
-    id and timestamps. ``schedule`` is stored verbatim and otherwise inert."""
+    id and timestamps. Scheduling is no longer stored here — a scheduled run is a
+    ``run_agent`` record in the schedule store (aime.scheduling) that references
+    this agent's id, so an agent can have zero or several schedules independent
+    of its definition."""
     now = _utc_now_iso()
     return {
         "agent_id": agent_id or new_agent_id(name),
@@ -64,8 +68,6 @@ def make_definition(
         "description": description,
         "instructions": instructions,
         "allow_web_search": bool(allow_web_search),
-        # Reserved for a future scheduler — persisted but never executed yet.
-        "schedule": schedule or None,
         "created_at": now,
         "updated_at": now,
     }
@@ -132,7 +134,8 @@ class AgentDefinitionStore:
                 self._dek, blob, aad=agent_id.encode("utf-8")
             )
             return json.loads(plaintext.decode("utf-8"))
-        except (OSError, ValueError):
+        except (OSError, ValueError, InvalidTag):
+            # Missing, corrupt, or AAD-mismatched (wrong id) — treat as unreadable.
             return None
 
     def list_agents(self) -> list[dict]:

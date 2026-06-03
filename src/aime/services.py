@@ -56,6 +56,20 @@ class CalendarService:
         )
         return _events_from(data)
 
+    def events_in_range(self, start_date: str, end_date: str, *, include_archived: bool = False) -> list[dict]:
+        """Every event with a date in ``[start_date, end_date]`` (both
+        ``DD/MM/YYYY``), ascending. Used by the scheduler to arm event reminders
+        over a horizon, off any request."""
+        data = self._gw.call(
+            "get_events",
+            sort_order="asc",
+            filter_by_date=True,
+            start_date=start_date,
+            end_date=end_date,
+            archived="all" if include_archived else "active_only",
+        )
+        return _events_from(data)
+
     def events_for_day(self, year: int, month: int, day: int, *, include_archived: bool = False) -> list[dict]:
         day_str = f"{day:02d}/{month:02d}/{year}"
         data = self._gw.call(

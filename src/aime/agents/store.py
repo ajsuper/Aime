@@ -18,6 +18,8 @@ import datetime
 import json
 import os
 
+from cryptography.exceptions import InvalidTag
+
 from .. import encryption as _enc
 
 
@@ -70,7 +72,8 @@ class AgentRunStore:
                 self._dek, blob, aad=run_id.encode("utf-8")
             )
             return json.loads(plaintext.decode("utf-8"))
-        except (OSError, ValueError):
+        except (OSError, ValueError, InvalidTag):
+            # Missing, corrupt, or AAD-mismatched (wrong id) — treat as unreadable.
             return None
 
     def list_runs(self) -> list[dict]:

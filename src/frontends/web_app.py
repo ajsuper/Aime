@@ -73,6 +73,13 @@ from aime.agents import (
     make_definition,
     register as _register_agent,
 )
+from aime.scheduling import (
+    ScheduleStore,
+    Scheduler,
+    make_schedule,
+    render_message,
+    validate_schedule,
+)
 from aime import auth as _auth
 from aime import encryption as _enc
 from aime import backup as _backup
@@ -138,6 +145,12 @@ def _agents_dir(user_id: int) -> str:
     Sibling of ``agent_runs/``: the agent's *definition* lives here, the records
     of what it did live there."""
     return os.path.join(_user_dir(user_id), "agents")
+
+
+def _schedules_dir(user_id: int) -> str:
+    """Where ``ScheduleStore`` keeps this user's encrypted schedule records
+    (scheduled agents + event reminders). Sibling of ``agents/``."""
+    return os.path.join(_user_dir(user_id), "schedules")
 
 
 # LEGACY MIGRATION — pre-multi-user installs kept all conversations in a
@@ -1931,6 +1944,105 @@ def _agent_def_store(user_id: int) -> AgentDefinitionStore:
     return AgentDefinitionStore(_agents_dir(user_id), _auth_backend.get_dek(user_id))
 
 
+def _schedule_store(user_id: int) -> ScheduleStore:
+    return ScheduleStore(_schedules_dir(user_id), _auth_backend.get_dek(user_id))
+
+
+# --- Scheduler wiring ------------------------------------------------------
+# The scheduler core (aime.scheduling) is deliberately ignorant of this app: it
+# fires due records by calling back into these three helpers. They are the only
+# bridge between the headless loop and the request-time machinery (agent runs,
+# messaging, the events backend).
+
+
+def _scheduler_run_agent(agent_id: str, user_id: int, tz: str | None) -> None:
+    """Scheduler action: run a saved agent now, exactly as its Run button does.
+
+    Honors the same api-access gate as ``/agents/<id>/run`` — a scheduled run
+    spends tokens, so an account without send access must not fire one. A
+    deleted agent is a quiet no-op (the user can remove the dangling schedule)."""
+    rec = _auth_backend.lookup(user_id)
+    if rec is None or not rec.api_access:
+        return
+    record = _agent_def_store(user_id).load(agent_id)
+    if record is None:
+        return
+    _launch_agent_run(definition_to_spec(record), user_id, tz, agent_id=agent_id)
+
+
+def _scheduler_send_message(user_id: int, text: str) -> None:
+    """Scheduler action: deliver a reminder to the user's stored contact over the
+    configured channel. Best-effort — messaging off, no contact connected, or a
+    transport hiccup all degrade to a quiet skip rather than a hard failure."""
+    from aime import messaging as _aime_messaging
+    messenger = _aime_messaging.get_messenger()
+    if messenger is None:
+        return
+    rec = _auth_backend.lookup(user_id)
+    contact = rec.messaging_contact if rec else None
+    if not contact:
+        return
+    try:
+        messenger.send(contact, text)
+    except _aime_messaging.MessageSendError as exc:
+        app.logger.warning("scheduled reminder to user %s failed: %s", user_id, exc)
+
+
+def _scheduler_upcoming_events(user_id: int) -> list:
+    """Active events from today out to the reminder horizon (~400 days, past the
+    366-day ``days_before`` cap), for the scheduler's event reminders. Built off
+    any request, so it constructs its own gateway rather than a UserContext.
+
+    Returning the full horizon is a correctness contract: a relative schedule
+    whose linked event isn't in this list is treated as an orphan and deleted,
+    so the window must be wide enough to always include an armed reminder's
+    event (see docs/scheduling.md §8)."""
+    gw = ToolGateway(api_url=aime_config.API_URL, user_id=user_id)
+    today = datetime.date.today()
+    end = today + datetime.timedelta(days=400)
+    return CalendarService(gw).events_in_range(
+        today.strftime("%d/%m/%Y"), end.strftime("%d/%m/%Y")
+    )
+
+
+def _dispatch_schedule_now(user_id: int, record: dict, tz: str | None) -> None:
+    """Fire a schedule's action immediately (the manual /run path), mirroring
+    what the loop's ``_fire`` does — including resolving the linked event so a
+    relative reminder's template renders the same way it would on a real fire.
+    Works even when the background loop is disabled."""
+    action = record.get("action", {})
+    if action.get("kind") == "run_agent":
+        _scheduler_run_agent(action.get("agent_id"), user_id, tz)
+        return
+    event = None
+    trigger = record.get("trigger", {})
+    if trigger.get("kind") == "relative" and trigger.get("event_id") is not None:
+        events = {e["id"]: e for e in _scheduler_upcoming_events(user_id) if "id" in e}
+        event = events.get(trigger["event_id"])
+    _scheduler_send_message(user_id, render_message(action.get("message", ""), event))
+
+
+_scheduler: Scheduler | None = None
+
+
+def _start_scheduler() -> None:
+    """Boot the background scheduler thread once, unless disabled via
+    ``AIME_SCHEDULER=0`` (tests, or a deploy that runs the loop elsewhere)."""
+    global _scheduler
+    if os.environ.get("AIME_SCHEDULER", "1").strip().lower() in ("0", "false", "no", "off"):
+        return
+    if _scheduler is not None:
+        return
+    _scheduler = Scheduler(
+        auth=_auth_backend,
+        schedules_dir=_schedules_dir,
+        run_agent=_scheduler_run_agent,
+        send_message=_scheduler_send_message,
+        upcoming_events=_scheduler_upcoming_events,
+    )
+    _scheduler.start()
+
+
 # In-flight background-agent runs, in memory only. A run record isn't written
 # until the run *finishes*, so without this the UI has no way to show that a run
 # is underway — which reads as "nothing happened" when you press Run. We track
@@ -2104,7 +2216,6 @@ def _agent_def_public(record: dict) -> dict:
         "description": record.get("description", ""),
         "instructions": record.get("instructions", ""),
         "allow_web_search": bool(record.get("allow_web_search", False)),
-        "schedule": record.get("schedule") or None,
         "created_at": record.get("created_at", ""),
         "updated_at": record.get("updated_at", ""),
     }
@@ -2122,7 +2233,7 @@ def agents_list():
 @login_required
 def agents_create():
     """Create and persist a new saved agent. A name and instructions are
-    required; ``schedule`` is accepted and stored but not yet acted on."""
+    required. Scheduling is set separately via /schedules."""
     data = request.get_json(silent=True) or {}
     name = (data.get("name") or "").strip()
     instructions = (data.get("instructions") or "").strip()
@@ -2135,7 +2246,6 @@ def agents_create():
         instructions=instructions,
         description=(data.get("description") or "").strip(),
         allow_web_search=bool(data.get("allow_web_search", False)),
-        schedule=(data.get("schedule") or "").strip() or None,
     )
     if not _agent_def_store(g.user_id).save(record):
         return jsonify({"ok": False, "error": "couldn't save the agent"}), 500
@@ -2166,8 +2276,6 @@ def agents_update(agent_id: str):
         record["description"] = (data.get("description") or "").strip()
     if "allow_web_search" in data:
         record["allow_web_search"] = bool(data.get("allow_web_search"))
-    if "schedule" in data:
-        record["schedule"] = (data.get("schedule") or "").strip() or None
     if not store.save(record):
         return jsonify({"ok": False, "error": "couldn't save the agent"}), 500
     return jsonify({"ok": True, "agent": _agent_def_public(record)})
@@ -2198,6 +2306,114 @@ def agents_run_saved(agent_id: str):
     spec = definition_to_spec(record)
     _launch_agent_run(spec, g.user_id, client_tz, agent_id=agent_id)
     return jsonify({"ok": True, "agent_name": spec.name})
+
+
+# --- Scheduled things ------------------------------------------------------
+# A per-user library of schedule records (scheduled agents + event reminders),
+# each pairing a trigger (when) with an action (what). The background loop fires
+# them; these routes are just CRUD over the encrypted store. See
+# docs/scheduling.md for the record shape and invariants.
+
+
+def _schedule_public(record: dict) -> dict:
+    """Project a stored schedule to the wire shape. The record is the user's own
+    data, so this is mostly pass-through; going through a projection keeps the
+    API decoupled from on-disk additions and surfaces ``state`` (last run /
+    sent markers) the UI uses for 'next run' hints."""
+    return {
+        "schedule_id": record.get("schedule_id", ""),
+        "enabled": bool(record.get("enabled", True)),
+        "tz": record.get("tz", ""),
+        "trigger": record.get("trigger", {}),
+        "action": record.get("action", {}),
+        "state": record.get("state", {}),
+        "created_at": record.get("created_at", ""),
+        "updated_at": record.get("updated_at", ""),
+    }
+
+
+@app.route("/schedules", methods=["GET"])
+@login_required
+def schedules_list():
+    """Every schedule this user has, newest first."""
+    items = _schedule_store(g.user_id).list_schedules()
+    return jsonify({"schedules": [_schedule_public(s) for s in items]})
+
+
+@app.route("/schedules", methods=["POST"])
+@login_required
+def schedules_create():
+    """Create a schedule from a ``{trigger, action, tz, enabled?, label?}`` body.
+    Validated against the tagged-variant invariants; a bad record is a 400 with
+    the precise reason."""
+    data = request.get_json(silent=True) or {}
+    record = make_schedule(
+        trigger=data.get("trigger") or {},
+        action=data.get("action") or {},
+        tz=(data.get("tz") or "").strip(),
+        enabled=bool(data.get("enabled", True)),
+        label=(data.get("label") or "").strip(),
+    )
+    err = validate_schedule(record)
+    if err is not None:
+        return jsonify({"ok": False, "error": err}), 400
+    if not _schedule_store(g.user_id).save(record):
+        return jsonify({"ok": False, "error": "couldn't save the schedule"}), 500
+    return jsonify({"ok": True, "schedule": _schedule_public(record)})
+
+
+@app.route("/schedules/<schedule_id>", methods=["PUT"])
+@login_required
+def schedules_update(schedule_id: str):
+    """Update an existing schedule. Only the fields present in the request are
+    changed; ``state``, id, and creation time are preserved. Editing the trigger
+    clears stale fire-state so the change takes effect cleanly."""
+    store = _schedule_store(g.user_id)
+    record = store.load(schedule_id)
+    if record is None:
+        return jsonify({"ok": False, "error": "schedule not found"}), 404
+    data = request.get_json(silent=True) or {}
+    if "enabled" in data:
+        record["enabled"] = bool(data.get("enabled"))
+    if "tz" in data:
+        record["tz"] = (data.get("tz") or "").strip()
+    if "trigger" in data:
+        record["trigger"] = data.get("trigger") or {}
+        # The trigger defines what the fire-state tracks; a changed trigger makes
+        # the old markers meaningless, so reset them to re-arm from scratch.
+        record["state"] = {"last_run_at": None, "fired_at": None, "sent_for_start": None}
+    if "action" in data:
+        record["action"] = data.get("action") or {}
+    err = validate_schedule(record)
+    if err is not None:
+        return jsonify({"ok": False, "error": err}), 400
+    if not store.save(record):
+        return jsonify({"ok": False, "error": "couldn't save the schedule"}), 500
+    return jsonify({"ok": True, "schedule": _schedule_public(record)})
+
+
+@app.route("/schedules/<schedule_id>", methods=["DELETE"])
+@login_required
+def schedules_delete(schedule_id: str):
+    """Delete a schedule. Any agent runs it already produced are left in place."""
+    _schedule_store(g.user_id).delete(schedule_id)
+    return jsonify({"ok": True})
+
+
+@app.route("/schedules/<schedule_id>/run", methods=["POST"])
+@login_required
+@api_access_required
+def schedules_run_now(schedule_id: str):
+    """Fire a schedule's action immediately — a manual test trigger. Doesn't
+    touch fire-state, so the normal cadence is unaffected."""
+    record = _schedule_store(g.user_id).load(schedule_id)
+    if record is None:
+        return jsonify({"ok": False, "error": "schedule not found"}), 404
+    data = request.get_json(silent=True) or {}
+    tz = data.get("tz")
+    client_tz = tz if isinstance(tz, str) and tz else record.get("tz")
+    _dispatch_schedule_now(g.user_id, record, client_tz)
+    return jsonify({"ok": True})
 
 
 @app.route("/calendar/<int:year>/<int:month>")
@@ -2537,5 +2753,9 @@ if __name__ == "__main__":
     ssl_context = None
     if int(os.environ.get("AIME_HTTPS", "0")):
         ssl_context = _load_or_create_tls_context()
+    # Start the background scheduler (scheduled agents + event reminders). Safe
+    # here because the deployment is a single threaded process — one loop, no
+    # double-fire. Disabled with AIME_SCHEDULER=0.
+    _start_scheduler()
     app.run(host=host, port=port, threaded=True, debug=False,
             ssl_context=ssl_context)

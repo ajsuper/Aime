@@ -895,6 +895,51 @@
     .agent-edit-actions .ghost { background: transparent; color: var(--text); }
     .agent-edit-actions .ghost:hover { border-color: var(--accent); }
 
+    /* Schedule control (agent modal) + the card's quick toggle. */
+    .sched-switch { display: inline-flex; align-items: center; gap: 0.55rem;
+                    cursor: pointer; user-select: none; margin-top: 0.3rem; }
+    .sched-switch input { position: absolute; opacity: 0; width: 0; height: 0; }
+    .sched-slider { position: relative; flex: 0 0 auto; width: 38px; height: 22px;
+                    background: var(--border); border-radius: 999px;
+                    transition: background 0.18s ease; }
+    .sched-slider::before { content: ""; position: absolute; top: 2px; left: 2px;
+                    width: 18px; height: 18px; border-radius: 50%; background: #fff;
+                    box-shadow: 0 1px 2px rgba(0,0,0,0.3); transition: transform 0.18s ease; }
+    .sched-switch input:checked + .sched-slider { background: var(--accent); }
+    .sched-switch input:checked + .sched-slider::before { transform: translateX(16px); }
+    .sched-switch input:focus-visible + .sched-slider {
+                    outline: 2px solid var(--accent); outline-offset: 2px; }
+    .sched-switch.mini .sched-slider { width: 32px; height: 18px; }
+    .sched-switch.mini .sched-slider::before { width: 14px; height: 14px; }
+    .sched-switch.mini input:checked + .sched-slider::before { transform: translateX(14px); }
+    .sched-switch-label { font-size: 0.88rem; color: var(--text); }
+
+    .sched-config { display: flex; flex-direction: column; gap: 0.5rem;
+                    margin-top: 0.55rem; padding: 0.6rem 0.7rem;
+                    border: 1px solid var(--border); border-radius: 10px;
+                    background: var(--bg); }
+    .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 8px;
+           overflow: hidden; align-self: flex-start; }
+    .seg button { background: transparent; color: var(--muted); border: none;
+                  padding: 0.35rem 0.8rem; font: inherit; font-size: 0.85rem;
+                  font-weight: 600; cursor: pointer; border-right: 1px solid var(--border); }
+    .seg button:last-child { border-right: none; }
+    .seg button.active { background: var(--accent); color: #fff; }
+    .sched-row { display: flex; align-items: center; gap: 0.5rem; }
+    .sched-row label { font-size: 0.85rem; color: var(--muted); min-width: 5.5em; }
+    .sched-config input[type="time"], .sched-config select {
+                  background: var(--bg); color: var(--text);
+                  border: 1px solid var(--border); border-radius: 8px;
+                  padding: 0.35rem 0.5rem; font: inherit; font-size: 0.88rem; }
+    .sched-config input[type="time"]:focus, .sched-config select:focus {
+                  outline: none; border-color: var(--accent); }
+
+    /* The schedule line on a saved-agent card. */
+    .agent-card-sched { display: flex; align-items: center; gap: 0.5rem;
+                        margin-top: 0.15rem; }
+    .agent-card-sched-text { font-size: 0.78rem; color: var(--muted); }
+    .agent-card-sched-text.off { opacity: 0.65; font-style: italic; }
+
     /* Calendar */
     .cal-toolbar { display: flex; align-items: center; gap: 0.5rem;
                    padding: 0.5rem 1rem; border-bottom: 1px solid var(--border);
@@ -2319,10 +2364,31 @@
           <input type="checkbox" id="agent-edit-web-search">
           <span>Allow web search</span>
         </label>
-        <label class="agents-label" for="agent-schedule">Schedule <span class="agents-optional">(coming soon)</span></label>
-        <input id="agent-schedule" type="text" spellcheck="false" maxlength="120"
-               placeholder="e.g. every Monday at 9am" disabled>
-        <p class="agents-hint">Scheduling isn't active yet — saved here for when it lands.</p>
+        <label class="agents-label">Schedule</label>
+        <label class="sched-switch">
+          <input type="checkbox" id="agent-sched-enabled">
+          <span class="sched-slider"></span>
+          <span class="sched-switch-label">Run this agent automatically</span>
+        </label>
+        <div id="agent-sched-config" class="sched-config" hidden>
+          <div class="seg" id="agent-sched-freq" role="group" aria-label="Frequency">
+            <button type="button" data-freq="daily" class="active">Daily</button>
+            <button type="button" data-freq="weekly">Weekly</button>
+            <button type="button" data-freq="monthly">Monthly</button>
+          </div>
+          <div class="sched-row">
+            <label for="agent-sched-time">Time</label>
+            <input type="time" id="agent-sched-time" value="09:00">
+          </div>
+          <div class="sched-row" id="agent-sched-weekday-row" hidden>
+            <label for="agent-sched-weekday">On</label>
+            <select id="agent-sched-weekday"></select>
+          </div>
+          <div class="sched-row" id="agent-sched-day-row" hidden>
+            <label for="agent-sched-day">Day of month</label>
+            <select id="agent-sched-day"></select>
+          </div>
+        </div>
         <p class="agents-hint error" id="agent-edit-hint" hidden></p>
         <div class="agent-edit-actions">
           <button id="agent-edit-cancel" class="ghost">Cancel</button>
@@ -4240,11 +4306,13 @@ async function loadAgentsPane(silent) {
     savedAgentsListEl.innerHTML = '<div class="empty">loading…</div>';
     agentRunsListEl.innerHTML = '<div class="empty">loading…</div>';
   }
-  let agents = null, runData = null;
+  let agents = null, runData = null, schedules = [];
   try {
-    const [ar, rr] = await Promise.all([fetch("/agents"), fetch("/agent-runs")]);
+    const [ar, rr, sr] = await Promise.all([
+      fetch("/agents"), fetch("/agent-runs"), fetch("/schedules")]);
     agents = (await ar.json()).agents || [];
     runData = await rr.json();
+    schedules = (await sr.json()).schedules || [];
   } catch (e) {
     if (!silent) {
       const msg = '<div class="empty">error: ' + e + '</div>';
@@ -4253,6 +4321,15 @@ async function loadAgentsPane(silent) {
     }
     return;
   }
+  // Attach each agent's run_agent schedule (at most one per agent) to its card
+  // data, so the card can show the toggle and the editor can prefill it.
+  const schedByAgent = {};
+  schedules.forEach(s => {
+    if (s.action && s.action.kind === "run_agent" && s.action.agent_id) {
+      schedByAgent[s.action.agent_id] = s;
+    }
+  });
+  agents.forEach(a => { a._schedule = schedByAgent[a.agent_id] || null; });
   const active = runData.active || [];
   // Agent ids with a run in flight, so their cards show a running state.
   const activeAgentIds = new Set(active.map(a => a.agent_id).filter(Boolean));
@@ -4324,12 +4401,31 @@ function buildAgentCard(agent, running) {
     w.textContent = "🌐 web search";
     meta.appendChild(w);
   }
-  if (agent.schedule) {
-    const s = document.createElement("span");
-    s.textContent = "🕑 " + agent.schedule;
-    meta.appendChild(s);
-  }
   if (meta.childNodes.length) card.appendChild(meta);
+
+  // Schedule line: a quick on/off toggle + a human summary, shown only once the
+  // agent has a schedule configured (set up in the editor). Toggling here flips
+  // `enabled` without reopening the modal — and sends only that field, so the
+  // fire-state (last run) is preserved.
+  if (agent._schedule) {
+    const srow = document.createElement("div");
+    srow.className = "agent-card-sched";
+    const sw = document.createElement("label");
+    sw.className = "sched-switch mini";
+    sw.title = "Run automatically on this schedule";
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = !!agent._schedule.enabled;
+    const slider = document.createElement("span");
+    slider.className = "sched-slider";
+    const txt = document.createElement("span");
+    txt.className = "agent-card-sched-text" + (cb.checked ? "" : " off");
+    txt.textContent = scheduleSummary(agent._schedule.trigger);
+    cb.addEventListener("change", () => toggleAgentSchedule(agent._schedule, cb, txt));
+    sw.appendChild(cb); sw.appendChild(slider);
+    srow.appendChild(sw); srow.appendChild(txt);
+    card.appendChild(srow);
+  }
 
   const actions = document.createElement("div");
   actions.className = "agent-card-actions";
@@ -4393,10 +4489,58 @@ function deleteSavedAgent(agent) {
       try {
         await fetch("/agents/" + encodeURIComponent(agent.agent_id),
                     { method: "DELETE" });
+        // Drop the agent's schedule too, so the loop isn't left firing a
+        // run_agent record pointing at an agent that no longer exists.
+        if (agent._schedule) {
+          await fetch("/schedules/" + encodeURIComponent(agent._schedule.schedule_id),
+                      { method: "DELETE" });
+        }
       } catch (e) { /* a failed delete just leaves the card; reload shows truth */ }
       loadAgentsPane(true);
     },
   });
+}
+
+const WEEKDAY_NAMES = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"];
+
+// "9:00 AM" from "09:00" — friendlier than 24h on the cards.
+function fmt12(hhmm) {
+  const [h, m] = (hhmm || "09:00").split(":").map(n => parseInt(n, 10));
+  const ap = h < 12 ? "AM" : "PM";
+  const h12 = ((h + 11) % 12) + 1;
+  return h12 + ":" + String(m).padStart(2, "0") + " " + ap;
+}
+
+// A human one-liner for a recurring trigger, e.g. "Weekly · Mon 9:00 AM".
+function scheduleSummary(t) {
+  if (!t) return "";
+  const time = fmt12(t.time);
+  if (t.freq === "weekly") {
+    const wd = WEEKDAY_NAMES[(parseInt(t.weekday, 10) || 1) - 1] || "Mon";
+    return "Weekly · " + wd.slice(0, 3) + " " + time;
+  }
+  if (t.freq === "monthly") return "Monthly · day " + (t.day || 1) + " " + time;
+  return "Daily · " + time;
+}
+
+// Card quick-toggle: flip only `enabled` (never the trigger), so the server
+// keeps the fire-state intact. Reverts the switch if the request fails.
+async function toggleAgentSchedule(schedule, cb, txt) {
+  const enabled = cb.checked;
+  try {
+    const r = await fetch("/schedules/" + encodeURIComponent(schedule.schedule_id), {
+      method: "PUT",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ enabled }),
+    });
+    const data = await r.json();
+    if (!data.ok) throw new Error(data.message || data.error || "failed");
+    schedule.enabled = enabled;
+    if (txt) txt.classList.toggle("off", !enabled);
+  } catch (e) {
+    cb.checked = !enabled;
+    alert("Couldn't update the schedule — " + (e.message || e));
+  }
 }
 
 // -- Create / edit modal ------------------------------------------------
@@ -4407,12 +4551,77 @@ const agentNameEl = document.getElementById("agent-name");
 const agentDescEl = document.getElementById("agent-desc");
 const agentEditInstructionsEl = document.getElementById("agent-edit-instructions");
 const agentEditWebSearchEl = document.getElementById("agent-edit-web-search");
-const agentScheduleEl = document.getElementById("agent-schedule");
 const agentEditHint = document.getElementById("agent-edit-hint");
 const agentEditSaveBtn = document.getElementById("agent-edit-save");
 
-// The agent currently being edited (null => creating a new one).
+// Schedule control elements (agent modal).
+const agentSchedEnabledEl = document.getElementById("agent-sched-enabled");
+const agentSchedConfigEl = document.getElementById("agent-sched-config");
+const agentSchedFreqEl = document.getElementById("agent-sched-freq");
+const agentSchedTimeEl = document.getElementById("agent-sched-time");
+const agentSchedWeekdayRow = document.getElementById("agent-sched-weekday-row");
+const agentSchedWeekdayEl = document.getElementById("agent-sched-weekday");
+const agentSchedDayRow = document.getElementById("agent-sched-day-row");
+const agentSchedDayEl = document.getElementById("agent-sched-day");
+
+// The agent currently being edited (null => creating a new one), and that
+// agent's existing schedule record (null => none yet).
 let editingAgentId = null;
+let editingAgentSchedule = null;
+
+// Populate the weekday/day-of-month selects once.
+WEEKDAY_NAMES.forEach((name, i) => {
+  const o = document.createElement("option");
+  o.value = String(i + 1); o.textContent = name;
+  agentSchedWeekdayEl.appendChild(o);
+});
+for (let d = 1; d <= 31; d++) {
+  const o = document.createElement("option");
+  o.value = String(d); o.textContent = String(d);
+  agentSchedDayEl.appendChild(o);
+}
+
+function currentSchedFreq() {
+  const b = agentSchedFreqEl.querySelector("button.active");
+  return b ? b.dataset.freq : "daily";
+}
+
+function setSchedFreq(freq) {
+  agentSchedFreqEl.querySelectorAll("button").forEach(b =>
+    b.classList.toggle("active", b.dataset.freq === freq));
+  updateSchedVisibility();
+}
+
+// Config block appears only when the toggle is on; the weekday/day rows appear
+// only for the frequency that uses them.
+function updateSchedVisibility() {
+  agentSchedConfigEl.hidden = !agentSchedEnabledEl.checked;
+  const freq = currentSchedFreq();
+  agentSchedWeekdayRow.hidden = freq !== "weekly";
+  agentSchedDayRow.hidden = freq !== "monthly";
+}
+
+function setScheduleControl(sched) {
+  const t = (sched && sched.trigger) || {};
+  agentSchedEnabledEl.checked = !!(sched && sched.enabled);
+  agentSchedTimeEl.value = t.time || "09:00";
+  agentSchedWeekdayEl.value = String(t.weekday || 1);
+  agentSchedDayEl.value = String(t.day || 1);
+  setSchedFreq(t.freq || "daily");
+}
+
+// Build a recurring trigger from the control's current state.
+function scheduleTriggerFromControl() {
+  const freq = currentSchedFreq();
+  const t = { kind: "recurring", freq, time: agentSchedTimeEl.value || "09:00" };
+  if (freq === "weekly") t.weekday = parseInt(agentSchedWeekdayEl.value, 10);
+  if (freq === "monthly") t.day = parseInt(agentSchedDayEl.value, 10);
+  return t;
+}
+
+agentSchedEnabledEl.addEventListener("change", updateSchedVisibility);
+agentSchedFreqEl.querySelectorAll("button").forEach(b =>
+  b.addEventListener("click", () => setSchedFreq(b.dataset.freq)));
 
 function openAgentEditor(agent) {
   editingAgentId = agent ? agent.agent_id : null;
@@ -4421,7 +4630,8 @@ function openAgentEditor(agent) {
   agentDescEl.value = agent ? (agent.description || "") : "";
   agentEditInstructionsEl.value = agent ? (agent.instructions || "") : "";
   agentEditWebSearchEl.checked = agent ? !!agent.allow_web_search : false;
-  agentScheduleEl.value = agent ? (agent.schedule || "") : "";
+  editingAgentSchedule = agent ? (agent._schedule || null) : null;
+  setScheduleControl(editingAgentSchedule);
   setAgentEditHint("");
   agentEditBackdrop.hidden = false;
   agentNameEl.focus();
@@ -4451,7 +4661,6 @@ async function saveAgentEditor() {
     instructions,
     description: agentDescEl.value.trim(),
     allow_web_search: agentEditWebSearchEl.checked,
-    schedule: agentScheduleEl.value.trim(),
   };
   const editing = editingAgentId;
   agentEditSaveBtn.disabled = true;
@@ -4463,6 +4672,8 @@ async function saveAgentEditor() {
     });
     const data = await r.json();
     if (!data.ok) throw new Error(data.message || data.error || "failed to save");
+    const agentId = editing || (data.agent && data.agent.agent_id);
+    await saveAgentSchedule(agentId);
     closeAgentEditor();
     loadAgentsPane(true);
   } catch (e) {
@@ -4470,6 +4681,39 @@ async function saveAgentEditor() {
   } finally {
     agentEditSaveBtn.disabled = false;
   }
+}
+
+// Upsert the agent's one schedule from the modal control:
+//  • existing record → PUT the new trigger + enabled (re-arms on trigger change).
+//  • no record + toggle on → POST a new run_agent schedule for this agent.
+//  • no record + toggle off → nothing to do.
+// A throw here surfaces in saveAgentEditor's catch as a save error.
+async function saveAgentSchedule(agentId) {
+  if (!agentId) return;
+  const enabled = agentSchedEnabledEl.checked;
+  const trigger = scheduleTriggerFromControl();
+  const tz = clientTimezone();
+  let resp;
+  if (editingAgentSchedule) {
+    resp = await fetch("/schedules/" + encodeURIComponent(editingAgentSchedule.schedule_id), {
+      method: "PUT",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ enabled, tz, trigger }),
+    });
+  } else if (enabled) {
+    resp = await fetch("/schedules", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        enabled: true, tz, trigger,
+        action: { kind: "run_agent", agent_id: agentId },
+      }),
+    });
+  } else {
+    return;
+  }
+  const data = await resp.json();
+  if (!data.ok) throw new Error(data.message || data.error || "couldn't save the schedule");
 }
 
 document.getElementById("agent-new-btn")
