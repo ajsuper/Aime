@@ -1931,13 +1931,53 @@ def _agent_def_store(user_id: int) -> AgentDefinitionStore:
     return AgentDefinitionStore(_agents_dir(user_id), _auth_backend.get_dek(user_id))
 
 
-def _launch_agent_run(spec: AgentSpec, user_id: int, client_tz: str | None) -> None:
+# In-flight background-agent runs, in memory only. A run record isn't written
+# until the run *finishes*, so without this the UI has no way to show that a run
+# is underway — which reads as "nothing happened" when you press Run. We track
+# every launched run here (keyed user_id -> token -> descriptor) for the brief
+# window it's executing, surface it as a "running" entry, and drop it the moment
+# the run lands its record. Safe as a plain dict + lock because the server is a
+# single process; it's intentionally ephemeral (a restart clears it, which is
+# correct — those threads died with the process).
+_active_agent_runs: dict[int, dict[str, dict]] = {}
+_active_runs_lock = threading.Lock()
+
+
+def _add_active_run(user_id: int, descriptor: dict) -> None:
+    with _active_runs_lock:
+        _active_agent_runs.setdefault(user_id, {})[descriptor["token"]] = descriptor
+
+
+def _remove_active_run(user_id: int, token: str) -> None:
+    with _active_runs_lock:
+        runs = _active_agent_runs.get(user_id)
+        if runs:
+            runs.pop(token, None)
+            if not runs:
+                _active_agent_runs.pop(user_id, None)
+
+
+def _list_active_runs(user_id: int) -> list[dict]:
+    """Descriptors for this user's in-flight runs, newest first."""
+    with _active_runs_lock:
+        runs = list(_active_agent_runs.get(user_id, {}).values())
+    runs.sort(key=lambda r: r.get("started_at", ""), reverse=True)
+    return runs
+
+
+def _launch_agent_run(
+    spec: AgentSpec, user_id: int, client_tz: str | None,
+    *, agent_id: str | None = None,
+) -> None:
     """Start a background-agent run for ``spec`` against ``user_id``'s data on a
     daemon thread and return immediately. The run persists its own encrypted run
     record (and converts its own failures into an ``error`` record), so there is
     nothing to await here — open panes learn the outcome via the run-update
     fanout fired when the thread finishes. Shared by the ad-hoc launcher and the
-    saved-agent run button so both behave identically."""
+    saved-agent run button so both behave identically.
+
+    ``agent_id`` ties the run back to a saved agent (None for ad-hoc), so the UI
+    can mark that agent's card as running."""
     ctx = _context_for(user_id)
     username = ctx.username
     dek = _auth_backend.get_dek(user_id)
@@ -1947,6 +1987,16 @@ def _launch_agent_run(spec: AgentSpec, user_id: int, client_tz: str | None) -> N
     # graceful "no contact connected" result instead of a misfire.
     _rec = _auth_backend.lookup(user_id)
     messaging_contact = _rec.messaging_contact if _rec else None
+
+    token = base64.b16encode(os.urandom(8)).decode().lower()
+    descriptor = {
+        "token": token,
+        "agent_id": agent_id,
+        "agent_name": spec.name,
+        "started_at": datetime.datetime.now(datetime.timezone.utc)
+                          .isoformat(timespec="seconds"),
+    }
+    _add_active_run(user_id, descriptor)
 
     def _run() -> None:
         try:
@@ -1967,13 +2017,14 @@ def _launch_agent_run(spec: AgentSpec, user_id: int, client_tz: str | None) -> N
             # fires so the UI doesn't hang on "running…".
             pass
         finally:
+            _remove_active_run(user_id, token)
             ctx.notify_agent_run_update()
 
     threading.Thread(
         target=_run, name=f"agent-run-{user_id}", daemon=True
     ).start()
-    # Tell open panes a run is now in flight (so a "running…" state can show);
-    # the result lands via the run record + the finished fanout above.
+    # Tell open panes a run is now in flight (so the "running" entry appears
+    # immediately); the result lands via the run record + the finished fanout.
     ctx.notify_agent_run_update()
 
 
@@ -1981,8 +2032,13 @@ def _launch_agent_run(spec: AgentSpec, user_id: int, client_tz: str | None) -> N
 @login_required
 def agent_runs():
     """Lightweight metadata for every stored run, newest first — enough to
-    list them without pulling full transcripts into the listing."""
-    return jsonify({"runs": _agent_run_store(g.user_id).list_runs()})
+    list them without pulling full transcripts into the listing. ``active`` adds
+    the runs in flight right now (which have no record on disk yet) so the UI can
+    show what's currently running."""
+    return jsonify({
+        "runs": _agent_run_store(g.user_id).list_runs(),
+        "active": _list_active_runs(g.user_id),
+    })
 
 
 @app.route("/agent-runs/<run_id>")
@@ -2140,7 +2196,7 @@ def agents_run_saved(agent_id: str):
     tz = data.get("tz")
     client_tz = tz if isinstance(tz, str) and tz else None
     spec = definition_to_spec(record)
-    _launch_agent_run(spec, g.user_id, client_tz)
+    _launch_agent_run(spec, g.user_id, client_tz, agent_id=agent_id)
     return jsonify({"ok": True, "agent_name": spec.name})
 
 

@@ -856,6 +856,21 @@
                        color: var(--error); }
     .agent-card-actions button:disabled { opacity: 0.5; cursor: default;
                        border-color: var(--border); color: var(--muted); }
+    /* Running state: a card with a run in flight gets an accent edge, and its
+       Run button shows a live spinner. */
+    .agent-card.is-running { border-left: 2px solid var(--accent); }
+    .agent-card-actions .run-btn:disabled { opacity: 1; color: var(--accent);
+                       border-color: var(--accent); }
+    .agent-run-item.is-active { cursor: default; }
+    .agent-run-item.is-active .summary { color: var(--text); }
+    .agent-status.running .run-spinner, .run-btn .run-spinner {
+                       border-top-color: var(--accent); }
+    .run-spinner { display: inline-block; width: 0.7em; height: 0.7em;
+                       margin-right: 0.35em; vertical-align: -0.05em;
+                       border: 2px solid currentColor; border-top-color: transparent;
+                       border-radius: 50%; opacity: 0.85;
+                       animation: run-spin 0.7s linear infinite; }
+    @keyframes run-spin { to { transform: rotate(360deg); } }
 
     /* Create/edit modal inputs. */
     #agent-edit-modal { max-width: 560px; }
@@ -4219,53 +4234,76 @@ const savedAgentsListEl = document.getElementById("saved-agents-list");
 const agentRunsListEl = document.getElementById("agent-runs-list");
 
 async function loadAgentsPane(silent) {
-  await Promise.all([loadSavedAgents(silent), loadAgentRunsList(silent)]);
-}
-
-async function loadSavedAgents(silent) {
-  if (!silent) savedAgentsListEl.innerHTML = '<div class="empty">loading…</div>';
-  let agents = [];
+  // Fetch saved agents and runs (which include the in-flight ones) together so
+  // the "running" state is consistent across the cards and the runs list.
+  if (!silent) {
+    savedAgentsListEl.innerHTML = '<div class="empty">loading…</div>';
+    agentRunsListEl.innerHTML = '<div class="empty">loading…</div>';
+  }
+  let agents = null, runData = null;
   try {
-    const r = await fetch("/agents");
-    const data = await r.json();
-    agents = data.agents || [];
+    const [ar, rr] = await Promise.all([fetch("/agents"), fetch("/agent-runs")]);
+    agents = (await ar.json()).agents || [];
+    runData = await rr.json();
   } catch (e) {
-    if (!silent) savedAgentsListEl.innerHTML = '<div class="empty">error: ' + e + '</div>';
+    if (!silent) {
+      const msg = '<div class="empty">error: ' + e + '</div>';
+      savedAgentsListEl.innerHTML = msg;
+      agentRunsListEl.innerHTML = msg;
+    }
     return;
   }
+  const active = runData.active || [];
+  // Agent ids with a run in flight, so their cards show a running state.
+  const activeAgentIds = new Set(active.map(a => a.agent_id).filter(Boolean));
+  renderSavedAgents(agents, activeAgentIds);
+  renderAgentRuns(runData.runs || [], active);
+}
+
+function renderSavedAgents(agents, activeAgentIds) {
   savedAgentsListEl.innerHTML = "";
   if (!agents.length) {
     savedAgentsListEl.innerHTML =
       '<div class="empty">No agents yet — create one to get started.</div>';
     return;
   }
-  agents.forEach(a => savedAgentsListEl.appendChild(buildAgentCard(a)));
+  agents.forEach(a =>
+    savedAgentsListEl.appendChild(buildAgentCard(a, activeAgentIds.has(a.agent_id))));
 }
 
-async function loadAgentRunsList(silent) {
-  if (!silent) agentRunsListEl.innerHTML = '<div class="empty">loading…</div>';
-  let runs = [];
-  try {
-    const r = await fetch("/agent-runs");
-    const data = await r.json();
-    runs = data.runs || [];
-  } catch (e) {
-    if (!silent) agentRunsListEl.innerHTML = '<div class="empty">error: ' + e + '</div>';
-    return;
-  }
+function renderAgentRuns(runs, active) {
   agentRunsListEl.innerHTML = "";
-  if (!runs.length) {
+  if (!active.length && !runs.length) {
     agentRunsListEl.innerHTML = '<div class="empty">no runs yet</div>';
     return;
   }
+  // In-flight runs first (they have no record yet), then finished runs.
+  active.forEach(a => agentRunsListEl.appendChild(buildActiveRunItem(a)));
   runs.forEach(run => agentRunsListEl.appendChild(buildRunItem(run)));
 }
 
+// A run that's executing right now: name + a live "running" badge with a
+// spinner. Not clickable — there's no record to open until it finishes.
+function buildActiveRunItem(active) {
+  const item = document.createElement("div");
+  item.className = "session-item agent-run-item is-active";
+  const summary = document.createElement("div");
+  summary.className = "summary";
+  summary.textContent = active.agent_name || "agent";
+  const badge = document.createElement("span");
+  badge.className = "agent-status running";
+  badge.innerHTML = '<span class="run-spinner"></span>running';
+  item.appendChild(summary);
+  item.appendChild(badge);
+  return item;
+}
+
 // One saved-agent card: name, optional description, a web-search/schedule meta
-// line, and Run / Edit / Delete actions.
-function buildAgentCard(agent) {
+// line, and Run / Edit / Delete actions. When ``running`` the Run button shows
+// a live spinner and is disabled until the run lands.
+function buildAgentCard(agent, running) {
   const card = document.createElement("div");
-  card.className = "agent-card";
+  card.className = "agent-card" + (running ? " is-running" : "");
 
   const name = document.createElement("div");
   name.className = "agent-card-name";
@@ -4298,8 +4336,13 @@ function buildAgentCard(agent) {
 
   const runBtn = document.createElement("button");
   runBtn.className = "run-btn";
-  runBtn.textContent = "Run";
-  runBtn.addEventListener("click", () => runSavedAgent(agent, runBtn));
+  if (running) {
+    runBtn.disabled = true;
+    runBtn.innerHTML = '<span class="run-spinner"></span>Running…';
+  } else {
+    runBtn.textContent = "Run";
+    runBtn.addEventListener("click", () => runSavedAgent(agent, runBtn));
+  }
   actions.appendChild(runBtn);
 
   const editBtn = document.createElement("button");
@@ -4318,7 +4361,13 @@ function buildAgentCard(agent) {
 }
 
 async function runSavedAgent(agent, btn) {
-  if (btn) { btn.disabled = true; btn.textContent = "Starting…"; }
+  // Optimistic: show the run as starting immediately. The server's run-update
+  // fanout then refreshes the pane into the real "running" state, and again
+  // when it finishes.
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = '<span class="run-spinner"></span>Starting…';
+  }
   try {
     const r = await fetch("/agents/" + encodeURIComponent(agent.agent_id) + "/run", {
       method: "POST",
@@ -4327,11 +4376,9 @@ async function runSavedAgent(agent, btn) {
     });
     const data = await r.json();
     if (!data.ok) throw new Error(data.message || data.error || "failed to start");
-    // The run-update fanout refreshes the runs list when it lands; nothing else
-    // to do but reset the button.
+    loadAgentsPane(true);  // pull in the running state right away
   } catch (e) {
     alert("Couldn't run this agent — " + (e.message || e));
-  } finally {
     if (btn) { btn.disabled = false; btn.textContent = "Run"; }
   }
 }
@@ -4347,7 +4394,7 @@ function deleteSavedAgent(agent) {
         await fetch("/agents/" + encodeURIComponent(agent.agent_id),
                     { method: "DELETE" });
       } catch (e) { /* a failed delete just leaves the card; reload shows truth */ }
-      loadSavedAgents(true);
+      loadAgentsPane(true);
     },
   });
 }
@@ -4417,7 +4464,7 @@ async function saveAgentEditor() {
     const data = await r.json();
     if (!data.ok) throw new Error(data.message || data.error || "failed to save");
     closeAgentEditor();
-    loadSavedAgents(true);
+    loadAgentsPane(true);
   } catch (e) {
     setAgentEditHint("Couldn't save — " + (e.message || e));
   } finally {
