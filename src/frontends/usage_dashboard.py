@@ -325,6 +325,81 @@ def _aggregate_tool_per_day(records, day_keys):
     return sorted(out.items(), key=lambda kv: sum(kv[1]), reverse=True)
 
 
+def _aggregate_agents(records):
+    """Fold the background-agent records into per-agent totals.
+
+    Only records stamped ``source == "agent"`` (set by the background-agent
+    runner on its backend, web-search sub-agent and tool calls) count here, so
+    interactive chat cost is excluded. Cost is the *api-record* cost — the same
+    real, billed basis as the Overview/per-user figure — so an agent's spend is
+    directly comparable to a user's. Tool records contribute their call count
+    (what the agent actually did) but not extra cost: their downstream-input
+    cost is already billed on the following turn's api record, and adding the
+    Tools-tab estimate on top would double-count the real bill.
+
+    ``runs`` counts distinct ``session_id``s — each background run opens its
+    own in-memory session, so this is the number of times the agent ran. It
+    requires ``AIME_USAGE_LINK_USERS=1`` (session_id is null otherwise) and
+    reads 0 when linkage is off.
+    """
+    agents = {}
+    for rec in records:
+        if (rec.get("source") or "interactive") != "agent":
+            continue
+        name = rec.get("agent_name") or "(unnamed)"
+        a = agents.setdefault(name, {
+            "api_calls": 0, "tool_calls": 0, "input": 0, "output": 0,
+            "cache_r": 0, "cache_w": 0, "web_searches": 0, "cost": 0.0,
+            "purposes": {}, "_sessions": set(),
+        })
+        sid = rec.get("session_id")
+        if sid:
+            a["_sessions"].add(sid)
+        kind = rec.get("kind")
+        if kind == "api":
+            cc_5m, cc_1h = _report._cache_write_tokens(rec)
+            cost = _report._api_cost(rec)
+            a["api_calls"]    += 1
+            a["input"]        += rec.get("input_tokens", 0)
+            a["output"]       += rec.get("output_tokens", 0)
+            a["cache_r"]      += rec.get("cache_read_tokens", 0)
+            a["cache_w"]      += cc_5m + cc_1h
+            a["web_searches"] += rec.get("web_search_requests", 0)
+            a["cost"]         += cost
+            purpose = rec.get("purpose") or "(unspecified)"
+            a["purposes"][purpose] = a["purposes"].get(purpose, 0.0) + cost
+        elif kind == "tool":
+            a["tool_calls"] += 1
+    for a in agents.values():
+        a["runs"] = len(a.pop("_sessions"))
+        a["cost_per_run"] = (a["cost"] / a["runs"]) if a["runs"] else 0.0
+        # Compact "turn 62% · web_search 30% · …" mix string for the table.
+        total = a["cost"] or 0.0
+        a["purpose_mix"] = ", ".join(
+            f"{p} {100.0 * c / total:.0f}%"
+            for p, c in sorted(a["purposes"].items(), key=lambda kv: kv[1], reverse=True)
+        ) if total else ""
+    return agents
+
+
+def _aggregate_agent_per_day(records, day_keys):
+    """Per-agent daily api cost, aligned to `day_keys` — same shape as
+    `_aggregate_by_day_model`; the Agents tab stacks these into a daily bar
+    chart and feeds the per-agent sparklines."""
+    idx = {d: i for i, d in enumerate(day_keys)}
+    out = {}
+    for rec in records:
+        if rec.get("kind") != "api" or (rec.get("source") or "interactive") != "agent":
+            continue
+        day = str(rec.get("ts", ""))[:10]
+        if day not in idx:
+            continue
+        name = rec.get("agent_name") or "(unnamed)"
+        row = out.setdefault(name, [0.0] * len(day_keys))
+        row[idx[day]] += _report._api_cost(rec)
+    return sorted(out.items(), key=lambda kv: sum(kv[1]), reverse=True)
+
+
 def _prompt_costs(rec):
     """Return (with_cache, without_cache) prompt-token cost for an api record.
 
@@ -2503,6 +2578,101 @@ _FRAGMENT_TOOLS = """<div class="meta">
 """
 
 
+# Agents tab — what headless background-agent runs cost and do, broken down
+# per agent. Records are tagged source=="agent" by the background-agent runner;
+# this view excludes interactive chat entirely. Empty-state when no agent has
+# run in the window.
+_FRAGMENT_AGENTS = """<div class="meta">
+    <span title="Filesystem path of the usage.jsonl log being read.">log: {{ log }}</span><br>
+    <span title="Records matching the current filters.">{{ record_count }} records</span>
+    &middot; <span title="Window the figures cover.">{{ window }}</span>
+    {% if user_raw %} &middot; <span>user: {{ user_raw }}</span>{% endif %}
+    {% if model_raw %} &middot; <span>model: {{ model_raw }}</span>{% endif %}
+</div>
+
+{% if not agents %}
+  <p class="dim">No background-agent activity in this window. Headless agent
+  runs stamp their usage with <code>source="agent"</code>; rows appear here
+  once an agent runs under <code>AIME_USAGE_STATS=1</code>. (The per-agent
+  <em>runs</em> count additionally needs <code>AIME_USAGE_LINK_USERS=1</code>.)</p>
+{% else %}
+
+  <div class="cards">
+    <div class="card accent-blue"
+      title="Real billed USD cost of all background-agent API calls in this window. Same cost basis as the Costs tab (api records only), so it is directly comparable to per-user spend.">
+      <div class="num blue">${{ '%.2f' % agent_total_cost }}</div>
+      <div class="lbl">agent cost</div></div>
+    <div class="card accent-amber"
+      title="Share of total estimated spend in this window that was driven by background agents rather than live chat.">
+      <div class="num warn">{{ '%.1f%%' % agent_cost_share }}</div>
+      <div class="lbl">of total spend</div></div>
+    <div class="card accent-green"
+      title="Number of background-agent runs in this window — distinct agent sessions. Requires AIME_USAGE_LINK_USERS=1; shows 0 when user/session linkage is off.">
+      <div class="num good">{{ '{:,}'.format(agent_total_runs) }}</div>
+      <div class="lbl">runs</div></div>
+    <div class="card accent-red"
+      title="Most expensive agent in this window and its cost — where agent spend concentrates.">
+      <div class="num bad">{{ agent_top_name }}</div>
+      <div class="lbl">top agent · ${{ '%.2f' % agent_top_cost }}</div></div>
+  </div>
+
+  <h2 title="Daily background-agent cost stacked by agent, top 6 by total cost plus an 'other' bucket. The widest band is the agent carrying the most spend in this window.">Agent cost (daily)</h2>
+  {{ chart_agent_stack | safe }}
+
+  <div class="two-col">
+    <div>
+      <h2 title="Share of background-agent cost in this window, by agent.">Agent mix</h2>
+      {{ chart_agent_donut | safe }}
+    </div>
+    <div>
+      <h2 title="How to read this tab.">What this covers</h2>
+      <p>Only headless <strong>background-agent</strong> runs appear here — every API call and tool call a run makes is tagged <code>source="agent"</code> and attributed to the agent's name.</p>
+      <p>Cost is the real, billed api cost (the same basis as the Costs tab), so an agent's spend sits on the same scale as a user's. <em>Tool calls</em> are counted as activity but add no extra cost — their downstream-input cost is already billed on the following turn.</p>
+      <p>Use the Model and Purpose filters to see, e.g., only an agent's web-search sub-calls or only its main turns.</p>
+    </div>
+  </div>
+
+  <h2 title="One row per background agent, sorted by cost. 'Runs' is distinct sessions (needs user linkage). 'Purpose mix' shows where each agent's cost goes (main turns vs web_search sub-calls vs compaction).">By agent</h2>
+  <table>
+    <thead>
+      <tr>
+        <th title="Agent spec name, as registered (e.g. morning-briefing). (unnamed) covers ad-hoc runs with no saved agent.">Agent</th>
+        <th title="Daily cost trend for this agent across the visible window.">Trend</th>
+        <th title="Distinct runs (sessions) for this agent. Requires AIME_USAGE_LINK_USERS=1; blank when linkage is off.">Runs</th>
+        <th title="Anthropic API calls this agent made (main turns + background Haiku calls like web_search/compaction).">API calls</th>
+        <th title="Tool invocations this agent made (data tools, web_search). Activity only — no extra cost is attributed here.">Tool calls</th>
+        <th title="Total input tokens billed across this agent's API calls.">Input</th>
+        <th title="Total output tokens billed across this agent's API calls.">Output</th>
+        <th title="Cache-read tokens served to this agent (billed at 0.1x input).">Cache read</th>
+        <th title="Server-side web_search requests this agent triggered (flat $10 / 1,000).">Web searches</th>
+        <th title="Mean real api cost per run = cost ÷ runs. Blank when runs is unknown (linkage off).">$/run</th>
+        <th title="Total real api cost attributed to this agent.">Est. cost</th>
+        <th title="Share of total background-agent cost in this window.">Share</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for name, a in agents %}
+      <tr>
+        <td title="{{ a.purpose_mix }}">{{ name }}</td>
+        <td class="spark">{{ agent_sparklines.get(name, '') | safe }}</td>
+        <td>{{ '{:,}'.format(a.runs) if a.runs else '—' }}</td>
+        <td>{{ '{:,}'.format(a.api_calls) }}</td>
+        <td>{{ '{:,}'.format(a.tool_calls) }}</td>
+        <td>{{ '{:,}'.format(a.input) }}</td>
+        <td>{{ '{:,}'.format(a.output) }}</td>
+        <td>{{ '{:,}'.format(a.cache_r) }}</td>
+        <td>{{ '{:,}'.format(a.web_searches) if a.web_searches else '—' }}</td>
+        <td>{{ ('$%.4f' % a.cost_per_run) if a.runs else '—' }}</td>
+        <td>${{ '%.4f' % a.cost }}</td>
+        <td>{{ ('%.1f%%' % (100.0 * a.cost / agent_total_cost)) if agent_total_cost else '—' }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endif %}
+"""
+
+
 # Model Routing tab — how much the per-turn Haiku/Sonnet router saves vs an
 # always-Sonnet baseline, after subtracting the cheap classifier-call
 # overhead. Empty-state when no records carry a `routed_decision` (routing
@@ -3863,6 +4033,8 @@ _PAGE = """<!doctype html>
       title="Call purpose, stop reasons, latency percentiles, hour-of-day shape.">Activity</a>
     <a href="/?{{ qs_tools }}" class="{{ 'active' if tab == 'tools' else '' }}"
       title="Per-tool cost — which tool is worth trimming first.">Tools</a>
+    <a href="/?{{ qs_agents }}" class="{{ 'active' if tab == 'agents' else '' }}"
+      title="What background-agent runs cost and do, broken down per agent — and their share of total spend.">Agents</a>
     <a href="/?{{ qs_routing }}" class="{{ 'active' if tab == 'routing' else '' }}"
       title="Per-turn Haiku/Sonnet routing — net cost saved vs always-Sonnet, after subtracting classifier overhead.">Routing</a>
     <a href="/?{{ qs_trends }}" class="{{ 'active' if tab == 'trends' else '' }}"
@@ -3882,7 +4054,7 @@ _PAGE = """<!doctype html>
   <div class="flash {{ f.level }}">{{ f.msg }}</div>
   {% endfor %}
 
-  {% if tab in ('overview', 'cache', 'activity', 'tools', 'trends', 'users', 'routing', 'conversations') %}
+  {% if tab in ('overview', 'cache', 'activity', 'tools', 'agents', 'trends', 'users', 'routing', 'conversations') %}
   <form class="filter" method="get">
     <input type="hidden" name="tab" value="{{ tab }}">
     <label title="Only include records on or after this date, interpreted in the selected time zone. Accepts YYYY-MM-DD or a full ISO-8601 timestamp. Leave blank for no lower bound.">Since ({{ tz_label or 'UTC' }})
@@ -4388,6 +4560,32 @@ def _compute(args):
     tool_total_calls = sum(t["calls"] for _n, t in by_tool)
     tool_top_name, tool_top_cost = (by_tool[0][0], by_tool[0][1]["cost"]) if by_tool else ("—", 0.0)
 
+    # --- Agents tab aggregations ---
+    # Cost/usage of headless background-agent runs (source=="agent"), broken
+    # down per agent, plus a daily cost stack and per-agent sparklines. The
+    # cost basis matches Overview (real api cost), so agent_total_cost / the
+    # grand total is a true "share of spend driven by agents".
+    agents_map = _aggregate_agents(records)
+    agents = sorted(agents_map.items(), key=lambda kv: kv[1]["cost"], reverse=True)
+    agent_total_cost = sum(a["cost"] for _n, a in agents)
+    agent_total_calls = sum(a["api_calls"] for _n, a in agents)
+    agent_total_tool_calls = sum(a["tool_calls"] for _n, a in agents)
+    agent_total_runs = sum(a["runs"] for _n, a in agents)
+    agent_cost_share = (100.0 * agent_total_cost / grand_cost) if grand_cost else 0.0
+    agent_top_name, agent_top_cost = (
+        (agents[0][0], agents[0][1]["cost"]) if agents else ("—", 0.0)
+    )
+    by_day_agent = _aggregate_agent_per_day(records, day_keys)
+    by_day_agent_top = _top_n_series(by_day_agent)
+    chart_agent_stack = _svg_stacked_bars(day_keys, by_day_agent_top, money=True)
+    agent_slices = [
+        (name, a["cost"], _color_for(i))
+        for i, (name, a) in enumerate(agents)
+        if a["cost"] > 0
+    ]
+    chart_agent_donut = _svg_donut(agent_slices[:8])
+    agent_sparklines = {name: _svg_sparkline(vs) for name, vs in by_day_agent}
+
     # --- Model Routing tab aggregations ---
     # Sums savings from Haiku-routed turns (vs counterfactual Sonnet cost on
     # the same token counts), subtracts the classifier-call overhead, and
@@ -4558,6 +4756,18 @@ def _compute(args):
         tool_total_calls=tool_total_calls,
         tool_top_name=tool_top_name,
         tool_top_cost=tool_top_cost,
+        # agents
+        agents=agents,
+        agent_total_cost=agent_total_cost,
+        agent_total_calls=agent_total_calls,
+        agent_total_tool_calls=agent_total_tool_calls,
+        agent_total_runs=agent_total_runs,
+        agent_cost_share=agent_cost_share,
+        agent_top_name=agent_top_name,
+        agent_top_cost=agent_top_cost,
+        chart_agent_stack=chart_agent_stack,
+        chart_agent_donut=chart_agent_donut,
+        agent_sparklines=agent_sparklines,
         # model routing
         routing_users=routing_users,
         routing_total=routing_total,
@@ -4861,9 +5071,9 @@ def _user_context(username: str, tz_raw: str = ""):
 
 def _tab(args) -> str:
     t = args.get("tab")
-    return t if t in ("overview", "cache", "activity", "tools", "trends",
-                      "users", "conversations", "routing", "accounts", "keys",
-                      "system", "security") else "users"
+    return t if t in ("overview", "cache", "activity", "tools", "agents",
+                      "trends", "users", "conversations", "routing", "accounts",
+                      "keys", "system", "security") else "users"
 
 
 def _render_fragment(ctx, tab) -> str:
@@ -4871,6 +5081,7 @@ def _render_fragment(ctx, tab) -> str:
         "cache": _FRAGMENT_CACHE,
         "activity": _FRAGMENT_ACTIVITY,
         "tools": _FRAGMENT_TOOLS,
+        "agents": _FRAGMENT_AGENTS,
         "trends": _FRAGMENT_TRENDS,
         "users": _FRAGMENT_USERS,
         "conversations": _FRAGMENT_CONVERSATIONS,
@@ -4991,9 +5202,9 @@ def index():
                       "tz", "tz_auto")
             if request.args.get(k)}
     qs = {t: urlencode({**keep, "tab": t})
-          for t in ("overview", "cache", "activity", "tools", "trends", "users",
-                    "conversations", "routing", "accounts", "keys", "system",
-                    "security")}
+          for t in ("overview", "cache", "activity", "tools", "agents", "trends",
+                    "users", "conversations", "routing", "accounts", "keys",
+                    "system", "security")}
 
     return render_template_string(
         _PAGE, fragment=fragment, tab=tab, auto=auto,
@@ -5001,6 +5212,7 @@ def index():
         csrf=csrf, flashes=flashes,
         qs_overview=qs["overview"], qs_cache=qs["cache"],
         qs_activity=qs["activity"], qs_tools=qs["tools"],
+        qs_agents=qs["agents"],
         qs_trends=qs["trends"], qs_users=qs["users"],
         qs_conversations=qs["conversations"],
         qs_routing=qs["routing"],
@@ -5053,15 +5265,16 @@ def user_drilldown(username):
     keep_tz = {k: request.args.get(k) for k in ("tz", "tz_auto")
                if request.args.get(k)}
     qs = {t: urlencode({**keep_tz, "tab": t})
-          for t in ("overview", "cache", "activity", "tools", "trends", "users",
-                    "conversations", "routing", "accounts", "keys", "system",
-                    "security")}
+          for t in ("overview", "cache", "activity", "tools", "agents", "trends",
+                    "users", "conversations", "routing", "accounts", "keys",
+                    "system", "security")}
     return render_template_string(
         _PAGE, fragment=fragment, tab="user", auto=0,
         auto_label="second",
         csrf=csrf, flashes=flashes,
         qs_overview=qs["overview"], qs_cache=qs["cache"],
         qs_activity=qs["activity"], qs_tools=qs["tools"],
+        qs_agents=qs["agents"],
         qs_trends=qs["trends"], qs_users=qs["users"],
         qs_conversations=qs["conversations"],
         qs_routing=qs["routing"],
@@ -5130,15 +5343,16 @@ def session_drilldown(session_id):
     keep_tz = {k: request.args.get(k) for k in ("tz", "tz_auto")
                if request.args.get(k)}
     qs = {t: urlencode({**keep_tz, "tab": t})
-          for t in ("overview", "cache", "activity", "tools", "trends", "users",
-                    "conversations", "routing", "accounts", "keys", "system",
-                    "security")}
+          for t in ("overview", "cache", "activity", "tools", "agents", "trends",
+                    "users", "conversations", "routing", "accounts", "keys",
+                    "system", "security")}
     return render_template_string(
         _PAGE, fragment=fragment, tab="session", auto=0,
         auto_label="second",
         csrf=csrf, flashes=flashes,
         qs_overview=qs["overview"], qs_cache=qs["cache"],
         qs_activity=qs["activity"], qs_tools=qs["tools"],
+        qs_agents=qs["agents"],
         qs_trends=qs["trends"], qs_users=qs["users"],
         qs_conversations=qs["conversations"],
         qs_routing=qs["routing"],

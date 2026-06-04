@@ -67,6 +67,8 @@ class WebSearchAgent:
         tool_version: str,
         usage_label: str | None = None,
         record_api: Callable | None = None,
+        usage_source: str = "interactive",
+        agent_name: str | None = None,
         # A single request may now bundle many items (the caller is told to
         # batch — "tuition for 10 colleges" in one call), so the search budget
         # has to be generous enough to cover each. Each search is a flat
@@ -82,6 +84,11 @@ class WebSearchAgent:
             "max_uses": max_searches,
         }
         self._usage_label = usage_label
+        # When this search agent serves a background-agent run, its offloaded
+        # Haiku searches should bill to that agent, not show up as interactive
+        # web_search cost. Threaded onto every usage record (see _record).
+        self._usage_source = usage_source or "interactive"
+        self._agent_name = agent_name
         # Injected so this module doesn't import aime.usage directly (keeps it
         # testable and avoids an import cycle), mirroring ModelRouter.
         self._record_api = record_api
@@ -211,6 +218,8 @@ class WebSearchAgent:
                 # No routed_decision: this is its own purpose, not a routed user
                 # turn, so it stays out of the routing tab's turn/misclass counts.
                 # The web-search savings view re-prices it on its own.
+                source=self._usage_source,
+                agent_name=self._agent_name,
             )
         except Exception:
             pass

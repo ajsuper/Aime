@@ -313,6 +313,8 @@ class AnthropicMessagesBackend:
         web_search_schema: str | None = None,
         terminal_tool_schema: "str | dict | None" = None,
         persist_enabled: bool = True,
+        usage_source: str = "interactive",
+        agent_name: str | None = None,
     ):
         self._client = Anthropic(max_retries=3)
         self._system_prompt = system_prompt
@@ -333,6 +335,12 @@ class AnthropicMessagesBackend:
         # opt-in usage log. None for unattributed callers. Whether it is
         # actually written is a separate opt-in inside aime.usage.
         self._usage_label = usage_label
+        # Tags every usage record from this backend with what drove it: a live
+        # chat ("interactive") or a named background-agent run ("agent" +
+        # agent_name). Lets the dashboard separate autonomous-agent cost from
+        # user-facing cost. Non-identifying, so unconditionally recorded.
+        self._usage_source = usage_source or "interactive"
+        self._agent_name = agent_name
         # Per-user state: where this user's encrypted conversation files live
         # and the data key that decrypts them. Both are required for any IO.
         self._conversations_dir = conversations_dir
@@ -846,6 +854,8 @@ class AnthropicMessagesBackend:
                         model=tmodel,
                         result_bytes=len(content_text.encode("utf-8")),
                         session_id=self._session_id,
+                        source=self._usage_source,
+                        agent_name=self._agent_name,
                     )
                 except Exception:
                     pass
@@ -1205,6 +1215,8 @@ class AnthropicMessagesBackend:
                                 result_bytes=len(json.dumps(result_block.get("content"))),
                                 web_search_requests=1,
                                 session_id=self._session_id,
+                                source=self._usage_source,
+                                agent_name=self._agent_name,
                             )
                         except Exception:
                             pass
@@ -1785,6 +1797,8 @@ class AnthropicMessagesBackend:
                 stop_reason=stop_reason,
                 duration_ms=duration_ms,
                 routed_decision=routed_decision,
+                source=self._usage_source,
+                agent_name=self._agent_name,
             )
         except Exception:
             pass
