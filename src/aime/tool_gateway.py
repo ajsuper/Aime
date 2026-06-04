@@ -37,7 +37,7 @@ class ToolGateway:
         api_url: str = API_URL,
         timeout: float = 10.0,
         user_id: int | None = None,
-        on_mutation: Callable[[str], None] | None = None,
+        on_mutation: Callable[[str, dict], None] | None = None,
     ):
         """`user_id` is forwarded with every backend call so the C++ side can
         route each request to that user's database. None preserves the legacy
@@ -45,9 +45,11 @@ class ToolGateway:
         absent in that case.
 
         `on_mutation` fires after any successful call whose tool name isn't
-        read-only — used to broadcast a refresh signal to other sessions of
-        the same user. Hooking it here (rather than at each endpoint) means a
-        future mutating tool ships sync support automatically."""
+        read-only, receiving `(backend_tool_name, request_body)` — the body
+        carries the record id, so the handler can tell *what* changed and fan a
+        precise refresh/stale notification out from this one choke point. Hooking
+        it here (rather than at each endpoint) means a future mutating tool ships
+        sync support automatically."""
         self._url = api_url
         self._timeout = timeout
         self._user_id = user_id
@@ -98,7 +100,7 @@ class ToolGateway:
             and _is_mutation(body.get("tool_name", ""))
         ):
             try:
-                self._on_mutation(body.get("tool_name", ""))
+                self._on_mutation(body.get("tool_name", ""), body)
             except Exception:
                 pass
         return result

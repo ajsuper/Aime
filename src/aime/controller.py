@@ -113,10 +113,10 @@ WorkerSpawner = Callable[[Callable[[], None]], None]
 
 # Per-topic tools that take an `id` and so may address a *shared* topic — one
 # that lives in another user's silo, reachable through a "<owner>:<topic>"
-# composite handle. When a topic-share resolver is wired (see the controller's
-# `topic_share_resolver`), these are routed through it; otherwise they hit the
-# user's own gateway unchanged. FilterTopics is handled separately (its result
-# is enriched, not rerouted).
+# composite handle. When a record-sync bridge is wired (see the controller's
+# `record_sync`), these are routed through it; otherwise they hit the user's
+# own gateway unchanged. FilterTopics is handled separately (its result is
+# enriched, not rerouted).
 _SHAREABLE_TOPIC_TOOLS = frozenset(
     {"GetTopicContents", "ReplaceTopicContents", "EditTopicContents"}
 )
@@ -167,20 +167,21 @@ class ConversationController:
         messenger=None,
         message_recipient: str | None = None,
         reminder_service=None,
-        topic_share_resolver=None,
+        record_sync=None,
     ):
         self._backend = backend
         self._tools = tool_gateway
         self._spawn_worker = worker_spawner
-        # Optional topic-sharing bridge (built by the web layer, which owns the
-        # cross-user grant store and the per-owner gateways). When set, it lets
-        # the model see and open topics shared *with* this user and flags the
-        # user's own shared-out topics. Two methods are used: run_topic_tool()
-        # dispatches a per-topic tool (rerouting it to the owner's silo when its
-        # id is a shared handle), and merge_shared_into_list() enriches a
-        # FilterTopics result. None for the TUI / background agents, where every
-        # topic tool simply runs against the user's own gateway.
-        self._topic_shares = topic_share_resolver
+        # Optional cross-user record-sync bridge (built by the web layer, which
+        # owns the grant store and per-owner gateways). When set it lets the
+        # model see and open topics shared *with* this user, flags the user's own
+        # shared-out topics, and (after any tracked write) clears this user's own
+        # stale flag for the record it just changed. run_if_shared() reroutes a
+        # per-topic tool to the owner's silo when its id is a shared handle,
+        # merge_shared_into_list() enriches a FilterTopics result, and
+        # after_model_write() does the self-clear. None for the TUI / background
+        # agents, where every tool simply runs against the user's own gateway.
+        self._record_sync = record_sync
         # Optional event-reminder engine (aime.scheduling.ReminderService). When
         # set, the CreateReminder / ListReminders / DeleteReminder client tools
         # are handled here against the user's ScheduleStore; when None they
@@ -796,19 +797,25 @@ class ConversationController:
             return
         # Topic sharing. A per-topic tool whose id is a "<owner>:<topic>" handle
         # addresses a topic in another user's silo, so it's rerouted (after a
-        # grant check) through that owner's gateway by the resolver; a bare id
-        # is one of this user's own topics and runs normally. FilterTopics runs
+        # grant check) through that owner's gateway by the bridge; a bare id is
+        # one of this user's own topics and runs normally. FilterTopics runs
         # normally and is then enriched with the user's shared topics + "shared
-        # with" flags. With no resolver wired this is all the plain path.
-        if self._topic_shares is not None and tool_name in _SHAREABLE_TOPIC_TOOLS:
+        # with" flags. With no bridge wired this is all the plain path.
+        if self._record_sync is not None and tool_name in _SHAREABLE_TOPIC_TOOLS:
             tool_input = _normalize_topic_id(tool_input)
-            result = self._topic_shares.run_if_shared(tool_name, tool_input)
+            result = self._record_sync.run_if_shared(tool_name, tool_input)
             if result is None:
                 result = self._tools.execute(tool_name, tool_input)
         else:
             result = self._tools.execute(tool_name, tool_input)
-        if tool_name == "FilterTopics" and self._topic_shares is not None:
-            result = self._topic_shares.merge_shared_into_list(result, tool_input)
+        if tool_name == "FilterTopics" and self._record_sync is not None:
+            result = self._record_sync.merge_shared_into_list(result, tool_input)
+        # The write above flowed through the gateway's mutation choke point, which
+        # flags the changed record stale for every party — this user included.
+        # But the model just made the change and has the fresh content, so clear
+        # its own flag (no-op for reads, errors, and untracked tools).
+        if self._record_sync is not None:
+            self._record_sync.after_model_write(tool_name, tool_input, result)
         summary = format_tool_response(tool_name, result)
         self._emit(CoreEvent(
             kind="tool_result",

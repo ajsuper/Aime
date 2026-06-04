@@ -88,6 +88,7 @@ from aime import encryption as _enc
 from aime import backup as _backup
 from aime import email_send as _email_send
 from aime import topic_shares as _topic_shares
+from aime.tool_formatting import TOOL_NAME_MAP
 
 from . import stt as _stt
 
@@ -489,9 +490,10 @@ class UserContext:
             lambda: _scheduler_upcoming_events(user_id),
         )
 
-        # Bridge so the model sees this user's shared topics (both directions);
-        # see _TopicShareBridge. Bound to this user_id for the context's life.
-        self.topic_shares = _TopicShareBridge(user_id)
+        # Bridge giving the model cross-user record access: shared topics (both
+        # directions) plus the post-write self-clear. See _RecordSyncBridge.
+        # Bound to this user_id for the context's life.
+        self.record_sync = _RecordSyncBridge(user_id)
 
         self.controller = ConversationController(
             backend=backend,
@@ -501,7 +503,7 @@ class UserContext:
             messenger=messenger,
             message_recipient=messaging_contact,
             reminder_service=reminder_service,
-            topic_share_resolver=self.topic_shares,
+            record_sync=self.record_sync,
         )
 
         # Seed the session with the user's last-seen zone so any turn that runs
@@ -541,9 +543,15 @@ class UserContext:
 
     # ---- Stale-record tracking --------------------------------------------
 
-    def mark_record_stale(self, kind: str, record_id: int, title: str) -> None:
-        """Note that the user just edited a record via the UI. Dedupes on
-        (kind, id) so repeated edits to the same record only cost one entry."""
+    def mark_record_stale(self, kind: str, record_id: int | str, title: str) -> None:
+        """Note that a record this user's model has seen just changed (a UI edit,
+        or a change pushed in from the other side of a shared topic), so the next
+        user turn carries a <stale> tag and the model knows to re-read it. Dedupes
+        on (kind, id) so repeated edits to the same record only cost one entry.
+
+        `record_id` is normally the bare integer id, but for a topic shared *to*
+        this user it's the composite "<owner>:<topic>" handle string — i.e. the
+        id their model actually addresses the topic by, so the tag lines up."""
         title = (title or "").strip()
         with self._stale_lock:
             self._stale_records = [
@@ -551,6 +559,17 @@ class UserContext:
                 if not (e[0] == kind and e[1] == record_id)
             ]
             self._stale_records.append((kind, record_id, title))
+
+    def clear_record_stale(self, kind: str, record_id: int | str) -> None:
+        """Drop a pending stale flag for (kind, id). Used when this user's own
+        model just wrote the record: the cross-user mutation choke point flags
+        every party (this user included), but the model already holds the fresh
+        content, so re-reading would be wasted — remove its own flag."""
+        with self._stale_lock:
+            self._stale_records = [
+                e for e in self._stale_records
+                if not (e[0] == kind and e[1] == record_id)
+            ]
 
     def drain_stale_tag(self) -> str:
         """Build the <stale> tag for the next user turn, then clear the list.
@@ -641,19 +660,22 @@ class UserContext:
         thread, which has no other path into the SSE fanout."""
         self._broadcast({"kind": "agent_run_update"})
 
-    def _on_backend_mutation(self, tool_name: str) -> None:
-        # Fired by ToolGateway after any successful non-read tool call,
-        # covering both AI tool calls and direct UI service calls.
+    def _on_backend_mutation(self, tool_name: str, payload: dict | None = None) -> None:
+        # Fired by ToolGateway after any successful non-read tool call, covering
+        # both AI tool calls and direct UI service calls. Refresh this user's own
+        # open tabs unconditionally.
         self.notify_remote_edit(tool_name)
-        # If a topic this user owns just changed (manual edit, checkbox toggle,
-        # or the model editing it), fan the same refresh ping out to everyone
-        # they share a topic with so it syncs live on the recipient side too.
-        # This is the single choke point for topic-content sync: every content
-        # write — owner's or recipient's — flows through the owner's gateway and
-        # lands here. The ping is owner-wide because the tool name doesn't carry
-        # which topic changed; it's cheap and only reaches accepted partners.
-        if "topic" in tool_name:
-            _fanout_owner_topic_change(self.user_id)
+        # If the write changed a tracked record (topic content, event, …), fan a
+        # single notification out to everyone who can see it — each party's model
+        # gets a <stale> tag on its next turn and their live UI re-fetches. This
+        # is the one choke point for record sync: every write flows through here,
+        # and self.user_id is always the record's *owner* (a shared-topic write
+        # is routed through the owner's gateway, so this runs on their context),
+        # so the payload id is the bare owner-side id.
+        kind = _RECORD_KIND_BY_TOOL.get(tool_name)
+        record_id = payload.get("id") if isinstance(payload, dict) else None
+        if kind is not None and record_id is not None:
+            _propagate_record_change(kind, self.user_id, record_id, payload)
 
     def _fanout(self, event: CoreEvent) -> None:
         partial_full: str | None = None
@@ -2698,7 +2720,9 @@ def calendar_event_update(event_id: int):
         )
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 500
-    ctx.mark_record_stale("event", event_id, title)
+    # The replace_event call flows through the gateway's on_mutation choke point,
+    # which marks this record stale for the model (and refreshes the UI) — the
+    # same path topic edits use. No explicit stale call needed here.
     return jsonify({"ok": True, "result": result})
 
 
@@ -2864,14 +2888,14 @@ def _shared_topics_for(recipient_id: int) -> list[dict]:
     return out
 
 
-class _TopicShareBridge:
-    """Adapter handed to a user's ConversationController so the *model* sees the
-    same shared topics the web UI does.
+class _RecordSyncBridge:
+    """Adapter handed to a user's ConversationController for cross-user record
+    access — currently shared topics, with room for more shared kinds.
 
     The controller is deliberately ignorant of sharing (it's reused by the TUI
     and background agents); this bridge holds the cross-user knowledge —
     `_share_store` for grants and `_context_for` to reach an owner's silo — and
-    is bound to one ``user_id`` for the life of that user's context. Two entry
+    is bound to one ``user_id`` for the life of that user's context. The entry
     points the controller calls:
 
     * :meth:`run_if_shared` reroutes a per-topic tool addressed to a composite
@@ -2882,11 +2906,14 @@ class _TopicShareBridge:
     * :meth:`merge_shared_into_list` enriches a FilterTopics result with the
       topics shared *with* this user and flags which of their *own* topics are
       shared out (and to whom), so the model knows the state on both sides.
+    * :meth:`after_model_write` clears this user's own stale flag once its model
+      has written a tracked record (the choke point flags every party; the actor
+      already has the fresh content).
 
     Routing writes through the owner's gateway is deliberate: it lands the edit
-    in the owner's silo and trips that gateway's on_mutation fanout, so the
+    in the owner's silo and trips that gateway's on_mutation choke point, so the
     change syncs back to the owner (and every share partner) exactly like a UI
-    edit — the same single choke point the web routes rely on.
+    edit — the same single path every record change flows through.
     """
 
     # Of the shareable tools, these mutate and so require edit permission;
@@ -2931,6 +2958,33 @@ class _TopicShareBridge:
             return _context_for(owner_id).gateway.execute(agent_tool_name, payload)
         except Exception as exc:  # noqa: BLE001
             return {"error": f"shared topic access failed: {exc}"}
+
+    def after_model_write(self, agent_tool_name: str, tool_input: dict, result) -> None:
+        """Clear this user's own stale flag for a record its model just wrote.
+
+        The mutation choke point flags a changed record as stale for every party
+        who can see it, this user included. When the change came from this user's
+        *own* model it already holds the fresh content, so that flag would only
+        force a needless re-read — drop it. The id is taken straight from the
+        tool input, which is already in this user's own addressing form (a bare
+        id for an own record, the ``"<owner>:<topic>"`` handle for a shared one),
+        so it matches what the choke point recorded for this context. A no-op for
+        reads, failed writes, and tools that don't change a tracked record."""
+        if isinstance(result, dict) and "error" in result:
+            return
+        backend_tool = TOOL_NAME_MAP.get(agent_tool_name, agent_tool_name)
+        kind = _RECORD_KIND_BY_TOOL.get(backend_tool)
+        if kind is None:
+            return
+        record_id = (tool_input or {}).get("id")
+        if record_id is None:
+            return
+        ctx = _user_contexts.get(self.user_id)
+        if ctx is not None:
+            try:
+                ctx.clear_record_stale(kind, record_id)
+            except Exception:
+                pass
 
     def merge_shared_into_list(self, result, tool_input: dict | None = None):
         """Append the topics shared *with* this user to a FilterTopics result
@@ -3045,19 +3099,76 @@ def _notify_share(user_id: int, message_text: str) -> None:
         pass
 
 
-def _fanout_owner_topic_change(owner_id: int) -> None:
-    """Ping the live sessions of everyone with an accepted share on any of
-    `owner_id`'s topics, so a content change syncs to the recipient side
-    without a manual reload. Called from the gateway's on_mutation choke point,
-    which fires for every topic write (owner's or recipient's, manual or
-    model-driven). Best-effort — a missing/closed session is simply skipped."""
-    for uid in _share_store.owner_partners(owner_id):
+# --- Unified record-change propagation -------------------------------------
+#
+# A single notification path for "a tracked record changed", driven from the
+# gateway's on_mutation choke point so every write (UI or model, own or shared)
+# flows through it automatically — add a new shared record type by registering
+# its mutation tools below and teaching `_record_partners`/`_record_title` about
+# it, not by wiring a fresh fan-out at each call site.
+
+# Backend mutation tool name -> the record kind it changes. Only tools listed
+# here trigger a stale/refresh fan-out; everything else still gets the plain
+# own-UI ping. (Creates are intentionally absent: a brand-new record has no
+# prior view to invalidate.)
+_RECORD_KIND_BY_TOOL = {
+    "replace_topic_contents": "topic",
+    "edit_topic_contents": "topic",
+    "replace_event": "event",
+}
+
+
+def _record_partners(kind: str, owner_id: int, record_id: int) -> list[int]:
+    """Accepted recipients (not incl. the owner) who can see a shared record.
+    Empty for kinds that aren't shareable yet — events have no recipients, so a
+    change to one only ever notifies its owner."""
+    if kind == "topic":
+        return _share_store.topic_partners(owner_id, record_id)
+    return []
+
+
+def _record_title(kind: str, owner_id: int, record_id: int, payload: dict) -> str:
+    """A human-readable title for the <stale> tag, best-effort. Event writes
+    carry the title in their payload (no re-read needed); topic-content writes
+    don't, so fall back to a quick lookup in the owner's topic list."""
+    if kind == "event":
+        title = payload.get("title") if isinstance(payload, dict) else ""
+        return (title or "").strip()
+    if kind == "topic":
+        return _topic_title(owner_id, record_id)
+    return ""
+
+
+def _propagate_record_change(
+    kind: str, owner_id: int, record_id: int, payload: dict,
+) -> None:
+    """Fan a record change out to everyone who can see it — the owner plus any
+    accepted recipients. Each party's model gets a <stale> tag on its next turn
+    (with the id in the form *they* address the record by: the owner the bare
+    id, a recipient the "<owner>:<record>" handle) and each recipient's live UI
+    is refreshed. The owner's own UI is pinged separately by the caller, so it's
+    only marked stale here. Only parties with a live context are touched — an
+    inactive user rebuilds fresh state next time they interact. Best-effort.
+
+    When the change came from a party's *own* model, that model already holds
+    the fresh content; it clears its own flag right after (see
+    `_RecordSyncBridge.after_model_write`), so this can mark unconditionally."""
+    title = _record_title(kind, owner_id, record_id, payload)
+    owner_ctx = _user_contexts.get(owner_id)
+    if owner_ctx is not None:
+        try:
+            owner_ctx.mark_record_stale(kind, record_id, title)
+        except Exception:
+            pass
+    for uid in _record_partners(kind, owner_id, record_id):
         ctx = _user_contexts.get(uid)
-        if ctx is not None:
-            try:
-                ctx.notify_remote_edit(f"shared_topic:{owner_id}")
-            except Exception:
-                pass
+        if ctx is None:
+            continue
+        try:
+            ctx.mark_record_stale(kind, f"{owner_id}:{record_id}", title)
+            ctx.notify_remote_edit(f"{kind}:{owner_id}")
+        except Exception:
+            pass
 
 
 def _username_of(user_id: int | None) -> str | None:
@@ -3273,22 +3384,11 @@ def topic_contents_save(topic_id: str):
         ctx.topic_service.replace_topic_contents(tid, contents)
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 500
-    # Look up the title so the <stale> tag carries a recognizable name. If the
-    # list call fails for any reason, fall through with an empty title — the id
-    # alone is still enough for the model to know the record changed.
-    title = ""
-    try:
-        for t in ctx.topic_service.list_topics():
-            if int(t.get("id", -1)) == tid:
-                title = (t.get("title") or "").strip()
-                break
-    except Exception:
-        pass
-    # Stale-tracking is the owner's (it feeds the owner's agent context). The
-    # cross-user refresh ping is handled by the gateway's on_mutation choke
-    # point (replace_topic_contents above flows through it), which fans out to
-    # the owner's share partners — no explicit fan-out needed here.
-    ctx.mark_record_stale("topic", tid, title)
+    # No explicit notification here: the replace_topic_contents call above flows
+    # through the gateway's on_mutation choke point, which fans the <stale> tag
+    # and live-UI refresh out to every party — the owner and all recipients.
+    # A UI edit doesn't go through the model dispatch, so nothing clears the
+    # editor's own flag: their model is correctly told its view is now stale.
     return jsonify({"ok": True})
 
 
