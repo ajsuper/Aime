@@ -102,6 +102,20 @@ class UserRecord:
     # chat id today, a phone number once an SMS channel lands. NULL = the user
     # hasn't connected a messaging contact, so proactive messages are skipped.
     messaging_contact: str | None = None
+    # Display-only real name. Unlike `username` (the immutable identity that
+    # keys every piece of the user's data) these are purely cosmetic, freely
+    # changeable, and may be NULL. Nothing keys off them today; they exist so a
+    # future UI can greet the user by name.
+    first_name: str | None = None
+    last_name: str | None = None
+
+    @property
+    def display_name(self) -> str:
+        """Best human-facing label: the full real name if any was given, else
+        the username. Callers that want to render "who is this" should prefer
+        this over reaching for the raw fields."""
+        full = " ".join(p for p in (self.first_name, self.last_name) if p)
+        return full or self.username
 
 
 class AuthError(Exception):
@@ -162,6 +176,11 @@ class InvalidEmail(AuthError):
     pass
 
 
+class InvalidName(AuthError):
+    """A display name (first/last) failed validation — currently only a length
+    cap. Names are optional, so an empty value never raises this."""
+
+
 class VerificationError(AuthError):
     """Wrong / expired / used-up verification code, or unknown token. Kept
     deliberately generic so the UI doesn't differentiate between "wrong code"
@@ -180,8 +199,15 @@ class AuthBackend(Protocol):
 
     # ---- accounts & sessions ---------------------------------------------
     def create(
-        self, username: str, password: str, api_access: bool = True
+        self, username: str, password: str, api_access: bool = True,
+        *, first_name: str | None = None, last_name: str | None = None,
     ) -> tuple[UserRecord, bytes]: ...
+    # Update the display-only first/last name on an existing account. The
+    # username is never touched here — it's the immutable identity.
+    def set_display_name(
+        self, user_id: int,
+        first_name: str | None, last_name: str | None,
+    ) -> bool: ...
     # `was_reinitialized` is True when verify() upgraded a pre-existing v0/v1
     # account to the current encryption scheme. The DEK is fresh in that case,
     # so any conversation files previously on disk are now unreadable garbage
@@ -222,6 +248,9 @@ class AuthBackend(Protocol):
 
 _USERNAME_RE = re.compile(r"^[A-Za-z0-9_.\-]{3,32}$")
 _MIN_PASSWORD_LEN = 8
+# Display names are free-form (any script, spaces, punctuation) so we only
+# bound the length — enough to stop abuse, generous enough for real names.
+_MAX_NAME_LEN = 64
 
 # Tunables for the lockout policy.
 _FAIL_WINDOW_SECONDS = 15 * 60
@@ -399,6 +428,18 @@ class LocalAuthBackend:
                 )
             # END messaging_contact MIGRATION
 
+            # display-name MIGRATION — first_name/last_name added as purely
+            # cosmetic fields. A bare ADD COLUMN defaults every existing row to
+            # NULL, i.e. "no name given", which is exactly right: the UI falls
+            # back to the username. Dropping the feature is just dropping these
+            # two columns.
+            for col in ("first_name", "last_name"):
+                if col not in existing_cols:
+                    self._conn.execute(
+                        f"ALTER TABLE users ADD COLUMN {col} TEXT"
+                    )
+            # END display-name MIGRATION
+
             # Pending email-verification rows. Used for two flows:
             #   purpose='signup'    — username/password are being held until
             #                         the 6-digit code mailed to `email` is
@@ -423,22 +464,48 @@ class LocalAuthBackend:
                     api_access    INTEGER NOT NULL DEFAULT 0,
                     created_at    INTEGER NOT NULL,
                     expires_at    INTEGER NOT NULL,
-                    attempts      INTEGER NOT NULL DEFAULT 0
+                    attempts      INTEGER NOT NULL DEFAULT 0,
+                    -- Display-only name held alongside the pending signup so it
+                    -- can be written onto the real row when the code is
+                    -- confirmed. NULL for 'add_email' rows (which don't touch
+                    -- the name) and for pre-feature pending rows.
+                    first_name    TEXT,
+                    last_name     TEXT
                 )
                 """
             )
+            # display-name MIGRATION (email_verifications) — same columns added
+            # to a table that may predate the feature on an existing install.
+            ev_cols = {
+                row[1]
+                for row in self._conn.execute(
+                    "PRAGMA table_info(email_verifications)"
+                )
+            }
+            for col in ("first_name", "last_name"):
+                if col not in ev_cols:
+                    self._conn.execute(
+                        f"ALTER TABLE email_verifications ADD COLUMN {col} TEXT"
+                    )
+            # END display-name MIGRATION (email_verifications)
             self._conn.commit()
 
     # ---- AuthBackend interface --------------------------------------------
 
     def create(
-        self, username: str, password: str, api_access: bool = True
+        self, username: str, password: str, api_access: bool = True,
+        *, first_name: str | None = None, last_name: str | None = None,
     ) -> tuple[UserRecord, bytes]:
         """Create a new account. `api_access` is the value stamped into the
         new row: callers pass True for AIME_ACCESS_MODE=open and False for
-        =keys (see web_app.py). It is plain persistent state from here on."""
+        =keys (see web_app.py). It is plain persistent state from here on.
+
+        `first_name`/`last_name` are optional display-only fields (see
+        UserRecord); they're normalized to NULL when blank."""
         self._validate_username(username)
         self._validate_password(password)
+        first_name = self._validate_name(first_name)
+        last_name = self._validate_name(last_name)
         pw_hash = self._hasher.hash(password)
 
         # Generate this user's per-account data key and wrap it under a KEK
@@ -456,15 +523,19 @@ class LocalAuthBackend:
                 cur = self._conn.execute(
                     "INSERT INTO users "
                     "(username, password_hash, salt_dek, wrapped_dek_v2, "
-                    "enc_version, api_access) "
-                    f"VALUES (?, ?, ?, ?, {_ENC_VERSION_CURRENT}, ?)",
-                    (username, pw_hash, salt_dek, wrapped, 1 if api_access else 0),
+                    "enc_version, api_access, first_name, last_name) "
+                    f"VALUES (?, ?, ?, ?, {_ENC_VERSION_CURRENT}, ?, ?, ?)",
+                    (username, pw_hash, salt_dek, wrapped,
+                     1 if api_access else 0, first_name, last_name),
                 )
                 self._conn.commit()
             except sqlite3.IntegrityError as e:
                 raise UsernameTaken(f"username already taken: {username!r}") from e
             return (
-                UserRecord(id=cur.lastrowid, username=username, api_access=api_access),
+                UserRecord(
+                    id=cur.lastrowid, username=username, api_access=api_access,
+                    first_name=first_name, last_name=last_name,
+                ),
                 dek,
             )
 
@@ -486,7 +557,8 @@ class LocalAuthBackend:
         with self._lock:
             row = self._conn.execute(
                 "SELECT id, username, password_hash, salt_dek, wrapped_dek_v2, "
-                "enc_version, api_access, deleted_at, email, messaging_contact "
+                "enc_version, api_access, deleted_at, email, messaging_contact, "
+                "first_name, last_name "
                 "FROM users WHERE username = ?",
                 (username,),
             ).fetchone()
@@ -502,7 +574,8 @@ class LocalAuthBackend:
             raise InvalidCredentials("invalid username or password")
 
         (user_id, stored_username, pw_hash, salt_dek, wrapped_dek_v2,
-         enc_version, api_access, deleted_at, email, messaging_contact) = row
+         enc_version, api_access, deleted_at, email, messaging_contact,
+         first_name, last_name) = row
         try:
             self._hasher.verify(pw_hash, password)
         except (VerifyMismatchError, InvalidHashError):
@@ -563,6 +636,8 @@ class LocalAuthBackend:
                 api_access=bool(api_access),
                 email=email,
                 messaging_contact=messaging_contact,
+                first_name=first_name,
+                last_name=last_name,
             ),
             dek,
             was_reinitialized,
@@ -626,7 +701,8 @@ class LocalAuthBackend:
         # to login (where recovery is offered).
         with self._lock:
             row = self._conn.execute(
-                "SELECT id, username, api_access, email, messaging_contact "
+                "SELECT id, username, api_access, email, messaging_contact, "
+                "first_name, last_name "
                 "FROM users WHERE id = ? AND deleted_at IS NULL",
                 (user_id,),
             ).fetchone()
@@ -635,6 +711,29 @@ class LocalAuthBackend:
         return UserRecord(
             id=row[0], username=row[1],
             api_access=bool(row[2]), email=row[3], messaging_contact=row[4],
+            first_name=row[5], last_name=row[6],
+        )
+
+    def lookup_by_username(self, username: str) -> UserRecord | None:
+        """Resolve an active account by its (case-insensitive) username. Used by
+        features that key off a user-typed name — e.g. picking a topic-share
+        recipient. Soft-deleted accounts return None, same as lookup()."""
+        username = (username or "").strip()
+        if not username:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, username, api_access, email, messaging_contact, "
+                "first_name, last_name "
+                "FROM users WHERE username = ? AND deleted_at IS NULL",
+                (username,),
+            ).fetchone()
+        if row is None:
+            return None
+        return UserRecord(
+            id=row[0], username=row[1],
+            api_access=bool(row[2]), email=row[3], messaging_contact=row[4],
+            first_name=row[5], last_name=row[6],
         )
 
     def set_messaging_contact(self, user_id: int, contact: str | None) -> bool:
@@ -647,6 +746,25 @@ class LocalAuthBackend:
                 "UPDATE users SET messaging_contact = ? "
                 "WHERE id = ? AND deleted_at IS NULL",
                 (normalized, user_id),
+            )
+            self._conn.commit()
+        return cur.rowcount > 0
+
+    def set_display_name(
+        self, user_id: int,
+        first_name: str | None, last_name: str | None,
+    ) -> bool:
+        """Set (or, with blanks, clear) the account's display-only first/last
+        name — see UserRecord. The username is intentionally not touchable here;
+        it's the immutable identity. Returns False if there's no matching active
+        account. Raises InvalidName if a value is over the length cap."""
+        first_name = self._validate_name(first_name)
+        last_name = self._validate_name(last_name)
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE users SET first_name = ?, last_name = ? "
+                "WHERE id = ? AND deleted_at IS NULL",
+                (first_name, last_name, user_id),
             )
             self._conn.commit()
         return cur.rowcount > 0
@@ -899,6 +1017,20 @@ class LocalAuthBackend:
             )
 
     @staticmethod
+    def _validate_name(name: str | None) -> str | None:
+        """Normalize an optional display name: trim whitespace, treat blank as
+        "not given" (None), and enforce a length cap. Returns the cleaned value.
+        Names are free-form, so the only rejection is over-length."""
+        if name is None:
+            return None
+        cleaned = name.strip()
+        if not cleaned:
+            return None
+        if len(cleaned) > _MAX_NAME_LEN:
+            raise InvalidName(f"name must be at most {_MAX_NAME_LEN} characters")
+        return cleaned
+
+    @staticmethod
     def _validate_email(email: str) -> None:
         if not isinstance(email, str):
             raise InvalidEmail("please enter your email address")
@@ -954,7 +1086,8 @@ class LocalAuthBackend:
         return row is not None
 
     def start_signup_verification(
-        self, username: str, password: str, email: str, api_access: bool = True
+        self, username: str, password: str, email: str, api_access: bool = True,
+        *, first_name: str | None = None, last_name: str | None = None,
     ) -> tuple[str, str, str]:
         """Begin a signup. Validates everything, stashes a pending row, and
         returns (token, code, normalized_email). The caller mails the code;
@@ -962,11 +1095,15 @@ class LocalAuthBackend:
 
         Raises UsernameTaken, WeakPassword, InvalidUsername, InvalidEmail at
         the same points create() would, so the UI can surface the same errors
-        on the signup form before we ever send mail.
+        on the signup form before we ever send mail. The optional
+        first_name/last_name are held with the pending row and written onto the
+        account when the code is confirmed.
         """
         self._validate_username(username)
         self._validate_password(password)
         self._validate_email(email)
+        first_name = self._validate_name(first_name)
+        last_name = self._validate_name(last_name)
         email_norm = email.strip()
 
         # Pre-hash the password so the plaintext never sits in the DB.
@@ -999,10 +1136,11 @@ class LocalAuthBackend:
             self._conn.execute(
                 "INSERT INTO email_verifications "
                 "(token, purpose, username, password_hash, email, code_hash, "
-                "api_access, created_at, expires_at) "
-                "VALUES (?, 'signup', ?, ?, ?, ?, ?, ?, ?)",
+                "api_access, created_at, expires_at, first_name, last_name) "
+                "VALUES (?, 'signup', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (token, username, pw_hash, email_norm, code_hash,
-                 1 if api_access else 0, now, expires_at),
+                 1 if api_access else 0, now, expires_at,
+                 first_name, last_name),
             )
             self._conn.commit()
         return token, code, email_norm
@@ -1085,7 +1223,8 @@ class LocalAuthBackend:
             self._purge_expired_verifications()
             row = self._conn.execute(
                 "SELECT token, purpose, user_id, username, password_hash, "
-                "email, code_hash, api_access, attempts, expires_at "
+                "email, code_hash, api_access, attempts, expires_at, "
+                "first_name, last_name "
                 "FROM email_verifications WHERE token = ?",
                 (token,),
             ).fetchone()
@@ -1094,7 +1233,7 @@ class LocalAuthBackend:
                     "this verification has expired — please start over"
                 )
             (_t, purpose, _uid, _user, _pwh, _email, stored_hash,
-             _api, attempts, expires_at) = row
+             _api, attempts, expires_at, _fn, _ln) = row
             if purpose != expected_purpose or expires_at < now:
                 self._conn.execute(
                     "DELETE FROM email_verifications WHERE token = ?", (token,)
@@ -1137,7 +1276,7 @@ class LocalAuthBackend:
         (UserRecord, dek) identical to create()."""
         row = self._consume_verification(token, code, expected_purpose="signup")
         (_t, _purpose, _uid, username, pw_hash, email, _code_hash,
-         api_access, _attempts, _exp) = row
+         api_access, _attempts, _exp, first_name, last_name) = row
 
         # Re-check uniqueness right before the INSERT — a different signup may
         # have completed for the same username in the interval the code was
@@ -1151,10 +1290,10 @@ class LocalAuthBackend:
                 cur = self._conn.execute(
                     "INSERT INTO users "
                     "(username, password_hash, email, salt_dek, wrapped_dek_v2, "
-                    "enc_version, api_access) "
-                    f"VALUES (?, ?, ?, ?, ?, {_ENC_VERSION_CURRENT}, ?)",
+                    "enc_version, api_access, first_name, last_name) "
+                    f"VALUES (?, ?, ?, ?, ?, {_ENC_VERSION_CURRENT}, ?, ?, ?)",
                     (username, pw_hash, email, salt_dek, wrapped,
-                     int(api_access)),
+                     int(api_access), first_name, last_name),
                 )
                 self._conn.commit()
             except sqlite3.IntegrityError as e:
@@ -1165,6 +1304,7 @@ class LocalAuthBackend:
             UserRecord(
                 id=cur.lastrowid, username=username,
                 api_access=bool(api_access), email=email,
+                first_name=first_name, last_name=last_name,
             ),
             dek,
         )
@@ -1176,7 +1316,7 @@ class LocalAuthBackend:
         the new email onto the existing user row. Returns the updated record."""
         row = self._consume_verification(token, code, expected_purpose="add_email")
         (_t, _purpose, user_id, _username, _pwh, email, _code_hash,
-         _api, _attempts, _exp) = row
+         _api, _attempts, _exp, _fn, _ln) = row
         with self._lock:
             self._conn.execute(
                 "UPDATE users SET email = ? WHERE id = ?",

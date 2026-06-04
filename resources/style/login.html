@@ -90,6 +90,9 @@
     button.submit:hover { background: var(--cta-hover); }
     button.submit:active { transform: translateY(1px); }
     button.submit:disabled { opacity: 0.6; cursor: default; }
+    .name-row { display: flex; gap: 0.6rem; }
+    .name-row input { flex: 1; min-width: 0; }
+    .optional { color: var(--muted); font-weight: 400; font-style: italic; }
     .hint { color: var(--muted); font-size: 0.78rem; margin: -0.2rem 0 0; }
     .error { color: var(--error); font-size: 0.85rem; margin: 0;
              min-height: 1.1rem; }
@@ -129,10 +132,21 @@
     </form>
 
     <form data-form="signup" method="post" action="/signup" autocomplete="on">
+      <label for="signup-first-name">Name <span class="optional">(optional)</span></label>
+      <div class="name-row">
+        <input id="signup-first-name" name="first_name" type="text"
+               autocomplete="given-name" placeholder="First"
+               maxlength="64" value="__SIGNUP_FIRST_NAME__">
+        <input id="signup-last-name" name="last_name" type="text"
+               autocomplete="family-name" placeholder="Last"
+               maxlength="64" value="__SIGNUP_LAST_NAME__">
+      </div>
+      <p class="hint">How you'd like to be shown. You can change this later.</p>
       <label for="signup-username">Username</label>
       <input id="signup-username" name="username" type="text" autocomplete="username"
              autocapitalize="off" autocorrect="off" value="__SIGNUP_USERNAME__" required>
-      <p class="hint">3–32 characters: letters, digits, dot, underscore, dash.</p>
+      <p class="hint">3–32 characters: letters, digits, dot, underscore, dash.
+        This is permanent and can't be changed.</p>
       <label for="signup-email">Email</label>
       <input id="signup-email" name="email" type="email" autocomplete="email"
              autocapitalize="off" autocorrect="off" value="__SIGNUP_EMAIL__"

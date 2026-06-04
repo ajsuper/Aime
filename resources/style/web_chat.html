@@ -1287,6 +1287,55 @@
     .topic-item:hover { background: rgba(124, 140, 255, 0.08); }
     .topic-item.active { background: rgba(124, 140, 255, 0.18); color: var(--accent); }
     .topic-item .cat { color: var(--muted); font-size: 0.7rem; margin-top: 0.1rem; }
+    /* Shared-with-me topics: dimmed, with a small "(Shared)" / owner tag.
+       Pending invites are dimmed further and italicised — they're not yet
+       openable, just a prompt to accept or decline. */
+    .topic-item.shared { opacity: 0.82; }
+    .topic-item.shared.pending { opacity: 0.55; font-style: italic; }
+    .topic-item .share-tag { color: var(--muted); font-size: 0.66rem;
+                             margin-top: 0.12rem; letter-spacing: 0.02em; }
+    .topic-item .share-tag .perm { opacity: 0.8; }
+    /* Accept / decline prompt shown in the topic body for a pending invite. */
+    .share-invite { padding: 1.5rem 1.25rem; max-width: 460px; }
+    .share-invite h3 { margin: 0 0 0.4rem; font-family: var(--font-display);
+                       font-size: 1.2rem; }
+    .share-invite p { color: var(--muted); font-size: 0.92rem; margin: 0 0 1.1rem;
+                      line-height: 1.5; }
+    .share-invite .row { display: flex; gap: 0.5rem; }
+    /* Share dialog — reuses the confirm-backdrop look, wider for the list. */
+    #share-backdrop { position: fixed; inset: 0; z-index: 310;
+                      background: rgba(0,0,0,0.55);
+                      backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);
+                      display: none; align-items: center; justify-content: center;
+                      padding: 2rem; }
+    #share-backdrop.open { display: flex; }
+    #share-modal { background: var(--bg-elev); border: 1px solid var(--border);
+                   border-radius: var(--r-md); max-width: 460px; width: 100%;
+                   padding: 1.25rem; max-height: 80vh; overflow-y: auto;
+                   box-shadow: inset 0 1px 0 var(--edge-light, transparent),
+                               var(--shadow-2, 0 20px 60px rgba(0,0,0,0.6)); }
+    #share-modal h3 { margin: 0 0 0.2rem; font-size: 1.15rem;
+                      font-family: var(--font-display); }
+    #share-modal .sub { margin: 0 0 1rem; color: var(--muted); font-size: 0.85rem; }
+    .share-add { display: flex; gap: 0.5rem; margin-bottom: 0.4rem; }
+    .share-add input, .share-add select, .share-row select {
+        background: var(--bg-input); color: var(--text);
+        border: 1px solid var(--border); border-radius: 8px;
+        padding: 0.4rem 0.6rem; font: inherit; font-size: 0.85rem; }
+    .share-add input { flex: 1; min-width: 0; }
+    .share-msg { font-size: 0.8rem; margin: 0 0 0.8rem; min-height: 1em; }
+    .share-list { display: flex; flex-direction: column; gap: 0.4rem; }
+    .share-list .empty { color: var(--muted); font-size: 0.85rem; padding: 0.3rem 0; }
+    .share-row { display: flex; align-items: center; gap: 0.5rem;
+                 padding: 0.45rem 0.55rem; background: var(--bg);
+                 border: 1px solid var(--border); border-radius: 8px; }
+    .share-row .who { flex: 1; min-width: 0; overflow: hidden;
+                      text-overflow: ellipsis; white-space: nowrap; font-size: 0.88rem; }
+    .share-row .who .status { color: var(--muted); font-size: 0.72rem; }
+    .share-row .revoke { background: transparent; border: 0; color: var(--muted);
+                         cursor: pointer; font-size: 1.1rem; line-height: 1;
+                         padding: 0 0.2rem; }
+    .share-row .revoke:hover { color: var(--error); }
     /* Folder children — indented and marked with a left guide-line so the
        eye instantly distinguishes them from root-level topics, which sit
        flush with the search input above. */
@@ -2180,6 +2229,16 @@
           <div class="topic-content scroll" id="topic-content">
             <div class="topic-toolbar" id="topic-toolbar">
               <button id="topic-edit-btn" class="advanced-only" title="Edit topic">Edit</button>
+              <button id="topic-share-btn" title="Share topic" aria-label="Share topic">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                     stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+                     width="16" height="16">
+                  <circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/>
+                  <circle cx="18" cy="19" r="3"/>
+                  <line x1="8.6" y1="10.5" x2="15.4" y2="6.5"/>
+                  <line x1="8.6" y1="13.5" x2="15.4" y2="17.5"/>
+                </svg>
+              </button>
               <div class="topic-download-wrap" id="topic-download-wrap">
                 <button id="topic-download-btn" title="Download topic"
                         aria-label="Download topic" aria-haspopup="menu"
@@ -2619,6 +2678,26 @@
               <span class="label">Email</span>
               <span class="value" id="account-email">—</span>
             </div>
+            <p class="desc" style="margin-top:0.6rem">Your name (display only — you
+              can change it any time). Your username stays the same.</p>
+            <div class="settings-row">
+              <input id="account-first-name-input" type="text" autocomplete="given-name"
+                     placeholder="First name" maxlength="64"
+                     style="flex:1;min-width:0;margin-right:0.5rem;background:var(--bg-input);
+                            color:var(--text);border:1px solid var(--border);
+                            border-radius:8px;padding:0.4rem 0.6rem;font-size:0.85rem">
+              <input id="account-last-name-input" type="text" autocomplete="family-name"
+                     placeholder="Last name" maxlength="64"
+                     style="flex:1;min-width:0;margin-right:0.5rem;background:var(--bg-input);
+                            color:var(--text);border:1px solid var(--border);
+                            border-radius:8px;padding:0.4rem 0.6rem;font-size:0.85rem">
+              <button class="btn-primary" id="account-name-btn"
+                      style="background:var(--accent);color:#fff;border:0;border-radius:8px;
+                             padding:0.4rem 0.9rem;cursor:pointer;font-size:0.85rem">
+                Save
+              </button>
+            </div>
+            <p class="desc" id="account-name-msg" style="display:none;margin-top:0.4rem"></p>
           </div>
           <div class="settings-section" id="account-access-section">
             <h3>Account usage</h3>
@@ -2733,6 +2812,26 @@
       <div class="confirm-actions">
         <button class="btn-secondary" id="confirm-cancel">Cancel</button>
         <button class="btn-danger" id="confirm-ok">Delete</button>
+      </div>
+    </div>
+  </div>
+  <div id="share-backdrop" role="dialog" aria-modal="true" aria-labelledby="share-title">
+    <div id="share-modal">
+      <h3 id="share-title">Share topic</h3>
+      <p class="sub" id="share-subtitle">Choose who can see this topic.</p>
+      <div class="share-add">
+        <input id="share-username" type="text" autocomplete="off"
+               autocapitalize="off" autocorrect="off" placeholder="Username">
+        <select id="share-permission">
+          <option value="view">Can view</option>
+          <option value="edit">Can edit</option>
+        </select>
+        <button class="btn-primary" id="share-add-btn">Share</button>
+      </div>
+      <p class="share-msg" id="share-msg" style="display:none"></p>
+      <div class="share-list" id="share-list"></div>
+      <div class="confirm-actions" style="margin-top:1rem">
+        <button class="btn-secondary" id="share-close">Done</button>
       </div>
     </div>
   </div>
@@ -3656,6 +3755,14 @@ es.onmessage = (ev) => {
       // section) so the new/updated run appears without a manual reload.
       scheduleActivePaneRefresh();
       break;
+    case "share_update":
+      // Someone shared a topic with this user, responded to one of their
+      // shares, revoked access, or edited a shared topic. Reload the topic
+      // list (silently — keeps any open topic) so invites and shared items
+      // appear/update, and refresh the open topic in case its content changed.
+      loadTopics(true);
+      refreshOpenTopic();
+      break;
     case "turn_end":
       if (verbosity === "minimal") freezeWorkingIndicator();
       else clearWorkingIndicator();
@@ -4193,6 +4300,10 @@ function refreshActivePane(silent) {
 // existing markdown stays rendered until the new copy is parsed.
 function refreshOpenTopic() {
   if (!selectedTopicId || topicEditing) return;
+  // A pending shared invite shows an accept/decline prompt, not content — don't
+  // overwrite it (and the server would 403 a pending read anyway).
+  const open = topicByHandle(selectedTopicId);
+  if (open && open.shared && open.status === "pending") return;
   fetch("/topics/" + encodeURIComponent(selectedTopicId))
     .then(r => r.json())
     .then(data => {
@@ -6453,6 +6564,7 @@ topicBackBtn.addEventListener("click", () => {
   sideColEl.classList.remove("topic-open");
 });
 const topicEditBtn = document.getElementById("topic-edit-btn");
+const topicShareBtn = document.getElementById("topic-share-btn");
 const topicBoldBtn = document.getElementById("topic-bold-btn");
 const topicItalicBtn = document.getElementById("topic-italic-btn");
 const topicSaveBtn = document.getElementById("topic-save-btn");
@@ -6575,11 +6687,25 @@ function buildTopicItem(t) {
   item.className = "topic-item";
   const tid = t.id || t.topic_id || t.name || t.title;
   if (tid === selectedTopicId) item.classList.add("active");
-  applyCategoryColor(item, t.category);
+  if (t.shared) {
+    item.classList.add("shared");
+    if (t.status === "pending") item.classList.add("pending");
+  } else {
+    applyCategoryColor(item, t.category);
+  }
   const title = document.createElement("div");
   title.textContent = t.title || t.name || "(untitled)";
   item.appendChild(title);
-  if (t.category) {
+  if (t.shared) {
+    // Shared topics show owner + access instead of the #category color chip.
+    const tag = document.createElement("div");
+    tag.className = "share-tag";
+    const perm = t.permission === "edit" ? "can edit" : "view only";
+    tag.innerHTML = t.status === "pending"
+      ? `Shared by ${escapeHtml(t.owner || "?")} — tap to respond`
+      : `Shared by ${escapeHtml(t.owner || "?")} · <span class="perm">${perm}</span>`;
+    item.appendChild(tag);
+  } else if (t.category) {
     const c = document.createElement("div");
     c.className = "cat";
     c.textContent = "#" + t.category;
@@ -6587,6 +6713,19 @@ function buildTopicItem(t) {
   }
   item.addEventListener("click", () => selectTopic(tid, item));
   return item;
+}
+
+// Find the loaded topic object for a handle (own or shared composite id).
+function topicByHandle(tid) {
+  return allTopics.find(
+    t => String(t.id ?? t.topic_id ?? t.name ?? t.title) === String(tid)
+  ) || null;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+  }[c]));
 }
 
 function renderTopicList() {
@@ -6702,14 +6841,63 @@ topicSearchEl.addEventListener("keydown", (e) => {
 
 let currentTopicMarkdown = "";
 let topicEditing = false;
+// Sharing state for the currently open topic. Drives which toolbar buttons
+// show: only the owner can Share, and only an owner / edit-recipient can Edit.
+let currentTopicShared = false;
+let currentTopicCanEdit = true;
 
 function setTopicEditMode(on) {
   topicEditing = !!on;
-  topicEditBtn.hidden = topicEditing;
+  // Edit is available only when the viewer may edit (own topic, or a shared
+  // one granted "edit"). Share is owner-only.
+  topicEditBtn.hidden = topicEditing || !currentTopicCanEdit;
+  topicShareBtn.hidden = topicEditing || currentTopicShared;
   topicBoldBtn.hidden = !topicEditing;
   topicItalicBtn.hidden = !topicEditing;
   topicSaveBtn.hidden = !topicEditing;
   topicCancelBtn.hidden = !topicEditing;
+}
+
+// A pending invite isn't openable yet — show an accept/decline prompt instead
+// of fetching content (the server would 403 a pending read anyway).
+function renderShareInvite(t) {
+  topicToolbarEl.classList.add("show");
+  topicShareBtn.hidden = true;
+  topicEditBtn.hidden = true;
+  const title = escapeHtml(t.title || "this topic");
+  const owner = escapeHtml(t.owner || "someone");
+  const perm = t.permission === "edit" ? "edit" : "view";
+  topicBodyEl.innerHTML =
+    '<div class="share-invite">' +
+      '<h3>' + title + '</h3>' +
+      '<p>' + owner + ' shared this topic with you (' + perm + ' access). ' +
+        'Accept to add it to your topics, or decline to remove the invite.</p>' +
+      '<div class="row">' +
+        '<button class="btn-primary" id="invite-accept">Accept</button>' +
+        '<button class="btn-secondary" id="invite-decline">Decline</button>' +
+      '</div>' +
+    '</div>';
+  const [owner_id, topic_id] = String(t.id).split(":");
+  document.getElementById("invite-accept").addEventListener("click",
+    () => respondToShare(owner_id, topic_id, true));
+  document.getElementById("invite-decline").addEventListener("click",
+    () => respondToShare(owner_id, topic_id, false));
+}
+
+async function respondToShare(ownerId, topicId, accept) {
+  try {
+    await fetch("/shares/" + ownerId + "/" + topicId + "/respond", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      credentials: "same-origin",
+      body: JSON.stringify({accept}),
+    });
+  } catch {}
+  selectedTopicId = null;
+  topicBodyEl.innerHTML = '<div class="empty">select a topic</div>';
+  topicToolbarEl.classList.remove("show");
+  sideColEl.classList.remove("topic-open");
+  loadTopics(false);
 }
 
 async function selectTopic(tid, item) {
@@ -6717,9 +6905,18 @@ async function selectTopic(tid, item) {
   document.querySelectorAll(".topic-item").forEach(t => t.classList.remove("active"));
   if (item) item.classList.add("active");
   // Reset any in-progress edit when switching topics.
+  const t = topicByHandle(tid) || {};
+  currentTopicShared = !!t.shared;
+  currentTopicCanEdit = !t.shared || t.permission === "edit";
   setTopicEditMode(false);
   topicToolbarEl.classList.remove("show");
   topicBodyEl.innerHTML = '<div class="empty">loading…</div>';
+  // A pending invite gets the accept/decline prompt, not the content.
+  if (t.shared && t.status === "pending") {
+    if (mobileMQ.matches) { sideColEl.classList.add("topic-open"); topicContentEl.scrollTop = 0; }
+    renderShareInvite(t);
+    return;
+  }
   // Mobile: slide the topic content in over the full window. The toolbar
   // (which carries the back arrow) is shown up front so the user can leave
   // even while the topic is still loading.
@@ -6734,6 +6931,9 @@ async function selectTopic(tid, item) {
     const md = data.contents || "";
     currentTopicMarkdown = md;
     topicToolbarEl.classList.add("show");
+    // Re-apply gating now the toolbar is shown (selectTopic may race a list
+    // refresh that rebuilt currentTopic* — keep buttons correct).
+    setTopicEditMode(false);
     if (!md.trim()) {
       topicBodyEl.innerHTML = '<div class="empty">(empty)</div>';
       return;
@@ -6901,6 +7101,142 @@ topicItalicBtn.addEventListener("click", () => {
   if (ta) wrapEditorSelection(ta, "*");
 });
 
+// -- Topic sharing (owner side) -----------------------------------------
+const shareBackdrop = document.getElementById("share-backdrop");
+const shareUsernameEl = document.getElementById("share-username");
+const sharePermissionEl = document.getElementById("share-permission");
+const shareAddBtn = document.getElementById("share-add-btn");
+const shareMsgEl = document.getElementById("share-msg");
+const shareListEl = document.getElementById("share-list");
+// The plain integer id of the topic whose share dialog is open (owner-only,
+// so always one of our own topics — never a composite handle).
+let shareTopicId = null;
+
+function showShareMsg(text, isError) {
+  shareMsgEl.textContent = text || "";
+  shareMsgEl.style.color = isError ? "var(--error)" : "var(--muted)";
+  shareMsgEl.style.display = text ? "" : "none";
+}
+
+function openShareModal() {
+  if (!selectedTopicId || currentTopicShared) return;
+  shareTopicId = selectedTopicId;
+  shareUsernameEl.value = "";
+  sharePermissionEl.value = "view";
+  showShareMsg("", false);
+  shareListEl.innerHTML = '<div class="empty">loading…</div>';
+  shareBackdrop.classList.add("open");
+  shareUsernameEl.focus();
+  loadShareList();
+}
+
+function closeShareModal() {
+  shareBackdrop.classList.remove("open");
+  shareTopicId = null;
+}
+
+async function loadShareList() {
+  try {
+    const r = await fetch("/topics/" + encodeURIComponent(shareTopicId) + "/shares");
+    const data = await r.json();
+    const shares = (data && data.shares) || [];
+    if (!shares.length) {
+      shareListEl.innerHTML = '<div class="empty">Not shared with anyone yet.</div>';
+      return;
+    }
+    shareListEl.innerHTML = "";
+    shares.forEach(s => shareListEl.appendChild(buildShareRow(s)));
+  } catch {
+    shareListEl.innerHTML = '<div class="empty">Couldn\'t load shares.</div>';
+  }
+}
+
+function buildShareRow(s) {
+  const row = document.createElement("div");
+  row.className = "share-row";
+  const who = document.createElement("div");
+  who.className = "who";
+  const statusLabel = s.status === "pending" ? " · pending"
+    : (s.status === "declined" ? " · declined" : "");
+  who.innerHTML = escapeHtml(s.username) +
+    '<span class="status">' + statusLabel + '</span>';
+  row.appendChild(who);
+
+  const perm = document.createElement("select");
+  perm.innerHTML = '<option value="view">Can view</option>' +
+                   '<option value="edit">Can edit</option>';
+  perm.value = s.permission;
+  perm.addEventListener("change", () => changeShare(s.username, perm.value));
+  row.appendChild(perm);
+
+  const revoke = document.createElement("button");
+  revoke.className = "revoke";
+  revoke.title = "Remove";
+  revoke.textContent = "×";
+  revoke.addEventListener("click", () => removeShare(s.username));
+  row.appendChild(revoke);
+  return row;
+}
+
+async function addShare() {
+  const username = shareUsernameEl.value.trim();
+  if (!username || shareTopicId == null) return;
+  shareAddBtn.disabled = true;
+  try {
+    const r = await fetch("/topics/" + encodeURIComponent(shareTopicId) + "/share", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      credentials: "same-origin",
+      body: JSON.stringify({username, permission: sharePermissionEl.value}),
+    });
+    const data = await r.json();
+    if (data.ok) {
+      shareUsernameEl.value = "";
+      showShareMsg("Shared with " + username + ".", false);
+      loadShareList();
+    } else {
+      showShareMsg(data.error || "Couldn't share.", true);
+    }
+  } catch {
+    showShareMsg("Network error — try again.", true);
+  }
+  shareAddBtn.disabled = false;
+}
+
+async function changeShare(username, permission) {
+  try {
+    await fetch("/topics/" + encodeURIComponent(shareTopicId) + "/share", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      credentials: "same-origin",
+      body: JSON.stringify({username, permission}),
+    });
+    loadShareList();
+  } catch {}
+}
+
+async function removeShare(username) {
+  try {
+    await fetch("/topics/" + encodeURIComponent(shareTopicId) + "/unshare", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      credentials: "same-origin",
+      body: JSON.stringify({username}),
+    });
+    loadShareList();
+  } catch {}
+}
+
+topicShareBtn.addEventListener("click", openShareModal);
+shareAddBtn.addEventListener("click", addShare);
+shareUsernameEl.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); addShare(); }
+});
+document.getElementById("share-close").addEventListener("click", closeShareModal);
+shareBackdrop.addEventListener("click", (e) => {
+  if (e.target === shareBackdrop) closeShareModal();
+});
+
 // Regex matches a markdown task-list marker at the start of a list item:
 //   "- [ ]", "* [x]", "+ [X]", with optional leading indent and ordered-list
 // variants like "1. [ ]". Group 1 is the leading prefix (list bullet + space),
@@ -6919,6 +7255,9 @@ function flipNthTask(md, n, checked) {
 let saveInFlight = Promise.resolve();
 async function onTopicCheckboxToggle(e) {
   const box = e.currentTarget;
+  // View-only viewers of a shared topic can't toggle tasks — the server would
+  // 403 the save. Revert the checkbox and bail.
+  if (!currentTopicCanEdit) { box.checked = !box.checked; return; }
   const idx = parseInt(box.dataset.taskIndex, 10);
   if (isNaN(idx) || !selectedTopicId) return;
   const updated = flipNthTask(currentTopicMarkdown, idx, box.checked);
@@ -7313,6 +7652,10 @@ document.addEventListener("keydown", (e) => {
 
 const accountUsernameEl = document.getElementById("account-username");
 const accountEmailEl = document.getElementById("account-email");
+const firstNameInput = document.getElementById("account-first-name-input");
+const lastNameInput = document.getElementById("account-last-name-input");
+const nameBtn = document.getElementById("account-name-btn");
+const nameMsg = document.getElementById("account-name-msg");
 
 // Access state (see docs/access-control.md). Optimistic defaults until the
 // first /me resolves; the server-side /send gate is the real guard.
@@ -7364,6 +7707,8 @@ async function refreshMe() {
     const data = await r.json();
     accountUsernameEl.textContent = data.username || "—";
     accountEmailEl.textContent = data.email || "—";
+    if (firstNameInput) firstNameInput.value = data.first_name || "";
+    if (lastNameInput) lastNameInput.value = data.last_name || "";
     if (contactInput) contactInput.value = data.messaging_contact || "";
     __accessMode = data.access_mode || "open";
     __apiAccess = !!data.api_access;
@@ -7439,6 +7784,43 @@ contactBtn.addEventListener("click", async () => {
 });
 contactInput.addEventListener("keydown", (e) => {
   if (e.key === "Enter") { e.preventDefault(); contactBtn.click(); }
+});
+
+// Save the display-only first/last name. The username is never editable here.
+nameBtn.addEventListener("click", async () => {
+  nameMsg.style.display = "none";
+  nameBtn.disabled = true;
+  try {
+    const r = await fetch("/display-name", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      credentials: "same-origin",
+      body: JSON.stringify({
+        first_name: firstNameInput.value.trim(),
+        last_name: lastNameInput.value.trim(),
+      }),
+    });
+    const data = await r.json();
+    if (data.ok) {
+      firstNameInput.value = data.first_name || "";
+      lastNameInput.value = data.last_name || "";
+      nameMsg.textContent = "Saved.";
+      nameMsg.style.color = "var(--muted)";
+    } else {
+      nameMsg.textContent = data.message || "Couldn't save that.";
+      nameMsg.style.color = "var(--error)";
+    }
+  } catch {
+    nameMsg.textContent = "Network error — try again.";
+    nameMsg.style.color = "var(--error)";
+  }
+  nameMsg.style.display = "";
+  nameBtn.disabled = false;
+});
+[firstNameInput, lastNameInput].forEach((el) => {
+  el.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); nameBtn.click(); }
+  });
 });
 
 document.getElementById("account-logout-btn").addEventListener("click", logout);
