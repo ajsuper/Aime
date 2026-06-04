@@ -1220,10 +1220,11 @@
     .todo-item.canceled .todo-label { text-decoration: line-through;
                                       text-decoration-thickness: 1px;
                                       color: var(--muted); }
-    /* Unknown = a past, unconfirmed event. Not struck through (we don't know
-       it didn't happen); an amber check outline invites the user to confirm. */
-    .todo-item.unknown .todo-check { border-color: var(--warning, #e29a4a);
-                                     border-style: dashed; }
+    /* Unknown ("unconfirmed" to the user) = a past event we never resolved.
+       Not struck through (we don't know it didn't happen); a soft amber-tinted
+       check border gently invites the user to confirm — no loud dashed edge. */
+    .todo-item.unknown .todo-check {
+      border-color: color-mix(in srgb, var(--warning, #e29a4a) 45%, var(--border)); }
 
     /* Day view to-do strip: a clear stacked list spanning the full width
        so it reads as a single panel, not a row of pills. */
@@ -1611,8 +1612,7 @@
     .status-pill.active.s-canceled {
       background: color-mix(in srgb, #d2554d 26%, transparent); }
     .status-pill.active.s-unknown {
-      background: color-mix(in srgb, var(--warning, #e29a4a) 24%, transparent);
-      border: 1px dashed color-mix(in srgb, var(--warning, #e29a4a) 60%, transparent); }
+      background: color-mix(in srgb, var(--warning, #e29a4a) 18%, transparent); }
     .ev-meta-details { display: flex; flex-wrap: wrap; gap: 0.3rem 0.7rem;
                        align-items: center; }
     .ev-meta-item { color: var(--muted); }
@@ -1714,16 +1714,15 @@
     .cal-sched .ev-pill.canceled,
     .cal-sched .ev-block.canceled { text-decoration: line-through; }
 
-    /* Unknown = a past event the user never resolved. Unlike completed/canceled
-       it's not a settled outcome, so it isn't greyed out — instead it keeps an
-       amber dashed edge to read as "this still needs a yes/no". */
+    /* Unknown ("unconfirmed" to the user) = a past event we never resolved.
+       Unlike completed/canceled it's not a settled outcome, so it isn't greyed
+       out — instead a quiet soft-amber left edge hints "this still needs a
+       yes/no" without the loud dashed outline. */
     .cal-cell .ev.unknown,
     .cal-sched .ev-pill.unknown,
     .cal-sched .ev-block.unknown {
-      opacity: 0.8;
-      box-shadow: inset 3px 0 0 var(--warning, #e29a4a);
-      outline: 1px dashed color-mix(in srgb, var(--warning, #e29a4a) 70%, transparent);
-      outline-offset: -1px;
+      box-shadow: inset 2px 0 0
+        color-mix(in srgb, var(--warning, #e29a4a) 45%, transparent);
     }
 
     /* Settings modal: floating panel over a blurred chat backdrop. */
@@ -2146,8 +2145,8 @@
           </div>
           <span class="cal-spacer"></span>
           <select id="cal-view" class="cal-view" aria-label="Calendar view">
-            <option value="month" selected>Month</option>
-            <option value="week">Week</option>
+            <option value="month">Month</option>
+            <option value="week" selected>Week</option>
             <option value="day">Day</option>
           </select>
         </div>
@@ -4910,7 +4909,13 @@ const now = new Date();
 // calSelectedDay aliases in sync so existing fetch URLs and refresh hooks
 // keep working — they were already month-indexed.
 const calCursor = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-let calView = "month";              // "month" | "week" | "day"
+// Persisted across reloads so the rendered view and the dropdown never drift
+// apart (the browser restores the <select> on refresh; without this the state
+// variable would reset and disagree with it). Defaults to the week view.
+const CAL_VIEW_KEY = "aime.calView";
+const CAL_VIEWS = ["month", "week", "day"];
+let calView = localStorage.getItem(CAL_VIEW_KEY);
+if (!CAL_VIEWS.includes(calView)) calView = "week";  // "month" | "week" | "day"
 let calYear = calCursor.getFullYear();
 let calMonth = calCursor.getMonth() + 1;
 let calSelectedDay = null;          // 1..31, kept in sync for month-cell highlighting
@@ -4996,8 +5001,14 @@ document.querySelector('[data-action="cal-prev"]').addEventListener("click",
   () => moveCalCursor(-1));
 document.querySelector('[data-action="cal-next"]').addEventListener("click",
   () => moveCalCursor(1));
-document.getElementById("cal-view").addEventListener("change", (e) => {
+// Force the dropdown to match the (possibly persisted) state on load, so a
+// browser-restored selection can't leave the control showing one view while
+// another is rendered.
+const calViewSel = document.getElementById("cal-view");
+calViewSel.value = calView;
+calViewSel.addEventListener("change", (e) => {
   calView = e.target.value;
+  localStorage.setItem(CAL_VIEW_KEY, calView);
   calSelectedDay = null;
   calSelectedDate = null;
   renderCalendar();
@@ -5568,6 +5579,12 @@ evAddReminderBtn.addEventListener("click", addReminder);
 // too, so it's selectable like the rest.)
 const EVENT_STATUS_OPTIONS = ["scheduled", "completed", "canceled", "unknown"];
 
+// Backend status value -> friendly user-facing label. `unknown` stays `unknown`
+// everywhere in the data/API, but reads as the warmer "unconfirmed" in the UI.
+// Other statuses display as-is (capitalized via CSS).
+const EVENT_STATUS_LABELS = { unknown: "unconfirmed" };
+const eventStatusLabel = (s) => EVENT_STATUS_LABELS[s] || s;
+
 // Lifecycle section under the category field: a row of status pills (active one
 // lit, the others greyed — click to switch) plus any populated commitment /
 // status-change-reason / reschedule-origin detail underneath. Built with DOM
@@ -5583,7 +5600,7 @@ function renderEventMeta(ev) {
     const pill = document.createElement("button");
     pill.type = "button";
     pill.className = "status-pill s-" + s + (s === status ? " active" : "");
-    pill.textContent = s;
+    pill.textContent = eventStatusLabel(s);
     pill.setAttribute("aria-pressed", s === status ? "true" : "false");
     pill.addEventListener("click", async (e) => {
       e.stopPropagation();
