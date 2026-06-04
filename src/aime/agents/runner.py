@@ -143,7 +143,7 @@ class BackgroundAgentRunner:
     ):
         web_search_agent = None
         web_search_schema = None
-        if spec.allow_web_search and config.WEB_SEARCH_ENABLED:
+        if spec.web_search_allowed and config.WEB_SEARCH_ENABLED:
             web_search_agent = WebSearchAgent(
                 model=config.WEB_SEARCH_MODEL,
                 tool_version=config.WEB_SEARCH_TOOL_VERSION,

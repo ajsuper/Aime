@@ -27,7 +27,7 @@ import os
 from cryptography.exceptions import InvalidTag
 
 from .. import encryption as _enc
-from .spec import AgentSpec
+from .spec import AgentSpec, permissions_to_allowlist
 
 
 _SUFFIX = ".json.enc"
@@ -54,13 +54,18 @@ def make_definition(
     instructions: str,
     description: str = "",
     allow_web_search: bool = False,
+    allow_modify_topics: bool = False,
+    allow_modify_events: bool = False,
+    allow_send_message: bool = False,
     agent_id: str | None = None,
 ) -> dict:
     """Build a fresh definition record from user-supplied fields, stamping the
-    id and timestamps. Scheduling is no longer stored here — a scheduled run is a
-    ``run_agent`` record in the schedule store (aime.scheduling) that references
-    this agent's id, so an agent can have zero or several schedules independent
-    of its definition."""
+    id and timestamps. An agent is least-privilege by default: read-only data
+    access plus whichever permission toggles are set (see
+    ``permissions_to_allowlist``). Scheduling is no longer stored here — a
+    scheduled run is a ``run_agent`` record in the schedule store
+    (aime.scheduling) that references this agent's id, so an agent can have zero
+    or several schedules independent of its definition."""
     now = _utc_now_iso()
     return {
         "agent_id": agent_id or new_agent_id(name),
@@ -68,6 +73,9 @@ def make_definition(
         "description": description,
         "instructions": instructions,
         "allow_web_search": bool(allow_web_search),
+        "allow_modify_topics": bool(allow_modify_topics),
+        "allow_modify_events": bool(allow_modify_events),
+        "allow_send_message": bool(allow_send_message),
         "created_at": now,
         "updated_at": now,
     }
@@ -78,13 +86,19 @@ def definition_to_spec(record: dict) -> AgentSpec:
 
     The spec's ``name`` is the user's display name (the runner sanitizes it for
     the run id, and the run record keeps it as ``agent_name`` so saved-agent runs
-    show a friendly label in the runs list). A saved agent gets the full toolset
-    and the standard agent model — the same defaults as an ad-hoc run."""
+    show a friendly label in the runs list). The toolset is derived from the
+    agent's permission toggles — the read-only baseline plus whichever mutating
+    groups are enabled — so an agent can only do what the user allowed."""
     return AgentSpec(
         name=record.get("name") or record.get("agent_id") or "agent",
         description=record.get("description") or "Saved agent",
         instructions=record.get("instructions") or "",
-        allow_web_search=bool(record.get("allow_web_search", False)),
+        tool_allowlist=permissions_to_allowlist(
+            modify_topics=bool(record.get("allow_modify_topics", False)),
+            modify_events=bool(record.get("allow_modify_events", False)),
+            send_message=bool(record.get("allow_send_message", False)),
+            web_search=bool(record.get("allow_web_search", False)),
+        ),
     )
 
 

@@ -19,6 +19,76 @@ from .. import config
 _RESULT_PROPERTY = "result"
 
 
+# --- Agent permissions -------------------------------------------------------
+# A background agent is least-privilege by default: it can always *read* the
+# user's data, but each mutating (or side-effecting) capability is unlocked by
+# an explicit permission toggle. The groups below name the tools each permission
+# covers; ``permissions_to_allowlist`` turns a set of toggles into the
+# ``tool_allowlist`` — the single source of truth for what an agent may do.
+#
+# Web search rides the same pipeline as every other capability: it is just
+# another tool name ("WebSearch") in the allowlist. It differs only in *how* it
+# is served (an offloaded Haiku sub-agent, not a SCHEMA_FILES data tool), so the
+# runner reads ``AgentSpec.web_search_allowed`` to decide whether to wire that
+# sub-agent in — but the gating decision lives in the allowlist, like the rest.
+
+# Always available: every read-only data tool. An agent with no permissions can
+# still look at events, topics, folders, and the activity/pattern summaries.
+READONLY_TOOLS = frozenset({
+    "FilterUsersEvents",
+    "FilterTopics",
+    "GetTopicContents",
+    "ListFolders",
+    "GetCommitmentHistory",
+    "GetPatternSummary",
+    "GetRecentActivity",
+})
+
+# Unlocked by the "modify events" permission.
+MODIFY_EVENTS_TOOLS = frozenset({"CreateEvent", "EditEvent"})
+
+# Unlocked by the "modify topics" permission (topic + folder writes).
+MODIFY_TOPICS_TOOLS = frozenset({
+    "CreateTopic",
+    "ReplaceTopic",
+    "ReplaceTopicContents",
+    "EditTopicContents",
+    "RenameFolder",
+})
+
+# Unlocked by the "send message" permission.
+SEND_MESSAGE_TOOLS = frozenset({"SendMessage"})
+
+# Unlocked by the "web search" permission. Not a SCHEMA_FILES tool (it's served
+# by the offloaded Haiku sub-agent), but it lives in the allowlist all the same
+# so every capability is gated in one place. The name matches the WebSearch tool
+# the conversational model calls.
+WEB_SEARCH_TOOLS = frozenset({"WebSearch"})
+
+
+def permissions_to_allowlist(
+    *,
+    modify_topics: bool = False,
+    modify_events: bool = False,
+    send_message: bool = False,
+    web_search: bool = False,
+) -> frozenset[str]:
+    """The ``tool_allowlist`` for an agent with the given permission toggles:
+    the read-only baseline plus each unlocked group. Every capability — web
+    search included — is expressed as a tool name here, so the allowlist is the
+    one place that says what an agent may do."""
+    allow = set(READONLY_TOOLS)
+    if modify_events:
+        allow |= MODIFY_EVENTS_TOOLS
+    if modify_topics:
+        allow |= MODIFY_TOPICS_TOOLS
+    if send_message:
+        allow |= SEND_MESSAGE_TOOLS
+    if web_search:
+        allow |= WEB_SEARCH_TOOLS
+    return frozenset(allow)
+
+
 @dataclass(frozen=True)
 class AgentSpec:
     """The complete definition of a background agent.
@@ -40,14 +110,15 @@ class AgentSpec:
                       property so the model is guided to the right structure.
                       None => a free-form object (or omitted) result.
       tool_allowlist: Optional set of agent-facing tool names the worker may use
-                      (e.g. {"FilterUsersEvents", "GetTopicContents"}). None =>
-                      the full Aime toolset. Read-only agents can use this to
-                      forbid mutations.
+                      (e.g. {"FilterUsersEvents", "GetTopicContents", "WebSearch"}).
+                      None => the full Aime toolset (and web search). The single
+                      source of truth for the worker's capabilities, including web
+                      search (see ``web_search_allowed``). Build it from a set of
+                      permission toggles with ``permissions_to_allowlist``.
       model:          Model id for the run. Defaults to the standard agent model.
       max_turns:      Safety budget: the maximum number of assistant turns before
                       the runner gives up on a worker that never calls
                       SubmitResult.
-      allow_web_search: Whether the worker is given the WebSearch tool.
     """
 
     name: str
@@ -57,7 +128,13 @@ class AgentSpec:
     tool_allowlist: frozenset[str] | None = None
     model: str = config.AGENT_MODEL
     max_turns: int = 12
-    allow_web_search: bool = True
+
+    @property
+    def web_search_allowed(self) -> bool:
+        """Whether the worker may use web search. Web search is gated by the
+        allowlist like every other tool: present when "WebSearch" is allowed, or
+        when the allowlist is None (the full toolset includes web search)."""
+        return self.tool_allowlist is None or "WebSearch" in self.tool_allowlist
 
     def render_kickoff(self, inputs: dict | None = None) -> str:
         """The task message sent to the model at kickoff.

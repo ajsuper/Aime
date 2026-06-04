@@ -71,6 +71,7 @@ from aime.agents import (
     BackgroundAgentRunner,
     definition_to_spec,
     make_definition,
+    permissions_to_allowlist,
     register as _register_agent,
 )
 from aime.scheduling import (
@@ -2202,11 +2203,18 @@ def agents_run():
     # runs listed in creation order; the random suffix avoids collisions.
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     name = f"adhoc-{stamp}-{base64.b16encode(os.urandom(3)).decode().lower()}"
+    # An ad-hoc run is a one-off the user typed by hand, so it gets the full data
+    # toolset; web search rides the same allowlist and follows the checkbox.
     spec = AgentSpec(
         name=name,
         description="Ad-hoc agent",
         instructions=instructions,
-        allow_web_search=allow_web,
+        tool_allowlist=permissions_to_allowlist(
+            modify_topics=True,
+            modify_events=True,
+            send_message=True,
+            web_search=allow_web,
+        ),
     )
     _register_agent(spec)
     _launch_agent_run(spec, g.user_id, client_tz)
@@ -2231,6 +2239,9 @@ def _agent_def_public(record: dict) -> dict:
         "description": record.get("description", ""),
         "instructions": record.get("instructions", ""),
         "allow_web_search": bool(record.get("allow_web_search", False)),
+        "allow_modify_topics": bool(record.get("allow_modify_topics", False)),
+        "allow_modify_events": bool(record.get("allow_modify_events", False)),
+        "allow_send_message": bool(record.get("allow_send_message", False)),
         "created_at": record.get("created_at", ""),
         "updated_at": record.get("updated_at", ""),
     }
@@ -2261,6 +2272,9 @@ def agents_create():
         instructions=instructions,
         description=(data.get("description") or "").strip(),
         allow_web_search=bool(data.get("allow_web_search", False)),
+        allow_modify_topics=bool(data.get("allow_modify_topics", False)),
+        allow_modify_events=bool(data.get("allow_modify_events", False)),
+        allow_send_message=bool(data.get("allow_send_message", False)),
     )
     if not _agent_def_store(g.user_id).save(record):
         return jsonify({"ok": False, "error": "couldn't save the agent"}), 500
@@ -2291,6 +2305,12 @@ def agents_update(agent_id: str):
         record["description"] = (data.get("description") or "").strip()
     if "allow_web_search" in data:
         record["allow_web_search"] = bool(data.get("allow_web_search"))
+    if "allow_modify_topics" in data:
+        record["allow_modify_topics"] = bool(data.get("allow_modify_topics"))
+    if "allow_modify_events" in data:
+        record["allow_modify_events"] = bool(data.get("allow_modify_events"))
+    if "allow_send_message" in data:
+        record["allow_send_message"] = bool(data.get("allow_send_message"))
     if not store.save(record):
         return jsonify({"ok": False, "error": "couldn't save the agent"}), 500
     return jsonify({"ok": True, "agent": _agent_def_public(record)})

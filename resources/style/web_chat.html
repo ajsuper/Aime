@@ -830,6 +830,9 @@
                     color: var(--muted); font-size: 0.85rem; cursor: pointer;
                     margin-top: 0.2rem; }
     .agents-check input { accent-color: var(--accent); }
+    .agent-perms { display: flex; flex-direction: column; gap: 0.45rem;
+                   margin-top: 0.35rem; }
+    #agent-perm-send-message-hint { margin-top: 0.35rem; }
     .agents-hint { color: var(--muted); font-size: 0.8rem; margin: 0; }
     .agents-hint.error { color: var(--error); }
     #agent-new-btn { background: var(--accent); border: 1px solid var(--accent);
@@ -2438,10 +2441,33 @@
         <label class="agents-label" for="agent-edit-instructions">Instructions</label>
         <textarea id="agent-edit-instructions" rows="6" spellcheck="false"
                   placeholder="Describe the task for the agent to carry out against your data…"></textarea>
-        <label class="agents-check">
-          <input type="checkbox" id="agent-edit-web-search">
-          <span>Allow web search</span>
-        </label>
+        <label class="agents-label">Permissions</label>
+        <div class="agent-perms">
+          <label class="sched-switch">
+            <input type="checkbox" id="agent-perm-modify-topics">
+            <span class="sched-slider"></span>
+            <span class="sched-switch-label">Modify topics</span>
+          </label>
+          <label class="sched-switch">
+            <input type="checkbox" id="agent-perm-modify-events">
+            <span class="sched-slider"></span>
+            <span class="sched-switch-label">Modify events</span>
+          </label>
+          <label class="sched-switch">
+            <input type="checkbox" id="agent-perm-web-search">
+            <span class="sched-slider"></span>
+            <span class="sched-switch-label">Web search</span>
+          </label>
+          <label class="sched-switch">
+            <input type="checkbox" id="agent-perm-send-message">
+            <span class="sched-slider"></span>
+            <span class="sched-switch-label">Send message</span>
+          </label>
+        </div>
+        <p class="agents-hint" id="agent-perm-send-message-hint">
+          To actually get a message, tell the agent in its instructions to send
+          you one — this permission only lets it.
+        </p>
         <label class="agents-label">Schedule</label>
         <label class="sched-switch">
           <input type="checkbox" id="agent-sched-enabled">
@@ -4496,10 +4522,17 @@ function buildAgentCard(agent) {
 
   const meta = document.createElement("div");
   meta.className = "agent-card-meta";
-  if (agent.allow_web_search) {
-    const w = document.createElement("span");
-    w.textContent = "🌐 web search";
-    meta.appendChild(w);
+  const perms = [
+    [agent.allow_modify_topics, "📝 modify topics"],
+    [agent.allow_modify_events, "📅 modify events"],
+    [agent.allow_web_search, "🌐 web search"],
+    [agent.allow_send_message, "✉️ send message"],
+  ];
+  for (const [on, label] of perms) {
+    if (!on) continue;
+    const span = document.createElement("span");
+    span.textContent = label;
+    meta.appendChild(span);
   }
   if (meta.childNodes.length) card.appendChild(meta);
 
@@ -4672,7 +4705,10 @@ const agentEditTitle = document.getElementById("agent-edit-title");
 const agentNameEl = document.getElementById("agent-name");
 const agentDescEl = document.getElementById("agent-desc");
 const agentEditInstructionsEl = document.getElementById("agent-edit-instructions");
-const agentEditWebSearchEl = document.getElementById("agent-edit-web-search");
+const agentPermModifyTopicsEl = document.getElementById("agent-perm-modify-topics");
+const agentPermModifyEventsEl = document.getElementById("agent-perm-modify-events");
+const agentPermWebSearchEl = document.getElementById("agent-perm-web-search");
+const agentPermSendMessageEl = document.getElementById("agent-perm-send-message");
 const agentEditHint = document.getElementById("agent-edit-hint");
 const agentEditSaveBtn = document.getElementById("agent-edit-save");
 
@@ -4751,7 +4787,10 @@ function openAgentEditor(agent) {
   agentNameEl.value = agent ? (agent.name || "") : "";
   agentDescEl.value = agent ? (agent.description || "") : "";
   agentEditInstructionsEl.value = agent ? (agent.instructions || "") : "";
-  agentEditWebSearchEl.checked = agent ? !!agent.allow_web_search : false;
+  agentPermModifyTopicsEl.checked = agent ? !!agent.allow_modify_topics : false;
+  agentPermModifyEventsEl.checked = agent ? !!agent.allow_modify_events : false;
+  agentPermWebSearchEl.checked = agent ? !!agent.allow_web_search : false;
+  agentPermSendMessageEl.checked = agent ? !!agent.allow_send_message : false;
   editingAgentSchedule = agent ? (agent._schedule || null) : null;
   setScheduleControl(editingAgentSchedule);
   setAgentEditHint("");
@@ -4782,7 +4821,10 @@ async function saveAgentEditor() {
     name,
     instructions,
     description: agentDescEl.value.trim(),
-    allow_web_search: agentEditWebSearchEl.checked,
+    allow_web_search: agentPermWebSearchEl.checked,
+    allow_modify_topics: agentPermModifyTopicsEl.checked,
+    allow_modify_events: agentPermModifyEventsEl.checked,
+    allow_send_message: agentPermSendMessageEl.checked,
   };
   const editing = editingAgentId;
   agentEditSaveBtn.disabled = true;

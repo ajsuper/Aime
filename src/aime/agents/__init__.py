@@ -27,7 +27,7 @@ Then run it:
 This module ships no concrete agents — only the framework.
 """
 
-from .spec import AgentSpec, AgentResult, RunStatus
+from .spec import AgentSpec, AgentResult, RunStatus, permissions_to_allowlist
 from .registry import register, get, all_specs
 from .runner import BackgroundAgentRunner
 from .store import AgentRunStore, new_run_id
@@ -43,6 +43,7 @@ __all__ = [
     "AgentSpec",
     "AgentResult",
     "RunStatus",
+    "permissions_to_allowlist",
     "register",
     "get",
     "all_specs",
