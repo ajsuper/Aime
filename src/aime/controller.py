@@ -371,6 +371,15 @@ class ConversationController:
         self._backend.set_client_timezone(tz)
         self._tools.set_client_timezone(tz)
 
+    def set_client_date_prefs(
+        self, date_format: str | None, time_format: str | None
+    ) -> None:
+        """Forward the user's date/time *display* preferences to the backend so
+        the per-turn clock block tells the model which format to write dates and
+        times in (prose, event/topic summaries, messages). Display-only — the
+        stored DD/MM/YYYY + HH:MM wire format is untouched."""
+        self._backend.set_client_date_prefs(date_format, time_format)
+
     # --- session operations ---
 
     def stop_model(self, timeout: float = 5.0) -> bool:

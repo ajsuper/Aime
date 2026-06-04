@@ -499,6 +499,21 @@ class UserContext:
             reminder_service=reminder_service,
         )
 
+        # Seed the session with the user's last-seen zone so any turn that runs
+        # before the first /send (notably onboarding's opening turn) stamps the
+        # right local "now". Each /send still refreshes it, so a traveling user
+        # self-corrects on their next message.
+        if _user_rec and _user_rec.tz:
+            self.controller.set_client_timezone(_user_rec.tz)
+
+        # Likewise seed the date/time display preferences so a pre-/send turn
+        # (onboarding) already writes dates in the user's format. Refreshed on
+        # each /send.
+        if _user_rec and (_user_rec.date_format or _user_rec.time_format):
+            self.controller.set_client_date_prefs(
+                _user_rec.date_format, _user_rec.time_format
+            )
+
         self.controller.subscribe(self._fanout)
         self.controller.start()
 
@@ -508,6 +523,16 @@ class UserContext:
         # Tuple is (kind, id, title); kind is "topic" or "event".
         self._stale_lock = threading.Lock()
         self._stale_records: list[tuple[str, int, str]] = []
+
+        # Last IANA timezone we persisted for this user (see /send). Seeded from
+        # the stored value so we only write to the DB when the browser reports a
+        # *changed* zone, not on every message.
+        self._persisted_tz = _user_rec.tz if _user_rec else None
+        # Same change-detection for the date/time display prefs (see /send).
+        self._persisted_date_prefs = (
+            (_user_rec.date_format, _user_rec.time_format) if _user_rec
+            else (None, None)
+        )
 
     # ---- Stale-record tracking --------------------------------------------
 
@@ -2002,6 +2027,24 @@ def send():
     tz = data.get("tz")
     if isinstance(tz, str) and tz:
         ctx.controller.set_client_timezone(tz)
+        # Persist the zone so code with no live client (background agent runs)
+        # has a sane fallback. Only write when it actually changed, so the
+        # common case (same zone every message) costs nothing.
+        if tz != ctx._persisted_tz:
+            if _auth_backend.set_timezone(g.user_id, tz):
+                ctx._persisted_tz = tz
+    # Date/time display preferences ride along the same way (the browser
+    # resolves its "auto" option to a concrete value before sending). They tell
+    # the model which format to write dates/times in. Persisted like the zone so
+    # a clientless background run honors an explicit choice; only on change.
+    df = data.get("date_format")
+    tf = data.get("time_format")
+    df = df if isinstance(df, str) and df else None
+    tf = tf if isinstance(tf, str) and tf else None
+    ctx.controller.set_client_date_prefs(df, tf)
+    if (df, tf) != ctx._persisted_date_prefs:
+        if _auth_backend.set_date_prefs(g.user_id, df, tf):
+            ctx._persisted_date_prefs = (df, tf)
     stale_tag = ctx.drain_stale_tag()
     should_quit = ctx.controller.dispatch_input(
         text, images=images or None, hidden_prefix=stale_tag,
@@ -2249,6 +2292,12 @@ def _launch_agent_run(
     # graceful "no contact connected" result instead of a misfire.
     _rec = _auth_backend.lookup(user_id)
     messaging_contact = _rec.messaging_contact if _rec else None
+    # Fall back to the user's last-seen timezone when the caller didn't supply
+    # one (e.g. a scheduled run on a schedule with no tz). Better than the
+    # runner's server-local default, which would stamp the wrong "now" on a run
+    # for a user who isn't in the server's zone.
+    if not client_tz and _rec is not None:
+        client_tz = _rec.tz
 
     token = base64.b16encode(os.urandom(8)).decode().lower()
     descriptor = {

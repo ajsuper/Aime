@@ -102,6 +102,20 @@ class UserRecord:
     # chat id today, a phone number once an SMS channel lands. NULL = the user
     # hasn't connected a messaging contact, so proactive messages are skipped.
     messaging_contact: str | None = None
+    # Last-seen IANA timezone (e.g. "America/New_York"), persisted from the
+    # browser on each /send so it self-corrects if the user travels. Interactive
+    # sessions still drive "now" from the live per-request tz; this stored value
+    # is the fallback for code that runs with no live client — chiefly background
+    # agent runs. NULL until the user has sent at least one message.
+    tz: str | None = None
+    # How the user wants dates/times *displayed* — the patterns from the web
+    # settings ("MM/DD/YYYY", "12"/"24", etc.; see aime.dateformat). The browser
+    # resolves its "auto" option to a concrete value before sending, and
+    # persists it here on each /send like `tz`. The stored value drives how the
+    # model writes dates back to the user; NULL means "not set" and callers fall
+    # back to an unambiguous default (see dateformat.default_date_format).
+    date_format: str | None = None
+    time_format: str | None = None
     # Display-only real name. Unlike `username` (the immutable identity that
     # keys every piece of the user's data) these are purely cosmetic, freely
     # changeable, and may be NULL. Nothing keys off them today; they exist so a
@@ -428,6 +442,32 @@ class LocalAuthBackend:
                 )
             # END messaging_contact MIGRATION
 
+            # tz MIGRATION — last-seen IANA timezone, persisted from the browser
+            # on each /send (see UserRecord.tz). NULL until the user's first
+            # message. Used as the timezone fallback for runs with no live client
+            # (background agents). Dropping it is just dropping this column + its
+            # setter and the persist call in the /send handler.
+            if "tz" not in existing_cols:
+                self._conn.execute(
+                    "ALTER TABLE users ADD COLUMN tz TEXT"
+                )
+            # END tz MIGRATION
+
+            # date-prefs MIGRATION — how the user wants dates/times *displayed*
+            # (see UserRecord.date_format / .time_format). Forwarded from the
+            # browser on each /send, same as tz, so the model writes prose and
+            # summaries in the user's format. NULL until first set; the live
+            # client always sends a concrete value, so these are mainly the
+            # fallback for runs with no client (background agents). Dropping the
+            # feature is just dropping these columns + their setter + the persist
+            # call in the /send handler.
+            for col in ("date_format", "time_format"):
+                if col not in existing_cols:
+                    self._conn.execute(
+                        f"ALTER TABLE users ADD COLUMN {col} TEXT"
+                    )
+            # END date-prefs MIGRATION
+
             # display-name MIGRATION — first_name/last_name added as purely
             # cosmetic fields. A bare ADD COLUMN defaults every existing row to
             # NULL, i.e. "no name given", which is exactly right: the UI falls
@@ -702,7 +742,7 @@ class LocalAuthBackend:
         with self._lock:
             row = self._conn.execute(
                 "SELECT id, username, api_access, email, messaging_contact, "
-                "first_name, last_name "
+                "first_name, last_name, tz, date_format, time_format "
                 "FROM users WHERE id = ? AND deleted_at IS NULL",
                 (user_id,),
             ).fetchone()
@@ -711,7 +751,8 @@ class LocalAuthBackend:
         return UserRecord(
             id=row[0], username=row[1],
             api_access=bool(row[2]), email=row[3], messaging_contact=row[4],
-            first_name=row[5], last_name=row[6],
+            first_name=row[5], last_name=row[6], tz=row[7],
+            date_format=row[8], time_format=row[9],
         )
 
     def lookup_by_username(self, username: str) -> UserRecord | None:
@@ -724,7 +765,7 @@ class LocalAuthBackend:
         with self._lock:
             row = self._conn.execute(
                 "SELECT id, username, api_access, email, messaging_contact, "
-                "first_name, last_name "
+                "first_name, last_name, tz, date_format, time_format "
                 "FROM users WHERE username = ? AND deleted_at IS NULL",
                 (username,),
             ).fetchone()
@@ -733,7 +774,8 @@ class LocalAuthBackend:
         return UserRecord(
             id=row[0], username=row[1],
             api_access=bool(row[2]), email=row[3], messaging_contact=row[4],
-            first_name=row[5], last_name=row[6],
+            first_name=row[5], last_name=row[6], tz=row[7],
+            date_format=row[8], time_format=row[9],
         )
 
     def set_messaging_contact(self, user_id: int, contact: str | None) -> bool:
@@ -746,6 +788,39 @@ class LocalAuthBackend:
                 "UPDATE users SET messaging_contact = ? "
                 "WHERE id = ? AND deleted_at IS NULL",
                 (normalized, user_id),
+            )
+            self._conn.commit()
+        return cur.rowcount > 0
+
+    def set_timezone(self, user_id: int, tz: str | None) -> bool:
+        """Persist the account's last-seen IANA timezone (see UserRecord.tz).
+        Called from the /send handler when the browser-reported zone changes, so
+        it self-corrects as the user travels. A blank/None value clears it.
+        Returns False if there's no matching active account."""
+        normalized = (tz or "").strip() or None
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE users SET tz = ? "
+                "WHERE id = ? AND deleted_at IS NULL",
+                (normalized, user_id),
+            )
+            self._conn.commit()
+        return cur.rowcount > 0
+
+    def set_date_prefs(
+        self, user_id: int, date_format: str | None, time_format: str | None
+    ) -> bool:
+        """Persist the account's display preferences for dates/times (see
+        UserRecord.date_format / .time_format). Called from /send when the
+        browser-reported values change. Blank/None clears a field. Returns False
+        if there's no matching active account."""
+        df = (date_format or "").strip() or None
+        tf = (time_format or "").strip() or None
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE users SET date_format = ?, time_format = ? "
+                "WHERE id = ? AND deleted_at IS NULL",
+                (df, tf, user_id),
             )
             self._conn.commit()
         return cur.rowcount > 0

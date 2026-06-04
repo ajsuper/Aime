@@ -3941,13 +3941,34 @@ function clientTimezone() {
   }
 }
 
+// The user's *effective* date/time display format, sent with each message so
+// the model writes dates/times back in the format the user reads (see the
+// settings modal). "auto" is resolved to a concrete value here — where Intl is
+// available — so the server and model never have to re-derive the locale.
+function clientDateFormat() {
+  try {
+    return dateFormat === "auto" ? _autoDatePattern() : dateFormat;
+  } catch (_) {
+    return "";
+  }
+}
+function clientTimeFormat() {
+  try {
+    const f = timeFormat === "auto" ? (_autoUse24h() ? "24" : "12") : timeFormat;
+    return f === "24" ? "24" : "12";
+  } catch (_) {
+    return "";
+  }
+}
+
 async function sendText(text, images) {
   let r;
   try {
     r = await fetch("/send", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({text, images: images || [], tz: clientTimezone()}),
+      body: JSON.stringify({text, images: images || [], tz: clientTimezone(),
+        date_format: clientDateFormat(), time_format: clientTimeFormat()}),
     });
   } catch (e) {
     // Network failure before the request landed — drop the "Sending…"

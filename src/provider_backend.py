@@ -270,6 +270,7 @@ class AgentBackend(Protocol):
 # Safe to import now: AgentBackend / BackendEvent / SessionInfo are defined,
 # so the aime package's eager import of controller can resolve them.
 import aime.encryption as _enc
+import aime.dateformat as dateformat
 
 
 class AnthropicMessagesBackend:
@@ -387,6 +388,12 @@ class AnthropicMessagesBackend:
         # per-turn date block so the model sees the *user's* local time
         # rather than the server's. Empty => fall back to server-local time.
         self._client_tz: str = ""
+        # The user's date/time *display* preferences (see aime.dateformat),
+        # refreshed from each /send alongside the timezone. They tell the model
+        # which format to write dates/times in (the per-turn date block carries
+        # them); None => fall back to an unambiguous default keyed off the tz.
+        self._date_format: str | None = None
+        self._time_format: str | None = None
 
         self._session_id: str | None = None
         # One-sentence human-readable description of the session, shown in
@@ -479,6 +486,20 @@ class AnthropicMessagesBackend:
         with self._lock:
             self._client_tz = tz or ""
 
+    def set_client_date_prefs(
+        self, date_format: str | None, time_format: str | None
+    ) -> None:
+        """Record the user's date/time display preferences (see aime.dateformat),
+        surfaced to the model in the per-turn date block. Like the timezone,
+        these belong to the client, not a conversation, so they survive
+        new_session/load. An unknown value is normalized to None so the block
+        falls back to the unambiguous default."""
+        df = (date_format or "").strip() or None
+        tf = (time_format or "").strip() or None
+        with self._lock:
+            self._date_format = df if df in dateformat.DATE_PATTERNS else None
+            self._time_format = tf if tf in dateformat.TIME_FORMATS else None
+
     def _build_system(self) -> list[dict]:
         """Assemble the system array for this turn.
 
@@ -506,7 +527,16 @@ class AnthropicMessagesBackend:
 
         Formatted in the client's timezone when one is known, so the model
         sees the *user's* local time; an unset or unrecognised zone falls
-        back to server-local time."""
+        back to server-local time.
+
+        The "now" is spelled out (weekday + full month name) so it is
+        unambiguous to reason from — "04/06" never has to be guessed as April
+        or June. It then states the user's chosen *display* format and shows
+        the current instant rendered in it, so the model both knows the format
+        and has a worked example to copy when it writes dates/times back to the
+        user. The system prompt teaches what to *do* with all this (write dates
+        in the user's format, keep tool fields in DD/MM/YYYY, never acknowledge
+        the tag), keeping that explainer in the cached prefix."""
         tz = self._client_tz
         now = None
         if tz:
@@ -518,16 +548,26 @@ class AnthropicMessagesBackend:
             now = datetime.datetime.now()
         day_names = ["Monday", "Tuesday", "Wednesday", "Thursday",
                      "Friday", "Saturday", "Sunday"]
-        date_str = now.strftime("%d/%m/%Y, %H:%M")
-        # Just the data — the system prompt teaches the model what the
-        # <clock silent> tag means (date for reasoning, never acknowledge),
-        # which keeps that explainer in the cached prefix instead of paying
-        # for it on every turn.
+        month_names = ["January", "February", "March", "April", "May", "June",
+                       "July", "August", "September", "October", "November",
+                       "December"]
+        anchor = (
+            f"{day_names[now.weekday()]}, {now.day} {month_names[now.month - 1]} "
+            f"{now.year}, {now.strftime('%H:%M')}"
+        )
+        date_fmt = self._date_format or dateformat.default_date_format(tz or None)
+        time_fmt = self._time_format or dateformat.DEFAULT_TIME_FORMAT
+        example = (
+            f"{dateformat.render_date(now.date(), date_fmt)}, "
+            f"{dateformat.render_time(now.time(), time_fmt)}"
+        )
+        time_label = "12-hour" if time_fmt == "12" else "24-hour"
         return {
             "type": "text",
             "text": (
-                f"<clock silent>{day_names[now.weekday()]}, {date_str}"
-                ". System info, don't repeat to user</clock>"
+                f"<clock silent>{anchor}. This user reads dates as {date_fmt} "
+                f"and times as {time_label} — now is \"{example}\" in their "
+                "format. System info, don't repeat to user</clock>"
             ),
         }
 
