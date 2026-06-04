@@ -7,8 +7,8 @@
   "required": ["id", "contents"],
   "properties": {
     "id": {
-      "type": "integer",
-      "description": "ID of the topic to update."
+      "type": ["integer", "string"],
+      "description": "ID of the topic to update. For your own topics this is the integer id. For a topic shared with you (edit permission required), pass the exact id string shown in the topic list (e.g. \"5:12\")."
     },
     "contents": {
       "type": "string",

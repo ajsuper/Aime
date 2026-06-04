@@ -192,6 +192,17 @@ def _render_topics(topics: list) -> str:
             head += f" | {tp['category']}"
         folder = (tp.get("folder") or "").strip()
         head += f" | folder: {folder}" if folder else " | (root)"
+        # Sharing state, both directions: a topic shared *with* this user shows
+        # who it's from and their access level; one of the user's own topics
+        # that's shared out shows who can see it.
+        if tp.get("shared"):
+            owner = (tp.get("owner") or "?").strip() or "?"
+            perm = tp.get("permission") or "view"
+            head += f" | shared from {owner} ({perm})"
+        elif tp.get("shared_with"):
+            who = ", ".join(n for n in tp["shared_with"] if n)
+            if who:
+                head += f" | shared with {who}"
         lines.append(head)
         summary = (tp.get("summary") or "").strip()
         for sline in summary.splitlines():

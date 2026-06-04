@@ -22,6 +22,7 @@ import zipfile
 import tempfile
 import datetime
 import threading
+import time
 from functools import wraps
 from io import StringIO, BytesIO
 
@@ -86,6 +87,8 @@ from aime import auth as _auth
 from aime import encryption as _enc
 from aime import backup as _backup
 from aime import email_send as _email_send
+from aime import topic_shares as _topic_shares
+from aime.tool_formatting import TOOL_NAME_MAP
 
 from . import stt as _stt
 
@@ -118,6 +121,74 @@ except Exception:  # noqa: BLE001 - PDF export is best-effort
 _auth_backend = _auth.LocalAuthBackend(
     os.path.join(aime_config.DATABASE_DIR, "auth.sql")
 )
+# Topic-sharing grants (who may see/edit whose topics). Cross-user, so it lives
+# at the root next to auth.sql, not in any one user's silo.
+_share_store = _topic_shares.ShareStore(
+    os.path.join(aime_config.DATABASE_DIR, "topic_shares.sql")
+)
+
+
+class _EditLocks:
+    """In-memory advisory edit-locks for shared topics, keyed by the canonical
+    (owner_id, topic_id). The first human to enter edit mode acquires the lock;
+    others are kept in view mode until it's released. It is deliberately:
+
+      * **Advisory** — it gates the *UI* (the acquire call decides the single
+        winner). The PUT save path and the model never consult it, so the agent
+        keeps editing freely (its edits are anchor-based and near-instant; a
+        rare clobber is acceptable and the model can retry).
+      * **In-memory** — locks are session state, not data. A server restart
+        drops every session anyway, so dropping every lock with it is correct.
+      * **TTL-backed** — a lock auto-expires so a holder who closes their tab
+        without releasing (beacon lost) can't wedge the topic forever. The
+        client refreshes its lock on a heartbeat well inside the TTL.
+    """
+
+    def __init__(self, ttl_seconds: float = 90.0):
+        self._ttl = ttl_seconds
+        self._lock = threading.Lock()
+        # (owner_id, topic_id) -> (holder_user_id, expires_at_monotonic)
+        self._held: dict[tuple[int, int], tuple[int, float]] = {}
+
+    def acquire(self, owner_id: int, topic_id: int, user_id: int) -> tuple[bool, int]:
+        """Try to take (or refresh, if already ours) the lock. Returns
+        (granted, holder_user_id). granted is False only when someone else holds
+        an unexpired lock — holder_user_id then names them."""
+        now = time.monotonic()
+        key = (owner_id, topic_id)
+        with self._lock:
+            cur = self._held.get(key)
+            if cur is not None and cur[1] > now and cur[0] != user_id:
+                return False, cur[0]
+            self._held[key] = (user_id, now + self._ttl)
+            return True, user_id
+
+    def release(self, owner_id: int, topic_id: int, user_id: int) -> bool:
+        """Release the lock if `user_id` holds it. Returns True if it did."""
+        key = (owner_id, topic_id)
+        with self._lock:
+            cur = self._held.get(key)
+            if cur is not None and cur[0] == user_id:
+                del self._held[key]
+                return True
+            return False
+
+    def holder(self, owner_id: int, topic_id: int) -> int | None:
+        """Current holder's user id, or None if free/expired. Prunes an expired
+        entry as a side effect."""
+        now = time.monotonic()
+        key = (owner_id, topic_id)
+        with self._lock:
+            cur = self._held.get(key)
+            if cur is None:
+                return None
+            if cur[1] <= now:
+                del self._held[key]
+                return None
+            return cur[0]
+
+
+_edit_locks = _EditLocks()
 _SECRET_KEY = _auth.load_or_create_secret_key(
     os.path.join(aime_config.DATABASE_DIR, "secret_key")
 )
@@ -419,6 +490,11 @@ class UserContext:
             lambda: _scheduler_upcoming_events(user_id),
         )
 
+        # Bridge giving the model cross-user record access: shared topics (both
+        # directions) plus the post-write self-clear. See _RecordSyncBridge.
+        # Bound to this user_id for the context's life.
+        self.record_sync = _RecordSyncBridge(user_id)
+
         self.controller = ConversationController(
             backend=backend,
             tool_gateway=gateway,
@@ -427,7 +503,23 @@ class UserContext:
             messenger=messenger,
             message_recipient=messaging_contact,
             reminder_service=reminder_service,
+            record_sync=self.record_sync,
         )
+
+        # Seed the session with the user's last-seen zone so any turn that runs
+        # before the first /send (notably onboarding's opening turn) stamps the
+        # right local "now". Each /send still refreshes it, so a traveling user
+        # self-corrects on their next message.
+        if _user_rec and _user_rec.tz:
+            self.controller.set_client_timezone(_user_rec.tz)
+
+        # Likewise seed the date/time display preferences so a pre-/send turn
+        # (onboarding) already writes dates in the user's format. Refreshed on
+        # each /send.
+        if _user_rec and (_user_rec.date_format or _user_rec.time_format):
+            self.controller.set_client_date_prefs(
+                _user_rec.date_format, _user_rec.time_format
+            )
 
         self.controller.subscribe(self._fanout)
         self.controller.start()
@@ -439,11 +531,27 @@ class UserContext:
         self._stale_lock = threading.Lock()
         self._stale_records: list[tuple[str, int, str]] = []
 
+        # Last IANA timezone we persisted for this user (see /send). Seeded from
+        # the stored value so we only write to the DB when the browser reports a
+        # *changed* zone, not on every message.
+        self._persisted_tz = _user_rec.tz if _user_rec else None
+        # Same change-detection for the date/time display prefs (see /send).
+        self._persisted_date_prefs = (
+            (_user_rec.date_format, _user_rec.time_format) if _user_rec
+            else (None, None)
+        )
+
     # ---- Stale-record tracking --------------------------------------------
 
-    def mark_record_stale(self, kind: str, record_id: int, title: str) -> None:
-        """Note that the user just edited a record via the UI. Dedupes on
-        (kind, id) so repeated edits to the same record only cost one entry."""
+    def mark_record_stale(self, kind: str, record_id: int | str, title: str) -> None:
+        """Note that a record this user's model has seen just changed (a UI edit,
+        or a change pushed in from the other side of a shared topic), so the next
+        user turn carries a <stale> tag and the model knows to re-read it. Dedupes
+        on (kind, id) so repeated edits to the same record only cost one entry.
+
+        `record_id` is normally the bare integer id, but for a topic shared *to*
+        this user it's the composite "<owner>:<topic>" handle string — i.e. the
+        id their model actually addresses the topic by, so the tag lines up."""
         title = (title or "").strip()
         with self._stale_lock:
             self._stale_records = [
@@ -451,6 +559,17 @@ class UserContext:
                 if not (e[0] == kind and e[1] == record_id)
             ]
             self._stale_records.append((kind, record_id, title))
+
+    def clear_record_stale(self, kind: str, record_id: int | str) -> None:
+        """Drop a pending stale flag for (kind, id). Used when this user's own
+        model just wrote the record: the cross-user mutation choke point flags
+        every party (this user included), but the model already holds the fresh
+        content, so re-reading would be wasted — remove its own flag."""
+        with self._stale_lock:
+            self._stale_records = [
+                e for e in self._stale_records
+                if not (e[0] == kind and e[1] == record_id)
+            ]
 
     def drain_stale_tag(self) -> str:
         """Build the <stale> tag for the next user turn, then clear the list.
@@ -498,7 +617,8 @@ class UserContext:
             if payload.get("kind") not in (
                 "assistant_text_delta", "assistant_text_end",
                 "assistant_html_partial", "turn_end", "ready",
-                "remote_edit", "agent_run_update",
+                "remote_edit", "agent_run_update", "share_update",
+                "topic_lock",
             ):
                 self._history.append(payload)
         with self._subscribers_lock:
@@ -518,6 +638,21 @@ class UserContext:
         up. `source` is for debugging — it shows up in the SSE payload."""
         self._broadcast({"kind": "remote_edit", "source": source})
 
+    def notify_topic_lock(self, payload: dict) -> None:
+        """Broadcast an edit-lock state change (someone started/stopped editing
+        a shared topic) to this user's sessions so their Edit affordance updates
+        live. `payload` carries kind=topic_lock, owner_id, topic_id, locked,
+        locked_by."""
+        self._broadcast(payload)
+
+    def notify_share_update(self) -> None:
+        """Tell every connected session of this user that their set of topic
+        shares changed (a share was offered to them, accepted/declined,
+        revoked, or a shared topic was edited), so any open topics pane
+        re-fetches and the in-app notification surfaces. Fired cross-user — the
+        sharing routes push this into the *recipient's* (or owner's) context."""
+        self._broadcast({"kind": "share_update"})
+
     def notify_agent_run_update(self) -> None:
         """Tell every connected session of this user that the set of stored
         background-agent runs changed (a run just started or finished), so any
@@ -525,10 +660,22 @@ class UserContext:
         thread, which has no other path into the SSE fanout."""
         self._broadcast({"kind": "agent_run_update"})
 
-    def _on_backend_mutation(self, tool_name: str) -> None:
-        # Fired by ToolGateway after any successful non-read tool call,
-        # covering both AI tool calls and direct UI service calls.
+    def _on_backend_mutation(self, tool_name: str, payload: dict | None = None) -> None:
+        # Fired by ToolGateway after any successful non-read tool call, covering
+        # both AI tool calls and direct UI service calls. Refresh this user's own
+        # open tabs unconditionally.
         self.notify_remote_edit(tool_name)
+        # If the write changed a tracked record (topic content, event, …), fan a
+        # single notification out to everyone who can see it — each party's model
+        # gets a <stale> tag on its next turn and their live UI re-fetches. This
+        # is the one choke point for record sync: every write flows through here,
+        # and self.user_id is always the record's *owner* (a shared-topic write
+        # is routed through the owner's gateway, so this runs on their context),
+        # so the payload id is the bare owner-side id.
+        kind = _RECORD_KIND_BY_TOOL.get(tool_name)
+        record_id = payload.get("id") if isinstance(payload, dict) else None
+        if kind is not None and record_id is not None:
+            _propagate_record_change(kind, self.user_id, record_id, payload)
 
     def _fanout(self, event: CoreEvent) -> None:
         partial_full: str | None = None
@@ -739,14 +886,17 @@ def _load_login_page(
     login_username: str = "",
     signup_username: str = "",
     signup_email: str = "",
+    signup_first_name: str = "",
+    signup_last_name: str = "",
 ) -> str:
     """Render the login page.
 
     `notice` shows an informational line above the sign-in form (e.g. after a
     recovery). `recover_username`, when set, switches the page into its
     account-recovery prompt for that account. `login_username` pre-fills the
-    sign-in username field; `signup_username` / `signup_email` pre-fill the
-    signup form after a validation error so the user doesn't retype them.
+    sign-in username field; `signup_username` / `signup_email` /
+    `signup_first_name` / `signup_last_name` pre-fill the signup form after a
+    validation error so the user doesn't retype them.
     """
     with open(_LOGIN_PAGE_PATH) as f:
         html = f.read()
@@ -759,6 +909,8 @@ def _load_login_page(
         .replace("__LOGIN_USERNAME__", _h(login_username))
         .replace("__SIGNUP_USERNAME__", _h(signup_username))
         .replace("__SIGNUP_EMAIL__", _h(signup_email))
+        .replace("__SIGNUP_FIRST_NAME__", _h(signup_first_name))
+        .replace("__SIGNUP_LAST_NAME__", _h(signup_last_name))
         .replace("__SIGNUP_DISABLED_STYLE__", "" if _ALLOW_SIGNUP else _SIGNUP_DISABLED_STYLE)
         .replace("__EMAIL_VERIFICATION_DISABLED_STYLE__",
                  "" if _DO_EMAIL_VERIFICATION else _EMAIL_VERIFICATION_DISABLED_STYLE)
@@ -1146,6 +1298,10 @@ def signup_submit():
     email = (request.form.get("email") or "").strip()
     password = request.form.get("password") or ""
     password2 = request.form.get("password2") or ""
+    # Display-only real name (optional). Stored verbatim; the username remains
+    # the immutable identity that keys everything.
+    first_name = (request.form.get("first_name") or "").strip()
+    last_name = (request.form.get("last_name") or "").strip()
 
     def _signup_err(msg: str, status: int = 400):
         _auth_backend.log_event(
@@ -1157,6 +1313,8 @@ def signup_submit():
                 signup_error=msg,
                 signup_username=username,
                 signup_email=email,
+                signup_first_name=first_name,
+                signup_last_name=last_name,
             ),
             mimetype="text/html", status=status,
         )
@@ -1171,13 +1329,16 @@ def signup_submit():
     if not _DO_EMAIL_VERIFICATION:
         try:
             user, _dek = _auth_backend.create(
-                username, password, api_access=(_ACCESS_MODE == "open")
+                username, password, api_access=(_ACCESS_MODE == "open"),
+                first_name=first_name, last_name=last_name,
             )
         except _auth.UsernameTaken:
             return _signup_err("That username is already taken.", status=409)
         except _auth.InvalidUsername as e:
             return _signup_err(str(e))
         except _auth.WeakPassword as e:
+            return _signup_err(str(e))
+        except _auth.InvalidName as e:
             return _signup_err(str(e))
         session.clear()
         session["user_id"] = user.id
@@ -1188,6 +1349,7 @@ def signup_submit():
         token, code, _email_norm = _auth_backend.start_signup_verification(
             username, password, email,
             api_access=(_ACCESS_MODE == "open"),
+            first_name=first_name, last_name=last_name,
         )
     except _auth.UsernameTaken:
         return _signup_err("That username is already taken.", status=409)
@@ -1196,6 +1358,8 @@ def signup_submit():
     except _auth.WeakPassword as e:
         return _signup_err(str(e))
     except _auth.InvalidEmail as e:
+        return _signup_err(str(e))
+    except _auth.InvalidName as e:
         return _signup_err(str(e))
 
     try:
@@ -1380,8 +1544,31 @@ def me():
         "username": g.username,
         "email": user.email if user else None,
         "messaging_contact": user.messaging_contact if user else None,
+        "first_name": user.first_name if user else None,
+        "last_name": user.last_name if user else None,
         "access_mode": _ACCESS_MODE,
         "api_access": g.api_access,
+    })
+
+
+@app.route("/display-name", methods=["POST"])
+@login_required
+def display_name():
+    """Set (or clear, with blanks) the account's display-only first/last name.
+    The username is intentionally not editable — it's the immutable identity
+    that keys all of the user's data. These names are cosmetic only."""
+    data = request.get_json(silent=True) or {}
+    first_name = (data.get("first_name") or "").strip() or None
+    last_name = (data.get("last_name") or "").strip() or None
+    try:
+        _auth_backend.set_display_name(g.user_id, first_name, last_name)
+    except _auth.InvalidName as e:
+        return jsonify({"ok": False, "error": "invalid", "message": str(e)}), 400
+    user = _auth_backend.lookup(g.user_id)
+    return jsonify({
+        "ok": True,
+        "first_name": user.first_name if user else first_name,
+        "last_name": user.last_name if user else last_name,
     })
 
 
@@ -1867,6 +2054,24 @@ def send():
     tz = data.get("tz")
     if isinstance(tz, str) and tz:
         ctx.controller.set_client_timezone(tz)
+        # Persist the zone so code with no live client (background agent runs)
+        # has a sane fallback. Only write when it actually changed, so the
+        # common case (same zone every message) costs nothing.
+        if tz != ctx._persisted_tz:
+            if _auth_backend.set_timezone(g.user_id, tz):
+                ctx._persisted_tz = tz
+    # Date/time display preferences ride along the same way (the browser
+    # resolves its "auto" option to a concrete value before sending). They tell
+    # the model which format to write dates/times in. Persisted like the zone so
+    # a clientless background run honors an explicit choice; only on change.
+    df = data.get("date_format")
+    tf = data.get("time_format")
+    df = df if isinstance(df, str) and df else None
+    tf = tf if isinstance(tf, str) and tf else None
+    ctx.controller.set_client_date_prefs(df, tf)
+    if (df, tf) != ctx._persisted_date_prefs:
+        if _auth_backend.set_date_prefs(g.user_id, df, tf):
+            ctx._persisted_date_prefs = (df, tf)
     stale_tag = ctx.drain_stale_tag()
     should_quit = ctx.controller.dispatch_input(
         text, images=images or None, hidden_prefix=stale_tag,
@@ -2114,6 +2319,12 @@ def _launch_agent_run(
     # graceful "no contact connected" result instead of a misfire.
     _rec = _auth_backend.lookup(user_id)
     messaging_contact = _rec.messaging_contact if _rec else None
+    # Fall back to the user's last-seen timezone when the caller didn't supply
+    # one (e.g. a scheduled run on a schedule with no tz). Better than the
+    # runner's server-local default, which would stamp the wrong "now" on a run
+    # for a user who isn't in the server's zone.
+    if not client_tz and _rec is not None:
+        client_tz = _rec.tz
 
     token = base64.b16encode(os.urandom(8)).decode().lower()
     descriptor = {
@@ -2509,7 +2720,9 @@ def calendar_event_update(event_id: int):
         )
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 500
-    ctx.mark_record_stale("event", event_id, title)
+    # The replace_event call flows through the gateway's on_mutation choke point,
+    # which marks this record stale for the model (and refreshes the UI) — the
+    # same path topic edits use. No explicit stale call needed here.
     return jsonify({"ok": True, "result": result})
 
 
@@ -2557,6 +2770,441 @@ def transcribe():
     return jsonify({"ok": True, "text": text})
 
 
+# ---------------------------------------------------------------------------
+# Topic sharing
+#
+# A topic lives only in its owner's silo. Sharing grants server-mediated
+# access: a recipient addresses a shared topic by the composite handle
+# "<owner_id>:<topic_id>", and the server fetches it through the *owner's*
+# gateway after checking _share_store for a matching accepted grant. The
+# recipient never gets the owner's key; revocation is just deleting the grant.
+# See aime.topic_shares for the data model.
+# ---------------------------------------------------------------------------
+
+
+class _ShareAccessError(Exception):
+    """Raised by the topic resolver when a request may not touch a topic.
+    Carries an HTTP status + a user-facing message the routes turn into JSON."""
+
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
+
+def _parse_topic_handle(handle: str) -> tuple[int | None, int]:
+    """Split a topic handle into (owner_id, topic_id). Own topics are bare
+    integers and return owner_id=None; shared topics are "<owner_id>:<topic_id>".
+    Raises _ShareAccessError(400) on anything malformed."""
+    if ":" in handle:
+        owner_s, _, tid_s = handle.partition(":")
+        if owner_s.isdigit() and tid_s.isdigit():
+            return int(owner_s), int(tid_s)
+        raise _ShareAccessError(400, "invalid topic id")
+    if handle.isdigit():
+        return None, int(handle)
+    raise _ShareAccessError(400, "invalid topic id")
+
+
+def _resolve_topic(handle: str, need: str) -> tuple[int, int]:
+    """Resolve a topic handle from the current user to (effective_owner_id,
+    topic_id), enforcing access. `need` is "view" or "edit".
+
+    For the user's own topics this is the identity mapping. For a shared topic
+    it verifies an *accepted* grant exists (and that it carries edit rights when
+    need=="edit") before returning the owner's id as the effective backend user.
+    The owner id is taken from _share_store, never trusted from the client, so a
+    forged handle can't reach a topic that wasn't actually shared."""
+    owner_id, topic_id = _parse_topic_handle(handle)
+    if owner_id is None or owner_id == g.user_id:
+        return g.user_id, topic_id
+    share = _share_store.get(owner_id, topic_id, g.user_id)
+    if share is None or share.status != _topic_shares.STATUS_ACCEPTED:
+        raise _ShareAccessError(403, "this topic isn't shared with you")
+    if need == "edit" and share.permission != _topic_shares.PERM_EDIT:
+        raise _ShareAccessError(403, "you have view-only access to this topic")
+    return owner_id, topic_id
+
+
+def _user_owns_topic(user_id: int, topic_id: int) -> bool:
+    """True if `topic_id` is one of `user_id`'s own topics. A light list scan —
+    topics number in the tens — used to gate the owner-only share endpoints."""
+    try:
+        for t in _context_for(user_id).topic_service.list_topics():
+            if int(t.get("id", -1)) == topic_id:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _shared_topics_for(recipient_id: int) -> list[dict]:
+    """Topic-list entries for everything shared with `recipient_id` (accepted =
+    openable, pending = greyed, awaiting a response). Borrows title/category
+    from each owner's store for display; the content itself is never copied.
+    Grants whose topic the owner has since deleted are skipped."""
+    shares = _share_store.incoming(
+        recipient_id,
+        statuses=(_topic_shares.STATUS_ACCEPTED, _topic_shares.STATUS_PENDING),
+    )
+    if not shares:
+        return []
+    by_owner: dict[int, list] = {}
+    for s in shares:
+        by_owner.setdefault(s.owner_id, []).append(s)
+    out: list[dict] = []
+    for owner_id, owner_shares in by_owner.items():
+        owner_rec = _auth_backend.lookup(owner_id)
+        owner_name = owner_rec.username if owner_rec else "(unknown)"
+        try:
+            owner_topics = {
+                int(t.get("id", -1)): t
+                for t in _context_for(owner_id).topic_service.list_topics()
+            }
+        except Exception:
+            owner_topics = {}
+        for s in owner_shares:
+            meta = owner_topics.get(s.topic_id)
+            if meta is None:
+                continue
+            entry = {
+                "id": f"{owner_id}:{s.topic_id}",
+                "title": meta.get("title") or meta.get("name") or "(untitled)",
+                "category": meta.get("category") or "",
+                "summary": meta.get("summary") or "",
+                "folder": meta.get("folder") or "",
+                "shared": True,
+                "permission": s.permission,
+                "status": s.status,
+                "owner": owner_name,
+            }
+            # Current edit-lock holder (if any) so the recipient's Edit button
+            # starts in the right state; topic_lock events keep it live after.
+            if s.status == _topic_shares.STATUS_ACCEPTED:
+                entry["locked_by"] = _username_of(
+                    _edit_locks.holder(owner_id, s.topic_id)
+                )
+            out.append(entry)
+    return out
+
+
+class _RecordSyncBridge:
+    """Adapter handed to a user's ConversationController for cross-user record
+    access — currently shared topics, with room for more shared kinds.
+
+    The controller is deliberately ignorant of sharing (it's reused by the TUI
+    and background agents); this bridge holds the cross-user knowledge —
+    `_share_store` for grants and `_context_for` to reach an owner's silo — and
+    is bound to one ``user_id`` for the life of that user's context. The entry
+    points the controller calls:
+
+    * :meth:`run_if_shared` reroutes a per-topic tool addressed to a composite
+      ``"<owner>:<topic>"`` handle into the owner's gateway after checking the
+      grant, so the model can read (and, with edit rights, write) a topic that
+      physically lives in someone else's silo. Returns ``None`` for a bare id so
+      the controller runs it normally against this user's own gateway.
+    * :meth:`merge_shared_into_list` enriches a FilterTopics result with the
+      topics shared *with* this user and flags which of their *own* topics are
+      shared out (and to whom), so the model knows the state on both sides.
+    * :meth:`after_model_write` clears this user's own stale flag once its model
+      has written a tracked record (the choke point flags every party; the actor
+      already has the fresh content).
+
+    Routing writes through the owner's gateway is deliberate: it lands the edit
+    in the owner's silo and trips that gateway's on_mutation choke point, so the
+    change syncs back to the owner (and every share partner) exactly like a UI
+    edit — the same single path every record change flows through.
+    """
+
+    # Of the shareable tools, these mutate and so require edit permission;
+    # GetTopicContents needs only an accepted (view) grant.
+    _WRITE_TOOLS = frozenset({"ReplaceTopicContents", "EditTopicContents"})
+
+    def __init__(self, user_id: int):
+        self.user_id = user_id
+
+    @staticmethod
+    def _parse_handle(value) -> tuple[int, int] | None:
+        """``(owner_id, topic_id)`` if `value` is a composite
+        ``"<owner>:<topic>"`` handle, else ``None`` (a bare id is one of this
+        user's own topics and takes the normal path)."""
+        if isinstance(value, str) and ":" in value:
+            owner_s, _, tid_s = value.partition(":")
+            if owner_s.isdigit() and tid_s.isdigit():
+                return int(owner_s), int(tid_s)
+        return None
+
+    def run_if_shared(self, agent_tool_name: str, tool_input: dict):
+        """Run a per-topic tool against the owner's silo when its id is a shared
+        handle; otherwise return ``None`` so the caller runs it locally.
+
+        Enforces the grant exactly as the topic routes do: an accepted grant is
+        required to read, and edit permission to write. A denied or unknown
+        grant comes back as a friendly ``{"error": ...}`` the model can relay,
+        never an exception that breaks the turn."""
+        parsed = self._parse_handle((tool_input or {}).get("id"))
+        if parsed is None:
+            return None
+        owner_id, topic_id = parsed
+        share = _share_store.get(owner_id, topic_id, self.user_id)
+        if share is None or share.status != _topic_shares.STATUS_ACCEPTED:
+            return {"error": "this topic isn't shared with you"}
+        if (agent_tool_name in self._WRITE_TOOLS
+                and share.permission != _topic_shares.PERM_EDIT):
+            return {"error": "you have view-only access to this shared topic"}
+        payload = dict(tool_input or {})
+        payload["id"] = topic_id
+        try:
+            return _context_for(owner_id).gateway.execute(agent_tool_name, payload)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"shared topic access failed: {exc}"}
+
+    def after_model_write(self, agent_tool_name: str, tool_input: dict, result) -> None:
+        """Clear this user's own stale flag for a record its model just wrote.
+
+        The mutation choke point flags a changed record as stale for every party
+        who can see it, this user included. When the change came from this user's
+        *own* model it already holds the fresh content, so that flag would only
+        force a needless re-read — drop it. The id is taken straight from the
+        tool input, which is already in this user's own addressing form (a bare
+        id for an own record, the ``"<owner>:<topic>"`` handle for a shared one),
+        so it matches what the choke point recorded for this context. A no-op for
+        reads, failed writes, and tools that don't change a tracked record."""
+        if isinstance(result, dict) and "error" in result:
+            return
+        backend_tool = TOOL_NAME_MAP.get(agent_tool_name, agent_tool_name)
+        kind = _RECORD_KIND_BY_TOOL.get(backend_tool)
+        if kind is None:
+            return
+        record_id = (tool_input or {}).get("id")
+        if record_id is None:
+            return
+        ctx = _user_contexts.get(self.user_id)
+        if ctx is not None:
+            try:
+                ctx.clear_record_stale(kind, record_id)
+            except Exception:
+                pass
+
+    def merge_shared_into_list(self, result, tool_input: dict | None = None):
+        """Append the topics shared *with* this user to a FilterTopics result
+        and tag the user's own shared-out topics with their recipients. Wholly
+        best-effort — any hiccup returns the original result so the model still
+        gets its own topics.
+
+        `tool_input` carries the FilterTopics filters (category / categories /
+        keyword). The backend already applied them to the owned topics; we apply
+        the same ones to the shared additions so a narrowed query stays coherent
+        rather than dumping every shared topic in regardless. `limit` is left to
+        the backend's own slice — shared topics are few and hiding them would
+        defeat the point, so we don't re-trim the merged list."""
+        try:
+            if isinstance(result, dict):
+                if "error" in result:
+                    return result
+                owned = list(result.get("topics") or [])
+            elif isinstance(result, list):
+                owned = list(result)
+            else:
+                return result
+            self._annotate_owned(owned)
+            shared = [
+                e for e in self._shared_with_me()
+                if self._matches_filters(e, tool_input or {})
+            ]
+            merged = owned + shared
+        except Exception:
+            return result
+        if isinstance(result, dict):
+            out = dict(result)
+            out["topics"] = merged
+            if "count" in out:
+                out["count"] = len(merged)
+            return out
+        return merged
+
+    @staticmethod
+    def _matches_filters(entry: dict, filters: dict) -> bool:
+        """Apply the FilterTopics category/keyword filters to a shared entry,
+        mirroring the backend's semantics: a single `category` is an exact match
+        and overrides `categories` (an OR set); `keyword` is a case-insensitive
+        substring over title + summary. Absent filters match everything."""
+        cat = (filters.get("category") or "").strip()
+        if cat:
+            if (entry.get("category") or "") != cat:
+                return False
+        else:
+            cats = filters.get("categories")
+            if isinstance(cats, list) and cats:
+                if (entry.get("category") or "") not in cats:
+                    return False
+        kw = (filters.get("keyword") or "").strip().lower()
+        if kw:
+            hay = (
+                (entry.get("title") or "") + " " + (entry.get("summary") or "")
+            ).lower()
+            if kw not in hay:
+                return False
+        return True
+
+    def _annotate_owned(self, topics: list) -> None:
+        """Tag each of this user's own topics that is shared out with the list
+        of accepted recipient usernames, so the model can say who can see it."""
+        shared_ids = _share_store.owner_shared_topic_ids(self.user_id)
+        if not shared_ids:
+            return
+        for t in topics:
+            if not isinstance(t, dict):
+                continue
+            try:
+                tid = int(t.get("id", -1))
+            except (TypeError, ValueError):
+                continue
+            if tid in shared_ids:
+                names = [
+                    _username_of(uid)
+                    for uid in _share_store.topic_partners(self.user_id, tid)
+                ]
+                t["shared_with"] = [n for n in names if n]
+
+    def _shared_with_me(self) -> list[dict]:
+        """Topic-list entries for topics this user has *accepted* from others —
+        the ones the model can actually open via their composite id. (Pending
+        offers are intentionally excluded; the model can't read those yet.)"""
+        return [
+            e for e in _shared_topics_for(self.user_id)
+            if e.get("status") == _topic_shares.STATUS_ACCEPTED
+        ]
+
+
+def _notify_share(user_id: int, message_text: str) -> None:
+    """Tell `user_id` about a sharing change: refresh their open sessions
+    (in-app, via SSE) and, if they've connected one, text them (out-of-app, via
+    the messaging layer). Best-effort — a notification failure never fails the
+    underlying action."""
+    ctx = _user_contexts.get(user_id)
+    if ctx is not None:
+        try:
+            ctx.notify_share_update()
+        except Exception:
+            pass
+    try:
+        rec = _auth_backend.lookup(user_id)
+        if rec and rec.messaging_contact:
+            from aime import messaging as _aime_messaging
+            messenger = _aime_messaging.get_messenger()
+            if messenger is not None:
+                messenger.send(rec.messaging_contact, message_text)
+    except Exception:
+        pass
+
+
+# --- Unified record-change propagation -------------------------------------
+#
+# A single notification path for "a tracked record changed", driven from the
+# gateway's on_mutation choke point so every write (UI or model, own or shared)
+# flows through it automatically — add a new shared record type by registering
+# its mutation tools below and teaching `_record_partners`/`_record_title` about
+# it, not by wiring a fresh fan-out at each call site.
+
+# Backend mutation tool name -> the record kind it changes. Only tools listed
+# here trigger a stale/refresh fan-out; everything else still gets the plain
+# own-UI ping. (Creates are intentionally absent: a brand-new record has no
+# prior view to invalidate.)
+_RECORD_KIND_BY_TOOL = {
+    "replace_topic_contents": "topic",
+    "edit_topic_contents": "topic",
+    "replace_event": "event",
+}
+
+
+def _record_partners(kind: str, owner_id: int, record_id: int) -> list[int]:
+    """Accepted recipients (not incl. the owner) who can see a shared record.
+    Empty for kinds that aren't shareable yet — events have no recipients, so a
+    change to one only ever notifies its owner."""
+    if kind == "topic":
+        return _share_store.topic_partners(owner_id, record_id)
+    return []
+
+
+def _record_title(kind: str, owner_id: int, record_id: int, payload: dict) -> str:
+    """A human-readable title for the <stale> tag, best-effort. Event writes
+    carry the title in their payload (no re-read needed); topic-content writes
+    don't, so fall back to a quick lookup in the owner's topic list."""
+    if kind == "event":
+        title = payload.get("title") if isinstance(payload, dict) else ""
+        return (title or "").strip()
+    if kind == "topic":
+        return _topic_title(owner_id, record_id)
+    return ""
+
+
+def _propagate_record_change(
+    kind: str, owner_id: int, record_id: int, payload: dict,
+) -> None:
+    """Fan a record change out to everyone who can see it — the owner plus any
+    accepted recipients. Each party's model gets a <stale> tag on its next turn
+    (with the id in the form *they* address the record by: the owner the bare
+    id, a recipient the "<owner>:<record>" handle) and each recipient's live UI
+    is refreshed. The owner's own UI is pinged separately by the caller, so it's
+    only marked stale here. Only parties with a live context are touched — an
+    inactive user rebuilds fresh state next time they interact. Best-effort.
+
+    When the change came from a party's *own* model, that model already holds
+    the fresh content; it clears its own flag right after (see
+    `_RecordSyncBridge.after_model_write`), so this can mark unconditionally."""
+    title = _record_title(kind, owner_id, record_id, payload)
+    owner_ctx = _user_contexts.get(owner_id)
+    if owner_ctx is not None:
+        try:
+            owner_ctx.mark_record_stale(kind, record_id, title)
+        except Exception:
+            pass
+    for uid in _record_partners(kind, owner_id, record_id):
+        ctx = _user_contexts.get(uid)
+        if ctx is None:
+            continue
+        try:
+            ctx.mark_record_stale(kind, f"{owner_id}:{record_id}", title)
+            ctx.notify_remote_edit(f"{kind}:{owner_id}")
+        except Exception:
+            pass
+
+
+def _username_of(user_id: int | None) -> str | None:
+    if user_id is None:
+        return None
+    rec = _auth_backend.lookup(user_id)
+    return rec.username if rec else None
+
+
+def _broadcast_topic_lock(
+    owner_id: int, topic_id: int, locked: bool, locked_by: str | None,
+    *, exclude: int | None = None,
+) -> None:
+    """Tell everyone who can see a shared topic that its edit-lock state
+    changed, so their Edit affordance updates live. Targets the owner plus the
+    topic's accepted recipients; `exclude` skips the actor (their own UI already
+    reflects the change)."""
+    payload = {
+        "kind": "topic_lock",
+        "owner_id": owner_id,
+        "topic_id": topic_id,
+        "locked": locked,
+        "locked_by": locked_by,
+    }
+    targets = [owner_id] + _share_store.topic_partners(owner_id, topic_id)
+    for uid in targets:
+        if uid == exclude:
+            continue
+        ctx = _user_contexts.get(uid)
+        if ctx is not None:
+            try:
+                ctx.notify_topic_lock(payload)
+            except Exception:
+                pass
+
+
 @app.route("/topics")
 @login_required
 def topics():
@@ -2564,16 +3212,37 @@ def topics():
         items = _context_for(g.user_id).topic_service.list_topics()
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 500
+    # Flag the owner's own topics that are shared with someone (so the client
+    # engages the edit-lock on them) and surface any current lock holder.
+    try:
+        shared_ids = _share_store.owner_shared_topic_ids(g.user_id)
+        for it in items:
+            tid = int(it.get("id", -1))
+            if tid in shared_ids:
+                it["shared_with_others"] = True
+                holder = _edit_locks.holder(g.user_id, tid)
+                if holder is not None and holder != g.user_id:
+                    it["locked_by"] = _username_of(holder)
+    except Exception:
+        pass
+    # Merge in topics shared with this user. Wrapped so a sharing hiccup can
+    # never take down the user's own topic list.
+    try:
+        items = items + _shared_topics_for(g.user_id)
+    except Exception:
+        pass
     return jsonify({"topics": items})
 
 
 @app.route("/topics/<topic_id>")
 @login_required
 def topic_contents(topic_id: str):
-    if not topic_id.isdigit():
-        return jsonify({"ok": False, "error": "invalid topic id"}), 400
     try:
-        contents = _context_for(g.user_id).topic_service.get_topic_contents(int(topic_id))
+        owner_id, tid = _resolve_topic(topic_id, "view")
+    except _ShareAccessError as e:
+        return jsonify({"ok": False, "error": e.message}), e.status
+    try:
+        contents = _context_for(owner_id).topic_service.get_topic_contents(tid)
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 500
     return jsonify({"contents": contents})
@@ -2602,28 +3271,30 @@ def _safe_filename(name: str, fallback: str) -> str:
 @app.route("/topics/<topic_id>/export")
 @login_required
 def topic_export(topic_id: str):
-    if not topic_id.isdigit():
-        return jsonify({"ok": False, "error": "invalid topic id"}), 400
+    try:
+        owner_id, tid = _resolve_topic(topic_id, "view")
+    except _ShareAccessError as e:
+        return jsonify({"ok": False, "error": e.message}), e.status
     fmt = (request.args.get("format") or "md").lower()
     if fmt not in _EXPORT_FORMATS:
         return jsonify({"ok": False, "error": "unsupported format"}), 400
     target, ext, mime = _EXPORT_FORMATS[fmt]
-    ctx = _context_for(g.user_id)
+    ctx = _context_for(owner_id)
     try:
-        markdown = ctx.topic_service.get_topic_contents(int(topic_id))
+        markdown = ctx.topic_service.get_topic_contents(tid)
         # Title comes from the topics list — get_topic_contents only returns
         # the body, not metadata. A small list scan is fine (topics are tens,
         # not thousands) and keeps this route independent of how the gateway
         # exposes single-topic metadata.
         title = ""
         for t in ctx.topic_service.list_topics():
-            if str(t.get("id") or t.get("topic_id") or "") == topic_id:
+            if int(t.get("id", -1)) == tid:
                 title = t.get("title") or t.get("name") or ""
                 break
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 500
 
-    filename = f"{_safe_filename(title, f'topic-{topic_id}')}.{ext}"
+    filename = f"{_safe_filename(title, f'topic-{tid}')}.{ext}"
     if target is None:
         # Raw markdown — no pandoc needed.
         data = markdown.encode("utf-8")
@@ -2694,8 +3365,10 @@ def topic_export(topic_id: str):
 @app.route("/topics/<topic_id>", methods=["PUT"])
 @login_required
 def topic_contents_save(topic_id: str):
-    if not topic_id.isdigit():
-        return jsonify({"ok": False, "error": "invalid topic id"}), 400
+    try:
+        owner_id, tid = _resolve_topic(topic_id, "edit")
+    except _ShareAccessError as e:
+        return jsonify({"ok": False, "error": e.message}), e.status
     data = request.get_json(silent=True) or {}
     contents = data.get("contents")
     if not isinstance(contents, str):
@@ -2704,25 +3377,185 @@ def topic_contents_save(topic_id: str):
     # from filling the disk via repeated PUTs.
     if len(contents.encode("utf-8")) > 2 * 1024 * 1024:
         return jsonify({"ok": False, "error": "contents too large (max 2 MiB)"}), 413
-    ctx = _context_for(g.user_id)
-    tid = int(topic_id)
+    # Edits always land in the owner's silo (owner_id == g.user_id for own
+    # topics; the topic owner for a shared one).
+    ctx = _context_for(owner_id)
     try:
         ctx.topic_service.replace_topic_contents(tid, contents)
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 500
-    # Look up the title so the <stale> tag carries a recognizable name. If the
-    # list call fails for any reason, fall through with an empty title — the id
-    # alone is still enough for the model to know the record changed.
-    title = ""
+    # No explicit notification here: the replace_topic_contents call above flows
+    # through the gateway's on_mutation choke point, which fans the <stale> tag
+    # and live-UI refresh out to every party — the owner and all recipients.
+    # A UI edit doesn't go through the model dispatch, so nothing clears the
+    # editor's own flag: their model is correctly told its view is now stale.
+    return jsonify({"ok": True})
+
+
+def _topic_title(user_id: int, topic_id: int) -> str:
+    """Best-effort title for one of `user_id`'s topics, for notification text."""
     try:
-        for t in ctx.topic_service.list_topics():
-            if int(t.get("id", -1)) == tid:
-                title = (t.get("title") or "").strip()
-                break
+        for t in _context_for(user_id).topic_service.list_topics():
+            if int(t.get("id", -1)) == topic_id:
+                return (t.get("title") or t.get("name") or "").strip()
     except Exception:
         pass
-    ctx.mark_record_stale("topic", tid, title)
-    return jsonify({"ok": True})
+    return ""
+
+
+def _share_view(share: _topic_shares.Share) -> dict:
+    """Serialize a grant for the owner's "shared with" list, resolving the
+    recipient's id to a username for display."""
+    rec = _auth_backend.lookup(share.recipient_id)
+    return {
+        "recipient_id": share.recipient_id,
+        "username": rec.username if rec else "(unknown)",
+        "permission": share.permission,
+        "status": share.status,
+    }
+
+
+@app.route("/topics/<int:topic_id>/share", methods=["POST"])
+@login_required
+def topic_share(topic_id: int):
+    """Owner shares one of their own topics with another user by username.
+    Body: {username, permission?: "view"|"edit"}. Idempotent — re-sharing
+    updates the permission (and re-offers a previously declined grant)."""
+    if not _user_owns_topic(g.user_id, topic_id):
+        return jsonify({"ok": False, "error": "no such topic"}), 404
+    data = request.get_json(silent=True) or {}
+    username = (data.get("username") or "").strip()
+    permission = (data.get("permission") or _topic_shares.PERM_VIEW).strip()
+    if not username:
+        return jsonify({"ok": False, "error": "username required"}), 400
+    recipient = _auth_backend.lookup_by_username(username)
+    if recipient is None:
+        return jsonify({"ok": False,
+                        "error": f"no user named {username!r}"}), 404
+    if recipient.id == g.user_id:
+        return jsonify({"ok": False,
+                        "error": "you can't share a topic with yourself"}), 400
+    # Distinguish a fresh (or re-sent) invite from a mere permission change on an
+    # existing grant: a new invite warrants an out-of-app message; a permission
+    # tweak only needs the recipient's open view to re-gate, so we keep it to a
+    # quiet in-app refresh and don't re-text them.
+    prior = _share_store.get(g.user_id, topic_id, recipient.id)
+    is_new_invite = prior is None or prior.status == _topic_shares.STATUS_DECLINED
+    try:
+        share = _share_store.share(g.user_id, topic_id, recipient.id, permission)
+    except _topic_shares.InvalidPermission as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    if is_new_invite:
+        title = _topic_title(g.user_id, topic_id) or "a topic"
+        _notify_share(
+            recipient.id,
+            f"{g.username} shared the topic “{title}” with you on Aime.",
+        )
+    else:
+        # In-app refresh only — flips the recipient's access (e.g. view→edit
+        # enables their Edit button) without a notification.
+        ctx = _user_contexts.get(recipient.id)
+        if ctx is not None:
+            try:
+                ctx.notify_share_update()
+            except Exception:
+                pass
+    return jsonify({"ok": True, "share": _share_view(share)})
+
+
+@app.route("/topics/<int:topic_id>/shares", methods=["GET"])
+@login_required
+def topic_shares_list(topic_id: int):
+    """Owner-only: who this topic is shared with, and at what permission."""
+    if not _user_owns_topic(g.user_id, topic_id):
+        return jsonify({"ok": False, "error": "no such topic"}), 404
+    shares = _share_store.for_topic(g.user_id, topic_id)
+    return jsonify({"ok": True, "shares": [_share_view(s) for s in shares]})
+
+
+@app.route("/topics/<int:topic_id>/unshare", methods=["POST"])
+@login_required
+def topic_unshare(topic_id: int):
+    """Owner revokes a grant. Body: {username}. Access stops immediately."""
+    if not _user_owns_topic(g.user_id, topic_id):
+        return jsonify({"ok": False, "error": "no such topic"}), 404
+    data = request.get_json(silent=True) or {}
+    username = (data.get("username") or "").strip()
+    recipient = _auth_backend.lookup_by_username(username) if username else None
+    if recipient is None:
+        return jsonify({"ok": False, "error": "no such user"}), 404
+    removed = _share_store.revoke(g.user_id, topic_id, recipient.id)
+    if removed:
+        # Refresh the (ex-)recipient's sessions so the topic drops out of their
+        # list. No message — quietly losing access is gentler than a "revoked"
+        # notification.
+        ctx = _user_contexts.get(recipient.id)
+        if ctx is not None:
+            try:
+                ctx.notify_share_update()
+            except Exception:
+                pass
+    return jsonify({"ok": True, "removed": removed})
+
+
+@app.route("/shares/<int:owner_id>/<int:topic_id>/respond", methods=["POST"])
+@login_required
+def share_respond(owner_id: int, topic_id: int):
+    """Recipient accepts or declines a pending grant. Body: {accept: bool}."""
+    data = request.get_json(silent=True) or {}
+    accept = bool(data.get("accept"))
+    ok = _share_store.respond(owner_id, topic_id, g.user_id, accept)
+    if not ok:
+        return jsonify({"ok": False,
+                        "error": "no pending share to respond to"}), 404
+    # Let the owner know the outcome, and refresh the recipient's own sessions
+    # so the item flips from pending to open (or disappears on decline).
+    title = _topic_title(owner_id, topic_id) or "a topic"
+    verb = "accepted" if accept else "declined"
+    _notify_share(owner_id,
+                  f"{g.username} {verb} your shared topic “{title}”.")
+    ctx = _user_contexts.get(g.user_id)
+    if ctx is not None:
+        try:
+            ctx.notify_share_update()
+        except Exception:
+            pass
+    return jsonify({"ok": True, "accepted": accept})
+
+
+@app.route("/topics/<topic_id>/lock", methods=["POST"])
+@login_required
+def topic_lock(topic_id: str):
+    """Acquire (or refresh, via heartbeat) the advisory edit-lock on a topic
+    before entering edit mode. Requires edit rights. On success broadcasts the
+    lock to other viewers so their Edit button disables. 409 if someone else
+    already holds it — the response names the holder."""
+    try:
+        owner_id, tid = _resolve_topic(topic_id, "edit")
+    except _ShareAccessError as e:
+        return jsonify({"ok": False, "error": e.message}), e.status
+    ok, holder_id = _edit_locks.acquire(owner_id, tid, g.user_id)
+    if not ok:
+        return jsonify({"ok": False, "locked_by": _username_of(holder_id),
+                        "is_me": False}), 409
+    _broadcast_topic_lock(owner_id, tid, True, g.username, exclude=g.user_id)
+    return jsonify({"ok": True, "locked_by": g.username, "is_me": True})
+
+
+@app.route("/topics/<topic_id>/unlock", methods=["POST"])
+@login_required
+def topic_unlock(topic_id: str):
+    """Release the edit-lock (on save, cancel, or page unload). Only the holder
+    can release; view access is enough so a since-downgraded editor can still
+    let go. Broadcasts the release so others' Edit buttons re-enable."""
+    try:
+        owner_id, tid = _resolve_topic(topic_id, "view")
+    except _ShareAccessError as e:
+        return jsonify({"ok": False, "error": e.message}), e.status
+    released = _edit_locks.release(owner_id, tid, g.user_id)
+    if released:
+        _broadcast_topic_lock(owner_id, tid, False, None, exclude=g.user_id)
+    return jsonify({"ok": True, "released": released})
 
 
 def _load_or_create_tls_context():
