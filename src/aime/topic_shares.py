@@ -85,6 +85,14 @@ class ShareStore:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._init_schema()
 
+    def close(self) -> None:
+        """Release the underlying connection. The long-lived web process never
+        calls this — its store lives for the life of the process — but
+        short-lived callers (e.g. the account-purge tooling) open a store per
+        run and should let it go rather than leak a connection."""
+        with self._lock:
+            self._conn.close()
+
     def _init_schema(self) -> None:
         with self._lock:
             self._conn.executescript(

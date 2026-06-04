@@ -489,6 +489,10 @@ class UserContext:
             lambda: _scheduler_upcoming_events(user_id),
         )
 
+        # Bridge so the model sees this user's shared topics (both directions);
+        # see _TopicShareBridge. Bound to this user_id for the context's life.
+        self.topic_shares = _TopicShareBridge(user_id)
+
         self.controller = ConversationController(
             backend=backend,
             tool_gateway=gateway,
@@ -497,6 +501,7 @@ class UserContext:
             messenger=messenger,
             message_recipient=messaging_contact,
             reminder_service=reminder_service,
+            topic_share_resolver=self.topic_shares,
         )
 
         # Seed the session with the user's last-seen zone so any turn that runs
@@ -2843,6 +2848,7 @@ def _shared_topics_for(recipient_id: int) -> list[dict]:
                 "title": meta.get("title") or meta.get("name") or "(untitled)",
                 "category": meta.get("category") or "",
                 "summary": meta.get("summary") or "",
+                "folder": meta.get("folder") or "",
                 "shared": True,
                 "permission": s.permission,
                 "status": s.status,
@@ -2856,6 +2862,165 @@ def _shared_topics_for(recipient_id: int) -> list[dict]:
                 )
             out.append(entry)
     return out
+
+
+class _TopicShareBridge:
+    """Adapter handed to a user's ConversationController so the *model* sees the
+    same shared topics the web UI does.
+
+    The controller is deliberately ignorant of sharing (it's reused by the TUI
+    and background agents); this bridge holds the cross-user knowledge —
+    `_share_store` for grants and `_context_for` to reach an owner's silo — and
+    is bound to one ``user_id`` for the life of that user's context. Two entry
+    points the controller calls:
+
+    * :meth:`run_if_shared` reroutes a per-topic tool addressed to a composite
+      ``"<owner>:<topic>"`` handle into the owner's gateway after checking the
+      grant, so the model can read (and, with edit rights, write) a topic that
+      physically lives in someone else's silo. Returns ``None`` for a bare id so
+      the controller runs it normally against this user's own gateway.
+    * :meth:`merge_shared_into_list` enriches a FilterTopics result with the
+      topics shared *with* this user and flags which of their *own* topics are
+      shared out (and to whom), so the model knows the state on both sides.
+
+    Routing writes through the owner's gateway is deliberate: it lands the edit
+    in the owner's silo and trips that gateway's on_mutation fanout, so the
+    change syncs back to the owner (and every share partner) exactly like a UI
+    edit — the same single choke point the web routes rely on.
+    """
+
+    # Of the shareable tools, these mutate and so require edit permission;
+    # GetTopicContents needs only an accepted (view) grant.
+    _WRITE_TOOLS = frozenset({"ReplaceTopicContents", "EditTopicContents"})
+
+    def __init__(self, user_id: int):
+        self.user_id = user_id
+
+    @staticmethod
+    def _parse_handle(value) -> tuple[int, int] | None:
+        """``(owner_id, topic_id)`` if `value` is a composite
+        ``"<owner>:<topic>"`` handle, else ``None`` (a bare id is one of this
+        user's own topics and takes the normal path)."""
+        if isinstance(value, str) and ":" in value:
+            owner_s, _, tid_s = value.partition(":")
+            if owner_s.isdigit() and tid_s.isdigit():
+                return int(owner_s), int(tid_s)
+        return None
+
+    def run_if_shared(self, agent_tool_name: str, tool_input: dict):
+        """Run a per-topic tool against the owner's silo when its id is a shared
+        handle; otherwise return ``None`` so the caller runs it locally.
+
+        Enforces the grant exactly as the topic routes do: an accepted grant is
+        required to read, and edit permission to write. A denied or unknown
+        grant comes back as a friendly ``{"error": ...}`` the model can relay,
+        never an exception that breaks the turn."""
+        parsed = self._parse_handle((tool_input or {}).get("id"))
+        if parsed is None:
+            return None
+        owner_id, topic_id = parsed
+        share = _share_store.get(owner_id, topic_id, self.user_id)
+        if share is None or share.status != _topic_shares.STATUS_ACCEPTED:
+            return {"error": "this topic isn't shared with you"}
+        if (agent_tool_name in self._WRITE_TOOLS
+                and share.permission != _topic_shares.PERM_EDIT):
+            return {"error": "you have view-only access to this shared topic"}
+        payload = dict(tool_input or {})
+        payload["id"] = topic_id
+        try:
+            return _context_for(owner_id).gateway.execute(agent_tool_name, payload)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"shared topic access failed: {exc}"}
+
+    def merge_shared_into_list(self, result, tool_input: dict | None = None):
+        """Append the topics shared *with* this user to a FilterTopics result
+        and tag the user's own shared-out topics with their recipients. Wholly
+        best-effort — any hiccup returns the original result so the model still
+        gets its own topics.
+
+        `tool_input` carries the FilterTopics filters (category / categories /
+        keyword). The backend already applied them to the owned topics; we apply
+        the same ones to the shared additions so a narrowed query stays coherent
+        rather than dumping every shared topic in regardless. `limit` is left to
+        the backend's own slice — shared topics are few and hiding them would
+        defeat the point, so we don't re-trim the merged list."""
+        try:
+            if isinstance(result, dict):
+                if "error" in result:
+                    return result
+                owned = list(result.get("topics") or [])
+            elif isinstance(result, list):
+                owned = list(result)
+            else:
+                return result
+            self._annotate_owned(owned)
+            shared = [
+                e for e in self._shared_with_me()
+                if self._matches_filters(e, tool_input or {})
+            ]
+            merged = owned + shared
+        except Exception:
+            return result
+        if isinstance(result, dict):
+            out = dict(result)
+            out["topics"] = merged
+            if "count" in out:
+                out["count"] = len(merged)
+            return out
+        return merged
+
+    @staticmethod
+    def _matches_filters(entry: dict, filters: dict) -> bool:
+        """Apply the FilterTopics category/keyword filters to a shared entry,
+        mirroring the backend's semantics: a single `category` is an exact match
+        and overrides `categories` (an OR set); `keyword` is a case-insensitive
+        substring over title + summary. Absent filters match everything."""
+        cat = (filters.get("category") or "").strip()
+        if cat:
+            if (entry.get("category") or "") != cat:
+                return False
+        else:
+            cats = filters.get("categories")
+            if isinstance(cats, list) and cats:
+                if (entry.get("category") or "") not in cats:
+                    return False
+        kw = (filters.get("keyword") or "").strip().lower()
+        if kw:
+            hay = (
+                (entry.get("title") or "") + " " + (entry.get("summary") or "")
+            ).lower()
+            if kw not in hay:
+                return False
+        return True
+
+    def _annotate_owned(self, topics: list) -> None:
+        """Tag each of this user's own topics that is shared out with the list
+        of accepted recipient usernames, so the model can say who can see it."""
+        shared_ids = _share_store.owner_shared_topic_ids(self.user_id)
+        if not shared_ids:
+            return
+        for t in topics:
+            if not isinstance(t, dict):
+                continue
+            try:
+                tid = int(t.get("id", -1))
+            except (TypeError, ValueError):
+                continue
+            if tid in shared_ids:
+                names = [
+                    _username_of(uid)
+                    for uid in _share_store.topic_partners(self.user_id, tid)
+                ]
+                t["shared_with"] = [n for n in names if n]
+
+    def _shared_with_me(self) -> list[dict]:
+        """Topic-list entries for topics this user has *accepted* from others —
+        the ones the model can actually open via their composite id. (Pending
+        offers are intentionally excluded; the model can't read those yet.)"""
+        return [
+            e for e in _shared_topics_for(self.user_id)
+            if e.get("status") == _topic_shares.STATUS_ACCEPTED
+        ]
 
 
 def _notify_share(user_id: int, message_text: str) -> None:

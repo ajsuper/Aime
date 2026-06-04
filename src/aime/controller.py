@@ -111,6 +111,33 @@ Subscriber = Callable[[CoreEvent], None]
 WorkerSpawner = Callable[[Callable[[], None]], None]
 
 
+# Per-topic tools that take an `id` and so may address a *shared* topic — one
+# that lives in another user's silo, reachable through a "<owner>:<topic>"
+# composite handle. When a topic-share resolver is wired (see the controller's
+# `topic_share_resolver`), these are routed through it; otherwise they hit the
+# user's own gateway unchanged. FilterTopics is handled separately (its result
+# is enriched, not rerouted).
+_SHAREABLE_TOPIC_TOOLS = frozenset(
+    {"GetTopicContents", "ReplaceTopicContents", "EditTopicContents"}
+)
+
+
+def _normalize_topic_id(tool_input: dict) -> dict:
+    """Coerce a bare numeric-string topic id back to an int.
+
+    The topic-content schemas accept a string id so the model can address a
+    shared topic by its "<owner>:<topic>" handle. A plain own-topic id may then
+    arrive as e.g. "7" instead of 7; the backend wants an int, so normalize it
+    here. Composite handles (containing ":") are left untouched for the resolver
+    to parse. Returns the input unchanged when there's nothing to do."""
+    raw = (tool_input or {}).get("id")
+    if isinstance(raw, str) and raw.isdigit():
+        out = dict(tool_input)
+        out["id"] = int(raw)
+        return out
+    return tool_input
+
+
 def _full_detail_text(value) -> str:
     """The complete, human-readable detail behind a tool's one-line summary —
     the full input args or the full result — for a verbose-mode dropdown.
@@ -140,10 +167,20 @@ class ConversationController:
         messenger=None,
         message_recipient: str | None = None,
         reminder_service=None,
+        topic_share_resolver=None,
     ):
         self._backend = backend
         self._tools = tool_gateway
         self._spawn_worker = worker_spawner
+        # Optional topic-sharing bridge (built by the web layer, which owns the
+        # cross-user grant store and the per-owner gateways). When set, it lets
+        # the model see and open topics shared *with* this user and flags the
+        # user's own shared-out topics. Two methods are used: run_topic_tool()
+        # dispatches a per-topic tool (rerouting it to the owner's silo when its
+        # id is a shared handle), and merge_shared_into_list() enriches a
+        # FilterTopics result. None for the TUI / background agents, where every
+        # topic tool simply runs against the user's own gateway.
+        self._topic_shares = topic_share_resolver
         # Optional event-reminder engine (aime.scheduling.ReminderService). When
         # set, the CreateReminder / ListReminders / DeleteReminder client tools
         # are handled here against the user's ScheduleStore; when None they
@@ -757,7 +794,21 @@ class ConversationController:
             except Exception as exc:
                 self._emit(CoreEvent(kind="error", text=f"tool result send failed: {exc}"))
             return
-        result = self._tools.execute(tool_name, tool_input)
+        # Topic sharing. A per-topic tool whose id is a "<owner>:<topic>" handle
+        # addresses a topic in another user's silo, so it's rerouted (after a
+        # grant check) through that owner's gateway by the resolver; a bare id
+        # is one of this user's own topics and runs normally. FilterTopics runs
+        # normally and is then enriched with the user's shared topics + "shared
+        # with" flags. With no resolver wired this is all the plain path.
+        if self._topic_shares is not None and tool_name in _SHAREABLE_TOPIC_TOOLS:
+            tool_input = _normalize_topic_id(tool_input)
+            result = self._topic_shares.run_if_shared(tool_name, tool_input)
+            if result is None:
+                result = self._tools.execute(tool_name, tool_input)
+        else:
+            result = self._tools.execute(tool_name, tool_input)
+        if tool_name == "FilterTopics" and self._topic_shares is not None:
+            result = self._topic_shares.merge_shared_into_list(result, tool_input)
         summary = format_tool_response(tool_name, result)
         self._emit(CoreEvent(
             kind="tool_result",

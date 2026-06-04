@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from . import auth as _auth
 from . import backup as _backup
 from . import config
+from . import topic_shares as _topic_shares
 
 
 # Default grace period: how long a soft-deleted account is kept recoverable
@@ -38,6 +39,25 @@ def _user_dir(user_id: int, database_dir: str) -> str:
     # Mirrors aime.backup._user_dir and web_app._user_dir — the per-user data
     # directory holding database.sql, topics/, and conversations/.
     return os.path.join(database_dir, "users", str(user_id))
+
+
+def _purge_shares(user_id: int, database_dir: str) -> None:
+    """Drop every topic-sharing grant that names ``user_id`` as owner or
+    recipient, so no dangling grant survives the purged account.
+
+    The share store is a single file at the database root (next to auth.sql),
+    mirroring web_app's wiring — not inside any user's silo, so step 3's
+    directory removal never touches it. If sharing was never used the file
+    won't exist and there is nothing to purge.
+    """
+    share_db = os.path.join(database_dir, "topic_shares.sql")
+    if not os.path.exists(share_db):
+        return
+    store = _topic_shares.ShareStore(share_db)
+    try:
+        store.purge_user(user_id)
+    finally:
+        store.close()
 
 
 def _utcnow() -> datetime.datetime:
@@ -123,6 +143,13 @@ def purge_user(
 
     # 3. Remove the data directory.
     shutil.rmtree(_user_dir(user_id, database_dir), ignore_errors=True)
+
+    # 4. Drop any topic-sharing grants naming this user. These live outside the
+    #    data directory (a single store at the database root), so step 3 leaves
+    #    them behind; clean them up explicitly. A stale grant would never
+    #    resolve to accessible content on its own, but leaving rows for a
+    #    purged account around is needless cruft.
+    _purge_shares(user_id, database_dir)
     return backup_path
 
 

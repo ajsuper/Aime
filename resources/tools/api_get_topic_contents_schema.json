@@ -7,8 +7,8 @@
   "required": ["id"],
   "properties": {
     "id": {
-      "type": "integer",
-      "description": "The ID of the topic whose content you want to retrieve."
+      "type": ["integer", "string"],
+      "description": "The ID of the topic whose content you want to retrieve. For your own topics this is the integer id. For a topic shared with you, pass the exact id string shown in the topic list (e.g. \"5:12\")."
     }
   }
 }
