@@ -1,0 +1,22 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "GetPatternSummary",
+  "description": "Get a computed behavioral summary for one commitment (commitment_id) OR one category: totals scheduled/completed/canceled/unknown, the most common cancel reason, the current streak (consecutive completions or cancellations from most recent), and the last completed date. Use this to surface a clean pattern without doing the math yourself. Provide exactly one of commitment_id or category.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "commitment_id": {
+      "type": "string",
+      "description": "Summarize this commitment slug. Takes precedence over category if both are given."
+    },
+    "category": {
+      "type": "string",
+      "description": "Summarize this category instead of a single commitment."
+    },
+    "since_date": {
+      "type": "string",
+      "pattern": "^\\d{2}/\\d{2}/\\d{4}$",
+      "description": "Optional inclusive lower bound, DD/MM/YYYY. Omit for all of history."
+    }
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ListReminders",
+  "description": "List the user's existing event reminders, each with its reminder id (needed to remove one), the event it points at, and when it fires. Pass `event_id` to see only the reminders for one event. Use this before creating a reminder to avoid duplicates, or before deleting one to find its id.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "event_id": {
+      "type": "integer",
+      "description": "Optional. Restrict the list to reminders for this event `id`. Omit to list every reminder."
+    }
+  }
+}

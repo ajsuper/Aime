@@ -64,6 +64,24 @@ from aime import (
     config as aime_config,
 )
 from aime.services import sort_events_by_date
+from aime.agents import (
+    AgentDefinitionStore,
+    AgentRunStore,
+    AgentSpec,
+    BackgroundAgentRunner,
+    definition_to_spec,
+    make_definition,
+    permissions_to_allowlist,
+    register as _register_agent,
+)
+from aime.scheduling import (
+    ReminderService,
+    ScheduleStore,
+    Scheduler,
+    make_schedule,
+    render_message,
+    validate_schedule,
+)
 from aime import auth as _auth
 from aime import encryption as _enc
 from aime import backup as _backup
@@ -115,6 +133,26 @@ def _user_dir(user_id: int) -> str:
 
 def _conversations_dir(user_id: int) -> str:
     return os.path.join(_user_dir(user_id), "conversations")
+
+
+def _agent_runs_dir(user_id: int) -> str:
+    """Where ``AgentRunStore`` keeps this user's encrypted background-agent run
+    records — the same path the runner writes to. Mirrors the conversations
+    directory but kept separate (runs never appear in the chat /load list)."""
+    return os.path.join(_user_dir(user_id), "agent_runs")
+
+
+def _agents_dir(user_id: int) -> str:
+    """Where ``AgentDefinitionStore`` keeps this user's saved-agent definitions.
+    Sibling of ``agent_runs/``: the agent's *definition* lives here, the records
+    of what it did live there."""
+    return os.path.join(_user_dir(user_id), "agents")
+
+
+def _schedules_dir(user_id: int) -> str:
+    """Where ``ScheduleStore`` keeps this user's encrypted schedule records
+    (scheduled agents + event reminders). Sibling of ``agents/``."""
+    return os.path.join(_user_dir(user_id), "schedules")
 
 
 # LEGACY MIGRATION — pre-multi-user installs kept all conversations in a
@@ -299,7 +337,19 @@ class UserContext:
         dek = _auth_backend.get_dek(user_id)
 
         from aime.model_router import ModelRouter
+        from aime.web_search_agent import WebSearchAgent
         from aime import usage as _aime_usage
+        from aime import messaging as _aime_messaging
+
+        # Outbound messaging destination for this user, if they've connected one.
+        # Looked up here (the auth backend is the source of truth) and handed to
+        # the controller so Aime's SendMessage tool can reach the user's phone.
+        _user_rec = _auth_backend.lookup(user_id)
+        messaging_contact = _user_rec.messaging_contact if _user_rec else None
+        # The messenger reflects server capability; the recipient is this user's
+        # contact. Kept separate so the controller can distinguish "not set up on
+        # the server" from "no contact connected" (see _deliver_message).
+        messenger = _aime_messaging.get_messenger()
         router = ModelRouter(
             haiku_model=aime_config.HAIKU_MODEL,
             sonnet_model=aime_config.SONNET_MODEL,
@@ -308,14 +358,27 @@ class UserContext:
             usage_label=username,
             record_api=_aime_usage.record_api,
         )
+        web_search_agent = WebSearchAgent(
+            model=aime_config.WEB_SEARCH_MODEL,
+            tool_version=aime_config.WEB_SEARCH_TOOL_VERSION,
+            usage_label=username,
+            record_api=_aime_usage.record_api,
+        ) if aime_config.WEB_SEARCH_ENABLED else None
         backend = AnthropicMessagesBackend(
             system_prompt=aime_config.load_system_prompt(),
             model=aime_config.AGENT_MODEL,
-            schema_files=aime_config.SCHEMA_FILES,
+            # Reminder tools are client-side (handled in the controller against
+            # the ScheduleStore), so they ride alongside the gateway-backed data
+            # tools in the model's tool list but are never forwarded to serve.cpp.
+            schema_files=aime_config.SCHEMA_FILES + aime_config.REMINDER_SCHEMA_FILES,
             conversations_dir=conv_dir,
             dek=dek,
             usage_label=username,
             router=router,
+            web_search_schema=(
+                aime_config.WEB_SEARCH_SCHEMA if aime_config.WEB_SEARCH_ENABLED else None
+            ),
+            terminal_tool_schema=aime_config.ONBOARDING_TOOL_SCHEMA,
         )
         backend.new_session()
 
@@ -347,10 +410,23 @@ class UserContext:
                 target=fn, name=f"agent-{user_id}", daemon=True
             ).start()
 
+        # Event reminders the model sets go through the same ScheduleStore the
+        # event-modal UI and the scheduler loop use, linked to events by id.
+        # Events are looked up via the shared horizon helper so a reminder can be
+        # set against anything the user has coming up.
+        reminder_service = ReminderService(
+            ScheduleStore(_schedules_dir(user_id), dek),
+            lambda: _scheduler_upcoming_events(user_id),
+        )
+
         self.controller = ConversationController(
             backend=backend,
             tool_gateway=gateway,
             worker_spawner=spawn_worker,
+            web_search_agent=web_search_agent,
+            messenger=messenger,
+            message_recipient=messaging_contact,
+            reminder_service=reminder_service,
         )
 
         self.controller.subscribe(self._fanout)
@@ -422,7 +498,7 @@ class UserContext:
             if payload.get("kind") not in (
                 "assistant_text_delta", "assistant_text_end",
                 "assistant_html_partial", "turn_end", "ready",
-                "remote_edit",
+                "remote_edit", "agent_run_update",
             ):
                 self._history.append(payload)
         with self._subscribers_lock:
@@ -441,6 +517,13 @@ class UserContext:
         funnel through here so the frontend only needs one handler to wire
         up. `source` is for debugging — it shows up in the SSE payload."""
         self._broadcast({"kind": "remote_edit", "source": source})
+
+    def notify_agent_run_update(self) -> None:
+        """Tell every connected session of this user that the set of stored
+        background-agent runs changed (a run just started or finished), so any
+        open agent/conversations pane re-fetches. Fired by the ad-hoc run
+        thread, which has no other path into the SSE fanout."""
+        self._broadcast({"kind": "agent_run_update"})
 
     def _on_backend_mutation(self, tool_name: str) -> None:
         # Fired by ToolGateway after any successful non-read tool call,
@@ -463,6 +546,7 @@ class UserContext:
             "tool_name": event.tool_name,
             "tool_details": event.tool_details,
             "tool_result_summary": event.tool_result_summary,
+            "tool_detail_full": event.tool_detail_full,
             "severity": event.severity,
             "stop_reason": event.stop_reason,
             "from_replay": event.from_replay,
@@ -1295,9 +1379,30 @@ def me():
         "id": g.user_id,
         "username": g.username,
         "email": user.email if user else None,
+        "messaging_contact": user.messaging_contact if user else None,
         "access_mode": _ACCESS_MODE,
         "api_access": g.api_access,
     })
+
+
+@app.route("/messaging-contact", methods=["POST"])
+@login_required
+def messaging_contact():
+    """Connect (or clear, with an empty value) the account's outbound-messaging
+    destination — the chat id / number Aime and background agents text via
+    aime.messaging. An advanced-settings convenience; the value is opaque to the
+    server and just stored. Takes effect on the user's next session (the live
+    controller reads its recipient at construction)."""
+    data = request.get_json(silent=True) or {}
+    contact = (data.get("contact") or "").strip() or None
+    _auth_backend.set_messaging_contact(g.user_id, contact)
+    # Push it into the live session too (if one is cached) so it works right
+    # away rather than only after the next login rebuilds the controller.
+    ctx = _user_contexts.get(g.user_id)
+    if ctx is not None:
+        from aime import messaging as _aime_messaging
+        ctx.controller.set_messaging_target(_aime_messaging.get_messenger(), contact)
+    return jsonify({"ok": True, "messaging_contact": contact})
 
 
 @app.route("/redeem", methods=["POST"])
@@ -1839,11 +1944,518 @@ def delete_all_sessions():
     return jsonify({"ok": True})
 
 
+# --- Background-agent runs -------------------------------------------------
+# Read-only audit trail of what every background agent did for this user. The
+# frontend only surfaces these to Verbose users (the same tier that sees tool
+# chatter), folding them into the Conversations menu. Runs are encrypted with
+# the user's DEK, exactly like conversations, so we decrypt on demand here.
+
+
+def _agent_run_store(user_id: int) -> AgentRunStore:
+    return AgentRunStore(_agent_runs_dir(user_id), _auth_backend.get_dek(user_id))
+
+
+def _agent_def_store(user_id: int) -> AgentDefinitionStore:
+    return AgentDefinitionStore(_agents_dir(user_id), _auth_backend.get_dek(user_id))
+
+
+def _schedule_store(user_id: int) -> ScheduleStore:
+    return ScheduleStore(_schedules_dir(user_id), _auth_backend.get_dek(user_id))
+
+
+# --- Scheduler wiring ------------------------------------------------------
+# The scheduler core (aime.scheduling) is deliberately ignorant of this app: it
+# fires due records by calling back into these three helpers. They are the only
+# bridge between the headless loop and the request-time machinery (agent runs,
+# messaging, the events backend).
+
+
+def _scheduler_run_agent(agent_id: str, user_id: int, tz: str | None) -> None:
+    """Scheduler action: run a saved agent now, exactly as its Run button does.
+
+    Honors the same api-access gate as ``/agents/<id>/run`` — a scheduled run
+    spends tokens, so an account without send access must not fire one. A
+    deleted agent is a quiet no-op (the user can remove the dangling schedule)."""
+    rec = _auth_backend.lookup(user_id)
+    if rec is None or not rec.api_access:
+        return
+    record = _agent_def_store(user_id).load(agent_id)
+    if record is None:
+        return
+    _launch_agent_run(definition_to_spec(record), user_id, tz, agent_id=agent_id)
+
+
+def _scheduler_send_message(user_id: int, text: str) -> None:
+    """Scheduler action: deliver a reminder to the user's stored contact over the
+    configured channel. Best-effort — messaging off, no contact connected, or a
+    transport hiccup all degrade to a quiet skip rather than a hard failure."""
+    from aime import messaging as _aime_messaging
+    messenger = _aime_messaging.get_messenger()
+    if messenger is None:
+        return
+    rec = _auth_backend.lookup(user_id)
+    contact = rec.messaging_contact if rec else None
+    if not contact:
+        return
+    try:
+        messenger.send(contact, text)
+    except _aime_messaging.MessageSendError as exc:
+        app.logger.warning("scheduled reminder to user %s failed: %s", user_id, exc)
+
+
+def _scheduler_upcoming_events(user_id: int) -> list:
+    """Active events from today out to the reminder horizon (~400 days, past the
+    366-day ``days_before`` cap), for the scheduler's event reminders. Built off
+    any request, so it constructs its own gateway rather than a UserContext.
+
+    Returning the full horizon is a correctness contract: a relative schedule
+    whose linked event isn't in this list is treated as an orphan and deleted,
+    so the window must be wide enough to always include an armed reminder's
+    event (see docs/scheduling.md §8)."""
+    gw = ToolGateway(api_url=aime_config.API_URL, user_id=user_id)
+    today = datetime.date.today()
+    end = today + datetime.timedelta(days=400)
+    return CalendarService(gw).events_in_range(
+        today.strftime("%d/%m/%Y"), end.strftime("%d/%m/%Y")
+    )
+
+
+def _dispatch_schedule_now(user_id: int, record: dict, tz: str | None) -> None:
+    """Fire a schedule's action immediately (the manual /run path), mirroring
+    what the loop's ``_fire`` does — including resolving the linked event so a
+    relative reminder's template renders the same way it would on a real fire.
+    Works even when the background loop is disabled."""
+    action = record.get("action", {})
+    if action.get("kind") == "run_agent":
+        _scheduler_run_agent(action.get("agent_id"), user_id, tz)
+        return
+    event = None
+    trigger = record.get("trigger", {})
+    if trigger.get("kind") == "relative" and trigger.get("event_id") is not None:
+        events = {e["id"]: e for e in _scheduler_upcoming_events(user_id) if "id" in e}
+        event = events.get(trigger["event_id"])
+    _scheduler_send_message(user_id, render_message(action.get("message", ""), event))
+
+
+_scheduler: Scheduler | None = None
+
+
+def _start_scheduler() -> None:
+    """Boot the background scheduler thread once, unless disabled via
+    ``AIME_SCHEDULER=0`` (tests, or a deploy that runs the loop elsewhere)."""
+    global _scheduler
+    if os.environ.get("AIME_SCHEDULER", "1").strip().lower() in ("0", "false", "no", "off"):
+        return
+    if _scheduler is not None:
+        return
+    _scheduler = Scheduler(
+        auth=_auth_backend,
+        schedules_dir=_schedules_dir,
+        run_agent=_scheduler_run_agent,
+        send_message=_scheduler_send_message,
+        upcoming_events=_scheduler_upcoming_events,
+    )
+    _scheduler.start()
+
+
+# In-flight background-agent runs, in memory only. A run record isn't written
+# until the run *finishes*, so without this the UI has no way to show that a run
+# is underway — which reads as "nothing happened" when you press Run. We track
+# every launched run here (keyed user_id -> token -> descriptor) for the brief
+# window it's executing, surface it as a "running" entry, and drop it the moment
+# the run lands its record. Safe as a plain dict + lock because the server is a
+# single process; it's intentionally ephemeral (a restart clears it, which is
+# correct — those threads died with the process).
+_active_agent_runs: dict[int, dict[str, dict]] = {}
+_active_runs_lock = threading.Lock()
+
+
+def _add_active_run(user_id: int, descriptor: dict) -> None:
+    with _active_runs_lock:
+        _active_agent_runs.setdefault(user_id, {})[descriptor["token"]] = descriptor
+
+
+def _remove_active_run(user_id: int, token: str) -> None:
+    with _active_runs_lock:
+        runs = _active_agent_runs.get(user_id)
+        if runs:
+            runs.pop(token, None)
+            if not runs:
+                _active_agent_runs.pop(user_id, None)
+
+
+def _list_active_runs(user_id: int) -> list[dict]:
+    """Descriptors for this user's in-flight runs, newest first."""
+    with _active_runs_lock:
+        runs = list(_active_agent_runs.get(user_id, {}).values())
+    runs.sort(key=lambda r: r.get("started_at", ""), reverse=True)
+    return runs
+
+
+def _launch_agent_run(
+    spec: AgentSpec, user_id: int, client_tz: str | None,
+    *, agent_id: str | None = None,
+) -> None:
+    """Start a background-agent run for ``spec`` against ``user_id``'s data on a
+    daemon thread and return immediately. The run persists its own encrypted run
+    record (and converts its own failures into an ``error`` record), so there is
+    nothing to await here — open panes learn the outcome via the run-update
+    fanout fired when the thread finishes. Shared by the ad-hoc launcher and the
+    saved-agent run button so both behave identically.
+
+    ``agent_id`` ties the run back to a saved agent (None for ad-hoc), so the UI
+    can mark that agent's card as running."""
+    ctx = _context_for(user_id)
+    username = ctx.username
+    dek = _auth_backend.get_dek(user_id)
+    runs_dir = _agent_runs_dir(user_id)
+    # Outbound-messaging destination, read fresh from auth (the source of truth —
+    # it may have changed since the session was built). None => the agent gets a
+    # graceful "no contact connected" result instead of a misfire.
+    _rec = _auth_backend.lookup(user_id)
+    messaging_contact = _rec.messaging_contact if _rec else None
+
+    token = base64.b16encode(os.urandom(8)).decode().lower()
+    descriptor = {
+        "token": token,
+        "agent_id": agent_id,
+        "agent_name": spec.name,
+        "started_at": datetime.datetime.now(datetime.timezone.utc)
+                          .isoformat(timespec="seconds"),
+    }
+    _add_active_run(user_id, descriptor)
+
+    def _run() -> None:
+        try:
+            BackgroundAgentRunner().run(
+                spec,
+                user_id=user_id,
+                dek=dek,
+                runs_dir=runs_dir,
+                usage_label=username,
+                client_tz=client_tz,
+                messaging_contact=messaging_contact,
+                api_url=aime_config.API_URL,
+                agent_id=agent_id,
+            )
+        except Exception:
+            # The runner already converts its own failures into a persisted
+            # error run; a failure here means it never got that far. Nothing
+            # actionable to do but stop quietly — the pane refresh below still
+            # fires so the UI doesn't hang on "running…".
+            pass
+        finally:
+            _remove_active_run(user_id, token)
+            ctx.notify_agent_run_update()
+
+    threading.Thread(
+        target=_run, name=f"agent-run-{user_id}", daemon=True
+    ).start()
+    # Tell open panes a run is now in flight (so the "running" entry appears
+    # immediately); the result lands via the run record + the finished fanout.
+    ctx.notify_agent_run_update()
+
+
+@app.route("/agent-runs")
+@login_required
+def agent_runs():
+    """Lightweight metadata for every stored run, newest first — enough to
+    list them without pulling full transcripts into the listing. ``active`` adds
+    the runs in flight right now (which have no record on disk yet) so the UI can
+    show what's currently running."""
+    return jsonify({
+        "runs": _agent_run_store(g.user_id).list_runs(),
+        "active": _list_active_runs(g.user_id),
+    })
+
+
+@app.route("/agent-runs/<run_id>")
+@login_required
+def agent_run(run_id: str):
+    """A single run record: status, summary, structured result, and the full
+    transcript, so the frontend can show what the agent actually did."""
+    record = _agent_run_store(g.user_id).load(run_id)
+    if record is None:
+        return jsonify({"ok": False, "error": "run not found"}), 404
+    return jsonify({"ok": True, "run": record})
+
+
+@app.route("/agents/run", methods=["POST"])
+@login_required
+@api_access_required
+def agents_run():
+    """Run an ad-hoc background agent: the caller supplies a system message
+    (the task brief) and we stand up a one-off, in-memory agent to carry it
+    out against this user's data. The agent is registered under a unique name
+    so it's a genuine registry-dispatched run, but nothing about it is
+    persisted as a definition — it's gone on the next server restart. Only the
+    encrypted *run record* survives (in agent_runs/), which the run viewer and
+    the agents pane read back. Gated like /send because a run spends tokens."""
+    data = request.get_json(silent=True) or {}
+    instructions = (data.get("instructions") or "").strip()
+    if not instructions:
+        return jsonify({"ok": False, "error": "a system message is required"}), 400
+    allow_web = bool(data.get("allow_web_search", False))
+    tz = data.get("tz")
+    client_tz = tz if isinstance(tz, str) and tz else None
+
+    # Unique, registry-safe name for this one-off agent. The timestamp keeps
+    # runs listed in creation order; the random suffix avoids collisions.
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    name = f"adhoc-{stamp}-{base64.b16encode(os.urandom(3)).decode().lower()}"
+    # An ad-hoc run is a one-off the user typed by hand, so it gets the full data
+    # toolset; web search rides the same allowlist and follows the checkbox.
+    spec = AgentSpec(
+        name=name,
+        description="Ad-hoc agent",
+        instructions=instructions,
+        tool_allowlist=permissions_to_allowlist(
+            modify_topics=True,
+            modify_events=True,
+            send_message=True,
+            web_search=allow_web,
+        ),
+    )
+    _register_agent(spec)
+    _launch_agent_run(spec, g.user_id, client_tz)
+    return jsonify({"ok": True, "agent_name": name})
+
+
+# --- Saved agents ----------------------------------------------------------
+# A per-user library of agent definitions the user created in the UI. Unlike
+# ad-hoc runs (which vanish on restart), these persist as encrypted records in
+# the user's agents/ directory, so an agent can be re-run, edited, or deleted —
+# and, later, run on a schedule. CRUD here; the actual run reuses the same
+# launcher the ad-hoc path does.
+
+
+def _agent_def_public(record: dict) -> dict:
+    """Project a stored definition to the fields the frontend needs. (Currently
+    the whole record is safe to expose, but going through a projection keeps the
+    wire shape decoupled from on-disk additions.)"""
+    return {
+        "agent_id": record.get("agent_id", ""),
+        "name": record.get("name", ""),
+        "description": record.get("description", ""),
+        "instructions": record.get("instructions", ""),
+        "allow_web_search": bool(record.get("allow_web_search", False)),
+        "allow_modify_topics": bool(record.get("allow_modify_topics", False)),
+        "allow_modify_events": bool(record.get("allow_modify_events", False)),
+        "allow_send_message": bool(record.get("allow_send_message", False)),
+        "created_at": record.get("created_at", ""),
+        "updated_at": record.get("updated_at", ""),
+    }
+
+
+@app.route("/agents", methods=["GET"])
+@login_required
+def agents_list():
+    """Every saved agent this user has defined, newest first."""
+    agents = _agent_def_store(g.user_id).list_agents()
+    return jsonify({"agents": [_agent_def_public(a) for a in agents]})
+
+
+@app.route("/agents", methods=["POST"])
+@login_required
+def agents_create():
+    """Create and persist a new saved agent. A name and instructions are
+    required. Scheduling is set separately via /schedules."""
+    data = request.get_json(silent=True) or {}
+    name = (data.get("name") or "").strip()
+    instructions = (data.get("instructions") or "").strip()
+    if not name:
+        return jsonify({"ok": False, "error": "a name is required"}), 400
+    if not instructions:
+        return jsonify({"ok": False, "error": "instructions are required"}), 400
+    record = make_definition(
+        name=name,
+        instructions=instructions,
+        description=(data.get("description") or "").strip(),
+        allow_web_search=bool(data.get("allow_web_search", False)),
+        allow_modify_topics=bool(data.get("allow_modify_topics", False)),
+        allow_modify_events=bool(data.get("allow_modify_events", False)),
+        allow_send_message=bool(data.get("allow_send_message", False)),
+    )
+    if not _agent_def_store(g.user_id).save(record):
+        return jsonify({"ok": False, "error": "couldn't save the agent"}), 500
+    return jsonify({"ok": True, "agent": _agent_def_public(record)})
+
+
+@app.route("/agents/<agent_id>", methods=["PUT"])
+@login_required
+def agents_update(agent_id: str):
+    """Update an existing saved agent. Only the fields present in the request
+    are changed; the id and creation time are preserved."""
+    store = _agent_def_store(g.user_id)
+    record = store.load(agent_id)
+    if record is None:
+        return jsonify({"ok": False, "error": "agent not found"}), 404
+    data = request.get_json(silent=True) or {}
+    if "name" in data:
+        name = (data.get("name") or "").strip()
+        if not name:
+            return jsonify({"ok": False, "error": "a name is required"}), 400
+        record["name"] = name
+    if "instructions" in data:
+        instructions = (data.get("instructions") or "").strip()
+        if not instructions:
+            return jsonify({"ok": False, "error": "instructions are required"}), 400
+        record["instructions"] = instructions
+    if "description" in data:
+        record["description"] = (data.get("description") or "").strip()
+    if "allow_web_search" in data:
+        record["allow_web_search"] = bool(data.get("allow_web_search"))
+    if "allow_modify_topics" in data:
+        record["allow_modify_topics"] = bool(data.get("allow_modify_topics"))
+    if "allow_modify_events" in data:
+        record["allow_modify_events"] = bool(data.get("allow_modify_events"))
+    if "allow_send_message" in data:
+        record["allow_send_message"] = bool(data.get("allow_send_message"))
+    if not store.save(record):
+        return jsonify({"ok": False, "error": "couldn't save the agent"}), 500
+    return jsonify({"ok": True, "agent": _agent_def_public(record)})
+
+
+@app.route("/agents/<agent_id>", methods=["DELETE"])
+@login_required
+def agents_delete(agent_id: str):
+    """Delete a saved agent definition. The run records it already produced are
+    left in place — they're a separate, immutable audit trail."""
+    _agent_def_store(g.user_id).delete(agent_id)
+    return jsonify({"ok": True})
+
+
+@app.route("/agents/<agent_id>/run", methods=["POST"])
+@login_required
+@api_access_required
+def agents_run_saved(agent_id: str):
+    """Run a saved agent now. Builds the spec from the stored definition and
+    hands it to the same launcher the ad-hoc path uses. Gated like /send
+    because a run spends tokens."""
+    record = _agent_def_store(g.user_id).load(agent_id)
+    if record is None:
+        return jsonify({"ok": False, "error": "agent not found"}), 404
+    data = request.get_json(silent=True) or {}
+    tz = data.get("tz")
+    client_tz = tz if isinstance(tz, str) and tz else None
+    spec = definition_to_spec(record)
+    _launch_agent_run(spec, g.user_id, client_tz, agent_id=agent_id)
+    return jsonify({"ok": True, "agent_name": spec.name})
+
+
+# --- Scheduled things ------------------------------------------------------
+# A per-user library of schedule records (scheduled agents + event reminders),
+# each pairing a trigger (when) with an action (what). The background loop fires
+# them; these routes are just CRUD over the encrypted store. See
+# docs/scheduling.md for the record shape and invariants.
+
+
+def _schedule_public(record: dict) -> dict:
+    """Project a stored schedule to the wire shape. The record is the user's own
+    data, so this is mostly pass-through; going through a projection keeps the
+    API decoupled from on-disk additions and surfaces ``state`` (last run /
+    sent markers) the UI uses for 'next run' hints."""
+    return {
+        "schedule_id": record.get("schedule_id", ""),
+        "enabled": bool(record.get("enabled", True)),
+        "tz": record.get("tz", ""),
+        "trigger": record.get("trigger", {}),
+        "action": record.get("action", {}),
+        "state": record.get("state", {}),
+        "created_at": record.get("created_at", ""),
+        "updated_at": record.get("updated_at", ""),
+    }
+
+
+@app.route("/schedules", methods=["GET"])
+@login_required
+def schedules_list():
+    """Every schedule this user has, newest first."""
+    items = _schedule_store(g.user_id).list_schedules()
+    return jsonify({"schedules": [_schedule_public(s) for s in items]})
+
+
+@app.route("/schedules", methods=["POST"])
+@login_required
+def schedules_create():
+    """Create a schedule from a ``{trigger, action, tz, enabled?, label?}`` body.
+    Validated against the tagged-variant invariants; a bad record is a 400 with
+    the precise reason."""
+    data = request.get_json(silent=True) or {}
+    record = make_schedule(
+        trigger=data.get("trigger") or {},
+        action=data.get("action") or {},
+        tz=(data.get("tz") or "").strip(),
+        enabled=bool(data.get("enabled", True)),
+        label=(data.get("label") or "").strip(),
+    )
+    err = validate_schedule(record)
+    if err is not None:
+        return jsonify({"ok": False, "error": err}), 400
+    if not _schedule_store(g.user_id).save(record):
+        return jsonify({"ok": False, "error": "couldn't save the schedule"}), 500
+    return jsonify({"ok": True, "schedule": _schedule_public(record)})
+
+
+@app.route("/schedules/<schedule_id>", methods=["PUT"])
+@login_required
+def schedules_update(schedule_id: str):
+    """Update an existing schedule. Only the fields present in the request are
+    changed; ``state``, id, and creation time are preserved. Editing the trigger
+    clears stale fire-state so the change takes effect cleanly."""
+    store = _schedule_store(g.user_id)
+    record = store.load(schedule_id)
+    if record is None:
+        return jsonify({"ok": False, "error": "schedule not found"}), 404
+    data = request.get_json(silent=True) or {}
+    if "enabled" in data:
+        record["enabled"] = bool(data.get("enabled"))
+    if "tz" in data:
+        record["tz"] = (data.get("tz") or "").strip()
+    if "trigger" in data:
+        record["trigger"] = data.get("trigger") or {}
+        # The trigger defines what the fire-state tracks; a changed trigger makes
+        # the old markers meaningless, so reset them to re-arm from scratch.
+        record["state"] = {"last_run_at": None, "fired_at": None, "sent_for_start": None}
+    if "action" in data:
+        record["action"] = data.get("action") or {}
+    err = validate_schedule(record)
+    if err is not None:
+        return jsonify({"ok": False, "error": err}), 400
+    if not store.save(record):
+        return jsonify({"ok": False, "error": "couldn't save the schedule"}), 500
+    return jsonify({"ok": True, "schedule": _schedule_public(record)})
+
+
+@app.route("/schedules/<schedule_id>", methods=["DELETE"])
+@login_required
+def schedules_delete(schedule_id: str):
+    """Delete a schedule. Any agent runs it already produced are left in place."""
+    _schedule_store(g.user_id).delete(schedule_id)
+    return jsonify({"ok": True})
+
+
+@app.route("/schedules/<schedule_id>/run", methods=["POST"])
+@login_required
+@api_access_required
+def schedules_run_now(schedule_id: str):
+    """Fire a schedule's action immediately — a manual test trigger. Doesn't
+    touch fire-state, so the normal cadence is unaffected."""
+    record = _schedule_store(g.user_id).load(schedule_id)
+    if record is None:
+        return jsonify({"ok": False, "error": "schedule not found"}), 404
+    data = request.get_json(silent=True) or {}
+    tz = data.get("tz")
+    client_tz = tz if isinstance(tz, str) and tz else record.get("tz")
+    _dispatch_schedule_now(g.user_id, record, client_tz)
+    return jsonify({"ok": True})
+
+
 @app.route("/calendar/<int:year>/<int:month>")
 @login_required
 def calendar_month(year: int, month: int):
     try:
-        events = _context_for(g.user_id).calendar_service.events_for_month(year, month, include_archived=True)
+        events = _context_for(g.user_id).calendar_service.events_for_month(year, month, include_archived=False)
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 500
     return jsonify({"events": events})
@@ -1854,7 +2466,7 @@ def calendar_month(year: int, month: int):
 def calendar_day(year: int, month: int, day: int):
     try:
         events = sort_events_by_date(
-            _context_for(g.user_id).calendar_service.events_for_day(year, month, day, include_archived=True)
+            _context_for(g.user_id).calendar_service.events_for_day(year, month, day, include_archived=False)
         )
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 500
@@ -1875,6 +2487,14 @@ def calendar_event_update(event_id: int):
     archived = data.get("archived", False)
     if not isinstance(title, str) or not isinstance(date, str):
         return jsonify({"ok": False, "error": "title and date are required"}), 400
+    # Lifecycle metadata is optional from the UI: only the fields actually sent
+    # are forwarded, so anything omitted is preserved by the backend's merge
+    # (e.g. saving a description edit never resets status or commitment_id).
+    extra = {
+        key: data[key]
+        for key in ("status", "commitment_id", "status_change_reason", "rescheduled_from")
+        if isinstance(data.get(key), str)
+    }
     ctx = _context_for(g.user_id)
     try:
         result = ctx.calendar_service.replace_event(
@@ -1885,6 +2505,7 @@ def calendar_event_update(event_id: int):
             date=date,
             time=time_ if isinstance(time_, str) else "",
             archived=bool(archived),
+            **extra,
         )
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 500
@@ -2167,5 +2788,9 @@ if __name__ == "__main__":
     ssl_context = None
     if int(os.environ.get("AIME_HTTPS", "0")):
         ssl_context = _load_or_create_tls_context()
+    # Start the background scheduler (scheduled agents + event reminders). Safe
+    # here because the deployment is a single threaded process — one loop, no
+    # double-fire. Disabled with AIME_SCHEDULER=0.
+    _start_scheduler()
     app.run(host=host, port=port, threaded=True, debug=False,
             ssl_context=ssl_context)

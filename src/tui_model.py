@@ -523,7 +523,17 @@ class Aime(App):
         dek = _enc.load_or_create_key_file(os.path.join(tui_user_dir, "tui_dek"))
 
         from aime.model_router import ModelRouter
+        from aime.web_search_agent import WebSearchAgent
         from aime import usage as _aime_usage
+        from aime import messaging as _aime_messaging
+
+        # The local TUI has no accounts DB, so its messaging destination comes
+        # from AIME_MESSAGING_CONTACT in the environment rather than a stored
+        # per-account contact (which is the web app's path).
+        messaging_contact = _aime_messaging.env_recipient()
+        # Messenger = server capability; recipient = the env contact. Separate so
+        # the controller can say "not set up" vs "no contact connected" distinctly.
+        messenger = _aime_messaging.get_messenger()
         router = ModelRouter(
             haiku_model=aime_config.HAIKU_MODEL,
             sonnet_model=aime_config.SONNET_MODEL,
@@ -531,6 +541,11 @@ class Aime(App):
             enabled=aime_config.MODEL_ROUTING_ENABLED,
             record_api=_aime_usage.record_api,
         )
+        web_search_agent = WebSearchAgent(
+            model=aime_config.WEB_SEARCH_MODEL,
+            tool_version=aime_config.WEB_SEARCH_TOOL_VERSION,
+            record_api=_aime_usage.record_api,
+        ) if aime_config.WEB_SEARCH_ENABLED else None
         backend = AnthropicMessagesBackend(
             system_prompt=aime_config.load_system_prompt(),
             model=aime_config.AGENT_MODEL,
@@ -538,6 +553,10 @@ class Aime(App):
             conversations_dir=conv_dir,
             dek=dek,
             router=router,
+            web_search_schema=(
+                aime_config.WEB_SEARCH_SCHEMA if aime_config.WEB_SEARCH_ENABLED else None
+            ),
+            terminal_tool_schema=aime_config.ONBOARDING_TOOL_SCHEMA,
         )
         backend.new_session()
 
@@ -549,6 +568,9 @@ class Aime(App):
             backend=backend,
             tool_gateway=gateway,
             worker_spawner=self._spawn_stream_worker,
+            web_search_agent=web_search_agent,
+            messenger=messenger,
+            message_recipient=messaging_contact,
         )
 
     def _spawn_stream_worker(self, fn) -> None:
@@ -668,8 +690,13 @@ class Aime(App):
             log.write("[bold green]Aime ready[/bold green]")
 
         elif kind == "notice":
-            color = _NOTICE_COLOR.get(event.severity, "white")
-            log.write(f"[{color}] {event.text} [/{color}]")
+            # Signal-only severities carry no banner text — they exist purely to
+            # toggle UI state in the web frontend; nothing to show in the TUI.
+            if event.severity in ("onboarding", "onboarding_done"):
+                pass
+            else:
+                color = _NOTICE_COLOR.get(event.severity, "white")
+                log.write(f"[{color}] {event.text} [/{color}]")
 
         elif kind == "session_restart":
             log.clear()

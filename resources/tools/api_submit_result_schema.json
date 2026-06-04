@@ -1,0 +1,22 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SubmitResult",
+  "description": "Finish the task and return your result. Call this exactly ONCE, as the very last thing you do, after you have completed everything the task asked for. There is no user to chat with — this call IS how you deliver your answer to whoever dispatched you. Put a clear, self-contained summary of what you found or did in `summary`, and any structured output in `result`. Do not use any other tools after calling this.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["summary"],
+  "properties": {
+    "summary": {
+      "type": "string",
+      "description": "A clear, self-contained summary of the outcome: what you found or did and anything the caller needs to know. Write findings, not a chat reply — the caller may never see the rest of your work."
+    },
+    "result": {
+      "type": "object",
+      "description": "Optional structured result payload. Its shape is defined by the task; omit it when a text summary is enough."
+    },
+    "message_to_user": {
+      "type": "string",
+      "description": "Optional. A short message to deliver directly to the user's phone / messaging app when your result is something they should be told about proactively (e.g. a reminder you were dispatched to surface, or a notable finding). Write it as a self-contained text to the user, not a report to your dispatcher. Omit it when the run does not need to reach the user — most don't."
+    }
+  }
+}

@@ -70,11 +70,11 @@ COPY scripts/usage_report.py ./scripts/usage_report.py
 # Pre-download Whisper STT models so voice input is instant out of the box.
 # Which models get baked in is controlled by DOWNLOAD_TINY / DOWNLOAD_BASE /
 # DOWNLOAD_SMALL (see .env.example) — only "1" downloads. Tiny is on by
-# default. Heavier models (medium, large-v3, large-v3-turbo) still work —
-# faster-whisper just fetches them on first use into the mounted models
-# volume. frontends/stt.py resolves the model dir as <repo>/models/whisper
-# (i.e. /app/models/whisper here) and only exposes downloaded models in the
-# UI dropdown.
+# default; set all three to 0 to bake no model. Heavier models (medium,
+# large-v3, large-v3-turbo) — and any model when none is baked — still work:
+# faster-whisper fetches them on first use into the mounted models volume.
+# frontends/stt.py resolves the model dir as <repo>/models/whisper (i.e.
+# /app/models/whisper here) and only exposes downloaded models in the UI dropdown.
 ARG DOWNLOAD_TINY=1
 ARG DOWNLOAD_BASE=0
 ARG DOWNLOAD_SMALL=0
@@ -95,15 +95,18 @@ if os.environ.get("DOWNLOAD_BASE") == "1":
 if os.environ.get("DOWNLOAD_SMALL") == "1":
     wanted.append("small.en")
 if not wanted:
-    # Always ship with at least one model so voice input works out of the box.
-    wanted.append("tiny.en")
-for name in wanted:
-    print(f"Downloading Whisper model {name!r} ...", flush=True)
-    WhisperModel(name, device="cpu", compute_type="int8", download_root=cache)
-# Default the UI to the smallest (fastest) downloaded model.
-with open(os.path.join(cache, ".selected"), "w") as f:
-    f.write(wanted[0])
-print(f"Whisper models cached under {cache}: {', '.join(wanted)}")
+    # Every flag is explicitly 0 — bake no model. This is a deliberate opt-out,
+    # not a misconfiguration: faster-whisper fetches the chosen model on first
+    # voice use into the mounted models volume (same as medium/large always do).
+    print("No Whisper models selected (all flags 0) — skipping bake.", flush=True)
+else:
+    for name in wanted:
+        print(f"Downloading Whisper model {name!r} ...", flush=True)
+        WhisperModel(name, device="cpu", compute_type="int8", download_root=cache)
+    # Default the UI to the smallest (fastest) downloaded model.
+    with open(os.path.join(cache, ".selected"), "w") as f:
+        f.write(wanted[0])
+    print(f"Whisper models cached under {cache}: {', '.join(wanted)}")
 PY
 
 # HOME drives every data path: aime/config.py derives DATABASE_DIR, the

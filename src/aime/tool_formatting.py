@@ -90,6 +90,36 @@ def format_tool_details(name: str, inp: dict) -> str:
             f"\"{_truncate_for_log(inp.get('old_name'), 30) or '?'}\""
             f" → \"{_truncate_for_log(inp.get('new_name'), 30) or '?'}\""
         )
+    elif name == "WebSearch":
+        q = _truncate_for_log(inp.get("request"), 60)
+        if q:
+            parts.append(f"\"{q}\"")
+    elif name == "SendMessage":
+        body = _truncate_for_log(inp.get("text"), 50)
+        if body:
+            parts.append(f"\"{body}\"")
+    elif name == "CreateReminder":
+        parts.append(f"event #{inp.get('event_id', '?')}")
+        days = inp.get("days_before")
+        if days is not None:
+            parts.append("on the day" if days == 0
+                         else f"{days} day{'s' if days != 1 else ''} before")
+        if inp.get("at_time"):
+            parts.append(f"at {inp['at_time']}")
+    elif name == "ListReminders":
+        parts.append(f"event #{inp['event_id']}" if inp.get("event_id") is not None
+                     else "all events")
+    elif name == "DeleteReminder":
+        parts.append(f"id={inp.get('reminder_id', '?')}")
+    elif name in ("GetCommitmentHistory", "GetPatternSummary", "GetRecentActivity"):
+        if inp.get("commitment_id"):
+            parts.append(f"commitment={inp['commitment_id']}")
+        if inp.get("category"):
+            parts.append(f"category={inp['category']}")
+        if inp.get("since_date"):
+            parts.append(f"since {inp['since_date']}")
+        if inp.get("limit"):
+            parts.append(f"limit={inp['limit']}")
     elif name == "GetTopicContents":
         parts.append(f"id={inp.get('id', '?')}")
     elif name == "ReplaceTopicContents":
@@ -112,6 +142,92 @@ def format_tool_details(name: str, inp: dict) -> str:
                 parts.append("with " + ", ".join(keys))
 
     return ", ".join(parts)
+
+
+def _render_events(events: list) -> str:
+    n = len(events)
+    if n == 0:
+        return "No events match the filters."
+    lines = [f"{n} event{'s' if n != 1 else ''}:"]
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        eid = ev.get("id", "?")
+        title = (ev.get("title") or "(untitled)").strip()
+        when = ev.get("date") or "?"
+        if ev.get("time"):
+            when += f" {ev['time']}"
+        head = f"• #{eid} {title} | {when}"
+        if ev.get("category"):
+            head += f" | {ev['category']}"
+        # Show the status only when it's something other than a plain pending
+        # `scheduled` — keeps the common case terse while making completed,
+        # canceled, and `unknown` (a past event swept from `scheduled` because
+        # its date/time passed unresolved) visible so the model isn't blind to
+        # outcomes and knows when to ask the user how something went.
+        status = (ev.get("status") or "scheduled").strip() or "scheduled"
+        if status != "scheduled":
+            head += f" | {status}"
+        if ev.get("archived"):
+            head += " | [archived]"
+        lines.append(head)
+        summary = (ev.get("summary") or "").strip()
+        for sline in summary.splitlines():
+            lines.append(f"    {sline}")
+    return "\n".join(lines)
+
+
+def _render_topics(topics: list) -> str:
+    n = len(topics)
+    if n == 0:
+        return "No topics match the filters."
+    lines = [f"{n} topic{'s' if n != 1 else ''}:"]
+    for tp in topics:
+        if not isinstance(tp, dict):
+            continue
+        tid = tp.get("id", "?")
+        title = (tp.get("title") or tp.get("name") or "(untitled)").strip()
+        head = f"• #{tid} {title}"
+        if tp.get("category"):
+            head += f" | {tp['category']}"
+        folder = (tp.get("folder") or "").strip()
+        head += f" | folder: {folder}" if folder else " | (root)"
+        lines.append(head)
+        summary = (tp.get("summary") or "").strip()
+        for sline in summary.splitlines():
+            lines.append(f"    {sline}")
+    return "\n".join(lines)
+
+
+def format_tool_result_for_model(name: str, result):
+    """Render get-events / get-topics results as a compact text view for the
+    model instead of raw JSON. Returns None for every other tool, signalling
+    the caller to send the raw result unchanged.
+
+    Errors on these two tools are still surfaced to the model — as a clean
+    `Error: ...` line so it can explain the failure and help the user — rather
+    than dropped or dumped as raw JSON.
+
+    JSON serialization of these list results is token-heavy: each item repeats
+    field names, quotes, and braces, and escapes every markdown newline in a
+    summary as a literal `\\n`. A flat text layout keeps every field the model
+    needs to act on — crucially the id — while shedding that syntactic
+    overhead, which is the bulk of the cached-context cost on read turns."""
+    if name not in ("FilterUsersEvents", "FilterTopics"):
+        return None
+    if isinstance(result, dict) and "error" in result:
+        return f"Error: {result.get('error')}"
+    if name == "FilterUsersEvents":
+        if isinstance(result, list):
+            return _render_events(result)
+        if isinstance(result, dict):
+            return _render_events(result.get("events") or [])
+    else:  # FilterTopics
+        if isinstance(result, list):
+            return _render_topics(result)
+        if isinstance(result, dict):
+            return _render_topics(result.get("topics") or [])
+    return None
 
 
 def format_tool_response(name: str, result) -> str:
@@ -162,6 +278,11 @@ def format_tool_response(name: str, result) -> str:
                 keys = list(result.keys())[:3]
                 if keys:
                     parts.append("keys: " + ", ".join(keys))
+    elif name in ("GetCommitmentHistory", "GetPatternSummary", "GetRecentActivity"):
+        # These tools return a text digest; its first line is the headline
+        # (e.g. "5 instance(s) of 'bouldering'…" or "Pattern summary for…").
+        first_line = str(result).splitlines()[0] if result else ""
+        parts.append(_truncate_for_log(first_line, 80))
     elif name == "GetTopicContents":
         if isinstance(result, dict):
             contents = result.get("contents", "") or ""

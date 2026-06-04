@@ -300,7 +300,7 @@
     .side-close svg { width: 16px; height: 16px; }
 
     #log { flex: 1; overflow-y: auto; padding: 1.5rem 1rem 1rem;
-           scroll-behavior: smooth; }
+           scroll-behavior: smooth; position: relative; }
     #log-inner { max-width: 760px; margin: 0 auto; display: flex;
                  flex-direction: column; gap: 0.75rem; }
     /* Empty-state / welcome: with no messages yet, the log shows the Aime
@@ -313,6 +313,22 @@
     #log-inner:empty::after {
       content: ""; width: 92px; height: 4px; border-radius: 2px;
       margin-top: 0.6rem; background: var(--rainbow, var(--accent)); }
+    /* First-run upload nudge: pinned under the centered wordmark, shown only
+       during onboarding (body.onboarding, set from the server's onboarding
+       signal) while the log is still empty. Points the user at the attach/drop
+       affordance the onboarding chat is about to talk up — so the fast path is
+       seen, not just mentioned. Gated on onboarding so returning users with an
+       empty new session never see it. */
+    #empty-hint { display: none; }
+    body.onboarding #log:has(#log-inner:empty) #empty-hint {
+      display: flex; align-items: center; gap: 0.4rem;
+      position: absolute; left: 50%; top: 50%;
+      /* Offset clears the wordmark + the rainbow bar beneath it (bar sits ~0.6rem
+         below the 3.2rem mark) so the hint doesn't overlap the bar. */
+      transform: translate(-50%, calc(50% + 2.9rem));
+      color: var(--muted); font-size: 0.85rem; white-space: nowrap;
+      animation: fade-in 0.4s ease-out; }
+    #empty-hint svg { width: 15px; height: 15px; color: var(--accent); }
     /* New-conversation welcome: the same centered Aime mark as the empty
        state, plus a caption. Rendered as a real element (so it can carry
        the caption and fade out on the first message) — it fills the log and
@@ -434,6 +450,31 @@
                          transition: opacity 0.45s ease; }
     .msg.notice.loaded::before { display: none; }
     .msg.notice.loaded.fading { opacity: 0; }
+    /* Verbose-mode tool entries: a <details> disclosure. We hide the notice
+       bullet and the native marker, and supply our own caret that rotates
+       open. Expanding reveals the full tool input/result in a scrollable pre. */
+    .msg.notice.tool-notice::before { display: none; }
+    .tool-notice > summary {
+      cursor: pointer; list-style: none; user-select: none;
+      display: flex; align-items: baseline; gap: 0.4rem;
+      white-space: pre-wrap; margin-left: -0.4rem;
+    }
+    .tool-notice > summary::-webkit-details-marker { display: none; }
+    .tool-notice > summary:hover { color: var(--text); }
+    .tool-notice .caret {
+      flex: 0 0 auto; font-size: 0.7em; opacity: 0.7; line-height: 1.3;
+      transition: transform 0.15s ease;
+    }
+    .tool-notice[open] > summary .caret { transform: rotate(90deg); }
+    .tool-notice .tool-detail {
+      margin: 0.4rem 0 0.2rem; padding: 0.55rem 0.7rem;
+      background: rgba(127, 127, 127, 0.09);
+      border: 1px solid var(--border); border-radius: 6px;
+      font-family: ui-monospace, "SF Mono", Menlo, monospace;
+      font-size: 0.82em; line-height: 1.4; color: var(--text);
+      white-space: pre-wrap; word-break: break-word;
+      max-height: 22rem; overflow: auto;
+    }
     .msg .content :is(pre, code) {
       font-family: ui-monospace, "SF Mono", Menlo, monospace;
       font-size: 0.88em;
@@ -762,6 +803,185 @@
     .session-item .del-btn svg { width: 15px; height: 15px; }
     .empty { color: var(--muted); font-size: 0.85rem; padding: 1rem; text-align: center; }
 
+    /* Section header inside the side panel / run modal — a small uppercase
+       label that separates conversations from background-agent runs. */
+    .side-section-head { color: var(--muted); font-size: 0.7rem;
+                         text-transform: uppercase; letter-spacing: 0.06em;
+                         padding: 0.7rem 1rem 0.35rem; font-weight: 600; }
+    /* Status pill shown on a run row and in the run modal's meta line. */
+    .agent-status { flex-shrink: 0; font-size: 0.68rem; font-weight: 600;
+                    text-transform: uppercase; letter-spacing: 0.04em;
+                    padding: 0.1rem 0.4rem; border-radius: 999px;
+                    color: var(--muted); border: 1px solid var(--border); }
+    .agent-status.completed { color: #4caf7e; border-color: rgba(76,175,126,0.5); }
+    .agent-status.error { color: var(--error); border-color: rgba(255,107,107,0.5); }
+    .agent-status.max_turns, .agent-status.no_result {
+        color: var(--warning, #e29a4a); border-color: rgba(226,154,74,0.5); }
+    .agent-status.running { color: var(--accent); border-color: var(--accent); }
+
+    /* Agents pane: a "new agent" toolbar, then the saved-agents dashboard and
+       the recent-runs list, all in one scroll region. */
+    .pane[data-pane="agents"] { flex-direction: column; }
+    .agents-toolbar { display: flex; padding: 0.7rem 1rem;
+                      border-bottom: 1px solid var(--border); flex-shrink: 0; }
+    #agents-pane-scroll { flex: 1; min-height: 0; overflow-y: auto; }
+    .agents-label { display: block; color: var(--muted); font-size: 0.7rem;
+                    font-weight: 600; text-transform: uppercase;
+                    letter-spacing: 0.06em; margin-top: 0.3rem; }
+    .agents-optional { text-transform: none; letter-spacing: 0;
+                       font-weight: 400; opacity: 0.7; }
+    .agents-check { display: flex; align-items: center; gap: 0.45rem;
+                    color: var(--muted); font-size: 0.85rem; cursor: pointer;
+                    margin-top: 0.2rem; }
+    .agents-check input { accent-color: var(--accent); }
+    .agent-perms { display: flex; flex-direction: column; gap: 0.45rem;
+                   margin-top: 0.35rem; }
+    #agent-perm-send-message-hint { margin-top: 0.35rem; }
+    .agents-hint { color: var(--muted); font-size: 0.8rem; margin: 0; }
+    .agents-hint.error { color: var(--error); }
+    #agent-new-btn { background: var(--accent); border: 1px solid var(--accent);
+                     color: white; border-radius: 8px; padding: 0.4rem 0.9rem;
+                     cursor: pointer; font: inherit; font-weight: 600;
+                     font-size: 0.88rem; transition: background 0.15s, opacity 0.15s; }
+    #agent-new-btn:hover { background: var(--accent-hover, var(--accent)); }
+
+    /* Saved-agent cards — each is a distinct elevated card, not a flat row, so
+       it reads as its own object against the pane. */
+    #saved-agents-list { display: flex; flex-direction: column; gap: 0.6rem;
+                  padding: 0.7rem 0.8rem; }
+    .agent-card { display: flex; flex-direction: column; gap: 0.3rem;
+                  padding: 0.7rem 0.85rem; background: var(--bg-elev);
+                  border: 1px solid var(--border); border-radius: 12px;
+                  box-shadow: 0 1px 2px rgba(0,0,0,0.06); }
+    .agent-card-head { display: flex; align-items: center; gap: 0.5rem; }
+    .agent-card-name { color: var(--text); font-weight: 600; font-size: 0.92rem;
+                  flex: 1; min-width: 0; }
+    /* "running…" pill on the card itself (not just the Run button). */
+    .agent-card-running { flex-shrink: 0; display: inline-flex; align-items: center;
+                  gap: 0.35rem; font-size: 0.7rem; font-weight: 600; color: var(--accent);
+                  border: 1px solid var(--accent); border-radius: 999px;
+                  padding: 0.1rem 0.5rem; }
+    .agent-card-desc { color: var(--muted); font-size: 0.82rem; line-height: 1.35; }
+    .agent-card-meta { color: var(--muted); font-size: 0.74rem; display: flex;
+                       flex-wrap: wrap; gap: 0.5rem; align-items: center; }
+    .agent-card-actions { display: flex; gap: 0.4rem; margin-top: 0.25rem; }
+    .agent-card-actions button { background: transparent; color: var(--text);
+                       border: 1px solid var(--border); border-radius: 6px;
+                       padding: 0.22rem 0.6rem; cursor: pointer; font: inherit;
+                       font-size: 0.82rem; transition: border-color 0.15s, opacity 0.15s; }
+    .agent-card-actions button:hover { border-color: var(--accent); }
+    .agent-card-actions .run-btn { color: var(--accent); border-color: var(--accent); }
+    .agent-card-actions .del-btn:hover { border-color: var(--error);
+                       color: var(--error); }
+    .agent-card-actions button:disabled { opacity: 0.5; cursor: default;
+                       border-color: var(--border); color: var(--muted); }
+    /* Running state: a card with a run in flight gets an accent edge, and its
+       Run button shows a live spinner. */
+    .agent-card.is-running { border-color: var(--accent);
+                       box-shadow: 0 0 0 1px var(--accent), 0 1px 3px rgba(0,0,0,0.08); }
+    .agent-card-actions .run-btn:disabled { opacity: 1; color: var(--accent);
+                       border-color: var(--accent); }
+
+    /* Per-agent runs, collapsed into a disclosure on the card so the pane isn't
+       one long flat list of every run. */
+    .agent-runs-disclosure { margin-top: 0.15rem; }
+    .agent-runs-disclosure > summary { cursor: pointer; list-style: none;
+                       color: var(--muted); font-size: 0.78rem; font-weight: 600;
+                       display: flex; align-items: center; gap: 0.35rem;
+                       padding: 0.15rem 0; user-select: none; }
+    .agent-runs-disclosure > summary::-webkit-details-marker { display: none; }
+    .agent-runs-disclosure > summary .caret { transition: transform 0.15s ease; }
+    .agent-runs-disclosure[open] > summary .caret { transform: rotate(90deg); }
+    .agent-runs-disclosure > summary:hover { color: var(--text); }
+    .agent-runs-list { display: flex; flex-direction: column; gap: 0.1rem;
+                       margin-top: 0.2rem; }
+    .agent-runs-list .agent-run-item { padding-left: 0.2rem; }
+    /* The "Other runs" disclosure is a top-level section, so it needs the pane's
+       horizontal padding (card disclosures inherit theirs from the card). */
+    .other-runs-disclosure { padding: 0 1rem; margin-top: 0.3rem; }
+    .agent-run-item.is-active { cursor: default; }
+    .agent-run-item.is-active .summary { color: var(--text); }
+    .agent-status.running .run-spinner, .run-btn .run-spinner {
+                       border-top-color: var(--accent); }
+    .run-spinner { display: inline-block; width: 0.7em; height: 0.7em;
+                       margin-right: 0.35em; vertical-align: -0.05em;
+                       border: 2px solid currentColor; border-top-color: transparent;
+                       border-radius: 50%; opacity: 0.85;
+                       animation: run-spin 0.7s linear infinite; }
+    @keyframes run-spin { to { transform: rotate(360deg); } }
+
+    /* Create/edit modal inputs. */
+    #agent-edit-modal { max-width: 560px; }
+    #agent-edit-body { display: flex; flex-direction: column; gap: 0.25rem; }
+    #agent-edit-body input[type="text"], #agent-edit-body textarea {
+        width: 100%; box-sizing: border-box; background: var(--bg);
+        color: var(--text); border: 1px solid var(--border); border-radius: 8px;
+        padding: 0.5rem 0.65rem; font: inherit; font-size: 0.9rem;
+        line-height: 1.45; margin-top: 0.15rem; }
+    #agent-edit-body textarea { resize: vertical; min-height: 5em; }
+    #agent-edit-body input:focus, #agent-edit-body textarea:focus {
+        outline: none; border-color: var(--accent); }
+    #agent-edit-body input:disabled { opacity: 0.6; cursor: not-allowed; }
+    .agent-edit-actions { display: flex; justify-content: flex-end; gap: 0.5rem;
+                          margin-top: 0.8rem; }
+    .agent-edit-actions button { border-radius: 8px; padding: 0.45rem 1rem;
+                          cursor: pointer; font: inherit; font-weight: 600;
+                          font-size: 0.88rem; border: 1px solid var(--border); }
+    .agent-edit-actions .primary { background: var(--accent);
+                          border-color: var(--accent); color: white; }
+    .agent-edit-actions .primary:disabled { opacity: 0.55; cursor: default; }
+    .agent-edit-actions .ghost { background: transparent; color: var(--text); }
+    .agent-edit-actions .ghost:hover { border-color: var(--accent); }
+
+    /* Schedule control (agent modal) + the card's quick toggle. */
+    .sched-switch { display: inline-flex; align-items: center; gap: 0.55rem;
+                    cursor: pointer; user-select: none; margin-top: 0.3rem; }
+    .sched-switch input { position: absolute; opacity: 0; width: 0; height: 0; }
+    .sched-slider { position: relative; flex: 0 0 auto; width: 38px; height: 22px;
+                    background: var(--border); border-radius: 999px;
+                    transition: background 0.18s ease; }
+    .sched-slider::before { content: ""; position: absolute; top: 2px; left: 2px;
+                    width: 18px; height: 18px; border-radius: 50%; background: #fff;
+                    box-shadow: 0 1px 2px rgba(0,0,0,0.3); transition: transform 0.18s ease; }
+    .sched-switch input:checked + .sched-slider { background: var(--accent); }
+    .sched-switch input:checked + .sched-slider::before { transform: translateX(16px); }
+    .sched-switch input:focus-visible + .sched-slider {
+                    outline: 2px solid var(--accent); outline-offset: 2px; }
+    .sched-switch.mini .sched-slider { width: 32px; height: 18px; }
+    .sched-switch.mini .sched-slider::before { width: 14px; height: 14px; }
+    .sched-switch.mini input:checked + .sched-slider::before { transform: translateX(14px); }
+    .sched-switch-label { font-size: 0.88rem; color: var(--text); }
+
+    .sched-config { display: flex; flex-direction: column; gap: 0.5rem;
+                    margin-top: 0.55rem; padding: 0.6rem 0.7rem;
+                    border: 1px solid var(--border); border-radius: 10px;
+                    background: var(--bg); }
+    .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 8px;
+           overflow: hidden; align-self: flex-start; }
+    .seg button { background: transparent; color: var(--muted); border: none;
+                  padding: 0.35rem 0.8rem; font: inherit; font-size: 0.85rem;
+                  font-weight: 600; cursor: pointer; border-right: 1px solid var(--border); }
+    .seg button:last-child { border-right: none; }
+    .seg button.active { background: var(--accent); color: #fff; }
+    .sched-row { display: flex; align-items: center; gap: 0.5rem; }
+    /* An explicit display: flex above beats the UA [hidden]{display:none}, so
+       re-assert it or the conditional weekday/day rows (and the whole config
+       block when the toggle is off) never actually hide. */
+    .sched-config[hidden], .sched-row[hidden] { display: none; }
+    .sched-row label { font-size: 0.85rem; color: var(--muted); min-width: 5.5em; }
+    .sched-config input[type="time"], .sched-config select {
+                  background: var(--bg); color: var(--text);
+                  border: 1px solid var(--border); border-radius: 8px;
+                  padding: 0.35rem 0.5rem; font: inherit; font-size: 0.88rem; }
+    .sched-config input[type="time"]:focus, .sched-config select:focus {
+                  outline: none; border-color: var(--accent); }
+
+    /* The schedule line on a saved-agent card. */
+    .agent-card-sched { display: flex; align-items: center; gap: 0.5rem;
+                        margin-top: 0.15rem; }
+    .agent-card-sched-text { font-size: 0.78rem; color: var(--muted); }
+    .agent-card-sched-text.off { opacity: 0.65; font-style: italic; }
+
     /* Calendar */
     .cal-toolbar { display: flex; align-items: center; gap: 0.5rem;
                    padding: 0.5rem 1rem; border-bottom: 1px solid var(--border);
@@ -957,8 +1177,8 @@
                                   text-overflow: ellipsis; white-space: nowrap; }
 
     /* To-do rows: all-day events render as checkable list items rather
-       than passive pills. The checkbox toggles archived (= done);
-       clicking the label still opens the event modal. */
+       than passive pills. The checkbox toggles completion status
+       (scheduled ⇄ completed); clicking the label opens the event modal. */
     .todo-item { display: flex; align-items: center; gap: 0.5rem;
                  min-width: 0; padding: 4px 8px;
                  background: rgba(124, 140, 255, 0.12);
@@ -998,6 +1218,17 @@
     .todo-item.done .todo-label { text-decoration: line-through;
                                   text-decoration-thickness: 1px;
                                   color: var(--muted); }
+    /* Canceled = it didn't happen: dimmed and struck through like a done item,
+       but the checkbox stays empty (it was never completed). */
+    .todo-item.canceled { opacity: 0.55; }
+    .todo-item.canceled .todo-label { text-decoration: line-through;
+                                      text-decoration-thickness: 1px;
+                                      color: var(--muted); }
+    /* Unknown ("unconfirmed" to the user) = a past event we never resolved.
+       Not struck through (we don't know it didn't happen); a soft amber-tinted
+       check border gently invites the user to confirm — no loud dashed edge. */
+    .todo-item.unknown .todo-check {
+      border-color: color-mix(in srgb, var(--warning, #e29a4a) 45%, var(--border)); }
 
     /* Day view to-do strip: a clear stacked list spanning the full width
        so it reads as a single panel, not a row of pills. */
@@ -1230,6 +1461,16 @@
                                   var(--warning, #e29a4a) 60%, var(--border)); }
     .modal-foot button.danger:hover { background:
         color-mix(in srgb, var(--warning, #e29a4a) 15%, transparent); }
+    /* Archive is a rare, secondary action — a quiet icon, not a labelled
+       button. Muted until hovered, where it warms to a delete-ish red. */
+    .modal-foot button.icon-ghost { border: 0; background: transparent;
+        color: var(--muted); padding: 0.3rem; width: 30px; height: 30px;
+        display: flex; align-items: center; justify-content: center;
+        border-radius: 6px; opacity: 0.7; }
+    .modal-foot button.icon-ghost:hover {
+        color: #d2554d; opacity: 1;
+        background: color-mix(in srgb, #d2554d 14%, transparent); }
+    .modal-foot button.icon-ghost svg { width: 16px; height: 16px; }
 
     /* Event modal field rows — compact, inline label + control on one
        line so the modal isn't dominated by uppercase tags. */
@@ -1262,19 +1503,52 @@
        more room than the 480px default. On mobile, fill the screen so the
        description has space to breathe. */
     #event-modal { max-width: 680px; }
-    #event-modal .modal-body { gap: 0.7rem; padding: 1rem 1.2rem;
-                               min-height: min(60vh, 460px); }
+    /* Let the card size to its content rather than reserving a tall fixed
+       body — short events shouldn't leave big empty gaps. */
+    #event-modal .modal-body { gap: 0.55rem; padding: 0.9rem 1.2rem; }
     @media (max-width: 768px) {
       #event-backdrop { padding: 0.75rem; }
       #event-modal { max-width: 100%; height: 100%; max-height: 100%; }
       #event-modal .modal-body { flex: 1; min-height: 0; }
+    }
+
+    /* Background-agent run viewer (Verbose only). A read-only report: a
+       summary, an optional structured result, and a collapsible transcript. */
+    #agent-run-modal { max-width: 680px; }
+    #agent-run-modal .modal-body { gap: 0.4rem; }
+    .agent-run-meta { display: flex; flex-wrap: wrap; align-items: center;
+                      gap: 0.5rem; color: var(--muted); font-size: 0.78rem;
+                      padding-bottom: 0.3rem; }
+    .agent-run-section { display: flex; flex-direction: column; }
+    .agent-run-section .side-section-head { padding: 0.5rem 0 0.25rem; }
+    .agent-run-summary { color: var(--text); font-size: 0.92rem;
+                         line-height: 1.5; overflow-wrap: anywhere; }
+    .agent-run-summary .muted-line { color: var(--muted); font-style: italic; }
+    .agent-run-json { background: var(--bg); border: 1px solid var(--border);
+                      border-radius: 8px; padding: 0.6rem 0.7rem; margin: 0;
+                      font-size: 0.78rem; line-height: 1.45; overflow-x: auto;
+                      white-space: pre; color: var(--text); }
+    .agent-run-transcript { margin-top: 0.5rem; border-top: 1px solid var(--border);
+                            padding-top: 0.5rem; }
+    .agent-run-transcript > summary { cursor: pointer; color: var(--muted);
+                            font-size: 0.7rem; text-transform: uppercase;
+                            letter-spacing: 0.06em; font-weight: 600;
+                            list-style: none; padding: 0.2rem 0; }
+    .agent-run-transcript > summary::-webkit-details-marker { display: none; }
+    .agent-run-transcript[open] > summary { margin-bottom: 0.4rem; }
+    .agent-run-assistant { color: var(--text); font-size: 0.9rem;
+                           line-height: 1.5; overflow-wrap: anywhere;
+                           padding: 0.3rem 0; }
+    @media (max-width: 768px) {
+      #agent-run-modal { max-width: 100%; height: 100%; max-height: 100%; }
+      #agent-run-modal .modal-body { flex: 1; min-height: 0; }
     }
     /* Read-only description renders as markdown; the textarea takes over in
        edit mode. Clicking the rendered block swaps into edit mode just like
        the other ev-fields. */
     .ev-summary-rendered { background: transparent; color: var(--text);
                            border: 1px solid transparent; border-radius: 6px;
-                           padding: 0.5rem 0.6rem; min-height: 5em;
+                           padding: 0.4rem 0.6rem; min-height: 3.2em;
                            cursor: pointer; font-size: 0.95rem; line-height: 1.5;
                            overflow-wrap: anywhere;
                            transition: background 0.15s, border-color 0.15s; }
@@ -1317,6 +1591,64 @@
         accent-color: var(--cta); }
     .ev-modal-error { color: var(--warning, #e29a4a); font-size: 0.8rem;
                       margin: 0; }
+    /* Lifecycle metadata in the event modal: a row of clickable status pills,
+       with commitment / reason / moved-from details underneath when present. */
+    .ev-meta { display: flex; flex-direction: column; align-items: stretch;
+               gap: 0.45rem; font-size: 0.82rem; }
+    .ev-status-pills { display: flex; flex-wrap: wrap; gap: 0.35rem; }
+    /* All four states are always shown; the inactive ones sit greyed and the
+       active one lights up in its colour. The whole row is a picker — click any
+       pill to switch the event to that status. */
+    .status-pill { cursor: pointer; font: inherit; font-size: 0.75rem;
+                   font-weight: 600; text-transform: capitalize;
+                   padding: 2px 11px; border-radius: 999px;
+                   border: 1px solid var(--border); background: transparent;
+                   color: var(--muted); opacity: 0.5;
+                   transition: opacity 0.15s, background 0.15s,
+                               color 0.15s, border-color 0.15s; }
+    .status-pill:hover { opacity: 0.85; border-color: var(--accent); }
+    .status-pill.active { opacity: 1; color: var(--text);
+                          border-color: transparent; cursor: default; }
+    .status-pill.active.s-scheduled {
+      background: color-mix(in srgb, var(--accent) 20%, transparent); }
+    .status-pill.active.s-completed {
+      background: color-mix(in srgb, #3fa65a 26%, transparent); }
+    .status-pill.active.s-canceled {
+      background: color-mix(in srgb, #d2554d 26%, transparent); }
+    .status-pill.active.s-unknown {
+      background: color-mix(in srgb, var(--warning, #e29a4a) 18%, transparent); }
+    .ev-meta-details { display: flex; flex-wrap: wrap; gap: 0.3rem 0.7rem;
+                       align-items: center; }
+    .ev-meta-item { color: var(--muted); }
+    .ev-meta-item b { color: var(--text); font-weight: 600; }
+    /* Reminders in the event modal: each row is a `relative` send_message
+       schedule linked to this event by id. Rows save the moment they change
+       (like the status pills), so they work regardless of the event's own
+       read-only/edit mode. */
+    .ev-reminders { display: flex; flex-direction: column; gap: 0.4rem; }
+    .ev-reminder-row { display: flex; align-items: center; gap: 0.5rem;
+                       flex-wrap: wrap; }
+    .ev-reminder-row select, .ev-reminder-row input[type="time"] {
+                       background: var(--bg); color: var(--text);
+                       border: 1px solid var(--border); border-radius: 8px;
+                       padding: 0.3rem 0.45rem; font: inherit; font-size: 0.85rem; }
+    .ev-reminder-row select:focus,
+    .ev-reminder-row input[type="time"]:focus {
+                       outline: none; border-color: var(--accent); }
+    .ev-reminder-sep { font-size: 0.82rem; color: var(--muted); }
+    .ev-reminder-del { margin-left: auto; background: transparent; border: none;
+                       color: var(--muted); cursor: pointer; font-size: 1.2rem;
+                       line-height: 1; padding: 0.1rem 0.4rem; border-radius: 6px; }
+    .ev-reminder-del:hover { color: var(--warning, #e29a4a);
+                             background: var(--bg-input); }
+    .ev-reminders-empty { font-size: 0.82rem; color: var(--muted);
+                          font-style: italic; }
+    .ev-reminder-add { align-self: flex-start; background: transparent;
+                       color: var(--accent); border: 1px dashed var(--border);
+                       border-radius: 8px; padding: 0.3rem 0.7rem; cursor: pointer;
+                       font: inherit; font-size: 0.82rem; font-weight: 600; }
+    .ev-reminder-add:hover { border-color: var(--accent); }
+    .ev-reminder-add[disabled] { opacity: 0.5; cursor: default; }
     /* Schedule and pill events should look interactive. */
     .cal-sched .ev-block, .cal-sched .ev-pill,
     .cal-cell .ev { cursor: pointer; }
@@ -1355,17 +1687,47 @@
                   0 1px 2px rgba(0,0,0,0.18);
     }
 
-    /* Archived events stay visible so users see their history, but are
-       desaturated and dimmed so active events read first. */
+    /* Resolved events (completed or canceled) stay visible so users see their
+       history, but are desaturated and dimmed so still-scheduled ones read
+       first. Archived (= deleted) events are normally filtered out entirely;
+       the .archived rule remains for any view that opts to show them. */
     .cal-cell .ev.archived,
     .cal-sched .ev-pill.archived,
-    .cal-sched .ev-block.archived {
+    .cal-sched .ev-block.archived,
+    .cal-cell .ev.completed,
+    .cal-sched .ev-pill.completed,
+    .cal-sched .ev-block.completed,
+    .cal-cell .ev.canceled,
+    .cal-sched .ev-pill.canceled,
+    .cal-sched .ev-block.canceled {
       opacity: 0.45;
       filter: grayscale(0.7);
     }
     .cal-sched .ev-block.archived:hover,
     .cal-sched .ev-pill.archived:hover,
-    .cal-cell .ev.archived:hover { opacity: 0.75; }
+    .cal-cell .ev.archived:hover,
+    .cal-sched .ev-block.completed:hover,
+    .cal-sched .ev-pill.completed:hover,
+    .cal-cell .ev.completed:hover,
+    .cal-sched .ev-block.canceled:hover,
+    .cal-sched .ev-pill.canceled:hover,
+    .cal-cell .ev.canceled:hover { opacity: 0.75; }
+    /* Canceled = it didn't happen: strike it through to distinguish from a
+       completed item at a glance. */
+    .cal-cell .ev.canceled,
+    .cal-sched .ev-pill.canceled,
+    .cal-sched .ev-block.canceled { text-decoration: line-through; }
+
+    /* Unknown ("unconfirmed" to the user) = a past event we never resolved.
+       Unlike completed/canceled it's not a settled outcome, so it isn't greyed
+       out — instead a quiet soft-amber left edge hints "this still needs a
+       yes/no" without the loud dashed outline. */
+    .cal-cell .ev.unknown,
+    .cal-sched .ev-pill.unknown,
+    .cal-sched .ev-block.unknown {
+      box-shadow: inset 2px 0 0
+        color-mix(in srgb, var(--warning, #e29a4a) 45%, transparent);
+    }
 
     /* Settings modal: floating panel over a blurred chat backdrop. */
     #settings-backdrop {
@@ -1741,6 +2103,16 @@
           <path d="M4 6h16M4 12h16M4 18h10"/>
         </svg>
       </button>
+      <button class="rail-btn pane-btn advanced-only" data-target="agents"
+              title="Agents" aria-label="Agents">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="4" y="8" width="16" height="12" rx="2"/>
+          <path d="M12 8V4M9 4h6"/>
+          <circle cx="9" cy="14" r="1"/>
+          <circle cx="15" cy="14" r="1"/>
+        </svg>
+      </button>
     </div>
     <div id="side-col" tabindex="-1">
       <div class="side-header">
@@ -1777,8 +2149,8 @@
           </div>
           <span class="cal-spacer"></span>
           <select id="cal-view" class="cal-view" aria-label="Calendar view">
-            <option value="month" selected>Month</option>
-            <option value="week">Week</option>
+            <option value="month">Month</option>
+            <option value="week" selected>Week</option>
             <option value="day">Day</option>
           </select>
         </div>
@@ -1844,10 +2216,41 @@
           </div>
         </div>
       </div>
+
+      <!-- Agents pane (Advanced only). A small management dashboard: create,
+           edit, delete and run saved background agents. Each agent is a card
+           that owns its own runs (in a click-to-open disclosure); runs with no
+           current agent fall to an "Other runs" section. Definitions persist
+           per-user. -->
+      <div class="pane" data-pane="agents">
+        <div class="agents-toolbar">
+          <button id="agent-new-btn" class="primary">+ New agent</button>
+        </div>
+        <div class="scroll" id="agents-pane-scroll">
+          <div class="side-section-head">Your agents</div>
+          <div id="saved-agents-list">
+            <div class="empty">loading…</div>
+          </div>
+          <!-- Runs that don't belong to a current agent (ad-hoc, or a since-
+               deleted agent), in a collapsible disclosure. Hidden when empty. -->
+          <details class="agent-runs-disclosure other-runs-disclosure" id="other-runs" hidden>
+            <summary><span class="caret">▸</span><span id="other-runs-label">Other runs</span></summary>
+            <div class="agent-runs-list" id="agent-runs-list"></div>
+          </details>
+        </div>
+      </div>
     </div>
     <div id="divider" title="Drag to resize"></div>
     <div id="chat-col">
-      <div id="log"><div id="log-inner"></div></div>
+      <div id="log"><div id="log-inner"></div><div id="empty-hint">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="3" y="3" width="18" height="18" rx="2"/>
+          <circle cx="8.5" cy="8.5" r="1.5"/>
+          <path d="M21 15l-5-5L5 21"/>
+        </svg>
+        <span>Drop in a calendar screenshot or a file to get started</span>
+      </div></div>
       <div id="attachments"></div>
       <div id="queued-bar" hidden></div>
       <form id="f">
@@ -1952,6 +2355,13 @@
           <span class="lbl">Category</span>
           <input type="text" id="ev-f-category" readonly>
         </label>
+        <!-- Read-only lifecycle metadata (status, commitment, cancel reason,
+             reschedule origin). Populated in openEventModal; the whole row
+             hides when there's nothing beyond a plain scheduled event. -->
+        <div class="ev-field stack" id="ev-f-meta-wrap">
+          <span class="lbl">Status</span>
+          <div id="ev-f-meta" class="ev-meta"></div>
+        </div>
         <!-- Not a <label>: the rendered markdown can contain its own
              form controls (task-list checkboxes), and a wrapping <label>
              would forward any stray click in the description to the first
@@ -1963,13 +2373,134 @@
                aria-label="Edit description"></div>
           <textarea id="ev-f-summary" rows="6" hidden></textarea>
         </div>
+        <!-- Reminders: each row is a `relative` + `send_message` schedule record
+             linked to this event by id (see docs/scheduling.md §7). They save
+             immediately on add/change/remove — like the status pills — so they
+             work whether or not the event is in edit mode. Hidden until the
+             modal is opened for a saved event. -->
+        <div class="ev-field stack" id="ev-f-reminders-wrap" hidden>
+          <span class="lbl">Reminders</span>
+          <div id="ev-f-reminders" class="ev-reminders"></div>
+          <button type="button" id="ev-add-reminder" class="ev-reminder-add">
+            + Add reminder</button>
+        </div>
         <p class="ev-modal-error" id="ev-modal-error" hidden></p>
       </div>
       <div class="modal-foot">
-        <button id="ev-archive-btn" class="danger">Archive</button>
+        <button id="ev-archive-btn" class="icon-ghost" title="Archive"
+                aria-label="Archive">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6M10 11v5M14 11v5"/>
+          </svg>
+        </button>
         <span class="spacer"></span>
         <button id="ev-cancel-btn" hidden>Cancel</button>
         <button id="ev-save-btn" class="primary" hidden>Save</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Background-agent run viewer (Verbose only). Read-only: shows what a
+       headless agent did — its result and full transcript. -->
+  <div id="agent-run-backdrop" class="modal-backdrop" role="dialog"
+       aria-modal="true" aria-labelledby="agent-run-title" hidden>
+    <div id="agent-run-modal" class="modal-card">
+      <div class="modal-head">
+        <span class="title" id="agent-run-title">Agent run</span>
+        <button class="modal-close" id="agent-run-close" title="Close"
+                aria-label="Close">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M6 6l12 12M18 6L6 18"/>
+          </svg>
+        </button>
+      </div>
+      <div class="modal-body" id="agent-run-body"></div>
+    </div>
+  </div>
+
+  <!-- Create / edit a saved agent (Advanced only). -->
+  <div id="agent-edit-backdrop" class="modal-backdrop" role="dialog"
+       aria-modal="true" aria-labelledby="agent-edit-title" hidden>
+    <div id="agent-edit-modal" class="modal-card">
+      <div class="modal-head">
+        <span class="title" id="agent-edit-title">New agent</span>
+        <button class="modal-close" id="agent-edit-close" title="Close"
+                aria-label="Close">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M6 6l12 12M18 6L6 18"/>
+          </svg>
+        </button>
+      </div>
+      <div class="modal-body" id="agent-edit-body">
+        <label class="agents-label" for="agent-name">Name</label>
+        <input id="agent-name" type="text" spellcheck="false" maxlength="80"
+               placeholder="e.g. Weekly calendar audit">
+        <label class="agents-label" for="agent-desc">Description <span class="agents-optional">(optional)</span></label>
+        <input id="agent-desc" type="text" spellcheck="false" maxlength="160"
+               placeholder="A short note about what this agent does">
+        <label class="agents-label" for="agent-edit-instructions">Instructions</label>
+        <textarea id="agent-edit-instructions" rows="6" spellcheck="false"
+                  placeholder="Describe the task for the agent to carry out against your data…"></textarea>
+        <label class="agents-label">Permissions</label>
+        <div class="agent-perms">
+          <label class="sched-switch">
+            <input type="checkbox" id="agent-perm-modify-topics">
+            <span class="sched-slider"></span>
+            <span class="sched-switch-label">Modify topics</span>
+          </label>
+          <label class="sched-switch">
+            <input type="checkbox" id="agent-perm-modify-events">
+            <span class="sched-slider"></span>
+            <span class="sched-switch-label">Modify events</span>
+          </label>
+          <label class="sched-switch">
+            <input type="checkbox" id="agent-perm-web-search">
+            <span class="sched-slider"></span>
+            <span class="sched-switch-label">Web search</span>
+          </label>
+          <label class="sched-switch">
+            <input type="checkbox" id="agent-perm-send-message">
+            <span class="sched-slider"></span>
+            <span class="sched-switch-label">Send message</span>
+          </label>
+        </div>
+        <p class="agents-hint" id="agent-perm-send-message-hint">
+          To actually get a message, tell the agent in its instructions to send
+          you one — this permission only lets it.
+        </p>
+        <label class="agents-label">Schedule</label>
+        <label class="sched-switch">
+          <input type="checkbox" id="agent-sched-enabled">
+          <span class="sched-slider"></span>
+          <span class="sched-switch-label">Run this agent automatically</span>
+        </label>
+        <div id="agent-sched-config" class="sched-config" hidden>
+          <div class="seg" id="agent-sched-freq" role="group" aria-label="Frequency">
+            <button type="button" data-freq="daily" class="active">Daily</button>
+            <button type="button" data-freq="weekly">Weekly</button>
+            <button type="button" data-freq="monthly">Monthly</button>
+          </div>
+          <div class="sched-row">
+            <label for="agent-sched-time">Time</label>
+            <input type="time" id="agent-sched-time" value="09:00">
+          </div>
+          <div class="sched-row" id="agent-sched-weekday-row" hidden>
+            <label for="agent-sched-weekday">On</label>
+            <select id="agent-sched-weekday"></select>
+          </div>
+          <div class="sched-row" id="agent-sched-day-row" hidden>
+            <label for="agent-sched-day">Day of month</label>
+            <select id="agent-sched-day"></select>
+          </div>
+        </div>
+        <p class="agents-hint error" id="agent-edit-hint" hidden></p>
+        <div class="agent-edit-actions">
+          <button id="agent-edit-cancel" class="ghost">Cancel</button>
+          <button id="agent-edit-save" class="primary">Save agent</button>
+        </div>
       </div>
     </div>
   </div>
@@ -2033,8 +2564,9 @@
               </select>
             </div>
             <p class="desc advanced-only">Minimal hides tool activity behind a status line.
-              Standard shows a line per step. Verbose shows tool names,
-              details, and full error text.</p>
+              Standard shows a line per step. Verbose shows tool names and
+              full error text, with a dropdown arrow on each tool step to
+              expand its complete input and result.</p>
           </div>
           <div class="settings-section advanced-only">
             <h3>Date & time</h3>
@@ -2108,6 +2640,26 @@
               </button>
             </div>
             <p class="desc" id="account-redeem-msg" style="display:none;margin-top:0.4rem"></p>
+          </div>
+          <div class="settings-section advanced-only">
+            <h3>Messaging</h3>
+            <p class="desc">Let Aime text you outside the chat — reminders, or
+              results from background tasks. Paste your Telegram chat ID (message
+              the bot, then open <code>/getUpdates</code> to find it). Leave
+              blank to turn off.</p>
+            <div class="settings-row">
+              <input id="account-contact-input" type="text" autocomplete="off"
+                     placeholder="Messaging contact (e.g. Telegram chat ID)"
+                     style="flex:1;min-width:0;margin-right:0.5rem;background:var(--bg-input);
+                            color:var(--text);border:1px solid var(--border);
+                            border-radius:8px;padding:0.4rem 0.6rem;font-size:0.85rem">
+              <button class="btn-primary" id="account-contact-btn"
+                      style="background:var(--accent);color:#fff;border:0;border-radius:8px;
+                             padding:0.4rem 0.9rem;cursor:pointer;font-size:0.85rem">
+                Save
+              </button>
+            </div>
+            <p class="desc" id="account-contact-msg" style="display:none;margin-top:0.4rem"></p>
           </div>
           <div class="settings-section advanced-only">
             <h3>Data</h3>
@@ -2739,6 +3291,33 @@ function appendNotice(text, severity) {
   return div;
 }
 
+// Like appendNotice, but when detailText is present renders a native <details>
+// disclosure: the one-line summary stays visible with a dropdown arrow, and
+// clicking it reveals the full tool input/result. Used in Verbose mode so the
+// transcript stays scannable while every detail is one click away. Falls back
+// to a plain notice when there's nothing extra to show.
+function appendToolNotice(summaryText, severity, detailText) {
+  if (!detailText) return appendNotice(summaryText, severity);
+  const det = document.createElement("details");
+  det.className = "msg notice tool-notice " + (severity || "info");
+  const sum = document.createElement("summary");
+  const caret = document.createElement("span");
+  caret.className = "caret";
+  caret.setAttribute("aria-hidden", "true");
+  caret.textContent = "▸";  // ▸ — rotates to ▾ when open (CSS)
+  sum.appendChild(caret);
+  sum.appendChild(document.createTextNode(summaryText));
+  det.appendChild(sum);
+  const pre = document.createElement("pre");
+  pre.className = "tool-detail";
+  // textContent (never innerHTML): tool inputs/results are untrusted content.
+  pre.textContent = detailText;
+  det.appendChild(pre);
+  logInner.appendChild(det);
+  scrollToBottom();
+  return det;
+}
+
 // The "Loaded conversation…" line and the new-conversation welcome splash —
 // kept so both can be faded out the moment the user sends a message (see the
 // user_message_shown handler).
@@ -3038,8 +3617,11 @@ es.onmessage = (ev) => {
       break;
     case "tool_call":
       if (verbosity === "verbose") {
-        appendNotice("· tool: " + e.tool_name +
-                     (e.tool_details ? " — " + e.tool_details : ""), "info");
+        // Collapsed dropdown: one-line summary + an arrow to expand the full
+        // tool input.
+        appendToolNotice("· tool: " + e.tool_name +
+                     (e.tool_details ? " — " + e.tool_details : ""),
+                     "info", e.tool_detail_full);
       } else if (verbosity === "standard") {
         appendNotice(toolLabel(e.tool_name, e.tool_details), "info");
       } else {  // minimal — a single shared status line
@@ -3048,9 +3630,11 @@ es.onmessage = (ev) => {
       break;
     case "tool_result":
       if (verbosity === "verbose") {
-        appendNotice("· tool done: " + e.tool_name +
+        // Collapsed dropdown: one-line result summary + an arrow to expand the
+        // full tool result.
+        appendToolNotice("· tool done: " + e.tool_name +
                      (e.tool_result_summary ? " — " + e.tool_result_summary : ""),
-                     "info");
+                     "info", e.tool_detail_full);
       }
       // Pane refresh is driven by `remote_edit` (fired for every backend
       // mutation regardless of origin — AI tool call or direct UI edit on
@@ -3064,6 +3648,12 @@ es.onmessage = (ev) => {
       // path that doesn't go through the tool gateway, have it call
       // UserContext.notify_remote_edit on the server and it will land here
       // with no frontend changes needed.
+      scheduleActivePaneRefresh();
+      break;
+    case "agent_run_update":
+      // A background-agent run just started or finished. Refresh whichever
+      // pane is showing runs (the Agents pane, or the Verbose conversations
+      // section) so the new/updated run appears without a manual reload.
       scheduleActivePaneRefresh();
       break;
     case "turn_end":
@@ -3090,6 +3680,16 @@ es.onmessage = (ev) => {
     case "ready":
       break;
     case "notice":
+      // Signal-only notices (no banner): the server toggles onboarding state so
+      // the empty-state upload nudge shows only during the first-run flow.
+      if (e.severity === "onboarding") {
+        document.body.classList.add("onboarding");
+        break;
+      }
+      if (e.severity === "onboarding_done") {
+        document.body.classList.remove("onboarding");
+        break;
+      }
       // The "Loaded conversation…" line — centered, and tracked so it can
       // fade out once the user sends their first message.
       if (e.severity === "loaded") {
@@ -3126,6 +3726,10 @@ es.onmessage = (ev) => {
       break;
     case "session_restart":
       logInner.innerHTML = "";
+      // Drop the onboarding nudge on any transcript clear; if onboarding
+      // re-fires (e.g. /reset for a not-yet-onboarded user) the server re-emits
+      // the "onboarding" signal right after and re-adds it.
+      document.body.classList.remove("onboarding");
       workingIndicator = null;
       loadedNotice = null;
       newSessionSplash = null;
@@ -3558,7 +4162,8 @@ window.addEventListener("paste", (e) => {
 
 const sideColEl = document.getElementById("side-col");
 const sideTitleEl = document.getElementById("side-title");
-const PANE_TITLES = { chats: "Conversations", calendar: "Calendar", topics: "Topics" };
+const PANE_TITLES = { chats: "Conversations", calendar: "Calendar",
+                      topics: "Topics", agents: "Agents" };
 let activePaneName = null;
 
 document.querySelectorAll(".pane-btn").forEach(btn => {
@@ -3580,6 +4185,7 @@ function refreshActivePane(silent) {
   if (activePaneName === "chats") loadChats(silent);
   else if (activePaneName === "calendar") renderCalendar(silent);
   else if (activePaneName === "topics") { loadTopics(silent); refreshOpenTopic(); }
+  else if (activePaneName === "agents") loadAgentsPane(silent);
 }
 
 // Re-fetch the currently-open topic's contents in place. Skipped when the
@@ -3646,6 +4252,7 @@ function activatePane(name) {
   if (name === "chats") loadChats();
   else if (name === "calendar") renderCalendar();
   else if (name === "topics") loadTopics();
+  else if (name === "agents") loadAgentsPane();
 }
 
 function closeSide() {
@@ -3676,11 +4283,13 @@ async function loadChats(silent) {
     const r = await fetch("/sessions");
     const data = await r.json();
     const sessions = data.sessions || [];
-    if (!sessions.length) {
-      chatsList.innerHTML = '<div class="empty">no saved conversations</div>';
-      return;
-    }
     chatsList.innerHTML = "";
+    if (!sessions.length) {
+      const empty = document.createElement("div");
+      empty.className = "empty";
+      empty.textContent = "no saved conversations";
+      chatsList.appendChild(empty);
+    }
     sessions.forEach(s => {
       const item = document.createElement("div");
       item.className = "session-item";
@@ -3745,12 +4354,567 @@ async function loadChats(silent) {
       item.addEventListener("click", openSession);
       chatsList.appendChild(item);
     });
+    // Verbose users also see background-agent runs, folded into this same
+    // menu beneath their conversations. Other tiers never fetch them.
+    if (verbosity === "verbose") await loadAgentRuns();
   } catch (e) {
     // Keep the prior list visible on a silent refresh failure rather than
     // flashing an error over content the user is reading.
     if (!silent) chatsList.innerHTML = '<div class="empty">error: ' + e + '</div>';
   }
 }
+
+// -- Background-agent runs (Verbose only) -------------------------------
+// A read-only audit trail of what each headless agent did, folded into the
+// Conversations menu for the Verbose tier. Runs aren't conversations, so a
+// click opens the run's transcript in a modal rather than loading it as chat.
+
+const AGENT_STATUS_LABELS = {
+  completed: "done", error: "error", no_result: "no result",
+  max_turns: "incomplete",
+};
+
+async function loadAgentRuns() {
+  let runs = [];
+  try {
+    const r = await fetch("/agent-runs");
+    const data = await r.json();
+    runs = data.runs || [];
+  } catch (e) {
+    return;  // a runs-fetch failure must never blank the conversations list
+  }
+  if (!runs.length) return;  // nothing yet — don't clutter the menu
+
+  const header = document.createElement("div");
+  header.className = "side-section-head";
+  header.textContent = "Background agents";
+  chatsList.appendChild(header);
+
+  runs.forEach(run => chatsList.appendChild(buildRunItem(run)));
+}
+
+// One row in a runs list: agent name + a status pill, clickable to open the
+// run's transcript. Shared by the Verbose conversations section and the
+// Advanced agents pane.
+function buildRunItem(run) {
+  const item = document.createElement("div");
+  item.className = "session-item agent-run-item";
+  const summary = document.createElement("div");
+  summary.className = "summary";
+  summary.textContent = run.agent_name || run.run_id;
+  const badge = document.createElement("span");
+  badge.className = "agent-status " + (run.status || "");
+  badge.textContent = AGENT_STATUS_LABELS[run.status] || run.status || "";
+  item.appendChild(summary);
+  if (badge.textContent) item.appendChild(badge);
+  item.addEventListener("click", () => openAgentRun(run.run_id));
+  return item;
+}
+
+// -- Agents pane (Advanced only) ----------------------------------------
+// A management dashboard: create, edit, delete and run saved background
+// agents. Definitions persist per-user (CRUD via /agents). Each card owns its
+// own runs (grouped from /agent-runs by agent_id) in a disclosure; runs with no
+// current agent go to an "Other runs" section.
+
+const savedAgentsListEl = document.getElementById("saved-agents-list");
+const agentRunsListEl = document.getElementById("agent-runs-list");
+const otherRunsEl = document.getElementById("other-runs");
+const otherRunsLabelEl = document.getElementById("other-runs-label");
+
+async function loadAgentsPane(silent) {
+  // Fetch saved agents, runs (incl. in-flight), and schedules together so each
+  // card can show its own running state, runs, and schedule consistently.
+  if (!silent) {
+    savedAgentsListEl.innerHTML = '<div class="empty">loading…</div>';
+  }
+  let agents = null, runData = null, schedules = [];
+  try {
+    const [ar, rr, sr] = await Promise.all([
+      fetch("/agents"), fetch("/agent-runs"), fetch("/schedules")]);
+    agents = (await ar.json()).agents || [];
+    runData = await rr.json();
+    schedules = (await sr.json()).schedules || [];
+  } catch (e) {
+    if (!silent) savedAgentsListEl.innerHTML = '<div class="empty">error: ' + e + '</div>';
+    return;
+  }
+  const schedByAgent = {};
+  schedules.forEach(s => {
+    if (s.action && s.action.kind === "run_agent" && s.action.agent_id) {
+      schedByAgent[s.action.agent_id] = s;
+    }
+  });
+
+  const agentIds = new Set(agents.map(a => a.agent_id));
+  const active = runData.active || [];
+  const finished = runData.runs || [];
+  // Group both in-flight and finished runs under their agent so each card owns
+  // its results (rather than one big flat list).
+  const activeByAgent = {}, finishedByAgent = {};
+  active.forEach(a => {
+    if (a.agent_id) (activeByAgent[a.agent_id] ||= []).push(a);
+  });
+  finished.forEach(r => {
+    if (r.agent_id && agentIds.has(r.agent_id)) (finishedByAgent[r.agent_id] ||= []).push(r);
+  });
+  agents.forEach(a => {
+    a._schedule = schedByAgent[a.agent_id] || null;
+    a._active = activeByAgent[a.agent_id] || [];
+    a._runs = finishedByAgent[a.agent_id] || [];
+  });
+  renderSavedAgents(agents);
+
+  // Anything not tied to a current agent (ad-hoc runs, or a since-deleted
+  // agent's runs) keeps a home in an "Other runs" section, hidden when empty.
+  const otherActive = active.filter(a => !a.agent_id || !agentIds.has(a.agent_id));
+  const otherFinished = finished.filter(r => !r.agent_id || !agentIds.has(r.agent_id));
+  renderOtherRuns(otherFinished, otherActive);
+}
+
+function renderSavedAgents(agents) {
+  savedAgentsListEl.innerHTML = "";
+  if (!agents.length) {
+    savedAgentsListEl.innerHTML =
+      '<div class="empty">No agents yet — create one to get started.</div>';
+    return;
+  }
+  agents.forEach(a => savedAgentsListEl.appendChild(buildAgentCard(a)));
+}
+
+function renderOtherRuns(finished, active) {
+  agentRunsListEl.innerHTML = "";
+  const total = finished.length + active.length;
+  otherRunsEl.hidden = total === 0;
+  if (!total) return;
+  otherRunsLabelEl.textContent = "Other runs (" + total + ")";
+  active.forEach(a => agentRunsListEl.appendChild(buildActiveRunItem(a)));
+  finished.forEach(run => agentRunsListEl.appendChild(buildRunItem(run)));
+}
+
+// A run that's executing right now: name + a live "running" badge with a
+// spinner. Not clickable — there's no record to open until it finishes.
+function buildActiveRunItem(active) {
+  const item = document.createElement("div");
+  item.className = "session-item agent-run-item is-active";
+  const summary = document.createElement("div");
+  summary.className = "summary";
+  summary.textContent = active.agent_name || "agent";
+  const badge = document.createElement("span");
+  badge.className = "agent-status running";
+  badge.innerHTML = '<span class="run-spinner"></span>running';
+  item.appendChild(summary);
+  item.appendChild(badge);
+  return item;
+}
+
+// One saved-agent card: a header (name + a "running…" pill when a run is in
+// flight), optional description, a web-search/schedule meta line, Run / Edit /
+// Delete actions, and a collapsible list of this agent's runs.
+function buildAgentCard(agent) {
+  const running = (agent._active || []).length > 0;
+  const card = document.createElement("div");
+  card.className = "agent-card" + (running ? " is-running" : "");
+
+  const head = document.createElement("div");
+  head.className = "agent-card-head";
+  const name = document.createElement("div");
+  name.className = "agent-card-name";
+  name.textContent = agent.name || agent.agent_id;
+  head.appendChild(name);
+  if (running) {
+    const pill = document.createElement("span");
+    pill.className = "agent-card-running";
+    pill.innerHTML = '<span class="run-spinner"></span>running…';
+    head.appendChild(pill);
+  }
+  card.appendChild(head);
+
+  if (agent.description) {
+    const desc = document.createElement("div");
+    desc.className = "agent-card-desc";
+    desc.textContent = agent.description;
+    card.appendChild(desc);
+  }
+
+  const meta = document.createElement("div");
+  meta.className = "agent-card-meta";
+  const perms = [
+    [agent.allow_modify_topics, "📝 modify topics"],
+    [agent.allow_modify_events, "📅 modify events"],
+    [agent.allow_web_search, "🌐 web search"],
+    [agent.allow_send_message, "✉️ send message"],
+  ];
+  for (const [on, label] of perms) {
+    if (!on) continue;
+    const span = document.createElement("span");
+    span.textContent = label;
+    meta.appendChild(span);
+  }
+  if (meta.childNodes.length) card.appendChild(meta);
+
+  // Schedule line: a quick on/off toggle + a human summary, shown only once the
+  // agent has a schedule configured (set up in the editor). Toggling here flips
+  // `enabled` without reopening the modal — and sends only that field, so the
+  // fire-state (last run) is preserved.
+  if (agent._schedule) {
+    const srow = document.createElement("div");
+    srow.className = "agent-card-sched";
+    const sw = document.createElement("label");
+    sw.className = "sched-switch mini";
+    sw.title = "Run automatically on this schedule";
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = !!agent._schedule.enabled;
+    const slider = document.createElement("span");
+    slider.className = "sched-slider";
+    const txt = document.createElement("span");
+    txt.className = "agent-card-sched-text" + (cb.checked ? "" : " off");
+    txt.textContent = scheduleSummary(agent._schedule.trigger);
+    cb.addEventListener("change", () => toggleAgentSchedule(agent._schedule, cb, txt));
+    sw.appendChild(cb); sw.appendChild(slider);
+    srow.appendChild(sw); srow.appendChild(txt);
+    card.appendChild(srow);
+  }
+
+  const actions = document.createElement("div");
+  actions.className = "agent-card-actions";
+
+  const runBtn = document.createElement("button");
+  runBtn.className = "run-btn";
+  if (running) {
+    runBtn.disabled = true;
+    runBtn.innerHTML = '<span class="run-spinner"></span>Running…';
+  } else {
+    runBtn.textContent = "Run";
+    runBtn.addEventListener("click", () => runSavedAgent(agent, runBtn));
+  }
+  actions.appendChild(runBtn);
+
+  const editBtn = document.createElement("button");
+  editBtn.textContent = "Edit";
+  editBtn.addEventListener("click", () => openAgentEditor(agent));
+  actions.appendChild(editBtn);
+
+  const delBtn = document.createElement("button");
+  delBtn.className = "del-btn";
+  delBtn.textContent = "Delete";
+  delBtn.addEventListener("click", () => deleteSavedAgent(agent));
+  actions.appendChild(delBtn);
+
+  card.appendChild(actions);
+
+  // This agent's runs, tucked into a click-to-open disclosure: in-flight ones
+  // first, then finished records (clickable to open the transcript).
+  const activeRuns = agent._active || [];
+  const finishedRuns = agent._runs || [];
+  if (activeRuns.length || finishedRuns.length) {
+    const det = document.createElement("details");
+    det.className = "agent-runs-disclosure";
+    const sum = document.createElement("summary");
+    sum.innerHTML = '<span class="caret">▸</span>';
+    const label = document.createElement("span");
+    label.textContent = "Runs (" + (activeRuns.length + finishedRuns.length) + ")";
+    sum.appendChild(label);
+    det.appendChild(sum);
+    const list = document.createElement("div");
+    list.className = "agent-runs-list";
+    activeRuns.forEach(a => list.appendChild(buildActiveRunItem(a)));
+    finishedRuns.forEach(r => list.appendChild(buildRunItem(r)));
+    det.appendChild(list);
+    card.appendChild(det);
+  }
+
+  return card;
+}
+
+async function runSavedAgent(agent, btn) {
+  // Optimistic: show the run as starting immediately. The server's run-update
+  // fanout then refreshes the pane into the real "running" state, and again
+  // when it finishes.
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = '<span class="run-spinner"></span>Starting…';
+  }
+  try {
+    const r = await fetch("/agents/" + encodeURIComponent(agent.agent_id) + "/run", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ tz: clientTimezone() }),
+    });
+    const data = await r.json();
+    if (!data.ok) throw new Error(data.message || data.error || "failed to start");
+    loadAgentsPane(true);  // pull in the running state right away
+  } catch (e) {
+    alert("Couldn't run this agent — " + (e.message || e));
+    if (btn) { btn.disabled = false; btn.textContent = "Run"; }
+  }
+}
+
+function deleteSavedAgent(agent) {
+  confirmAction({
+    title: "Delete agent",
+    message: "Delete “" + (agent.name || agent.agent_id) + "”? Its past run "
+           + "records are kept; only the saved agent is removed.",
+    confirmLabel: "Delete",
+    onConfirm: async () => {
+      try {
+        await fetch("/agents/" + encodeURIComponent(agent.agent_id),
+                    { method: "DELETE" });
+        // Drop the agent's schedule too, so the loop isn't left firing a
+        // run_agent record pointing at an agent that no longer exists.
+        if (agent._schedule) {
+          await fetch("/schedules/" + encodeURIComponent(agent._schedule.schedule_id),
+                      { method: "DELETE" });
+        }
+      } catch (e) { /* a failed delete just leaves the card; reload shows truth */ }
+      loadAgentsPane(true);
+    },
+  });
+}
+
+const WEEKDAY_NAMES = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"];
+
+// "9:00 AM" from "09:00" — friendlier than 24h on the cards.
+function fmt12(hhmm) {
+  const [h, m] = (hhmm || "09:00").split(":").map(n => parseInt(n, 10));
+  const ap = h < 12 ? "AM" : "PM";
+  const h12 = ((h + 11) % 12) + 1;
+  return h12 + ":" + String(m).padStart(2, "0") + " " + ap;
+}
+
+// A human one-liner for a recurring trigger, e.g. "Weekly · Mon 9:00 AM".
+function scheduleSummary(t) {
+  if (!t) return "";
+  const time = fmt12(t.time);
+  if (t.freq === "weekly") {
+    const wd = WEEKDAY_NAMES[(parseInt(t.weekday, 10) || 1) - 1] || "Mon";
+    return "Weekly · " + wd.slice(0, 3) + " " + time;
+  }
+  if (t.freq === "monthly") return "Monthly · day " + (t.day || 1) + " " + time;
+  return "Daily · " + time;
+}
+
+// Card quick-toggle: flip only `enabled` (never the trigger), so the server
+// keeps the fire-state intact. Reverts the switch if the request fails.
+async function toggleAgentSchedule(schedule, cb, txt) {
+  const enabled = cb.checked;
+  try {
+    const r = await fetch("/schedules/" + encodeURIComponent(schedule.schedule_id), {
+      method: "PUT",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ enabled }),
+    });
+    const data = await r.json();
+    if (!data.ok) throw new Error(data.message || data.error || "failed");
+    schedule.enabled = enabled;
+    if (txt) txt.classList.toggle("off", !enabled);
+  } catch (e) {
+    cb.checked = !enabled;
+    alert("Couldn't update the schedule — " + (e.message || e));
+  }
+}
+
+// -- Create / edit modal ------------------------------------------------
+
+const agentEditBackdrop = document.getElementById("agent-edit-backdrop");
+const agentEditTitle = document.getElementById("agent-edit-title");
+const agentNameEl = document.getElementById("agent-name");
+const agentDescEl = document.getElementById("agent-desc");
+const agentEditInstructionsEl = document.getElementById("agent-edit-instructions");
+const agentPermModifyTopicsEl = document.getElementById("agent-perm-modify-topics");
+const agentPermModifyEventsEl = document.getElementById("agent-perm-modify-events");
+const agentPermWebSearchEl = document.getElementById("agent-perm-web-search");
+const agentPermSendMessageEl = document.getElementById("agent-perm-send-message");
+const agentEditHint = document.getElementById("agent-edit-hint");
+const agentEditSaveBtn = document.getElementById("agent-edit-save");
+
+// Schedule control elements (agent modal).
+const agentSchedEnabledEl = document.getElementById("agent-sched-enabled");
+const agentSchedConfigEl = document.getElementById("agent-sched-config");
+const agentSchedFreqEl = document.getElementById("agent-sched-freq");
+const agentSchedTimeEl = document.getElementById("agent-sched-time");
+const agentSchedWeekdayRow = document.getElementById("agent-sched-weekday-row");
+const agentSchedWeekdayEl = document.getElementById("agent-sched-weekday");
+const agentSchedDayRow = document.getElementById("agent-sched-day-row");
+const agentSchedDayEl = document.getElementById("agent-sched-day");
+
+// The agent currently being edited (null => creating a new one), and that
+// agent's existing schedule record (null => none yet).
+let editingAgentId = null;
+let editingAgentSchedule = null;
+
+// Populate the weekday/day-of-month selects once.
+WEEKDAY_NAMES.forEach((name, i) => {
+  const o = document.createElement("option");
+  o.value = String(i + 1); o.textContent = name;
+  agentSchedWeekdayEl.appendChild(o);
+});
+for (let d = 1; d <= 31; d++) {
+  const o = document.createElement("option");
+  o.value = String(d); o.textContent = String(d);
+  agentSchedDayEl.appendChild(o);
+}
+
+function currentSchedFreq() {
+  const b = agentSchedFreqEl.querySelector("button.active");
+  return b ? b.dataset.freq : "daily";
+}
+
+function setSchedFreq(freq) {
+  agentSchedFreqEl.querySelectorAll("button").forEach(b =>
+    b.classList.toggle("active", b.dataset.freq === freq));
+  updateSchedVisibility();
+}
+
+// Config block appears only when the toggle is on; the weekday/day rows appear
+// only for the frequency that uses them.
+function updateSchedVisibility() {
+  agentSchedConfigEl.hidden = !agentSchedEnabledEl.checked;
+  const freq = currentSchedFreq();
+  agentSchedWeekdayRow.hidden = freq !== "weekly";
+  agentSchedDayRow.hidden = freq !== "monthly";
+}
+
+function setScheduleControl(sched) {
+  const t = (sched && sched.trigger) || {};
+  agentSchedEnabledEl.checked = !!(sched && sched.enabled);
+  agentSchedTimeEl.value = t.time || "09:00";
+  agentSchedWeekdayEl.value = String(t.weekday || 1);
+  agentSchedDayEl.value = String(t.day || 1);
+  setSchedFreq(t.freq || "daily");
+}
+
+// Build a recurring trigger from the control's current state.
+function scheduleTriggerFromControl() {
+  const freq = currentSchedFreq();
+  const t = { kind: "recurring", freq, time: agentSchedTimeEl.value || "09:00" };
+  if (freq === "weekly") t.weekday = parseInt(agentSchedWeekdayEl.value, 10);
+  if (freq === "monthly") t.day = parseInt(agentSchedDayEl.value, 10);
+  return t;
+}
+
+agentSchedEnabledEl.addEventListener("change", updateSchedVisibility);
+agentSchedFreqEl.querySelectorAll("button").forEach(b =>
+  b.addEventListener("click", () => setSchedFreq(b.dataset.freq)));
+
+function openAgentEditor(agent) {
+  editingAgentId = agent ? agent.agent_id : null;
+  agentEditTitle.textContent = agent ? "Edit agent" : "New agent";
+  agentNameEl.value = agent ? (agent.name || "") : "";
+  agentDescEl.value = agent ? (agent.description || "") : "";
+  agentEditInstructionsEl.value = agent ? (agent.instructions || "") : "";
+  agentPermModifyTopicsEl.checked = agent ? !!agent.allow_modify_topics : false;
+  agentPermModifyEventsEl.checked = agent ? !!agent.allow_modify_events : false;
+  agentPermWebSearchEl.checked = agent ? !!agent.allow_web_search : false;
+  agentPermSendMessageEl.checked = agent ? !!agent.allow_send_message : false;
+  editingAgentSchedule = agent ? (agent._schedule || null) : null;
+  setScheduleControl(editingAgentSchedule);
+  setAgentEditHint("");
+  agentEditBackdrop.hidden = false;
+  agentNameEl.focus();
+}
+
+function closeAgentEditor() {
+  agentEditBackdrop.hidden = true;
+  editingAgentId = null;
+}
+
+function setAgentEditHint(text) {
+  agentEditHint.textContent = text || "";
+  agentEditHint.hidden = !text;
+}
+
+async function saveAgentEditor() {
+  const name = agentNameEl.value.trim();
+  const instructions = agentEditInstructionsEl.value.trim();
+  if (!name) { setAgentEditHint("Give your agent a name."); agentNameEl.focus(); return; }
+  if (!instructions) {
+    setAgentEditHint("Add instructions describing the task.");
+    agentEditInstructionsEl.focus();
+    return;
+  }
+  const payload = {
+    name,
+    instructions,
+    description: agentDescEl.value.trim(),
+    allow_web_search: agentPermWebSearchEl.checked,
+    allow_modify_topics: agentPermModifyTopicsEl.checked,
+    allow_modify_events: agentPermModifyEventsEl.checked,
+    allow_send_message: agentPermSendMessageEl.checked,
+  };
+  const editing = editingAgentId;
+  agentEditSaveBtn.disabled = true;
+  try {
+    const r = await fetch(editing ? "/agents/" + encodeURIComponent(editing) : "/agents", {
+      method: editing ? "PUT" : "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(payload),
+    });
+    const data = await r.json();
+    if (!data.ok) throw new Error(data.message || data.error || "failed to save");
+    const agentId = editing || (data.agent && data.agent.agent_id);
+    await saveAgentSchedule(agentId);
+    closeAgentEditor();
+    loadAgentsPane(true);
+  } catch (e) {
+    setAgentEditHint("Couldn't save — " + (e.message || e));
+  } finally {
+    agentEditSaveBtn.disabled = false;
+  }
+}
+
+// Upsert the agent's one schedule from the modal control:
+//  • existing record → PUT the new trigger + enabled (re-arms on trigger change).
+//  • no record + toggle on → POST a new run_agent schedule for this agent.
+//  • no record + toggle off → nothing to do.
+// A throw here surfaces in saveAgentEditor's catch as a save error.
+async function saveAgentSchedule(agentId) {
+  if (!agentId) return;
+  const enabled = agentSchedEnabledEl.checked;
+  const trigger = scheduleTriggerFromControl();
+  const tz = clientTimezone();
+  let resp;
+  if (editingAgentSchedule) {
+    resp = await fetch("/schedules/" + encodeURIComponent(editingAgentSchedule.schedule_id), {
+      method: "PUT",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ enabled, tz, trigger }),
+    });
+  } else if (enabled) {
+    resp = await fetch("/schedules", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        enabled: true, tz, trigger,
+        action: { kind: "run_agent", agent_id: agentId },
+      }),
+    });
+  } else {
+    return;
+  }
+  const data = await resp.json();
+  if (!data.ok) throw new Error(data.message || data.error || "couldn't save the schedule");
+}
+
+document.getElementById("agent-new-btn")
+  .addEventListener("click", () => openAgentEditor(null));
+agentEditSaveBtn.addEventListener("click", saveAgentEditor);
+document.getElementById("agent-edit-cancel").addEventListener("click", closeAgentEditor);
+document.getElementById("agent-edit-close").addEventListener("click", closeAgentEditor);
+agentEditBackdrop.addEventListener("click", (e) => {
+  if (e.target === agentEditBackdrop) closeAgentEditor();
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !agentEditBackdrop.hidden) closeAgentEditor();
+});
+// Ctrl/Cmd+Enter from anywhere in the form saves, mirroring the chat box.
+agentEditBackdrop.addEventListener("keydown", (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+    e.preventDefault();
+    saveAgentEditor();
+  }
+});
 
 // -- Calendar -----------------------------------------------------------
 
@@ -3763,7 +4927,13 @@ const now = new Date();
 // calSelectedDay aliases in sync so existing fetch URLs and refresh hooks
 // keep working — they were already month-indexed.
 const calCursor = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-let calView = "month";              // "month" | "week" | "day"
+// Persisted across reloads so the rendered view and the dropdown never drift
+// apart (the browser restores the <select> on refresh; without this the state
+// variable would reset and disagree with it). Defaults to the week view.
+const CAL_VIEW_KEY = "aime.calView";
+const CAL_VIEWS = ["month", "week", "day"];
+let calView = localStorage.getItem(CAL_VIEW_KEY);
+if (!CAL_VIEWS.includes(calView)) calView = "week";  // "month" | "week" | "day"
 let calYear = calCursor.getFullYear();
 let calMonth = calCursor.getMonth() + 1;
 let calSelectedDay = null;          // 1..31, kept in sync for month-cell highlighting
@@ -3849,8 +5019,14 @@ document.querySelector('[data-action="cal-prev"]').addEventListener("click",
   () => moveCalCursor(-1));
 document.querySelector('[data-action="cal-next"]').addEventListener("click",
   () => moveCalCursor(1));
-document.getElementById("cal-view").addEventListener("change", (e) => {
+// Force the dropdown to match the (possibly persisted) state on load, so a
+// browser-restored selection can't leave the control showing one view while
+// another is rendered.
+const calViewSel = document.getElementById("cal-view");
+calViewSel.value = calView;
+calViewSel.addEventListener("change", (e) => {
   calView = e.target.value;
+  localStorage.setItem(CAL_VIEW_KEY, calView);
   calSelectedDay = null;
   calSelectedDate = null;
   renderCalendar();
@@ -4020,7 +5196,7 @@ async function renderMonthView(silent) {
         cell.appendChild(todo);
       } else {
         const e = document.createElement("div");
-        e.className = "ev" + (ev.archived ? " archived" : "");
+        e.className = "ev" + eventStateClasses(ev);
         e.textContent = "• " + (ev.title || ev.name || "(untitled)");
         applyCategoryColor(e, ev.category);
         cell.appendChild(e);
@@ -4072,6 +5248,29 @@ function eventKey(date) {
        + `${String(date.getDate()).padStart(2, "0")}`;
 }
 
+// An event's lifecycle status, defaulting to "scheduled" for records that
+// predate the field. (Archived is a separate, deleted-from-view flag.)
+function eventStatus(ev) {
+  return (ev && ev.status ? String(ev.status).trim() : "") || "scheduled";
+}
+// True when the event is resolved one way or the other — completed or canceled.
+// These render dimmed (a "done" look), same as deleted/archived ones used to.
+function isEventResolved(ev) {
+  const s = eventStatus(ev);
+  return s === "completed" || s === "canceled";
+}
+// Extra CSS classes for an event element based on its state. Archived is kept
+// for completeness even though such events are normally filtered out.
+function eventStateClasses(ev) {
+  let cls = "";
+  if (ev && ev.archived) cls += " archived";
+  const s = eventStatus(ev);
+  if (s === "completed") cls += " completed";
+  else if (s === "canceled") cls += " canceled";
+  else if (s === "unknown") cls += " unknown";
+  return cls;
+}
+
 function hourLabel(h) {
   if (h === 0 || h === 24) return "12 AM";
   if (h < 12) return `${h} AM`;
@@ -4104,6 +5303,8 @@ const evFTitle = document.getElementById("ev-f-title");
 const evFDate = document.getElementById("ev-f-date");
 const evFTime = document.getElementById("ev-f-time");
 const evFCategory = document.getElementById("ev-f-category");
+const evFMetaWrap = document.getElementById("ev-f-meta-wrap");
+const evFMeta = document.getElementById("ev-f-meta");
 const evFSummary = document.getElementById("ev-f-summary");
 const evFSummaryRendered = document.getElementById("ev-f-summary-rendered");
 const evSaveBtn = document.getElementById("ev-save-btn");
@@ -4111,6 +5312,21 @@ const evCancelBtn = document.getElementById("ev-cancel-btn");
 const evArchiveBtn = document.getElementById("ev-archive-btn");
 const evCloseBtn = document.getElementById("event-close");
 const evModalError = document.getElementById("ev-modal-error");
+const evRemindersWrap = document.getElementById("ev-f-reminders-wrap");
+const evRemindersEl = document.getElementById("ev-f-reminders");
+const evAddReminderBtn = document.getElementById("ev-add-reminder");
+
+// The reminder schedule records linked to the event currently in the modal.
+let activeEventReminders = [];
+
+// Friendly presets for "how far ahead". The stored value is days_before; an
+// off-preset value loaded from the server gets its own option appended so it
+// still round-trips.
+const REMINDER_DAY_OPTIONS = [
+  [0, "On the day"], [1, "1 day before"], [2, "2 days before"],
+  [3, "3 days before"], [7, "1 week before"], [14, "2 weeks before"],
+  [30, "1 month before"],
+];
 
 function backendDateToInput(d) {
   const m = /^(\d{2})\/(\d{2})\/(\d{4})/.exec(d || "");
@@ -4197,9 +5413,257 @@ function openEventModal(ev) {
   evFCategory.value = ev.category || "";
   evFSummary.value = ev.summary || "";
   renderEventSummary(ev.summary || "");
-  evArchiveBtn.textContent = ev.archived ? "Unarchive" : "Archive";
+  renderEventMeta(ev);
+  // Archive is now an icon button; convey its action through the label only.
+  const archiveLabel = ev.archived ? "Unarchive" : "Archive";
+  evArchiveBtn.title = archiveLabel;
+  evArchiveBtn.setAttribute("aria-label", archiveLabel);
   setEventEditMode(false);
+  loadEventReminders(ev.id);
   eventBackdrop.hidden = false;
+}
+
+// -- Event reminders ----------------------------------------------------
+// Each reminder is its own schedule record (relative trigger + send_message),
+// linked to the event by id. We fetch the user's schedules and keep only the
+// ones pointing at this event. Saving/removing happens immediately, so there's
+// no "unsaved reminder" state to reconcile with the event's Save button.
+
+function reminderMessageFor(ev) {
+  // Tokens are rendered against the *live* event at fire time, so moving the
+  // event keeps the message accurate without rewriting the record.
+  return (ev && (ev.time || "").trim())
+    ? "Reminder: {event_title} on {event_date} at {event_time}"
+    : "Reminder: {event_title} on {event_date}";
+}
+
+async function loadEventReminders(eventId) {
+  activeEventReminders = [];
+  if (eventId == null) { evRemindersWrap.hidden = true; return; }
+  evRemindersWrap.hidden = false;
+  renderEventReminders();  // show the empty state instantly while we fetch
+  try {
+    const r = await fetch("/schedules");
+    const data = await r.json();
+    activeEventReminders = (data.schedules || []).filter(s =>
+      s.trigger && s.trigger.kind === "relative" &&
+      String(s.trigger.event_id) === String(eventId));
+  } catch (e) {
+    activeEventReminders = [];
+  }
+  renderEventReminders();
+}
+
+function renderEventReminders() {
+  evRemindersEl.innerHTML = "";
+  if (!activeEventReminders.length) {
+    const empty = document.createElement("div");
+    empty.className = "ev-reminders-empty";
+    empty.textContent = "No reminders yet.";
+    evRemindersEl.appendChild(empty);
+    return;
+  }
+  activeEventReminders.forEach(s =>
+    evRemindersEl.appendChild(buildReminderRow(s)));
+}
+
+function buildReminderRow(sched) {
+  const t = sched.trigger || {};
+  const row = document.createElement("div");
+  row.className = "ev-reminder-row";
+
+  const daySel = document.createElement("select");
+  REMINDER_DAY_OPTIONS.forEach(([v, label]) => {
+    const o = document.createElement("option");
+    o.value = String(v); o.textContent = label;
+    daySel.appendChild(o);
+  });
+  const days = parseInt(t.days_before, 10) || 0;
+  if (!REMINDER_DAY_OPTIONS.some(([v]) => v === days)) {
+    const o = document.createElement("option");
+    o.value = String(days);
+    o.textContent = days + " day" + (days === 1 ? "" : "s") + " before";
+    daySel.appendChild(o);
+  }
+  daySel.value = String(days);
+
+  const sep = document.createElement("span");
+  sep.className = "ev-reminder-sep";
+  sep.textContent = "at";
+
+  const timeInput = document.createElement("input");
+  timeInput.type = "time";
+  timeInput.value = t.at_time || "";
+  timeInput.title = "Leave blank to use the event's own time";
+
+  const del = document.createElement("button");
+  del.type = "button";
+  del.className = "ev-reminder-del";
+  del.title = "Remove reminder";
+  del.setAttribute("aria-label", "Remove reminder");
+  del.textContent = "×";
+
+  const onChange = () =>
+    updateReminder(sched, parseInt(daySel.value, 10), timeInput.value);
+  daySel.addEventListener("change", onChange);
+  timeInput.addEventListener("change", onChange);
+  del.addEventListener("click", () => deleteReminder(sched));
+
+  row.append(daySel, sep, timeInput, del);
+  return row;
+}
+
+async function addReminder() {
+  if (!activeEventRecord || activeEventRecord.id == null) return;
+  evModalError.hidden = true;
+  evAddReminderBtn.disabled = true;
+  const trigger = {
+    kind: "relative",
+    event_id: activeEventRecord.id,
+    days_before: 1,
+    at_time: "09:00",
+    minutes_before: 0,
+  };
+  try {
+    const r = await fetch("/schedules", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        enabled: true,
+        tz: clientTimezone(),
+        trigger,
+        action: { kind: "send_message",
+                  message: reminderMessageFor(activeEventRecord) },
+      }),
+    });
+    const data = await r.json();
+    if (!data.ok) throw new Error(data.error || data.message || "failed");
+    activeEventReminders.push(data.schedule);
+    renderEventReminders();
+  } catch (e) {
+    evModalError.textContent = "Couldn't add reminder — " + (e.message || e);
+    evModalError.hidden = false;
+  } finally {
+    evAddReminderBtn.disabled = false;
+  }
+}
+
+async function updateReminder(sched, days, atTime) {
+  // Rebuild the whole trigger; the server re-arms fire-state on a trigger
+  // change, so an edited reminder always evaluates from scratch.
+  const trigger = {
+    kind: "relative",
+    event_id: sched.trigger.event_id,
+    days_before: isNaN(days) ? 0 : days,
+    at_time: atTime ? atTime : null,
+    minutes_before: 0,
+  };
+  try {
+    const r = await fetch("/schedules/" + encodeURIComponent(sched.schedule_id), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ trigger }),
+    });
+    const data = await r.json();
+    if (!data.ok) throw new Error(data.error || data.message || "failed");
+    sched.trigger = data.schedule.trigger;
+    evModalError.hidden = true;
+  } catch (e) {
+    evModalError.textContent = "Couldn't update reminder — " + (e.message || e);
+    evModalError.hidden = false;
+  }
+}
+
+async function deleteReminder(sched) {
+  try {
+    const r = await fetch("/schedules/" + encodeURIComponent(sched.schedule_id),
+                          { method: "DELETE" });
+    const data = await r.json();
+    if (!data.ok) throw new Error("failed");
+    activeEventReminders = activeEventReminders.filter(
+      s => s.schedule_id !== sched.schedule_id);
+    renderEventReminders();
+    evModalError.hidden = true;
+  } catch (e) {
+    evModalError.textContent = "Couldn't remove reminder — " + (e.message || e);
+    evModalError.hidden = false;
+  }
+}
+
+evAddReminderBtn.addEventListener("click", addReminder);
+
+// The four lifecycle states the user can pick between in the modal. (`unknown`
+// is normally system-set, but it's a legitimate "I genuinely don't know" choice
+// too, so it's selectable like the rest.)
+const EVENT_STATUS_OPTIONS = ["scheduled", "completed", "canceled", "unknown"];
+
+// Backend status value -> friendly user-facing label. `unknown` stays `unknown`
+// everywhere in the data/API, but reads as the warmer "unconfirmed" in the UI.
+// Other statuses display as-is (capitalized via CSS).
+const EVENT_STATUS_LABELS = { unknown: "unconfirmed" };
+const eventStatusLabel = (s) => EVENT_STATUS_LABELS[s] || s;
+
+// Lifecycle section under the category field: a row of status pills (active one
+// lit, the others greyed — click to switch) plus any populated commitment /
+// status-change-reason / reschedule-origin detail underneath. Built with DOM
+// nodes + textContent so user/agent-supplied values can't inject HTML.
+function renderEventMeta(ev) {
+  const status = eventStatus(ev);
+  evFMeta.textContent = "";
+  evFMetaWrap.hidden = false;
+
+  const pills = document.createElement("div");
+  pills.className = "ev-status-pills";
+  EVENT_STATUS_OPTIONS.forEach((s) => {
+    const pill = document.createElement("button");
+    pill.type = "button";
+    pill.className = "status-pill s-" + s + (s === status ? " active" : "");
+    pill.textContent = eventStatusLabel(s);
+    pill.setAttribute("aria-pressed", s === status ? "true" : "false");
+    pill.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      const prev = eventStatus(ev);
+      if (s === prev) return;
+      // Optimistic relight, then persist; roll back on failure.
+      ev.status = s;
+      if (activeEventRecord) activeEventRecord.status = s;
+      renderEventMeta(ev);
+      const ok = await setEventStatus(ev, s);
+      if (!ok) {
+        ev.status = prev;
+        if (activeEventRecord) activeEventRecord.status = prev;
+        renderEventMeta(ev);
+        evModalError.textContent = "Couldn't update status.";
+        evModalError.hidden = false;
+        return;
+      }
+      evModalError.hidden = true;
+      renderCalendar(true);  // reflect the change behind the modal, no flash
+    });
+    pills.appendChild(pill);
+  });
+  evFMeta.appendChild(pills);
+
+  const cid = (ev.commitment_id || "").trim();
+  const reason = (ev.status_change_reason || "").trim();
+  const moved = (ev.rescheduled_from || "").trim();
+  if (cid || reason || moved) {
+    const details = document.createElement("div");
+    details.className = "ev-meta-details";
+    const detail = (prefix, value) => {
+      const span = document.createElement("span");
+      span.className = "ev-meta-item";
+      span.append(prefix);
+      const strong = document.createElement("b");
+      strong.textContent = value;
+      span.appendChild(strong);
+      details.appendChild(span);
+    };
+    if (cid) detail("recurring: ", cid);
+    if (reason) detail("reason: ", reason);
+    if (moved) detail("moved from ", moved);
+    evFMeta.appendChild(details);
+  }
 }
 
 function closeEventModal() {
@@ -4341,6 +5805,209 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && !eventBackdrop.hidden) closeEventModal();
 });
 
+// -- Agent-run viewer modal ---------------------------------------------
+
+const agentRunBackdrop = document.getElementById("agent-run-backdrop");
+const agentRunBody = document.getElementById("agent-run-body");
+const agentRunTitle = document.getElementById("agent-run-title");
+
+function closeAgentRunModal() {
+  agentRunBackdrop.hidden = true;
+  agentRunBody.innerHTML = "";
+}
+
+document.getElementById("agent-run-close")
+  .addEventListener("click", closeAgentRunModal);
+agentRunBackdrop.addEventListener("click", (e) => {
+  if (e.target === agentRunBackdrop) closeAgentRunModal();
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !agentRunBackdrop.hidden) closeAgentRunModal();
+});
+
+// Render trusted-ish markdown (the agent's own text) to sanitized HTML, the
+// same way event descriptions are rendered.
+function agentMarkdown(text) {
+  const raw = (text || "").trim();
+  if (!raw) return "";
+  if (!window.marked) return raw;
+  const html = window.marked.parse(raw);
+  return window.DOMPurify ? window.DOMPurify.sanitize(html) : html;
+}
+
+async function openAgentRun(runId) {
+  agentRunTitle.textContent = "Agent run";
+  agentRunBody.innerHTML = '<div class="empty">loading…</div>';
+  agentRunBackdrop.hidden = false;
+  try {
+    const r = await fetch("/agent-runs/" + encodeURIComponent(runId));
+    const data = await r.json();
+    if (!data.ok) throw new Error(data.error || "not found");
+    renderAgentRun(data.run);
+  } catch (e) {
+    agentRunBody.innerHTML = "";
+    const err = document.createElement("div");
+    err.className = "empty";
+    err.textContent = "Couldn't open this run — " + (e.message || e);
+    agentRunBody.appendChild(err);
+  }
+}
+
+function renderAgentRun(run) {
+  agentRunTitle.textContent = run.agent_name || "Agent run";
+  agentRunBody.innerHTML = "";
+
+  // Meta line: status badge + timing + turn count.
+  const meta = document.createElement("div");
+  meta.className = "agent-run-meta";
+  const badge = document.createElement("span");
+  badge.className = "agent-status " + (run.status || "");
+  badge.textContent = AGENT_STATUS_LABELS[run.status] || run.status || "";
+  meta.appendChild(badge);
+  const when = [run.started_at, run.ended_at].filter(Boolean).join(" → ");
+  if (when) {
+    const t = document.createElement("span");
+    t.textContent = when;
+    meta.appendChild(t);
+  }
+  if (run.turns) {
+    const turns = document.createElement("span");
+    turns.textContent = run.turns + (run.turns === 1 ? " turn" : " turns");
+    meta.appendChild(turns);
+  }
+  agentRunBody.appendChild(meta);
+
+  // If the run errored, surface that up top.
+  if (run.error) {
+    const err = document.createElement("div");
+    err.className = "msg notice error";
+    err.textContent = run.error;
+    agentRunBody.appendChild(err);
+  }
+
+  // The headline result: the SubmitResult summary, rendered as markdown.
+  agentRunSection("Summary", () => {
+    const sum = document.createElement("div");
+    sum.className = "agent-run-summary";
+    const html = agentMarkdown(run.summary);
+    if (html) sum.innerHTML = html;
+    else sum.innerHTML = '<span class="muted-line">No summary was returned.</span>';
+    return sum;
+  });
+
+  // The structured payload, if the agent returned one.
+  if (run.result != null && !(typeof run.result === "object"
+      && !Array.isArray(run.result) && Object.keys(run.result).length === 0)) {
+    agentRunSection("Result", () => {
+      const pre = document.createElement("pre");
+      pre.className = "agent-run-json";
+      pre.textContent = JSON.stringify(run.result, null, 2);
+      return pre;
+    });
+  }
+
+  // The full transcript, collapsed by default — the detailed audit trail.
+  const events = Array.isArray(run.transcript) ? run.transcript : [];
+  if (events.length) {
+    const det = document.createElement("details");
+    det.className = "agent-run-transcript";
+    const sum = document.createElement("summary");
+    sum.textContent = "Transcript";
+    det.appendChild(sum);
+    events.forEach(ev => {
+      const node = renderTranscriptEvent(ev);
+      if (node) det.appendChild(node);
+    });
+    agentRunBody.appendChild(det);
+  }
+}
+
+// A labelled block inside the run modal.
+function agentRunSection(label, buildBody) {
+  const wrap = document.createElement("div");
+  wrap.className = "agent-run-section";
+  const head = document.createElement("div");
+  head.className = "side-section-head";
+  head.textContent = label;
+  wrap.appendChild(head);
+  wrap.appendChild(buildBody());
+  agentRunBody.appendChild(wrap);
+}
+
+// Render one transcript event (the same shape the live chat consumes over
+// SSE) into a compact, read-only line. Mirrors the SSE handler's tiers but
+// without any of its live-session side effects.
+function renderTranscriptEvent(ev) {
+  switch (ev.kind) {
+    case "assistant_text_end": {
+      const text = (ev.text || "").trim();
+      if (!text) return null;
+      const div = document.createElement("div");
+      div.className = "agent-run-assistant";
+      div.innerHTML = agentMarkdown(text) || "";
+      return div;
+    }
+    case "tool_call": {
+      const label = "· tool: " + (ev.tool_name || "") +
+        (ev.tool_details ? " — " + ev.tool_details : "");
+      return transcriptNotice(label, ev.tool_detail_full);
+    }
+    case "tool_result": {
+      const label = "· tool done: " + (ev.tool_name || "") +
+        (ev.tool_result_summary ? " — " + ev.tool_result_summary : "");
+      return transcriptNotice(label, ev.tool_detail_full);
+    }
+    case "agent_result": {
+      const div = document.createElement("div");
+      div.className = "msg notice info";
+      div.textContent = "✓ submitted result";
+      return div;
+    }
+    case "error": {
+      const div = document.createElement("div");
+      div.className = "msg notice error";
+      div.textContent = "error: " + (ev.text || "");
+      return div;
+    }
+    case "notice": {
+      const text = (ev.text || "").trim();
+      if (!text) return null;
+      const div = document.createElement("div");
+      div.className = "msg notice " + (ev.severity || "info");
+      div.textContent = text;
+      return div;
+    }
+    default:
+      return null;  // assistant_text deltas, turn_end, ready, etc. — skip
+  }
+}
+
+// A transcript line with an optional collapsible detail, mirroring the live
+// chat's appendToolNotice but as a returned node rather than a log append.
+function transcriptNotice(summaryText, detailText) {
+  if (!detailText) {
+    const div = document.createElement("div");
+    div.className = "msg notice info";
+    div.textContent = summaryText;
+    return div;
+  }
+  const det = document.createElement("details");
+  det.className = "msg notice tool-notice info";
+  const sum = document.createElement("summary");
+  const caret = document.createElement("span");
+  caret.className = "caret";
+  caret.setAttribute("aria-hidden", "true");
+  caret.textContent = "▸";
+  sum.appendChild(caret);
+  sum.appendChild(document.createTextNode(summaryText));
+  det.appendChild(sum);
+  const pre = document.createElement("pre");
+  pre.className = "tool-detail";
+  pre.textContent = detailText;  // textContent: tool I/O is untrusted
+  det.appendChild(pre);
+  return det;
+}
+
 // Greedy column packing for overlapping events. `items` is pre-sorted by
 // start. Returns one entry per item with its column index and the cluster's
 // total column count, so all siblings in a cluster render at the same width.
@@ -4369,9 +6036,10 @@ function layoutOverlaps(items) {
   return out;
 }
 
-// Toggle an event's archived flag without going through the full modal.
-// Used by the to-do checkboxes on all-day items.
-async function setEventArchived(ev, archived) {
+// Set an event's lifecycle status without going through the full modal. Used
+// by the to-do checkboxes on all-day items. Other fields are sent unchanged;
+// omitted metadata (commitment_id, etc.) is preserved by the backend.
+async function setEventStatus(ev, status) {
   if (!ev || ev.id == null) return false;
   const payload = {
     title: ev.title || "",
@@ -4379,7 +6047,8 @@ async function setEventArchived(ev, archived) {
     category: ev.category || "",
     date: ev.date || "",
     time: ev.time || "",
-    archived: !!archived,
+    archived: !!ev.archived,
+    status: status,
   };
   try {
     const r = await fetch(
@@ -4389,42 +6058,47 @@ async function setEventArchived(ev, archived) {
     );
     const j = await r.json();
     if (!r.ok || !j.ok) return false;
-    ev.archived = !!archived;
+    ev.status = status;
     return true;
   } catch (_) { return false; }
 }
 
-// Render an all-day event as a to-do row: checkbox toggles archived
-// (= done); clicking the label opens the event modal as before.
+// Render an all-day event as a to-do row: the checkbox toggles completion
+// status (scheduled ⇄ completed); clicking the label opens the event modal as
+// before. Canceled events render struck-through but unchecked.
 function buildTodoItem(ev, { compact = false, interactive = true } = {}) {
+  const status = eventStatus(ev);
   const item = document.createElement("div");
   item.className = "todo-item" + (compact ? " compact" : "")
-                 + (ev.archived ? " done" : "")
+                 + (status === "completed" ? " done" : "")
+                 + (status === "canceled" ? " canceled" : "")
+                 + (status === "unknown" ? " unknown" : "")
                  + (interactive ? "" : " static");
   applyCategoryColor(item, ev.category);
 
   if (interactive) {
+    const done = status === "completed";
     const box = document.createElement("button");
     box.type = "button";
     box.className = "todo-check";
     box.setAttribute("role", "checkbox");
-    box.setAttribute("aria-checked", ev.archived ? "true" : "false");
-    box.setAttribute("aria-label",
-      ev.archived ? "Mark not done" : "Mark done");
+    box.setAttribute("aria-checked", done ? "true" : "false");
+    box.setAttribute("aria-label", done ? "Mark not done" : "Mark done");
     box.innerHTML =
       '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" '
       + 'stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round">'
       + '<path d="M5 12l5 5L20 7"/></svg>';
     box.addEventListener("click", async (e) => {
       e.stopPropagation();
-      const next = !ev.archived;
-      item.classList.toggle("done", next);
-      box.setAttribute("aria-checked", next ? "true" : "false");
-      const ok = await setEventArchived(ev, next);
+      const wasDone = eventStatus(ev) === "completed";
+      const nextStatus = wasDone ? "scheduled" : "completed";
+      item.classList.toggle("done", !wasDone);
+      box.setAttribute("aria-checked", !wasDone ? "true" : "false");
+      const ok = await setEventStatus(ev, nextStatus);
       if (!ok) {
         // Roll back the optimistic flip so state stays truthful.
-        item.classList.toggle("done", !next);
-        box.setAttribute("aria-checked", !next ? "true" : "false");
+        item.classList.toggle("done", wasDone);
+        box.setAttribute("aria-checked", wasDone ? "true" : "false");
       }
     });
     item.appendChild(box);
@@ -4482,7 +6156,7 @@ function buildDayColumn(date, events, sched, allDayCol, hourPx, startHour, endHo
 
   placements.forEach(({ ev, start, colIdx, colCount }) => {
     const block = document.createElement("div");
-    block.className = "ev-block" + (ev.archived ? " archived" : "")
+    block.className = "ev-block" + eventStateClasses(ev)
                     + (colCount > 1 ? " is-overlap" : "");
     block.style.top = ((start - startMin) / 60 * hourPx) + "px";
     block.style.height = Math.max(18, DEFAULT_EV_MIN / 60 * hourPx) + "px";
@@ -5396,6 +7070,9 @@ verbositySelect.value = verbosity;
 verbositySelect.addEventListener("change", () => {
   verbosity = verbositySelect.value;
   localStorage.setItem(VERBOSITY_KEY, verbosity);
+  // Background-agent runs are a Verbose-only addition to the Conversations
+  // menu, so re-render it when the tier changes while it's open.
+  if (activePaneName === "chats") loadChats(true);
 });
 
 // -- UI mode (Simple / Advanced) ----------------------------------------
@@ -5416,6 +7093,9 @@ function applyUiMode(mode) {
       const userBtn = document.querySelector('.settings-tab-btn[data-tab="user"]');
       if (userBtn) userBtn.click();
     }
+    // The Agents pane is Advanced-only; its rail button just vanished, so
+    // close the pane if it was open rather than leaving it stranded.
+    if (activePaneName === "agents") closeSide();
   }
 }
 
@@ -5645,6 +7325,9 @@ const redeemRow = document.getElementById("account-redeem-row");
 const keyInput = document.getElementById("account-key-input");
 const redeemBtn = document.getElementById("account-redeem-btn");
 const redeemMsg = document.getElementById("account-redeem-msg");
+const contactInput = document.getElementById("account-contact-input");
+const contactBtn = document.getElementById("account-contact-btn");
+const contactMsg = document.getElementById("account-contact-msg");
 
 // Reflect access state into the composer and the Account modal. Sending is
 // locked only in "keys" mode for a user without api_access — login and all
@@ -5681,6 +7364,7 @@ async function refreshMe() {
     const data = await r.json();
     accountUsernameEl.textContent = data.username || "—";
     accountEmailEl.textContent = data.email || "—";
+    if (contactInput) contactInput.value = data.messaging_contact || "";
     __accessMode = data.access_mode || "open";
     __apiAccess = !!data.api_access;
   } catch {
@@ -5722,6 +7406,39 @@ redeemBtn.addEventListener("click", async () => {
 });
 keyInput.addEventListener("keydown", (e) => {
   if (e.key === "Enter") { e.preventDefault(); redeemBtn.click(); }
+});
+
+// Save (or clear, when blank) the account's outbound-messaging contact.
+contactBtn.addEventListener("click", async () => {
+  contactMsg.style.display = "none";
+  contactBtn.disabled = true;
+  try {
+    const r = await fetch("/messaging-contact", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      credentials: "same-origin",
+      body: JSON.stringify({contact: contactInput.value.trim()}),
+    });
+    const data = await r.json();
+    if (data.ok) {
+      contactInput.value = data.messaging_contact || "";
+      contactMsg.textContent = data.messaging_contact
+        ? "Saved — Aime can now text you here."
+        : "Cleared — Aime won't text you.";
+      contactMsg.style.color = "var(--muted)";
+    } else {
+      contactMsg.textContent = data.message || "Couldn't save that.";
+      contactMsg.style.color = "var(--error)";
+    }
+  } catch {
+    contactMsg.textContent = "Network error — try again.";
+    contactMsg.style.color = "var(--error)";
+  }
+  contactMsg.style.display = "";
+  contactBtn.disabled = false;
+});
+contactInput.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); contactBtn.click(); }
 });
 
 document.getElementById("account-logout-btn").addEventListener("click", logout);

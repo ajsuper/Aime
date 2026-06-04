@@ -56,6 +56,20 @@ class CalendarService:
         )
         return _events_from(data)
 
+    def events_in_range(self, start_date: str, end_date: str, *, include_archived: bool = False) -> list[dict]:
+        """Every event with a date in ``[start_date, end_date]`` (both
+        ``DD/MM/YYYY``), ascending. Used by the scheduler to arm event reminders
+        over a horizon, off any request."""
+        data = self._gw.call(
+            "get_events",
+            sort_order="asc",
+            filter_by_date=True,
+            start_date=start_date,
+            end_date=end_date,
+            archived="all" if include_archived else "active_only",
+        )
+        return _events_from(data)
+
     def events_for_day(self, year: int, month: int, day: int, *, include_archived: bool = False) -> list[dict]:
         day_str = f"{day:02d}/{month:02d}/{year}"
         data = self._gw.call(
@@ -71,12 +85,17 @@ class CalendarService:
     def replace_event(
         self, event_id: int, *, title: str, summary: str, category: str,
         date: str, time: str, archived: bool,
+        status: str | None = None, commitment_id: str | None = None,
+        status_change_reason: str | None = None, rescheduled_from: str | None = None,
     ) -> dict:
         """Edit / archive an existing event. Mirrors the backend's
         `replace_event` tool — caller supplies the full record so a partial
-        edit always sends the unchanged fields too."""
-        return self._gw.call(
-            "replace_event",
+        edit always sends the unchanged fields too.
+
+        The lifecycle-metadata kwargs (status, commitment_id, …) are optional:
+        only the ones passed are sent, and the backend preserves any field it
+        doesn't receive, so a plain title/summary edit never resets them."""
+        payload = dict(
             id=event_id,
             title=title,
             summary=summary,
@@ -85,6 +104,15 @@ class CalendarService:
             time=time,
             archived=archived,
         )
+        for key, value in (
+            ("status", status),
+            ("commitment_id", commitment_id),
+            ("status_change_reason", status_change_reason),
+            ("rescheduled_from", rescheduled_from),
+        ):
+            if value is not None:
+                payload[key] = value
+        return self._gw.call("replace_event", **payload)
 
 
 class TopicService:

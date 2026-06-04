@@ -60,6 +60,76 @@ def _jsonable(obj):
         return str(obj)
 
 
+class _ClockTagStripper:
+    """Removes ``<clock ...>...</clock>`` spans from a streamed text block.
+
+    The backend appends a volatile ``<clock silent>…</clock>`` block after the
+    cache breakpoint each turn (see ``_date_block``). The model occasionally
+    parrots that exact tag back into its reply. The tag is system plumbing the
+    user must never see, so we filter it out of the assistant text.
+
+    Because text arrives as deltas, the tag can be split across chunks. This
+    runs a tiny state machine that holds back only the minimal tail that could
+    still be the start of an opening tag (or a partial closing tag while inside
+    one), so ordinary text — including unrelated ``<`` characters — flows
+    through with at most a few characters of latency. Call ``feed`` per delta
+    and ``flush`` once at block end."""
+
+    _OPEN = "<clock"
+    _CLOSE = "</clock>"
+
+    def __init__(self) -> None:
+        self._buf = ""
+        self._in_tag = False  # seen <clock, waiting for </clock>
+
+    @staticmethod
+    def _suffix_prefix_len(s: str, target: str) -> int:
+        """Longest k where the last k chars of s equal the first k of target."""
+        for k in range(min(len(s), len(target)), 0, -1):
+            if s[-k:] == target[:k]:
+                return k
+        return 0
+
+    def feed(self, text: str) -> str:
+        self._buf += text
+        out: list[str] = []
+        while self._buf:
+            if self._in_tag:
+                idx = self._buf.find(self._CLOSE)
+                if idx == -1:
+                    # No close yet: discard the body, but keep a tail that
+                    # could be a partial </clock> spanning the next delta.
+                    keep = self._suffix_prefix_len(self._buf, self._CLOSE)
+                    self._buf = self._buf[len(self._buf) - keep:] if keep else ""
+                    break
+                self._buf = self._buf[idx + len(self._CLOSE):]
+                self._in_tag = False
+                continue
+            idx = self._buf.find(self._OPEN)
+            if idx == -1:
+                # No open tag: emit everything except a tail that could be a
+                # partial <clock spanning the next delta.
+                keep = self._suffix_prefix_len(self._buf, self._OPEN)
+                cut = len(self._buf) - keep
+                out.append(self._buf[:cut])
+                self._buf = self._buf[cut:]
+                break
+            out.append(self._buf[:idx])
+            self._buf = self._buf[idx:]  # now starts with <clock…
+            self._in_tag = True
+        return "".join(out)
+
+    def flush(self) -> str:
+        """Drain held-back text at block end. A buffer that's still mid-tag was
+        an unterminated <clock and is dropped; anything else was a false alarm
+        (a real ``<`` that never became a tag) and is emitted."""
+        if self._in_tag:
+            self._buf = ""
+            return ""
+        tail, self._buf = self._buf, ""
+        return tail
+
+
 # ============================================================================
 # Provider-agnostic agent backend
 # ============================================================================
@@ -239,6 +309,9 @@ class AnthropicMessagesBackend:
         max_tokens: int = 8192,
         usage_label: str | None = None,
         router=None,
+        web_search_schema: str | None = None,
+        terminal_tool_schema: "str | dict | None" = None,
+        persist_enabled: bool = True,
     ):
         self._client = Anthropic(max_retries=3)
         self._system_prompt = system_prompt
@@ -263,10 +336,15 @@ class AnthropicMessagesBackend:
         # and the data key that decrypts them. Both are required for any IO.
         self._conversations_dir = conversations_dir
         self._dek = dek
-        self._tools = [
-            {"type": "web_search_20250305", "name": "web_search"},
-            *[self._load_schema(p) for p in schema_files],
-        ]
+        self._tools = [self._load_schema(p) for p in schema_files]
+        # Web search is offloaded to a Haiku sub-agent via a small client-side
+        # `WebSearch` tool (see aime.web_search_agent and the controller's tool
+        # dispatch). When enabled, its schema loads like any other; the native
+        # server-side web_search tool is intentionally NOT exposed to the
+        # conversational model — that keeps bulky search results out of this
+        # model's re-cached context.
+        if web_search_schema:
+            self._tools.insert(0, self._load_schema(web_search_schema))
         # System prompt and tool schemas are byte-identical on every turn, so
         # mark them as prompt-cache breakpoints with a 1-hour TTL — across the
         # gaps typical of personal-assistant chat the 5-min default TTL would
@@ -281,6 +359,26 @@ class AnthropicMessagesBackend:
                 **self._tools[-1],
                 "cache_control": {"type": "ephemeral", "ttl": "1h"},
             }
+        # The "terminal tool" is special: it is offered to the model only while
+        # a particular flow is active (CompleteOnboarding during first-time
+        # onboarding; SubmitResult for the whole life of a background-agent run
+        # — see set_terminal_tool_active). It is deliberately NOT part of
+        # self._tools / the cached prefix — _tools_for_turn appends it AFTER the
+        # cache breakpoint, so toggling it never invalidates the cached prefix.
+        # Accepts a schema *path* (loaded here) or a pre-built raw schema dict
+        # (e.g. a per-agent SubmitResult whose `result` shape varies by task).
+        if terminal_tool_schema is None:
+            self._terminal_tool = None
+        elif isinstance(terminal_tool_schema, str):
+            self._terminal_tool = self._load_schema(terminal_tool_schema)
+        else:
+            self._terminal_tool = self._schema_to_tool(terminal_tool_schema)
+        self._terminal_tool_active = False
+        # When False, _persist() is a no-op: the conversation lives only in
+        # memory for the life of the process. Background-agent runs use this so
+        # they never litter the user's saved-conversation list; their audit
+        # trail is the separate run record (see aime.agents.store).
+        self._persist_enabled = persist_enabled
         # Per-session dynamic context (e.g. bootstrapped topic contents). Lives
         # in the system array rather than the message history so it stays out
         # of compaction and doesn't get replayed inside user turns.
@@ -330,6 +428,41 @@ class AnthropicMessagesBackend:
         self._persist_lock = threading.Lock()
 
     # --- AgentBackend interface ---
+
+    @property
+    def session_id(self) -> str | None:
+        """The on-disk name of the active conversation file, or None before a
+        session is opened. Read by the controller so sub-agent usage (e.g. the
+        web-search Haiku call) can be attributed to the same conversation."""
+        return self._session_id
+
+    @property
+    def conversations_dir(self) -> str:
+        """Per-user directory where this backend's encrypted conversation files
+        live. Also the natural home for small per-user state files (e.g. the
+        onboarding-complete flag)."""
+        return self._conversations_dir
+
+    def set_terminal_tool_active(self, active: bool) -> None:
+        """Offer (or withdraw) the configured terminal tool to the model.
+
+        For the interactive backend this is CompleteOnboarding: the controller
+        turns it on while first-time onboarding is in flight and off once the
+        model has called it (or on reset/load). For a background-agent backend
+        it is SubmitResult, turned on for the whole run. No-op if no terminal
+        tool schema was configured."""
+        with self._lock:
+            self._terminal_tool_active = bool(active) and self._terminal_tool is not None
+
+    def _tools_for_turn(self) -> list[dict]:
+        """The cached base tools, plus the terminal tool appended after the
+        cache breakpoint while it is active. Appending (rather than rebuilding)
+        keeps the cached tool prefix byte-stable."""
+        with self._lock:
+            active = self._terminal_tool_active
+        if active and self._terminal_tool is not None:
+            return [*self._tools, self._terminal_tool]
+        return self._tools
 
     def set_session_context(self, text: str) -> None:
         """Attach session-scoped context (e.g. bootstrapped topic contents) as
@@ -491,7 +624,7 @@ class AnthropicMessagesBackend:
         return sessions
 
     def _persist(self) -> None:
-        if not self._session_id:
+        if not self._session_id or not self._persist_enabled:
             return
         # Hold _persist_lock across the snapshot *and* the file write, so a
         # slow writer can't os.replace() a stale snapshot over a newer one
@@ -985,11 +1118,12 @@ class AnthropicMessagesBackend:
         with self._client.messages.stream(
             model=turn_model,
             system=self._build_system(),
-            tools=self._tools,
+            tools=self._tools_for_turn(),
             messages=self._cacheable_messages(messages_snapshot),
             max_tokens=self._max_tokens,
         ) as stream:
             current_text: list[str] = []
+            text_stripper = _ClockTagStripper()
             current_tool: dict | None = None
             partial_json = ""
 
@@ -1043,12 +1177,15 @@ class AnthropicMessagesBackend:
                         )
                     elif block.type == "text":
                         current_text = []
+                        text_stripper = _ClockTagStripper()
                 elif etype == "content_block_delta":
                     delta = event.delta
                     dtype = getattr(delta, "type", None)
                     if dtype == "text_delta":
-                        current_text.append(delta.text)
-                        yield BackendEvent(kind="assistant_text_delta", text=delta.text)
+                        clean = text_stripper.feed(delta.text)
+                        if clean:
+                            current_text.append(clean)
+                            yield BackendEvent(kind="assistant_text_delta", text=clean)
                     elif dtype == "input_json_delta":
                         partial_json += delta.partial_json
                 elif etype == "content_block_stop":
@@ -1083,12 +1220,17 @@ class AnthropicMessagesBackend:
                         )
                         current_tool = None
                         partial_json = ""
-                    elif current_text:
-                        text = "".join(current_text)
-                        with self._lock:
-                            assistant_blocks.append({"type": "text", "text": text})
-                        yield BackendEvent(kind="assistant_text_end", text=text)
-                        current_text = []
+                    else:
+                        tail = text_stripper.flush()
+                        if tail:
+                            current_text.append(tail)
+                            yield BackendEvent(kind="assistant_text_delta", text=tail)
+                        if current_text:
+                            text = "".join(current_text)
+                            with self._lock:
+                                assistant_blocks.append({"type": "text", "text": text})
+                            yield BackendEvent(kind="assistant_text_end", text=text)
+                            current_text = []
 
             if self._interrupted.is_set():
                 # Mid-stream interrupt. Leave _messages in a state that's
@@ -1545,7 +1687,14 @@ class AnthropicMessagesBackend:
 
     def _load_schema(self, schema_path: str) -> dict:
         with open(schema_path, "r") as f:
-            schema = json.load(f)
+            return self._schema_to_tool(json.load(f))
+
+    @staticmethod
+    def _schema_to_tool(schema: dict) -> dict:
+        """Translate a JSON-schema tool definition ({title, description, type,
+        properties, [required]}) into the Anthropic tool shape ({name,
+        description, input_schema}). Shared by the file loader and by callers
+        that build a schema in memory (e.g. a per-agent SubmitResult)."""
         input_schema = {"type": schema["type"], "properties": schema["properties"]}
         if "required" in schema:
             input_schema["required"] = schema["required"]

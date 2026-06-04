@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cctype>
 #include <mutex>
+#include <set>
 #include <unordered_map>
 
 #include "../include/crow_all.h"
@@ -48,6 +49,13 @@ struct CalenderEvent {
     std::string eventDate;  // DD/MM/YYYY
     std::string eventTime;  // HH:MM
     bool eventArchived = false;
+    // Commitment-tracking metadata (all additive; older rows default to these).
+    std::string commitmentId;                 // stable slug linking recurring instances
+    std::string status = "scheduled";         // scheduled / completed / canceled / unknown (unknown is system-set)
+    std::string statusChangeReason;           // why the status is what it is (most often a cancel reason)
+    std::string rescheduledFrom;              // original DD/MM/YYYY if moved
+    std::string createdAt;                    // ISO timestamp, server-stamped on create
+    std::string lastModifiedAt;               // ISO timestamp, server-stamped on every write
 };
 
 struct Date {
@@ -136,7 +144,15 @@ void createCalender(sqlite3* database) {
         "EVENT_CATEGORY TEXT NOT NULL,"
         "EVENT_DATE TEXT NOT NULL,"
         "EVENT_TIME TEXT NOT NULL,"
-        "EVENT_ARCHIVED TEXT NOT NULL"
+        "EVENT_ARCHIVED TEXT NOT NULL,"
+        // Commitment-tracking columns. Keep this order in sync with rowToEvent's
+        // positional reads (indices 7-12) and with the migration ALTERs below.
+        "EVENT_COMMITMENT_ID TEXT NOT NULL DEFAULT '',"
+        "EVENT_STATUS TEXT NOT NULL DEFAULT 'scheduled',"
+        "EVENT_STATUS_CHANGE_REASON TEXT NOT NULL DEFAULT '',"
+        "EVENT_RESCHEDULED_FROM TEXT NOT NULL DEFAULT '',"
+        "EVENT_CREATED_AT TEXT NOT NULL DEFAULT '',"
+        "EVENT_LAST_MODIFIED_AT TEXT NOT NULL DEFAULT ''"
         ")";
 
     int result = sqlite3_exec(database, sqlCommand.c_str(), NULL, 0, &errMsg);
@@ -144,6 +160,83 @@ void createCalender(sqlite3* database) {
         std::cout << "Note: createCalender — " << errMsg << std::endl;
     } else {
         std::cout << "Created calender!" << std::endl;
+    }
+
+    // Migration: older databases pre-date the commitment-tracking columns. Add
+    // any that are missing so existing user data keeps working untouched — each
+    // ADD COLUMN backfills existing rows with its DEFAULT, never overwrites them.
+    // Order matters: it must match createCalender's DDL and rowToEvent's reads.
+    struct ColumnDef { const char* name; const char* ddl; };
+    const ColumnDef newColumns[] = {
+        {"EVENT_COMMITMENT_ID",    "EVENT_COMMITMENT_ID TEXT NOT NULL DEFAULT ''"},
+        {"EVENT_STATUS",                "EVENT_STATUS TEXT NOT NULL DEFAULT 'scheduled'"},
+        {"EVENT_STATUS_CHANGE_REASON",  "EVENT_STATUS_CHANGE_REASON TEXT NOT NULL DEFAULT ''"},
+        {"EVENT_RESCHEDULED_FROM",      "EVENT_RESCHEDULED_FROM TEXT NOT NULL DEFAULT ''"},
+        {"EVENT_CREATED_AT",       "EVENT_CREATED_AT TEXT NOT NULL DEFAULT ''"},
+        {"EVENT_LAST_MODIFIED_AT", "EVENT_LAST_MODIFIED_AT TEXT NOT NULL DEFAULT ''"},
+    };
+
+    std::set<std::string> existingColumns;
+    sqlite3_stmt* infoStmt;
+    if (sqlite3_prepare_v2(database, "PRAGMA table_info(EVENT)", -1, &infoStmt, nullptr) == SQLITE_OK) {
+        while (sqlite3_step(infoStmt) == SQLITE_ROW) {
+            const unsigned char* col = sqlite3_column_text(infoStmt, 1);
+            if (col) existingColumns.insert(reinterpret_cast<const char*>(col));
+        }
+        sqlite3_finalize(infoStmt);
+    }
+
+    // Rename migration: EVENT_CANCEL_REASON became EVENT_STATUS_CHANGE_REASON.
+    // It's the same data — a cancel reason is just one kind of status-change
+    // reason — so rename the column in place to carry existing values over,
+    // rather than letting the add-column loop below create a fresh empty one
+    // (which would orphan the old data). Brand-new DBs already have the new
+    // name from createCalender's DDL and skip this. RENAME COLUMN preserves the
+    // column's ordinal position, so rowToEvent's positional reads stay valid.
+    if (existingColumns.count("EVENT_CANCEL_REASON") &&
+        !existingColumns.count("EVENT_STATUS_CHANGE_REASON")) {
+        const char* rename =
+            "ALTER TABLE EVENT RENAME COLUMN EVENT_CANCEL_REASON TO EVENT_STATUS_CHANGE_REASON";
+        char* renameErr = nullptr;
+        if (sqlite3_exec(database, rename, NULL, 0, &renameErr) == SQLITE_OK) {
+            std::cout << "Renamed EVENT_CANCEL_REASON to EVENT_STATUS_CHANGE_REASON." << std::endl;
+            existingColumns.erase("EVENT_CANCEL_REASON");
+            existingColumns.insert("EVENT_STATUS_CHANGE_REASON");
+        } else if (renameErr) {
+            std::cout << "Note: EVENT_STATUS_CHANGE_REASON rename — " << renameErr << std::endl;
+            sqlite3_free(renameErr);
+        }
+    }
+
+    for (const auto& column : newColumns) {
+        if (existingColumns.count(column.name)) continue;
+        std::string alter = std::string("ALTER TABLE EVENT ADD COLUMN ") + column.ddl;
+        char* alterErr = nullptr;
+        if (sqlite3_exec(database, alter.c_str(), NULL, 0, &alterErr) == SQLITE_OK) {
+            std::cout << "Added " << column.name << " column to existing EVENT table." << std::endl;
+        } else if (alterErr) {
+            std::cout << "Note: " << column.name << " migration — " << alterErr << std::endl;
+            sqlite3_free(alterErr);
+        }
+    }
+
+    // Status migration: 'rescheduled' was retired as a status. A moved event is
+    // just 'scheduled' again at its new date (the move is recorded in
+    // EVENT_RESCHEDULED_FROM), so fold any legacy 'rescheduled' rows back to
+    // 'scheduled'. Idempotent — once converted there's nothing left to match.
+    {
+        const char* fold =
+            "UPDATE EVENT SET EVENT_STATUS='scheduled' WHERE EVENT_STATUS='rescheduled'";
+        char* foldErr = nullptr;
+        if (sqlite3_exec(database, fold, NULL, 0, &foldErr) == SQLITE_OK) {
+            const int changed = sqlite3_changes(database);
+            if (changed > 0)
+                std::cout << "Migrated " << changed
+                          << " 'rescheduled' event(s) back to 'scheduled'." << std::endl;
+        } else if (foldErr) {
+            std::cout << "Note: rescheduled→scheduled migration — " << foldErr << std::endl;
+            sqlite3_free(foldErr);
+        }
     }
 }
 
@@ -206,6 +299,13 @@ static std::string sanitizeFileName(const std::string& input) {
     return result;
 }
 
+// Reads a TEXT column, returning "" for SQL NULL instead of dereferencing a
+// null pointer (older rows may predate a column before its migration runs).
+static std::string columnTextOrEmpty(sqlite3_stmt* stmt, int index) {
+    const unsigned char* text = sqlite3_column_text(stmt, index);
+    return text ? reinterpret_cast<const char*>(text) : "";
+}
+
 static CalenderEvent rowToEvent(sqlite3_stmt* stmt) {
     CalenderEvent event;
     event.id           = sqlite3_column_int(stmt, 0);
@@ -216,6 +316,14 @@ static CalenderEvent rowToEvent(sqlite3_stmt* stmt) {
     event.eventTime    = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 5));
     std::string archived = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 6));
     event.eventArchived = (archived == "TRUE");
+    // Commitment-tracking columns (indices match createCalender's DDL order).
+    event.commitmentId    = columnTextOrEmpty(stmt, 7);
+    std::string status    = columnTextOrEmpty(stmt, 8);
+    if (!status.empty()) event.status = status;  // keep the "scheduled" default if blank
+    event.statusChangeReason = columnTextOrEmpty(stmt, 9);
+    event.rescheduledFrom = columnTextOrEmpty(stmt, 10);
+    event.createdAt       = columnTextOrEmpty(stmt, 11);
+    event.lastModifiedAt  = columnTextOrEmpty(stmt, 12);
     return event;
 }
 
@@ -248,22 +356,128 @@ static bool timeInRange(const Time& t, const Time& start, const Time& end) {
 
 // ─── CRUD ─────────────────────────────────────────────────────────────────────
 
+// Current UTC time as an ISO-8601 string (e.g. "2026-06-01T14:30:00Z"). Used to
+// stamp created_at / last_modified_at server-side so clients can't skew them.
+static std::string isoTimestampNow() {
+    std::time_t now = std::time(nullptr);
+    std::tm utc{};
+#if defined(_WIN32)
+    gmtime_s(&utc, &now);
+#else
+    gmtime_r(&now, &utc);
+#endif
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &utc);
+    return buf;
+}
+
+// The only lifecycle states an event may hold. `unknown` is included because
+// it's a legitimate stored value (the system sets it) and clients may echo it
+// back on an unrelated edit — but it's not something a client should set fresh;
+// that's enforced by guidance, not here. Anything outside this set is a bug
+// (a typo or a synonym like "done") and is rejected so it can't silently split
+// the data the pattern tools aggregate on.
+static bool isValidStatus(const std::string& status) {
+    return status == "scheduled" || status == "completed" ||
+           status == "canceled"  || status == "unknown";
+}
+
+// Sweep still-`scheduled` events whose moment has passed over to `unknown`.
+//
+// A `scheduled` event the user never resolved doesn't mean it didn't happen —
+// it means we don't *know*. Leaving it `scheduled` forever is misleading (it
+// reads as still-upcoming) and quietly corrupts streaks, so once its time is
+// past we flip it to `unknown`, which is an honest "needs a human to say."
+// Only `scheduled` is touched — completed / canceled are real outcomes and
+// stay put; an already-`unknown` event past won't re-match either.
+//
+// `nowDate`/`nowTime` come from the caller in the *user's* local time (the C++
+// side only knows UTC), so the boundary matches what the user sees as "now".
+// All-day events (blank time) only flip once their whole day has elapsed;
+// timed events flip the minute they're past. last_modified is intentionally
+// left untouched: this is a system reconciliation, not a user edit, and
+// bumping it would spam the frontend's "edited since you last looked" tagging.
+static void reconcileStalePastEvents(sqlite3* database,
+                                     const std::string& nowDate,
+                                     const std::string& nowTime) {
+    if (nowDate.empty()) return;  // no trustworthy "now" → don't guess
+    const int nowDatePacked = packDate(parseDate(nowDate));
+    const int nowTimePacked = packTime(parseTime(nowTime));
+
+    std::vector<int> staleIds;
+    sqlite3_stmt* sel = nullptr;
+    const std::string selSql =
+        "SELECT ID, EVENT_DATE, EVENT_TIME FROM EVENT "
+        "WHERE EVENT_STATUS='scheduled' AND EVENT_ARCHIVED='FALSE'";
+    if (sqlite3_prepare_v2(database, selSql.c_str(), -1, &sel, nullptr) != SQLITE_OK) {
+        std::cout << "reconcileStalePastEvents select failed: "
+                  << sqlite3_errmsg(database) << std::endl;
+        return;
+    }
+    while (sqlite3_step(sel) == SQLITE_ROW) {
+        const int id = sqlite3_column_int(sel, 0);
+        const std::string dateStr = columnTextOrEmpty(sel, 1);
+        const std::string timeStr = columnTextOrEmpty(sel, 2);
+        const int datePacked = packDate(parseDate(dateStr));
+
+        bool isPast;
+        if (timeStr.empty()) {
+            // All-day: past only once the whole day is behind us.
+            isPast = datePacked < nowDatePacked;
+        } else {
+            isPast = datePacked < nowDatePacked ||
+                     (datePacked == nowDatePacked &&
+                      packTime(parseTime(timeStr)) < nowTimePacked);
+        }
+        if (isPast) staleIds.push_back(id);
+    }
+    sqlite3_finalize(sel);
+    if (staleIds.empty()) return;
+
+    sqlite3_stmt* upd = nullptr;
+    const std::string updSql = "UPDATE EVENT SET EVENT_STATUS='unknown' WHERE ID=?";
+    if (sqlite3_prepare_v2(database, updSql.c_str(), -1, &upd, nullptr) != SQLITE_OK) {
+        std::cout << "reconcileStalePastEvents update failed: "
+                  << sqlite3_errmsg(database) << std::endl;
+        return;
+    }
+    for (const int id : staleIds) {
+        sqlite3_bind_int(upd, 1, id);
+        sqlite3_step(upd);
+        sqlite3_reset(upd);
+    }
+    sqlite3_finalize(upd);
+}
+
 void addEvent(sqlite3* database, CalenderEvent& event) {
     sqlite3_stmt* stmt;
     const std::string sql =
-        "INSERT INTO EVENT(EVENT_TITLE, EVENT_SUMMARY, EVENT_CATEGORY, EVENT_DATE, EVENT_TIME, EVENT_ARCHIVED)"
-        " VALUES(?, ?, ?, ?, ?, 'FALSE')";
+        "INSERT INTO EVENT(EVENT_TITLE, EVENT_SUMMARY, EVENT_CATEGORY, EVENT_DATE, EVENT_TIME, EVENT_ARCHIVED,"
+        " EVENT_COMMITMENT_ID, EVENT_STATUS, EVENT_STATUS_CHANGE_REASON, EVENT_RESCHEDULED_FROM,"
+        " EVENT_CREATED_AT, EVENT_LAST_MODIFIED_AT)"
+        " VALUES(?, ?, ?, ?, ?, 'FALSE', ?, ?, ?, ?, ?, ?)";
 
     if (sqlite3_prepare_v2(database, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
         std::cout << "addEvent prepare failed: " << sqlite3_errmsg(database) << std::endl;
         return;
     }
 
-    sqlite3_bind_text(stmt, 1, event.eventTitle.c_str(),    -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 2, event.eventSummary.c_str(),  -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 3, event.eventCategory.c_str(), -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 4, event.eventDate.c_str(),     -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 5, event.eventTime.c_str(),     -1, SQLITE_STATIC);
+    const std::string now = isoTimestampNow();
+    event.createdAt = now;
+    event.lastModifiedAt = now;
+    const std::string status = event.status.empty() ? "scheduled" : event.status;
+
+    sqlite3_bind_text(stmt, 1, event.eventTitle.c_str(),     -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, event.eventSummary.c_str(),   -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 3, event.eventCategory.c_str(),  -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 4, event.eventDate.c_str(),      -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 5, event.eventTime.c_str(),      -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 6, event.commitmentId.c_str(),   -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 7, status.c_str(),               -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 8, event.statusChangeReason.c_str(), -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 9, event.rescheduledFrom.c_str(),-1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 10, event.createdAt.c_str(),     -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 11, event.lastModifiedAt.c_str(),-1, SQLITE_STATIC);
 
     if (sqlite3_step(stmt) != SQLITE_DONE) {
         std::cout << "addEvent failed: " << sqlite3_errmsg(database) << std::endl;
@@ -295,11 +509,14 @@ CalenderEvent getEvent(sqlite3* database, int eventID) {
     return event;
 }
 
-// Updates all fields except ID and archived status.
+// Updates all fields except ID and archived status. created_at is preserved;
+// last_modified_at is re-stamped server-side on every write.
 void updateEvent(sqlite3* database, const CalenderEvent& event) {
     sqlite3_stmt* stmt;
     const std::string sql =
-        "UPDATE EVENT SET EVENT_TITLE=?, EVENT_SUMMARY=?, EVENT_CATEGORY=?, EVENT_DATE=?, EVENT_TIME=?"
+        "UPDATE EVENT SET EVENT_TITLE=?, EVENT_SUMMARY=?, EVENT_CATEGORY=?, EVENT_DATE=?, EVENT_TIME=?,"
+        " EVENT_COMMITMENT_ID=?, EVENT_STATUS=?, EVENT_STATUS_CHANGE_REASON=?, EVENT_RESCHEDULED_FROM=?,"
+        " EVENT_LAST_MODIFIED_AT=?"
         " WHERE ID=?";
 
     if (sqlite3_prepare_v2(database, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
@@ -307,12 +524,20 @@ void updateEvent(sqlite3* database, const CalenderEvent& event) {
         return;
     }
 
-    sqlite3_bind_text(stmt, 1, event.eventTitle.c_str(),    -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 2, event.eventSummary.c_str(),  -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 3, event.eventCategory.c_str(), -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 4, event.eventDate.c_str(),     -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 5, event.eventTime.c_str(),     -1, SQLITE_STATIC);
-    sqlite3_bind_int (stmt, 6, event.id);
+    const std::string now = isoTimestampNow();
+    const std::string status = event.status.empty() ? "scheduled" : event.status;
+
+    sqlite3_bind_text(stmt, 1, event.eventTitle.c_str(),     -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, event.eventSummary.c_str(),   -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 3, event.eventCategory.c_str(),  -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 4, event.eventDate.c_str(),      -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 5, event.eventTime.c_str(),      -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 6, event.commitmentId.c_str(),   -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 7, status.c_str(),               -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 8, event.statusChangeReason.c_str(), -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 9, event.rescheduledFrom.c_str(),-1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 10, now.c_str(),                 -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int (stmt, 11, event.id);
 
     if (sqlite3_step(stmt) != SQLITE_DONE) {
         std::cout << "updateEvent failed: " << sqlite3_errmsg(database) << std::endl;
@@ -373,9 +598,10 @@ std::vector<CalenderEvent> filterEvents(sqlite3* database, const FilterOptions& 
         conditions.push_back("EVENT_ARCHIVED = 'TRUE'");
     }
 
-    // Single category
+    // Single category — COLLATE NOCASE so category names match regardless of
+    // case (ASCII), the same case-insensitivity the keyword LIKE below gets.
     if (!opts.category.empty()) {
-        conditions.push_back("EVENT_CATEGORY = ?");
+        conditions.push_back("EVENT_CATEGORY = ? COLLATE NOCASE");
         params.push_back(opts.category);
     } else if (!opts.categories.empty()) {
         // Multi-category OR
@@ -384,7 +610,7 @@ std::vector<CalenderEvent> filterEvents(sqlite3* database, const FilterOptions& 
             inClause += (i == 0 ? "?" : ",?");
             params.push_back(opts.categories[i]);
         }
-        inClause += ")";
+        inClause += ") COLLATE NOCASE";
         conditions.push_back(inClause);
     }
 
@@ -765,8 +991,10 @@ std::vector<Topic> filterTopics(sqlite3* database, const TopicFilterOptions& opt
     std::vector<std::string> conditions;
     std::vector<std::string> params;
 
+    // Category match is case-insensitive (ASCII) via COLLATE NOCASE, mirroring
+    // the event filter.
     if (!opts.category.empty()) {
-        conditions.push_back("TOPIC_CATEGORY = ?");
+        conditions.push_back("TOPIC_CATEGORY = ? COLLATE NOCASE");
         params.push_back(opts.category);
     } else if (!opts.categories.empty()) {
         std::string inClause = "TOPIC_CATEGORY IN (";
@@ -774,7 +1002,7 @@ std::vector<Topic> filterTopics(sqlite3* database, const TopicFilterOptions& opt
             inClause += (i == 0 ? "?" : ",?");
             params.push_back(opts.categories[i]);
         }
-        inClause += ")";
+        inClause += ") COLLATE NOCASE";
         conditions.push_back(inClause);
     }
 
@@ -851,6 +1079,12 @@ static crow::json::wvalue eventToJson(const CalenderEvent& e) {
     j["date"]     = e.eventDate;
     j["time"]     = e.eventTime;
     j["archived"] = e.eventArchived;
+    j["commitment_id"]    = e.commitmentId;
+    j["status"]           = e.status.empty() ? "scheduled" : e.status;
+    j["status_change_reason"] = e.statusChangeReason;
+    j["rescheduled_from"] = e.rescheduledFrom;
+    j["created_at"]       = e.createdAt;
+    j["last_modified_at"] = e.lastModifiedAt;
     return j;
 }
 
@@ -907,8 +1141,13 @@ static FilterOptions parseFilterOptions(const crow::json::rvalue& j) {
     return opts;
 }
 
-static CalenderEvent parseEditEvent(const crow::json::rvalue& j) {
-    CalenderEvent event;
+// Parses an event from a create/replace request. `base` is the starting record:
+// fields absent from the JSON keep their base value. On an edit, pass the existing
+// event as base so omitting the optional commitment fields preserves them rather
+// than resetting them to defaults; on create, the default-constructed base applies.
+static CalenderEvent parseEditEvent(const crow::json::rvalue& j,
+                                    const CalenderEvent& base = CalenderEvent()) {
+    CalenderEvent event = base;
     if (j.has("id"))       event.id            = static_cast<int>(j["id"].i());
     if (j.has("title"))    event.eventTitle    = std::string(j["title"].s());
     if (j.has("summary"))  event.eventSummary  = std::string(j["summary"].s());
@@ -916,6 +1155,10 @@ static CalenderEvent parseEditEvent(const crow::json::rvalue& j) {
     if (j.has("date"))     event.eventDate     = std::string(j["date"].s());
     if (j.has("time"))     event.eventTime     = std::string(j["time"].s());
     if (j.has("archived")) event.eventArchived = j["archived"].b();
+    if (j.has("commitment_id"))    event.commitmentId    = std::string(j["commitment_id"].s());
+    if (j.has("status"))           event.status          = std::string(j["status"].s());
+    if (j.has("status_change_reason")) event.statusChangeReason = std::string(j["status_change_reason"].s());
+    if (j.has("rescheduled_from")) event.rescheduledFrom = std::string(j["rescheduled_from"].s());
     return event;
 }
 
@@ -1167,6 +1410,17 @@ int main(int argc, char* argv[]) {
         sqlite3* database = getUserDb(user_id);
 
         if (jsonData["tool_name"] == "get_events") {
+            // Reconcile stale past events before reading so every surface
+            // (calendar, model, pattern tools) sees a coherent, up-to-date
+            // store. `now_*` arrive in the user's local time; absent them we
+            // skip rather than guess with the server's UTC clock.
+            if (jsonData.has("now_date")) {
+                reconcileStalePastEvents(
+                    database,
+                    std::string(jsonData["now_date"].s()),
+                    jsonData.has("now_time") ? std::string(jsonData["now_time"].s())
+                                             : std::string());
+            }
             FilterOptions opts = parseFilterOptions(jsonData);
             std::vector<CalenderEvent> events = filterEvents(database, opts);
 
@@ -1183,17 +1437,30 @@ int main(int argc, char* argv[]) {
                 !jsonData.has("archived")) {
                 return crow::response(400, "replace_event missing required fields");
             }
+            if (jsonData.has("status")) {
+                std::string st = std::string(jsonData["status"].s());
+                if (!st.empty() && !isValidStatus(st)) {
+                    return crow::response(400,
+                        "Invalid status \"" + st + "\". Valid statuses: "
+                        "scheduled, completed, canceled. ('unknown' is set "
+                        "automatically by the system for elapsed events — "
+                        "don't set it yourself.)");
+                }
+            }
 
-            CalenderEvent event = parseEditEvent(jsonData);
-
-            CalenderEvent existing = getEvent(database, event.id);
+            int editId = static_cast<int>(jsonData["id"].i());
+            CalenderEvent existing = getEvent(database, editId);
             if (existing.id == -1) {
                 crow::json::wvalue response;
                 response["ok"] = false;
                 response["error"] = "Event not found. Use create_event to add a new event.";
-                response["id"] = event.id;
+                response["id"] = editId;
                 return crow::response(404, response);
             }
+
+            // Merge onto the existing record so omitted optional fields (notably
+            // the commitment-tracking ones) are preserved rather than reset.
+            CalenderEvent event = parseEditEvent(jsonData, existing);
 
             updateEvent(database, event);
             if (event.eventArchived)
@@ -1210,6 +1477,16 @@ int main(int argc, char* argv[]) {
                 !jsonData.has("category") || !jsonData.has("date") ||
                 !jsonData.has("archived")) {
                 return crow::response(400, "create_event missing required fields");
+            }
+            if (jsonData.has("status")) {
+                std::string st = std::string(jsonData["status"].s());
+                if (!st.empty() && !isValidStatus(st)) {
+                    return crow::response(400,
+                        "Invalid status \"" + st + "\". Valid statuses: "
+                        "scheduled, completed, canceled. ('unknown' is set "
+                        "automatically by the system for elapsed events — "
+                        "don't set it yourself.)");
+                }
             }
 
             CalenderEvent event = parseEditEvent(jsonData);

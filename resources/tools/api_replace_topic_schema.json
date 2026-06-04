@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "ReplaceTopic",
-  "description": "Submit topic body for POST /api. Replaces the topic metadata. Does NOT replace the topic contents or .md file.",
+  "description": "Replace a topic's metadata. Does NOT touch its contents/.md file.",
   "type": "object",
   "additionalProperties": false,
   "required": ["id", "summary", "category"],
@@ -9,20 +9,20 @@
     "id": {
       "type": "integer",
       "minimum": 0,
-      "description": "The ID of the topic to replace."
+      "description": "ID of the topic to update."
     },
     "summary": {
       "type": "string",
-      "description": "A brief summary including keywords that make it easy to find later, but not take up too much context."
+      "description": "Brief, keyword-rich summary for later lookup; keep it short."
     },
     "category": {
       "type": "string",
-      "description": "A category to help organize and identify topics. Please attempt to use categories that are already being used by other topics and only use a new category if you think it is needed."
+      "description": "Category; reuse an existing one where possible."
     },
     "folder": {
       "type": "string",
       "maxLength": 32,
-      "description": "Optional folder name this topic belongs to. Omit to leave the topic's current folder unchanged. Pass an empty string to move it back to the root. Matching is case-insensitive: passing a case-variant of an existing folder ('work' vs 'Work') files into that folder. To rename a folder across many topics at once, use RenameFolder instead. Max 32 bytes; control characters and U+FFFD are rejected."
+      "description": "Optional folder (see the system prompt's Folders rules). Omit = leave unchanged; empty string = move to root. To rename a folder across topics, use RenameFolder. Max 32 bytes."
     }
   }
 }

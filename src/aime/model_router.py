@@ -6,8 +6,11 @@ X?", "what's in topic Y?"); Sonnet handles anything that creates or edits
 state (events, topics, folders, contents) or that needs multi-step reasoning.
 
 Design constraints (set by the operator, not the model):
-  * False-cheap is worse than false-expensive — if the classifier is at all
-    unsure, route to Sonnet.
+  * Lean toward Haiku on read-only turns. The bright line is mutation:
+    anything that creates/edits/deletes/moves state, does real multi-step
+    planning, or writes prose goes to Sonnet. Pure lookups go to Haiku, and
+    a read-only turn that needs only light reasoning over a few items can go
+    to Haiku too. Reserve Sonnet for mutation, genuine planning, and prose.
   * Continuation turns inside a tool loop stay on the model that started the
     turn. Downgrading mid-loop strands tool_use blocks the cheap model didn't
     plan for, and prompt-cache reads change rate.
@@ -29,15 +32,19 @@ _CLASSIFIER_SYSTEM = (
     "into folders). Read the user's latest message and decide whether the "
     "next assistant turn is EASY or HARD. Output exactly one token: EASY or "
     "HARD. Nothing else.\n\n"
-    "EASY — route to a cheaper, smaller model. Use ONLY when the request is "
-    "a pure read-only lookup that can be answered by fetching data and "
-    "reading it back, with NO mutation, planning, or reasoning across many "
-    "items. EASY cases include:\n"
+    "EASY — route to a cheaper, smaller model. Use whenever the request is "
+    "read-only — answerable by fetching data and reading it back — with NO "
+    "mutation, no real multi-step planning, and no prose writing. Light "
+    "reasoning over a handful of items is fine and still EASY. EASY cases "
+    "include:\n"
     "  - \"what do I have this week / today / on Friday?\"\n"
     "  - \"when is <event>?\" / \"do I have anything tomorrow morning?\"\n"
     "  - \"what's in our <topic> topic?\" / \"what does my About Me say?\"\n"
     "  - listing folders, listing topics, listing events in a date range\n"
     "  - short factual recall from already-fetched context\n"
+    "  - a quick availability check that only scans a day or two "
+    "(\"do I have time for lunch tomorrow?\")\n"
+    "  - a brief recap of context already in the conversation\n"
     "  - greetings, thanks, yes/no acknowledgements with no follow-up action\n"
     "  - casual chat with no action required\n\n"
     "HARD — route to the stronger model. Use for ANYTHING that might:\n"
@@ -124,13 +131,16 @@ _CLASSIFIER_SYSTEM = (
     "  - If the sentence is a wh- question (what / when / where / who / "
     "which / how many) and asks about ONE specific item or a single-day / "
     "single-folder listing → almost always EASY.\n"
-    "  - If the sentence asks for a recommendation, plan, summary, draft, "
-    "or comparison → HARD.\n"
-    "  - If you are uncertain, output HARD.\n\n"
-    "Decision rule: when in doubt, output HARD. False-cheap (HARD turns "
-    "routed EASY) is worse than false-expensive (EASY turns routed HARD). "
-    "Output exactly one token: EASY or HARD. Do not output any other text, "
-    "punctuation, or explanation."
+    "  - If the sentence asks for a multi-step plan, draft/prose, or a "
+    "synthesis across many items → HARD.\n"
+    "  - If you are uncertain whether the turn mutates state, output HARD. "
+    "If you are confident it is read-only but unsure how much reasoning it "
+    "needs, prefer EASY.\n\n"
+    "Decision rule: the bright line is mutation. Mutating, real multi-step "
+    "planning, and prose writing are HARD; everything else — lookups and "
+    "read-only turns that need only light reasoning — is EASY. Lean EASY on "
+    "read-only turns. Output exactly one token: EASY or HARD. Do not output "
+    "any other text, punctuation, or explanation."
 )
 
 

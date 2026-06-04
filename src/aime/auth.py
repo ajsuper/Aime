@@ -98,6 +98,10 @@ class UserRecord:
     api_access: bool = True
     deleted_at: str | None = None
     email: str | None = None
+    # Opaque destination for outbound messages (see aime.messaging): a Telegram
+    # chat id today, a phone number once an SMS channel lands. NULL = the user
+    # hasn't connected a messaging contact, so proactive messages are skipped.
+    messaging_contact: str | None = None
 
 
 class AuthError(Exception):
@@ -384,6 +388,17 @@ class LocalAuthBackend:
                 )
             # END email MIGRATION
 
+            # messaging_contact MIGRATION — added with the outbound-messaging
+            # feature (aime.messaging). NULL means the account has no messaging
+            # destination connected yet. Channel-agnostic on purpose: holds a
+            # Telegram chat id now, a phone number under a future SMS channel.
+            # Dropping the feature is just dropping this column + its setter.
+            if "messaging_contact" not in existing_cols:
+                self._conn.execute(
+                    "ALTER TABLE users ADD COLUMN messaging_contact TEXT"
+                )
+            # END messaging_contact MIGRATION
+
             # Pending email-verification rows. Used for two flows:
             #   purpose='signup'    — username/password are being held until
             #                         the 6-digit code mailed to `email` is
@@ -471,7 +486,7 @@ class LocalAuthBackend:
         with self._lock:
             row = self._conn.execute(
                 "SELECT id, username, password_hash, salt_dek, wrapped_dek_v2, "
-                "enc_version, api_access, deleted_at, email "
+                "enc_version, api_access, deleted_at, email, messaging_contact "
                 "FROM users WHERE username = ?",
                 (username,),
             ).fetchone()
@@ -487,7 +502,7 @@ class LocalAuthBackend:
             raise InvalidCredentials("invalid username or password")
 
         (user_id, stored_username, pw_hash, salt_dek, wrapped_dek_v2,
-         enc_version, api_access, deleted_at, email) = row
+         enc_version, api_access, deleted_at, email, messaging_contact) = row
         try:
             self._hasher.verify(pw_hash, password)
         except (VerifyMismatchError, InvalidHashError):
@@ -547,6 +562,7 @@ class LocalAuthBackend:
                 username=stored_username,
                 api_access=bool(api_access),
                 email=email,
+                messaging_contact=messaging_contact,
             ),
             dek,
             was_reinitialized,
@@ -610,16 +626,30 @@ class LocalAuthBackend:
         # to login (where recovery is offered).
         with self._lock:
             row = self._conn.execute(
-                "SELECT id, username, api_access, email FROM users "
-                "WHERE id = ? AND deleted_at IS NULL",
+                "SELECT id, username, api_access, email, messaging_contact "
+                "FROM users WHERE id = ? AND deleted_at IS NULL",
                 (user_id,),
             ).fetchone()
         if row is None:
             return None
         return UserRecord(
             id=row[0], username=row[1],
-            api_access=bool(row[2]), email=row[3],
+            api_access=bool(row[2]), email=row[3], messaging_contact=row[4],
         )
+
+    def set_messaging_contact(self, user_id: int, contact: str | None) -> bool:
+        """Connect (or, with None, clear) the account's outbound-messaging
+        destination — see aime.messaging and UserRecord.messaging_contact.
+        Returns False if there's no matching active account."""
+        normalized = (contact or "").strip() or None
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE users SET messaging_contact = ? "
+                "WHERE id = ? AND deleted_at IS NULL",
+                (normalized, user_id),
+            )
+            self._conn.commit()
+        return cur.rowcount > 0
 
     # ---- Account lifecycle ------------------------------------------------
     #
