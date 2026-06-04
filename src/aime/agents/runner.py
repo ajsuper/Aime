@@ -149,6 +149,10 @@ class BackgroundAgentRunner:
                 tool_version=config.WEB_SEARCH_TOOL_VERSION,
                 usage_label=usage_label,
                 record_api=_usage.record_api,
+                # Attribute this run's offloaded searches to agent usage, so
+                # they land under the Agents tab rather than interactive
+                # web_search. Cost is keyed to the owning user (usage_label).
+                usage_source="agent",
             )
             web_search_schema = config.WEB_SEARCH_SCHEMA
 
@@ -166,6 +170,10 @@ class BackgroundAgentRunner:
             web_search_schema=web_search_schema,
             terminal_tool_schema=spec.submit_result_raw_schema(),
             persist_enabled=False,
+            # Tag every API/tool record from this run as agent-sourced so the
+            # usage dashboard can separate a user's agent cost from their
+            # interactive cost. The owning user comes from usage_label.
+            usage_source="agent",
         )
         backend.new_session()
 

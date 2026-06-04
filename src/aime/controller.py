@@ -121,6 +121,24 @@ _SHAREABLE_TOPIC_TOOLS = frozenset(
     {"GetTopicContents", "ReplaceTopicContents", "EditTopicContents"}
 )
 
+# Other per-topic tools that take an `id` but change a topic's *metadata*
+# (title, folder, …) rather than its contents. A shared-topic recipient may
+# only edit the contents, never the metadata — so a composite "<owner>:<topic>"
+# handle aimed at one of these is refused outright. It must NOT fall through to
+# the local gateway: that would truncate "2:35" at the ":" and silently edit the
+# unrelated own-topic 2. Kept distinct from _SHAREABLE_TOPIC_TOOLS for exactly
+# this reason (these reroute; those refuse).
+_TOPIC_METADATA_TOOLS = frozenset({"ReplaceTopic"})
+
+
+def _is_shared_topic_handle(value) -> bool:
+    """True if `value` is a composite "<owner>:<topic>" shared-topic handle
+    rather than a bare own-topic id. Such a handle must never reach the local
+    gateway, which coerces it to an int and so silently addresses the wrong
+    topic; the only safe destinations are the share bridge (for content tools)
+    or a clean permission-denied error (for everything else)."""
+    return isinstance(value, str) and ":" in value
+
 
 def _normalize_topic_id(tool_input: dict) -> dict:
     """Coerce a bare numeric-string topic id back to an int.
@@ -806,6 +824,16 @@ class ConversationController:
             result = self._record_sync.run_if_shared(tool_name, tool_input)
             if result is None:
                 result = self._tools.execute(tool_name, tool_input)
+        elif (self._record_sync is not None
+              and tool_name in _TOPIC_METADATA_TOOLS
+              and _is_shared_topic_handle((tool_input or {}).get("id"))):
+            # A metadata edit (rename/move) aimed at a shared topic. Recipients
+            # may only touch the contents, so refuse cleanly — and, critically,
+            # never let the composite handle reach the local gateway, where it
+            # would be truncated to a bare id and edit the wrong own-topic.
+            result = {"error": "You can only edit the contents of a shared "
+                               "topic, not its title, folder, or other "
+                               "settings."}
         else:
             result = self._tools.execute(tool_name, tool_input)
         if tool_name == "FilterTopics" and self._record_sync is not None:
