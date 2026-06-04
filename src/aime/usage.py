@@ -104,7 +104,6 @@ def record_api(
     duration_ms: float | None = None,
     routed_decision: str | None = None,
     source: str = "interactive",
-    agent_name: str | None = None,
 ) -> None:
     """Record one Anthropic API call's token usage.
 
@@ -132,13 +131,12 @@ def record_api(
       * ``source``      — "interactive" for a call made on behalf of a live
                           chat session, or "agent" for one made by a headless
                           background-agent run. Lets the dashboard split out
-                          what autonomous agents cost from what users cost
-                          directly. Non-identifying, so recorded whenever stats
-                          are on (unlike user/session_id).
-      * ``agent_name``  — the background agent's spec name (e.g.
-                          "morning-briefing") when ``source`` is "agent", so
-                          cost can be broken down per agent. None for
-                          interactive calls. Also non-identifying.
+                          what a user's autonomous agents cost from what they
+                          cost in live chat. Deliberately a low-cardinality flag
+                          (not an agent name — that would explode across every
+                          user's agents); agent cost is attributed to the
+                          owning ``user``. Non-identifying, so recorded whenever
+                          stats are on (unlike user/session_id).
 
     Cache *writes* are recorded split by TTL — the Anthropic usage object
     carries a nested ``cache_creation`` breakdown, and a 1-hour cache write is
@@ -202,7 +200,6 @@ def record_api(
         # Who drove this call: a live chat ("interactive") or a background
         # agent run ("agent"). Non-identifying, so always stamped.
         "source": source or "interactive",
-        "agent_name": agent_name or None,
     })
     _append(rec)
 
@@ -217,7 +214,6 @@ def record_tool_use(
     web_search_requests: int = 0,
     session_id: str | None = None,
     source: str = "interactive",
-    agent_name: str | None = None,
 ) -> None:
     """Record one tool invocation by the agent.
 
@@ -235,9 +231,9 @@ def record_tool_use(
     so the dashboard can price the result's downstream input-token cost at
     that turn's rate (rather than guessing a default).
 
-    ``source`` / ``agent_name`` carry the same meaning as on ``record_api`` —
-    "interactive" vs a named background-agent run — so tool cost can be
-    attributed to agents alongside their API cost.
+    ``source`` carries the same meaning as on ``record_api`` — "interactive"
+    vs a background-agent run — so a user's agent tool cost can be separated
+    from their live-chat tool cost.
     """
     if not _enabled():
         return
@@ -250,7 +246,6 @@ def record_tool_use(
         "web_search_requests": int(web_search_requests or 0),
         "session_id": session_id if (session_id and _link_users()) else None,
         "source": source or "interactive",
-        "agent_name": agent_name or None,
     })
     _append(rec)
 

@@ -326,28 +326,33 @@ def _aggregate_tool_per_day(records, day_keys):
 
 
 def _aggregate_agents(records):
-    """Fold the background-agent records into per-agent totals.
+    """Fold the background-agent records into per-*user* totals.
 
     Only records stamped ``source == "agent"`` (set by the background-agent
     runner on its backend, web-search sub-agent and tool calls) count here, so
-    interactive chat cost is excluded. Cost is the *api-record* cost — the same
-    real, billed basis as the Overview/per-user figure — so an agent's spend is
-    directly comparable to a user's. Tool records contribute their call count
-    (what the agent actually did) but not extra cost: their downstream-input
-    cost is already billed on the following turn's api record, and adding the
-    Tools-tab estimate on top would double-count the real bill.
+    interactive chat cost is excluded. Keying by user — rather than by an agent
+    name — is deliberate: agent names are unbounded (every user can define
+    several), so the question worth answering on a shared deployment is "how
+    much do *this user's* agents cost?".
+
+    Cost is the *api-record* cost — the same real, billed basis as the
+    Overview/per-user figure — so a user's agent spend is directly comparable
+    to their live-chat spend. Tool records contribute their call count (what
+    the agents actually did) but not extra cost: their downstream-input cost is
+    already billed on the following turn's api record, and adding the Tools-tab
+    estimate on top would double-count the real bill.
 
     ``runs`` counts distinct ``session_id``s — each background run opens its
-    own in-memory session, so this is the number of times the agent ran. It
+    own in-memory session, so this is the number of agent runs for the user. It
     requires ``AIME_USAGE_LINK_USERS=1`` (session_id is null otherwise) and
     reads 0 when linkage is off.
     """
-    agents = {}
+    users = {}
     for rec in records:
         if (rec.get("source") or "interactive") != "agent":
             continue
-        name = rec.get("agent_name") or "(unnamed)"
-        a = agents.setdefault(name, {
+        name = rec.get("user") or "(anonymous)"
+        a = users.setdefault(name, {
             "api_calls": 0, "tool_calls": 0, "input": 0, "output": 0,
             "cache_r": 0, "cache_w": 0, "web_searches": 0, "cost": 0.0,
             "purposes": {}, "_sessions": set(),
@@ -370,7 +375,7 @@ def _aggregate_agents(records):
             a["purposes"][purpose] = a["purposes"].get(purpose, 0.0) + cost
         elif kind == "tool":
             a["tool_calls"] += 1
-    for a in agents.values():
+    for a in users.values():
         a["runs"] = len(a.pop("_sessions"))
         a["cost_per_run"] = (a["cost"] / a["runs"]) if a["runs"] else 0.0
         # Compact "turn 62% · web_search 30% · …" mix string for the table.
@@ -379,13 +384,13 @@ def _aggregate_agents(records):
             f"{p} {100.0 * c / total:.0f}%"
             for p, c in sorted(a["purposes"].items(), key=lambda kv: kv[1], reverse=True)
         ) if total else ""
-    return agents
+    return users
 
 
 def _aggregate_agent_per_day(records, day_keys):
-    """Per-agent daily api cost, aligned to `day_keys` — same shape as
+    """Per-user agent api cost by day, aligned to `day_keys` — same shape as
     `_aggregate_by_day_model`; the Agents tab stacks these into a daily bar
-    chart and feeds the per-agent sparklines."""
+    chart and feeds the per-user sparklines."""
     idx = {d: i for i, d in enumerate(day_keys)}
     out = {}
     for rec in records:
@@ -394,7 +399,7 @@ def _aggregate_agent_per_day(records, day_keys):
         day = str(rec.get("ts", ""))[:10]
         if day not in idx:
             continue
-        name = rec.get("agent_name") or "(unnamed)"
+        name = rec.get("user") or "(anonymous)"
         row = out.setdefault(name, [0.0] * len(day_keys))
         row[idx[day]] += _report._api_cost(rec)
     return sorted(out.items(), key=lambda kv: sum(kv[1]), reverse=True)
@@ -2578,10 +2583,11 @@ _FRAGMENT_TOOLS = """<div class="meta">
 """
 
 
-# Agents tab — what headless background-agent runs cost and do, broken down
-# per agent. Records are tagged source=="agent" by the background-agent runner;
-# this view excludes interactive chat entirely. Empty-state when no agent has
-# run in the window.
+# Agents tab — what each user's headless background-agent runs cost and do.
+# Records are tagged source=="agent" by the background-agent runner and keyed
+# to the owning user (agent names are unbounded, so we don't break out by
+# name); this view excludes interactive chat entirely. Empty-state when no
+# agent has run in the window.
 _FRAGMENT_AGENTS = """<div class="meta">
     <span title="Filesystem path of the usage.jsonl log being read.">log: {{ log }}</span><br>
     <span title="Records matching the current filters.">{{ record_count }} records</span>
@@ -2593,8 +2599,10 @@ _FRAGMENT_AGENTS = """<div class="meta">
 {% if not agents %}
   <p class="dim">No background-agent activity in this window. Headless agent
   runs stamp their usage with <code>source="agent"</code>; rows appear here
-  once an agent runs under <code>AIME_USAGE_STATS=1</code>. (The per-agent
-  <em>runs</em> count additionally needs <code>AIME_USAGE_LINK_USERS=1</code>.)</p>
+  once an agent runs under <code>AIME_USAGE_STATS=1</code>. (Attributing cost
+  to a user and counting <em>runs</em> additionally needs
+  <code>AIME_USAGE_LINK_USERS=1</code> — otherwise it lands under
+  <code>(anonymous)</code>.)</p>
 {% else %}
 
   <div class="cards">
@@ -2607,53 +2615,53 @@ _FRAGMENT_AGENTS = """<div class="meta">
       <div class="num warn">{{ '%.1f%%' % agent_cost_share }}</div>
       <div class="lbl">of total spend</div></div>
     <div class="card accent-green"
-      title="Number of background-agent runs in this window — distinct agent sessions. Requires AIME_USAGE_LINK_USERS=1; shows 0 when user/session linkage is off.">
+      title="Number of background-agent runs in this window — distinct agent sessions across all users. Requires AIME_USAGE_LINK_USERS=1; shows 0 when user/session linkage is off.">
       <div class="num good">{{ '{:,}'.format(agent_total_runs) }}</div>
       <div class="lbl">runs</div></div>
     <div class="card accent-red"
-      title="Most expensive agent in this window and its cost — where agent spend concentrates.">
+      title="User whose agents cost the most in this window, and that cost — where agent spend concentrates.">
       <div class="num bad">{{ agent_top_name }}</div>
-      <div class="lbl">top agent · ${{ '%.2f' % agent_top_cost }}</div></div>
+      <div class="lbl">top user · ${{ '%.2f' % agent_top_cost }}</div></div>
   </div>
 
-  <h2 title="Daily background-agent cost stacked by agent, top 6 by total cost plus an 'other' bucket. The widest band is the agent carrying the most spend in this window.">Agent cost (daily)</h2>
+  <h2 title="Daily background-agent cost stacked by user, top 6 by total cost plus an 'other' bucket. The widest band is the user whose agents carry the most spend in this window.">Agent cost (daily)</h2>
   {{ chart_agent_stack | safe }}
 
   <div class="two-col">
     <div>
-      <h2 title="Share of background-agent cost in this window, by agent.">Agent mix</h2>
+      <h2 title="Share of background-agent cost in this window, by user.">Agent cost by user</h2>
       {{ chart_agent_donut | safe }}
     </div>
     <div>
       <h2 title="How to read this tab.">What this covers</h2>
-      <p>Only headless <strong>background-agent</strong> runs appear here — every API call and tool call a run makes is tagged <code>source="agent"</code> and attributed to the agent's name.</p>
-      <p>Cost is the real, billed api cost (the same basis as the Costs tab), so an agent's spend sits on the same scale as a user's. <em>Tool calls</em> are counted as activity but add no extra cost — their downstream-input cost is already billed on the following turn.</p>
-      <p>Use the Model and Purpose filters to see, e.g., only an agent's web-search sub-calls or only its main turns.</p>
+      <p>Only headless <strong>background-agent</strong> runs appear here — every API call and tool call a run makes is tagged <code>source="agent"</code> and attributed to the user who owns the agent.</p>
+      <p>Cost is the real, billed api cost (the same basis as the Costs tab), so a user's agent spend sits on the same scale as their live-chat spend. <em>Tool calls</em> are counted as activity but add no extra cost — their downstream-input cost is already billed on the following turn.</p>
+      <p>Use the Model and Purpose filters to see, e.g., only agents' web-search sub-calls or only their main turns.</p>
     </div>
   </div>
 
-  <h2 title="One row per background agent, sorted by cost. 'Runs' is distinct sessions (needs user linkage). 'Purpose mix' shows where each agent's cost goes (main turns vs web_search sub-calls vs compaction).">By agent</h2>
+  <h2 title="One row per user with background-agent activity, sorted by cost. 'Runs' is distinct sessions (needs user linkage). 'Purpose mix' shows where the cost goes (main turns vs web_search sub-calls vs compaction).">By user</h2>
   <table>
     <thead>
       <tr>
-        <th title="Agent spec name, as registered (e.g. morning-briefing). (unnamed) covers ad-hoc runs with no saved agent.">Agent</th>
-        <th title="Daily cost trend for this agent across the visible window.">Trend</th>
-        <th title="Distinct runs (sessions) for this agent. Requires AIME_USAGE_LINK_USERS=1; blank when linkage is off.">Runs</th>
-        <th title="Anthropic API calls this agent made (main turns + background Haiku calls like web_search/compaction).">API calls</th>
-        <th title="Tool invocations this agent made (data tools, web_search). Activity only — no extra cost is attributed here.">Tool calls</th>
-        <th title="Total input tokens billed across this agent's API calls.">Input</th>
-        <th title="Total output tokens billed across this agent's API calls.">Output</th>
-        <th title="Cache-read tokens served to this agent (billed at 0.1x input).">Cache read</th>
-        <th title="Server-side web_search requests this agent triggered (flat $10 / 1,000).">Web searches</th>
+        <th title="User who owns the agents. (anonymous) covers records logged without user linkage. Click through to the user's drill-down.">User</th>
+        <th title="Daily agent-cost trend for this user across the visible window.">Trend</th>
+        <th title="Distinct agent runs (sessions) for this user. Requires AIME_USAGE_LINK_USERS=1; blank when linkage is off.">Runs</th>
+        <th title="Anthropic API calls this user's agents made (main turns + background Haiku calls like web_search/compaction).">API calls</th>
+        <th title="Tool invocations this user's agents made (data tools, web_search). Activity only — no extra cost is attributed here.">Tool calls</th>
+        <th title="Total input tokens billed across this user's agent API calls.">Input</th>
+        <th title="Total output tokens billed across this user's agent API calls.">Output</th>
+        <th title="Cache-read tokens served to this user's agents (billed at 0.1x input).">Cache read</th>
+        <th title="Server-side web_search requests this user's agents triggered (flat $10 / 1,000).">Web searches</th>
         <th title="Mean real api cost per run = cost ÷ runs. Blank when runs is unknown (linkage off).">$/run</th>
-        <th title="Total real api cost attributed to this agent.">Est. cost</th>
+        <th title="Total real api cost attributed to this user's agents.">Est. cost</th>
         <th title="Share of total background-agent cost in this window.">Share</th>
       </tr>
     </thead>
     <tbody>
       {% for name, a in agents %}
       <tr>
-        <td title="{{ a.purpose_mix }}">{{ name }}</td>
+        <td title="{{ a.purpose_mix }}"><a href="/user/{{ name }}">{{ name }}</a></td>
         <td class="spark">{{ agent_sparklines.get(name, '') | safe }}</td>
         <td>{{ '{:,}'.format(a.runs) if a.runs else '—' }}</td>
         <td>{{ '{:,}'.format(a.api_calls) }}</td>
@@ -4562,9 +4570,10 @@ def _compute(args):
 
     # --- Agents tab aggregations ---
     # Cost/usage of headless background-agent runs (source=="agent"), broken
-    # down per agent, plus a daily cost stack and per-agent sparklines. The
-    # cost basis matches Overview (real api cost), so agent_total_cost / the
-    # grand total is a true "share of spend driven by agents".
+    # down per *user* (not per agent — agent names are unbounded), plus a daily
+    # cost stack and per-user sparklines. The cost basis matches Overview (real
+    # api cost), so agent_total_cost / the grand total is a true "share of spend
+    # driven by agents".
     agents_map = _aggregate_agents(records)
     agents = sorted(agents_map.items(), key=lambda kv: kv[1]["cost"], reverse=True)
     agent_total_cost = sum(a["cost"] for _n, a in agents)
