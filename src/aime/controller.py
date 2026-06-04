@@ -70,6 +70,10 @@ CoreEventKind = Literal[
 
 Severity = Literal[
     "info", "warning", "error", "success", "recovery", "loaded", "new_session",
+    # Signal-only severities (no visible banner): tell the frontend that the
+    # first-run onboarding flow has started / finished so it can show or hide
+    # onboarding-only affordances like the empty-state upload nudge.
+    "onboarding", "onboarding_done",
 ]
 RestartReason = Literal["reset", "load"]
 
@@ -231,6 +235,10 @@ class ConversationController:
             self._backend.set_session_context(bootstrap)
         # bootstrap already ran — don't repeat on first user message
         self._user_first_interaction = False
+        # Signal-only notice so the frontend knows onboarding is live (used to
+        # show onboarding-only UI like the empty-state upload nudge). Cleared by
+        # the matching "onboarding_done" notice when CompleteOnboarding fires.
+        self._emit(CoreEvent(kind="notice", severity="onboarding"))
         # Offer the CompleteOnboarding tool for the duration of the flow.
         self._set_terminal_tool(True)
         try:
@@ -597,6 +605,9 @@ class ConversationController:
         if tool_name == "CompleteOnboarding":
             self._onboarding.mark_complete()
             self._set_terminal_tool(False)
+            # Signal-only notice: tell the frontend onboarding is over so it can
+            # drop onboarding-only affordances (mirrors the "onboarding" signal).
+            self._emit(CoreEvent(kind="notice", severity="onboarding_done"))
             self._emit(CoreEvent(
                 kind="tool_result",
                 tool_name=tool_name,

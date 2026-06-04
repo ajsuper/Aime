@@ -690,8 +690,13 @@ class Aime(App):
             log.write("[bold green]Aime ready[/bold green]")
 
         elif kind == "notice":
-            color = _NOTICE_COLOR.get(event.severity, "white")
-            log.write(f"[{color}] {event.text} [/{color}]")
+            # Signal-only severities carry no banner text — they exist purely to
+            # toggle UI state in the web frontend; nothing to show in the TUI.
+            if event.severity in ("onboarding", "onboarding_done"):
+                pass
+            else:
+                color = _NOTICE_COLOR.get(event.severity, "white")
+                log.write(f"[{color}] {event.text} [/{color}]")
 
         elif kind == "session_restart":
             log.clear()

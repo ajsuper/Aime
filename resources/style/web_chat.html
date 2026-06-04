@@ -314,14 +314,18 @@
       content: ""; width: 92px; height: 4px; border-radius: 2px;
       margin-top: 0.6rem; background: var(--rainbow, var(--accent)); }
     /* First-run upload nudge: pinned under the centered wordmark, shown only
-       while the log is empty (pure CSS via :has, mirroring the :empty mark).
-       Points the user at the attach/drop affordance the onboarding chat is
-       about to talk up — so the fast path is seen, not just mentioned. */
+       during onboarding (body.onboarding, set from the server's onboarding
+       signal) while the log is still empty. Points the user at the attach/drop
+       affordance the onboarding chat is about to talk up — so the fast path is
+       seen, not just mentioned. Gated on onboarding so returning users with an
+       empty new session never see it. */
     #empty-hint { display: none; }
-    #log:has(#log-inner:empty) #empty-hint {
+    body.onboarding #log:has(#log-inner:empty) #empty-hint {
       display: flex; align-items: center; gap: 0.4rem;
       position: absolute; left: 50%; top: 50%;
-      transform: translate(-50%, calc(50% + 1.4rem));
+      /* Offset clears the wordmark + the rainbow bar beneath it (bar sits ~0.6rem
+         below the 3.2rem mark) so the hint doesn't overlap the bar. */
+      transform: translate(-50%, calc(50% + 2.9rem));
       color: var(--muted); font-size: 0.85rem; white-space: nowrap;
       animation: fade-in 0.4s ease-out; }
     #empty-hint svg { width: 15px; height: 15px; color: var(--accent); }
@@ -3676,6 +3680,16 @@ es.onmessage = (ev) => {
     case "ready":
       break;
     case "notice":
+      // Signal-only notices (no banner): the server toggles onboarding state so
+      // the empty-state upload nudge shows only during the first-run flow.
+      if (e.severity === "onboarding") {
+        document.body.classList.add("onboarding");
+        break;
+      }
+      if (e.severity === "onboarding_done") {
+        document.body.classList.remove("onboarding");
+        break;
+      }
       // The "Loaded conversation…" line — centered, and tracked so it can
       // fade out once the user sends their first message.
       if (e.severity === "loaded") {
@@ -3712,6 +3726,10 @@ es.onmessage = (ev) => {
       break;
     case "session_restart":
       logInner.innerHTML = "";
+      // Drop the onboarding nudge on any transcript clear; if onboarding
+      // re-fires (e.g. /reset for a not-yet-onboarded user) the server re-emits
+      // the "onboarding" signal right after and re-adds it.
+      document.body.classList.remove("onboarding");
       workingIndicator = null;
       loadedNotice = null;
       newSessionSplash = null;
