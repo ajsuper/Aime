@@ -22,6 +22,7 @@ import zipfile
 import tempfile
 import datetime
 import threading
+import time
 from functools import wraps
 from io import StringIO, BytesIO
 
@@ -124,6 +125,69 @@ _auth_backend = _auth.LocalAuthBackend(
 _share_store = _topic_shares.ShareStore(
     os.path.join(aime_config.DATABASE_DIR, "topic_shares.sql")
 )
+
+
+class _EditLocks:
+    """In-memory advisory edit-locks for shared topics, keyed by the canonical
+    (owner_id, topic_id). The first human to enter edit mode acquires the lock;
+    others are kept in view mode until it's released. It is deliberately:
+
+      * **Advisory** — it gates the *UI* (the acquire call decides the single
+        winner). The PUT save path and the model never consult it, so the agent
+        keeps editing freely (its edits are anchor-based and near-instant; a
+        rare clobber is acceptable and the model can retry).
+      * **In-memory** — locks are session state, not data. A server restart
+        drops every session anyway, so dropping every lock with it is correct.
+      * **TTL-backed** — a lock auto-expires so a holder who closes their tab
+        without releasing (beacon lost) can't wedge the topic forever. The
+        client refreshes its lock on a heartbeat well inside the TTL.
+    """
+
+    def __init__(self, ttl_seconds: float = 90.0):
+        self._ttl = ttl_seconds
+        self._lock = threading.Lock()
+        # (owner_id, topic_id) -> (holder_user_id, expires_at_monotonic)
+        self._held: dict[tuple[int, int], tuple[int, float]] = {}
+
+    def acquire(self, owner_id: int, topic_id: int, user_id: int) -> tuple[bool, int]:
+        """Try to take (or refresh, if already ours) the lock. Returns
+        (granted, holder_user_id). granted is False only when someone else holds
+        an unexpired lock — holder_user_id then names them."""
+        now = time.monotonic()
+        key = (owner_id, topic_id)
+        with self._lock:
+            cur = self._held.get(key)
+            if cur is not None and cur[1] > now and cur[0] != user_id:
+                return False, cur[0]
+            self._held[key] = (user_id, now + self._ttl)
+            return True, user_id
+
+    def release(self, owner_id: int, topic_id: int, user_id: int) -> bool:
+        """Release the lock if `user_id` holds it. Returns True if it did."""
+        key = (owner_id, topic_id)
+        with self._lock:
+            cur = self._held.get(key)
+            if cur is not None and cur[0] == user_id:
+                del self._held[key]
+                return True
+            return False
+
+    def holder(self, owner_id: int, topic_id: int) -> int | None:
+        """Current holder's user id, or None if free/expired. Prunes an expired
+        entry as a side effect."""
+        now = time.monotonic()
+        key = (owner_id, topic_id)
+        with self._lock:
+            cur = self._held.get(key)
+            if cur is None:
+                return None
+            if cur[1] <= now:
+                del self._held[key]
+                return None
+            return cur[0]
+
+
+_edit_locks = _EditLocks()
 _SECRET_KEY = _auth.load_or_create_secret_key(
     os.path.join(aime_config.DATABASE_DIR, "secret_key")
 )
@@ -505,6 +569,7 @@ class UserContext:
                 "assistant_text_delta", "assistant_text_end",
                 "assistant_html_partial", "turn_end", "ready",
                 "remote_edit", "agent_run_update", "share_update",
+                "topic_lock",
             ):
                 self._history.append(payload)
         with self._subscribers_lock:
@@ -523,6 +588,13 @@ class UserContext:
         funnel through here so the frontend only needs one handler to wire
         up. `source` is for debugging — it shows up in the SSE payload."""
         self._broadcast({"kind": "remote_edit", "source": source})
+
+    def notify_topic_lock(self, payload: dict) -> None:
+        """Broadcast an edit-lock state change (someone started/stopped editing
+        a shared topic) to this user's sessions so their Edit affordance updates
+        live. `payload` carries kind=topic_lock, owner_id, topic_id, locked,
+        locked_by."""
+        self._broadcast(payload)
 
     def notify_share_update(self) -> None:
         """Tell every connected session of this user that their set of topic
@@ -543,6 +615,15 @@ class UserContext:
         # Fired by ToolGateway after any successful non-read tool call,
         # covering both AI tool calls and direct UI service calls.
         self.notify_remote_edit(tool_name)
+        # If a topic this user owns just changed (manual edit, checkbox toggle,
+        # or the model editing it), fan the same refresh ping out to everyone
+        # they share a topic with so it syncs live on the recipient side too.
+        # This is the single choke point for topic-content sync: every content
+        # write — owner's or recipient's — flows through the owner's gateway and
+        # lands here. The ping is owner-wide because the tool name doesn't carry
+        # which topic changed; it's cheap and only reaches accepted partners.
+        if "topic" in tool_name:
+            _fanout_owner_topic_change(self.user_id)
 
     def _fanout(self, event: CoreEvent) -> None:
         partial_full: str | None = None
@@ -2708,7 +2789,7 @@ def _shared_topics_for(recipient_id: int) -> list[dict]:
             meta = owner_topics.get(s.topic_id)
             if meta is None:
                 continue
-            out.append({
+            entry = {
                 "id": f"{owner_id}:{s.topic_id}",
                 "title": meta.get("title") or meta.get("name") or "(untitled)",
                 "category": meta.get("category") or "",
@@ -2717,7 +2798,14 @@ def _shared_topics_for(recipient_id: int) -> list[dict]:
                 "permission": s.permission,
                 "status": s.status,
                 "owner": owner_name,
-            })
+            }
+            # Current edit-lock holder (if any) so the recipient's Edit button
+            # starts in the right state; topic_lock events keep it live after.
+            if s.status == _topic_shares.STATUS_ACCEPTED:
+                entry["locked_by"] = _username_of(
+                    _edit_locks.holder(owner_id, s.topic_id)
+                )
+            out.append(entry)
     return out
 
 
@@ -2743,16 +2831,51 @@ def _notify_share(user_id: int, message_text: str) -> None:
         pass
 
 
-def _fanout_shared_topic_edit(owner_id: int, topic_id: int) -> None:
-    """After a shared topic is saved, ping every involved user's sessions so
-    their open view re-fetches (the near-live refresh). The owner's own tabs
-    already refresh via the gateway's on_mutation; this additionally reaches the
-    accepted recipients."""
-    for uid in _share_store.participants(owner_id, topic_id):
+def _fanout_owner_topic_change(owner_id: int) -> None:
+    """Ping the live sessions of everyone with an accepted share on any of
+    `owner_id`'s topics, so a content change syncs to the recipient side
+    without a manual reload. Called from the gateway's on_mutation choke point,
+    which fires for every topic write (owner's or recipient's, manual or
+    model-driven). Best-effort — a missing/closed session is simply skipped."""
+    for uid in _share_store.owner_partners(owner_id):
         ctx = _user_contexts.get(uid)
         if ctx is not None:
             try:
-                ctx.notify_remote_edit(f"shared_topic:{owner_id}:{topic_id}")
+                ctx.notify_remote_edit(f"shared_topic:{owner_id}")
+            except Exception:
+                pass
+
+
+def _username_of(user_id: int | None) -> str | None:
+    if user_id is None:
+        return None
+    rec = _auth_backend.lookup(user_id)
+    return rec.username if rec else None
+
+
+def _broadcast_topic_lock(
+    owner_id: int, topic_id: int, locked: bool, locked_by: str | None,
+    *, exclude: int | None = None,
+) -> None:
+    """Tell everyone who can see a shared topic that its edit-lock state
+    changed, so their Edit affordance updates live. Targets the owner plus the
+    topic's accepted recipients; `exclude` skips the actor (their own UI already
+    reflects the change)."""
+    payload = {
+        "kind": "topic_lock",
+        "owner_id": owner_id,
+        "topic_id": topic_id,
+        "locked": locked,
+        "locked_by": locked_by,
+    }
+    targets = [owner_id] + _share_store.topic_partners(owner_id, topic_id)
+    for uid in targets:
+        if uid == exclude:
+            continue
+        ctx = _user_contexts.get(uid)
+        if ctx is not None:
+            try:
+                ctx.notify_topic_lock(payload)
             except Exception:
                 pass
 
@@ -2764,6 +2887,19 @@ def topics():
         items = _context_for(g.user_id).topic_service.list_topics()
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 500
+    # Flag the owner's own topics that are shared with someone (so the client
+    # engages the edit-lock on them) and surface any current lock holder.
+    try:
+        shared_ids = _share_store.owner_shared_topic_ids(g.user_id)
+        for it in items:
+            tid = int(it.get("id", -1))
+            if tid in shared_ids:
+                it["shared_with_others"] = True
+                holder = _edit_locks.holder(g.user_id, tid)
+                if holder is not None and holder != g.user_id:
+                    it["locked_by"] = _username_of(holder)
+    except Exception:
+        pass
     # Merge in topics shared with this user. Wrapped so a sharing hiccup can
     # never take down the user's own topic list.
     try:
@@ -2934,11 +3070,11 @@ def topic_contents_save(topic_id: str):
                 break
     except Exception:
         pass
-    # Stale-tracking is the owner's (it feeds the owner's agent context). For a
-    # shared edit, also fan a live-refresh ping out to every involved session.
+    # Stale-tracking is the owner's (it feeds the owner's agent context). The
+    # cross-user refresh ping is handled by the gateway's on_mutation choke
+    # point (replace_topic_contents above flows through it), which fans out to
+    # the owner's share partners — no explicit fan-out needed here.
     ctx.mark_record_stale("topic", tid, title)
-    if owner_id != g.user_id:
-        _fanout_shared_topic_edit(owner_id, tid)
     return jsonify({"ok": True})
 
 
@@ -2985,16 +3121,31 @@ def topic_share(topic_id: int):
     if recipient.id == g.user_id:
         return jsonify({"ok": False,
                         "error": "you can't share a topic with yourself"}), 400
+    # Distinguish a fresh (or re-sent) invite from a mere permission change on an
+    # existing grant: a new invite warrants an out-of-app message; a permission
+    # tweak only needs the recipient's open view to re-gate, so we keep it to a
+    # quiet in-app refresh and don't re-text them.
+    prior = _share_store.get(g.user_id, topic_id, recipient.id)
+    is_new_invite = prior is None or prior.status == _topic_shares.STATUS_DECLINED
     try:
         share = _share_store.share(g.user_id, topic_id, recipient.id, permission)
     except _topic_shares.InvalidPermission as e:
         return jsonify({"ok": False, "error": str(e)}), 400
-    # Notify the recipient (in-app + messaging). Best-effort.
-    title = _topic_title(g.user_id, topic_id) or "a topic"
-    _notify_share(
-        recipient.id,
-        f"{g.username} shared the topic “{title}” with you on Aime.",
-    )
+    if is_new_invite:
+        title = _topic_title(g.user_id, topic_id) or "a topic"
+        _notify_share(
+            recipient.id,
+            f"{g.username} shared the topic “{title}” with you on Aime.",
+        )
+    else:
+        # In-app refresh only — flips the recipient's access (e.g. view→edit
+        # enables their Edit button) without a notification.
+        ctx = _user_contexts.get(recipient.id)
+        if ctx is not None:
+            try:
+                ctx.notify_share_update()
+            except Exception:
+                pass
     return jsonify({"ok": True, "share": _share_view(share)})
 
 
@@ -3056,6 +3207,41 @@ def share_respond(owner_id: int, topic_id: int):
         except Exception:
             pass
     return jsonify({"ok": True, "accepted": accept})
+
+
+@app.route("/topics/<topic_id>/lock", methods=["POST"])
+@login_required
+def topic_lock(topic_id: str):
+    """Acquire (or refresh, via heartbeat) the advisory edit-lock on a topic
+    before entering edit mode. Requires edit rights. On success broadcasts the
+    lock to other viewers so their Edit button disables. 409 if someone else
+    already holds it — the response names the holder."""
+    try:
+        owner_id, tid = _resolve_topic(topic_id, "edit")
+    except _ShareAccessError as e:
+        return jsonify({"ok": False, "error": e.message}), e.status
+    ok, holder_id = _edit_locks.acquire(owner_id, tid, g.user_id)
+    if not ok:
+        return jsonify({"ok": False, "locked_by": _username_of(holder_id),
+                        "is_me": False}), 409
+    _broadcast_topic_lock(owner_id, tid, True, g.username, exclude=g.user_id)
+    return jsonify({"ok": True, "locked_by": g.username, "is_me": True})
+
+
+@app.route("/topics/<topic_id>/unlock", methods=["POST"])
+@login_required
+def topic_unlock(topic_id: str):
+    """Release the edit-lock (on save, cancel, or page unload). Only the holder
+    can release; view access is enough so a since-downgraded editor can still
+    let go. Broadcasts the release so others' Edit buttons re-enable."""
+    try:
+        owner_id, tid = _resolve_topic(topic_id, "view")
+    except _ShareAccessError as e:
+        return jsonify({"ok": False, "error": e.message}), e.status
+    released = _edit_locks.release(owner_id, tid, g.user_id)
+    if released:
+        _broadcast_topic_lock(owner_id, tid, False, None, exclude=g.user_id)
+    return jsonify({"ok": True, "released": released})
 
 
 def _load_or_create_tls_context():

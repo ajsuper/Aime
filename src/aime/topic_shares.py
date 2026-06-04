@@ -291,14 +291,43 @@ class ShareStore:
             rows = self._conn.execute(q, params).fetchall()
         return [self._row_to_share(r) for r in rows]
 
-    def participants(self, owner_id: int, topic_id: int) -> list[int]:
-        """User ids that should be told when a shared topic changes: the owner
-        plus every recipient with an *accepted* grant. Used to fan out the
-        live-refresh ping across the involved users."""
+    def owner_shared_topic_ids(self, owner_id: int) -> set[int]:
+        """Topic ids the owner has an *accepted* share on — i.e. topics another
+        user can actually open. Used to flag the owner's own topic-list entries
+        as "shared with others" so the client knows to engage the edit-lock on
+        them (a purely private topic needs no locking)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT topic_id FROM topic_shares "
+                "WHERE owner_id = ? AND status = 'accepted'",
+                (owner_id,),
+            ).fetchall()
+        return {r[0] for r in rows}
+
+    def topic_partners(self, owner_id: int, topic_id: int) -> list[int]:
+        """Accepted recipients of one specific topic (not including the owner).
+        Used to target edit-lock broadcasts precisely at the people who can see
+        that topic."""
         with self._lock:
             rows = self._conn.execute(
                 "SELECT recipient_id FROM topic_shares "
                 "WHERE owner_id = ? AND topic_id = ? AND status = 'accepted'",
                 (owner_id, topic_id),
             ).fetchall()
-        return [owner_id] + [r[0] for r in rows]
+        return [r[0] for r in rows]
+
+    def owner_partners(self, owner_id: int) -> list[int]:
+        """Distinct recipient ids with an *accepted* grant on *any* of
+        `owner_id`'s topics. Used to fan a live-refresh ping out to everyone the
+        owner shares with when one of the owner's topics changes — the edit
+        path only knows "a topic this user owns changed", not which one, so the
+        ping is intentionally owner-wide (cheap, and only reaches existing share
+        partners)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT recipient_id FROM topic_shares "
+                "WHERE owner_id = ? AND status = 'accepted'",
+                (owner_id,),
+            ).fetchall()
+        return [r[0] for r in rows]
+
