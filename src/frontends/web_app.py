@@ -2942,8 +2942,15 @@ class _RecordSyncBridge:
         required to read, and edit permission to write. A denied or unknown
         grant comes back as a friendly ``{"error": ...}`` the model can relay,
         never an exception that breaks the turn."""
-        parsed = self._parse_handle((tool_input or {}).get("id"))
+        raw_id = (tool_input or {}).get("id")
+        parsed = self._parse_handle(raw_id)
         if parsed is None:
+            # A malformed composite handle ("2:foo", "x:y") still carries a ":",
+            # marking the model's intent to reach a shared topic. Refuse it here
+            # rather than returning None, which would let it fall through to the
+            # local gateway and be truncated to a bare own-topic id.
+            if isinstance(raw_id, str) and ":" in raw_id:
+                return {"error": "this topic isn't shared with you"}
             return None
         owner_id, topic_id = parsed
         share = _share_store.get(owner_id, topic_id, self.user_id)
