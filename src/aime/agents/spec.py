@@ -136,6 +136,17 @@ class AgentSpec:
         when the allowlist is None (the full toolset includes web search)."""
         return self.tool_allowlist is None or "WebSearch" in self.tool_allowlist
 
+    @property
+    def messaging_allowed(self) -> bool:
+        """Whether the worker may message the user out-of-band. Gated by the
+        allowlist like every other capability: present when "SendMessage" is
+        allowed, or when the allowlist is None (the full toolset includes
+        messaging). This covers *both* ways an agent can reach the user — the
+        SendMessage tool and the SubmitResult ``message_to_user`` field — so the
+        "send message" permission can't be sidestepped through the result
+        payload (see ``submit_result_raw_schema``)."""
+        return self.tool_allowlist is None or "SendMessage" in self.tool_allowlist
+
     def render_kickoff(self, inputs: dict | None = None) -> str:
         """The task message sent to the model at kickoff.
 
@@ -154,14 +165,21 @@ class AgentSpec:
         """The raw JSON schema (title/description/type/properties) for this
         agent's SubmitResult tool, with the ``result`` property specialized to
         ``result_schema`` when one is given. Returned in the on-disk schema
-        shape; the backend translates it into the Anthropic tool format."""
+        shape; the backend translates it into the Anthropic tool format.
+
+        When the agent isn't allowed to message the user, the optional
+        ``message_to_user`` field is dropped so the worker is never offered a way
+        to reach the user through its result — the SubmitResult terminal tool is
+        always armed, so leaving the field in would let an un-permitted agent
+        message the user despite the "send message" permission being off."""
         with open(config.SUBMIT_RESULT_SCHEMA) as f:
             schema = json.load(f)
+        props = dict(schema.get("properties", {}))
         if self.result_schema is not None:
-            props = dict(schema.get("properties", {}))
             props[_RESULT_PROPERTY] = self.result_schema
-            schema = {**schema, "properties": props}
-        return schema
+        if not self.messaging_allowed:
+            props.pop("message_to_user", None)
+        return {**schema, "properties": props}
 
 
 # Status of a finished run.
