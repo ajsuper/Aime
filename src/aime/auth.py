@@ -480,7 +480,7 @@ class LocalAuthBackend:
                     )
             # END display-name MIGRATION
 
-            # Pending email-verification rows. Used for two flows:
+            # Pending email-verification rows. Used for three flows:
             #   purpose='signup'    — username/password are being held until
             #                         the 6-digit code mailed to `email` is
             #                         confirmed; on confirm the row's data is
@@ -488,6 +488,10 @@ class LocalAuthBackend:
             #   purpose='add_email' — an existing user is attaching an email
             #                         to their account; on confirm the email
             #                         is written onto users.email.
+            #   purpose='login'     — login-time 2FA: a correct password has
+            #                         been seen and a code mailed to the
+            #                         account's existing email; on confirm the
+            #                         session is granted. Mutates nothing.
             # `token` is a 256-bit random secret kept in the user's signed
             # session — it's how a request proves it owns this pending row
             # without having to retype the username/email.
@@ -1116,14 +1120,18 @@ class LocalAuthBackend:
         if len(email) > 254:
             raise InvalidEmail("that email address is too long")
 
-    # ---- Email verification (signup 2FA + add-email-to-existing-user) -----
+    # ---- Email verification (signup 2FA + add-email + login 2FA) ----------
     #
-    # Two flows live in the email_verifications table:
+    # Three flows live in the email_verifications table:
     #   * 'signup' — username/password are *held*, not yet a real account,
     #     until the user proves they own the email. complete_signup_verification
     #     promotes the row into a real users row.
     #   * 'add_email' — an existing logged-in user attaches an email to their
     #     account; complete_add_email_verification writes users.email.
+    #   * 'login' — a correct password has been seen for an account that
+    #     already has an email; a code is mailed to that address and must be
+    #     entered before the session is granted. complete_login_verification
+    #     just consumes the row (the account is unchanged).
     #
     # The raw 6-digit code is mailed to the user; only its sha256 is stored.
     # The `token` is a fresh 256-bit secret kept in the user's signed session
@@ -1250,6 +1258,48 @@ class LocalAuthBackend:
             )
             self._conn.commit()
         return token, code, email_norm
+
+    def start_login_verification(
+        self, user_id: int, email: str
+    ) -> tuple[str, str, str]:
+        """Begin a login-time 2FA challenge for an account that already has a
+        verified email on file. Mails a fresh 6-digit code to that address and
+        stashes a pending 'login' row; same return shape as the other start_*
+        methods.
+
+        Unlike signup/add_email there is no uniqueness check — the address is
+        the account's own, already stored on users.email. Caller is expected to
+        only reach here *after* a successful password verify, so a code is
+        never mailed on a bad guess.
+        """
+        self._validate_email(email)
+        email_norm = email.strip()
+        token = secrets.token_urlsafe(32)
+        code = self._generate_code()
+        code_hash = self._hash_code(code)
+        now = int(time.time())
+        expires_at = now + self._VERIFICATION_TTL_SECONDS
+        with self._lock:
+            self._purge_expired_verifications()
+            self._conn.execute(
+                "INSERT INTO email_verifications "
+                "(token, purpose, user_id, email, code_hash, "
+                "created_at, expires_at) "
+                "VALUES (?, 'login', ?, ?, ?, ?, ?)",
+                (token, user_id, email_norm, code_hash, now, expires_at),
+            )
+            self._conn.commit()
+        return token, code, email_norm
+
+    def complete_login_verification(self, token: str, code: str) -> int:
+        """Finalize a 'login' challenge: validate the code and return the
+        user_id the pending row was bound to. Raises VerificationError on a
+        wrong / expired / used-up code. Mutates nothing beyond consuming the
+        pending row — the account already exists and is unchanged, so the
+        caller resolves the DEK and session the same way the password-only
+        path does."""
+        row = self._consume_verification(token, code, expected_purpose="login")
+        return row[2]  # user_id
 
     def resend_verification_code(self, token: str) -> tuple[str, str] | None:
         """Rotate the code on an existing pending row and reset its expiry.

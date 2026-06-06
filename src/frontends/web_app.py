@@ -1046,6 +1046,9 @@ def login_page():
     stale_email = session.pop("pending_email_token", None)
     if stale_email:
         _auth_backend.cancel_verification(stale_email)
+    stale_login = session.pop("pending_login_token", None)
+    if stale_login:
+        _auth_backend.cancel_verification(stale_login)
     session.pop("pending_email_user_id", None)
     session.pop("pending_email_was_reinitialized", None)
     return Response(_load_login_page(), mimetype="text/html")
@@ -1095,6 +1098,40 @@ def login_submit():
         if was_reinitialized:
             session["pending_email_was_reinitialized"] = True
         return redirect(url_for("add_email_page"))
+    # Full login 2FA: the password was correct and the account already has an
+    # email on file, so mail a one-time code to it and withhold the session
+    # until that code is entered. The verified user_id is parked in
+    # pending_email_user_id (not user_id) so nothing treats them as logged in
+    # mid-challenge; the shared add-email finalizer promotes it on success.
+    if _DO_EMAIL_VERIFICATION:
+        def _challenge_failed():
+            # Either the stored address is unusable or mail is down. With 2FA
+            # required we can't safely grant the session, so block the login
+            # with a calm message rather than bypassing the second factor.
+            return Response(
+                _load_login_page(
+                    login_error="We couldn't send your sign-in code right now. "
+                    "Please try again in a moment.",
+                ),
+                mimetype="text/html", status=502,
+            )
+        try:
+            token, code, _norm = _auth_backend.start_login_verification(
+                user.id, user.email,
+            )
+        except _auth.InvalidEmail:
+            return _challenge_failed()
+        try:
+            _email_send.send_verification_code(user.email, code)
+        except _email_send.EmailSendError:
+            # Drop the pending row whose code never made it out the door.
+            _auth_backend.cancel_verification(token)
+            return _challenge_failed()
+        session["pending_email_user_id"] = user.id
+        session["pending_login_token"] = token
+        if was_reinitialized:
+            session["pending_email_was_reinitialized"] = True
+        return redirect(url_for("login_verify_page"))
     session["user_id"] = user.id
     session.permanent = True
     # LEGACY MIGRATION AUTH — verify() auto-upgrades pre-v2 accounts to the
@@ -1112,6 +1149,103 @@ def login_submit():
 
 
 # ---------------------------------------------------------------------------
+# Login 2FA: code-entry gate for accounts that already have an email on file
+# ---------------------------------------------------------------------------
+#
+# Reached only from login_submit after a correct password. The challenge state
+# lives in pending_email_user_id (+ pending_login_token); the session is not
+# granted until the mailed code is confirmed, at which point the shared
+# _finalize_pending_email_login() promotes it. Mirrors the add-email/verify
+# routes, minus the email-collection step (the address is already known).
+
+
+def _login_verify_render(email: str, **kwargs) -> Response:
+    """Render the shared code-entry page wired to the login-2FA endpoints."""
+    return Response(
+        _load_verify_page(
+            email=email,
+            verify_action=url_for("login_verify_submit"),
+            resend_action=url_for("login_verify_resend"),
+            cancel_href=url_for("login_verify_cancel"),
+            purpose_phrase="finish signing in",
+            **kwargs,
+        ),
+        mimetype="text/html",
+    )
+
+
+@app.route("/login/verify", methods=["GET"])
+def login_verify_page():
+    uid = session.get("pending_email_user_id")
+    token = session.get("pending_login_token")
+    if not uid or not token:
+        return redirect(url_for("login_page"))
+    email = _auth_backend.verification_email(token)
+    if email is None:
+        # Code expired before it was entered — make them sign in again.
+        session.pop("pending_login_token", None)
+        return redirect(url_for("login_page"))
+    return _login_verify_render(email)
+
+
+@app.route("/login/verify", methods=["POST"])
+def login_verify_submit():
+    uid = session.get("pending_email_user_id")
+    token = session.get("pending_login_token")
+    if not uid or not token:
+        return redirect(url_for("login_page"))
+    code = (request.form.get("code") or "").strip()
+    try:
+        _auth_backend.complete_login_verification(token, code)
+    except _auth.VerificationError as e:
+        email = _auth_backend.verification_email(token)
+        if email is None:
+            # Attempts exhausted or expired — back to the login page.
+            session.pop("pending_login_token", None)
+            session.pop("pending_email_user_id", None)
+            session.pop("pending_email_was_reinitialized", None)
+            return Response(
+                _load_login_page(
+                    login_error="That code expired or was used up. "
+                    "Please sign in again.",
+                ),
+                mimetype="text/html", status=400,
+            )
+        return _login_verify_render(email, error=str(e))
+    _finalize_pending_email_login()
+    return redirect("/")
+
+
+@app.route("/login/verify/resend", methods=["POST"])
+def login_verify_resend():
+    if not session.get("pending_email_user_id"):
+        return redirect(url_for("login_page"))
+    token = session.get("pending_login_token")
+    if not token:
+        return redirect(url_for("login_page"))
+    fresh = _auth_backend.resend_verification_code(token)
+    if fresh is None:
+        session.pop("pending_login_token", None)
+        return redirect(url_for("login_page"))
+    code, email = fresh
+    try:
+        _email_send.send_verification_code(email, code)
+    except _email_send.EmailSendError as e:
+        return _login_verify_render(email, error=str(e))
+    return _login_verify_render(email, notice="We sent a fresh code.")
+
+
+@app.route("/login/verify/cancel", methods=["GET"])
+def login_verify_cancel():
+    token = session.pop("pending_login_token", None)
+    session.pop("pending_email_user_id", None)
+    session.pop("pending_email_was_reinitialized", None)
+    if token:
+        _auth_backend.cancel_verification(token)
+    return redirect(url_for("login_page"))
+
+
+# ---------------------------------------------------------------------------
 # Add-email-to-existing-account flow (post-login gate for legacy accounts)
 # ---------------------------------------------------------------------------
 
@@ -1122,6 +1256,7 @@ def _finalize_pending_email_login() -> None:
     uid = session.pop("pending_email_user_id", None)
     was_reinit = session.pop("pending_email_was_reinitialized", False)
     session.pop("pending_email_token", None)
+    session.pop("pending_login_token", None)
     if uid is None:
         return
     session["user_id"] = uid
