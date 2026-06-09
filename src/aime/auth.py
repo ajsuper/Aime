@@ -262,6 +262,10 @@ class AuthBackend(Protocol):
 
 _USERNAME_RE = re.compile(r"^[A-Za-z0-9_.\-]{3,32}$")
 _MIN_PASSWORD_LEN = 8
+# Upper bound on password length. Argon2 hashing cost scales with input size,
+# so an unbounded password is a cheap CPU-exhaustion vector; 1024 is far above
+# any real passphrase. (NIST 800-63B recommends accepting at least 64.)
+_MAX_PASSWORD_LEN = 1024
 # Display names are free-form (any script, spaces, punctuation) so we only
 # bound the length — enough to stop abuse, generous enough for real names.
 _MAX_NAME_LEN = 64
@@ -283,6 +287,8 @@ EVENT_LOGIN_WHILE_LOCKED  = "login_while_locked"
 EVENT_LOCKOUT_STARTED     = "lockout_started"
 EVENT_SIGNUP_RATE_LIMITED = "signup_rate_limited"
 EVENT_SIGNUP_FAILED       = "signup_failed"
+EVENT_LOGIN_IP_THROTTLED  = "login_ip_throttled"
+EVENT_PASSWORD_RESET      = "password_reset"
 
 # A pre-computed Argon2 hash of an unguessable string. We verify against this
 # whenever a username doesn't exist, so the request takes the same amount of
@@ -369,6 +375,24 @@ class LocalAuthBackend:
                     ON auth_events(ts DESC);
                 CREATE INDEX IF NOT EXISTS idx_auth_events_kind_ts
                     ON auth_events(kind, ts DESC);
+                -- Trusted-device tokens for "remember this device" — lets a
+                -- device that has already passed login 2FA skip the emailed
+                -- code on subsequent logins until the token expires. Only the
+                -- sha256 of the token is stored; the raw token lives in a
+                -- long-lived signed cookie on the device (see web_app.py). A
+                -- row is deleted when it expires, when the user revokes it, or
+                -- (via ON DELETE CASCADE) when the account is hard-deleted.
+                CREATE TABLE IF NOT EXISTS trusted_devices (
+                    token_hash   TEXT    PRIMARY KEY,
+                    user_id      INTEGER NOT NULL
+                                 REFERENCES users(id) ON DELETE CASCADE,
+                    created_at   INTEGER NOT NULL,
+                    expires_at   INTEGER NOT NULL,
+                    last_used_at INTEGER,
+                    user_agent   TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_trusted_devices_user
+                    ON trusted_devices(user_id);
                 """
             )
             # LEGACY MIGRATION AUTH — pre-encryption databases predate the
@@ -480,7 +504,7 @@ class LocalAuthBackend:
                     )
             # END display-name MIGRATION
 
-            # Pending email-verification rows. Used for two flows:
+            # Pending email-verification rows. Used for three flows:
             #   purpose='signup'    — username/password are being held until
             #                         the 6-digit code mailed to `email` is
             #                         confirmed; on confirm the row's data is
@@ -488,6 +512,10 @@ class LocalAuthBackend:
             #   purpose='add_email' — an existing user is attaching an email
             #                         to their account; on confirm the email
             #                         is written onto users.email.
+            #   purpose='login'     — login-time 2FA: a correct password has
+            #                         been seen and a code mailed to the
+            #                         account's existing email; on confirm the
+            #                         session is granted. Mutates nothing.
             # `token` is a 256-bit random secret kept in the user's signed
             # session — it's how a request proves it owns this pending row
             # without having to retype the username/email.
@@ -543,7 +571,7 @@ class LocalAuthBackend:
         `first_name`/`last_name` are optional display-only fields (see
         UserRecord); they're normalized to NULL when blank."""
         self._validate_username(username)
-        self._validate_password(password)
+        self._validate_password(password, username=username)
         first_name = self._validate_name(first_name)
         last_name = self._validate_name(last_name)
         pw_hash = self._hasher.hash(password)
@@ -1085,11 +1113,19 @@ class LocalAuthBackend:
             )
 
     @staticmethod
-    def _validate_password(password: str) -> None:
+    def _validate_password(password: str, *, username: str | None = None) -> None:
         if not isinstance(password, str) or len(password) < _MIN_PASSWORD_LEN:
             raise WeakPassword(
                 f"password must be at least {_MIN_PASSWORD_LEN} characters"
             )
+        if len(password) > _MAX_PASSWORD_LEN:
+            raise WeakPassword(
+                f"password must be at most {_MAX_PASSWORD_LEN} characters"
+            )
+        # Reject the single most-guessed credential: the password equal to the
+        # username. Cheap context-specific check (NIST 800-63B 5.1.1.2).
+        if username and password.strip().casefold() == username.strip().casefold():
+            raise WeakPassword("password must not be the same as your username")
 
     @staticmethod
     def _validate_name(name: str | None) -> str | None:
@@ -1116,14 +1152,18 @@ class LocalAuthBackend:
         if len(email) > 254:
             raise InvalidEmail("that email address is too long")
 
-    # ---- Email verification (signup 2FA + add-email-to-existing-user) -----
+    # ---- Email verification (signup 2FA + add-email + login 2FA) ----------
     #
-    # Two flows live in the email_verifications table:
+    # Three flows live in the email_verifications table:
     #   * 'signup' — username/password are *held*, not yet a real account,
     #     until the user proves they own the email. complete_signup_verification
     #     promotes the row into a real users row.
     #   * 'add_email' — an existing logged-in user attaches an email to their
     #     account; complete_add_email_verification writes users.email.
+    #   * 'login' — a correct password has been seen for an account that
+    #     already has an email; a code is mailed to that address and must be
+    #     entered before the session is granted. complete_login_verification
+    #     just consumes the row (the account is unchanged).
     #
     # The raw 6-digit code is mailed to the user; only its sha256 is stored.
     # The `token` is a fresh 256-bit secret kept in the user's signed session
@@ -1132,6 +1172,16 @@ class LocalAuthBackend:
 
     _VERIFICATION_TTL_SECONDS = 10 * 60
     _VERIFICATION_MAX_ATTEMPTS = 5
+
+    # How long a "remember this device" token stays valid. After this the
+    # device has to pass email 2FA again (and can re-trust). 30 days balances
+    # convenience against bounding how long a stolen cookie stays useful.
+    _TRUSTED_DEVICE_TTL_SECONDS = 30 * 24 * 60 * 60
+
+    # Cap on simultaneously-trusted devices per account — minting a new one past
+    # this evicts the oldest. Bounds both the table size and how many live
+    # bypass tokens a password-holder can stockpile.
+    _MAX_TRUSTED_DEVICES = 10
 
     @staticmethod
     def _generate_code() -> str:
@@ -1175,7 +1225,7 @@ class LocalAuthBackend:
         account when the code is confirmed.
         """
         self._validate_username(username)
-        self._validate_password(password)
+        self._validate_password(password, username=username)
         self._validate_email(email)
         first_name = self._validate_name(first_name)
         last_name = self._validate_name(last_name)
@@ -1251,6 +1301,158 @@ class LocalAuthBackend:
             self._conn.commit()
         return token, code, email_norm
 
+    def start_login_verification(
+        self, user_id: int, email: str
+    ) -> tuple[str, str, str]:
+        """Begin a login-time 2FA challenge for an account that already has a
+        verified email on file. Mails a fresh 6-digit code to that address and
+        stashes a pending 'login' row; same return shape as the other start_*
+        methods.
+
+        Unlike signup/add_email there is no uniqueness check — the address is
+        the account's own, already stored on users.email. Caller is expected to
+        only reach here *after* a successful password verify, so a code is
+        never mailed on a bad guess.
+        """
+        self._validate_email(email)
+        email_norm = email.strip()
+        token = secrets.token_urlsafe(32)
+        code = self._generate_code()
+        code_hash = self._hash_code(code)
+        now = int(time.time())
+        expires_at = now + self._VERIFICATION_TTL_SECONDS
+        with self._lock:
+            self._purge_expired_verifications()
+            self._conn.execute(
+                "INSERT INTO email_verifications "
+                "(token, purpose, user_id, email, code_hash, "
+                "created_at, expires_at) "
+                "VALUES (?, 'login', ?, ?, ?, ?, ?)",
+                (token, user_id, email_norm, code_hash, now, expires_at),
+            )
+            self._conn.commit()
+        return token, code, email_norm
+
+    def complete_login_verification(self, token: str, code: str) -> int:
+        """Finalize a 'login' challenge: validate the code and return the
+        user_id the pending row was bound to. Raises VerificationError on a
+        wrong / expired / used-up code. Mutates nothing beyond consuming the
+        pending row — the account already exists and is unchanged, so the
+        caller resolves the DEK and session the same way the password-only
+        path does."""
+        row = self._consume_verification(token, code, expected_purpose="login")
+        return row[2]  # user_id
+
+    def start_password_reset(
+        self, identifier: str
+    ) -> tuple[str, str, str] | None:
+        """Begin a password reset for the account matching `identifier` (a
+        username or an email). Mints a 'reset' verification bound to that
+        account and returns (token, code, email) for the caller to mail.
+
+        Returns None when no eligible account matches — an account is eligible
+        only if it is active and has an email on file (the code can only be
+        delivered to the address already stored, never to a caller-supplied
+        one). The caller must behave identically whether this returns a tuple
+        or None, so the response never reveals whether an account exists.
+        """
+        ident = (identifier or "").strip()
+        if not ident:
+            return None
+        token = secrets.token_urlsafe(32)
+        code = self._generate_code()
+        code_hash = self._hash_code(code)
+        now = int(time.time())
+        expires_at = now + self._VERIFICATION_TTL_SECONDS
+        with self._lock:
+            # username is COLLATE NOCASE; match email case-insensitively too.
+            row = self._conn.execute(
+                "SELECT id, username, email FROM users "
+                "WHERE deleted_at IS NULL AND email IS NOT NULL AND email != '' "
+                "AND (username = ? OR LOWER(email) = LOWER(?)) LIMIT 1",
+                (ident, ident),
+            ).fetchone()
+            if row is None:
+                return None
+            user_id, username, email = row
+            self._purge_expired_verifications()
+            # Only one outstanding reset per account: drop any prior 'reset'
+            # rows for this user before inserting the new one. The reset code is
+            # the *single* factor protecting the account (no password is
+            # required), so without this an attacker could open many parallel
+            # reset sessions for one victim, each with its own fresh code and
+            # 5-guess budget, and amplify a brute force against the 6-digit
+            # space. Capping to a single live code bounds the guessable surface
+            # to 5 attempts at any instant, refreshed only by re-mailing the
+            # victim (which is itself rate-limited and noisy).
+            self._conn.execute(
+                "DELETE FROM email_verifications "
+                "WHERE purpose = 'reset' AND user_id = ?",
+                (user_id,),
+            )
+            self._conn.execute(
+                "INSERT INTO email_verifications "
+                "(token, purpose, user_id, username, email, code_hash, "
+                "created_at, expires_at) "
+                "VALUES (?, 'reset', ?, ?, ?, ?, ?, ?)",
+                (token, user_id, username, email, code_hash, now, expires_at),
+            )
+            self._conn.commit()
+        return token, code, email
+
+    def complete_password_reset(
+        self, token: str, code: str, new_password: str
+    ) -> int:
+        """Finalize a 'reset': validate the code, then set the account's new
+        password. Returns the user_id.
+
+        The new password is validated *before* the one-shot code is consumed,
+        so a weak password doesn't burn the verification — the user can correct
+        it and resubmit the same code. On success the account's failed-login
+        lockout is cleared (proving control of the email is enough to get back
+        in) and every trusted-device token is the caller's to revoke. Because
+        the at-rest DEK is wrapped under the machine secret (not the password),
+        changing the password leaves all encrypted data readable — no re-key.
+
+        Raises WeakPassword for an unacceptable new password and
+        VerificationError for a wrong / expired / used-up code.
+        """
+        # Peek the pending row (without consuming) to get the username for the
+        # context-aware password check.
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT username, purpose, expires_at "
+                "FROM email_verifications WHERE token = ?",
+                (token,),
+            ).fetchone()
+        if row is None or row[1] != "reset" or row[2] < int(time.time()):
+            raise VerificationError(
+                "this reset has expired — please start over"
+            )
+        username = row[0]
+        # May raise WeakPassword; the verification row is still intact.
+        self._validate_password(new_password, username=username)
+        # Validates the code and consumes the row (or raises VerificationError).
+        consumed = self._consume_verification(
+            token, code, expected_purpose="reset"
+        )
+        user_id = consumed[2]
+        pw_hash = self._hasher.hash(new_password)
+        with self._lock:
+            self._conn.execute(
+                "UPDATE users SET password_hash = ? "
+                "WHERE id = ? AND deleted_at IS NULL",
+                (pw_hash, user_id),
+            )
+            self._conn.commit()
+        # Lift any standing lockout so the user can sign in with the new
+        # password immediately.
+        self._clear_failures(username)
+        self.log_event(
+            EVENT_PASSWORD_RESET, username=username, detail="completed",
+        )
+        return user_id
+
     def resend_verification_code(self, token: str) -> tuple[str, str] | None:
         """Rotate the code on an existing pending row and reset its expiry.
         Returns (code, email) for the caller to remail, or None if the token
@@ -1281,6 +1483,115 @@ class LocalAuthBackend:
                 "DELETE FROM email_verifications WHERE token = ?", (token,)
             )
             self._conn.commit()
+
+    # ---- Trusted devices ("remember this device") -------------------------
+    #
+    # A device that has just passed login 2FA can be remembered so it skips the
+    # emailed code next time. The flow mirrors access keys: we mint a 256-bit
+    # token, hand the raw value to the caller (it goes in a long-lived signed
+    # cookie), and store only its sha256. A later login presents the cookie;
+    # is_trusted_device() confirms the hash maps to a live, unexpired row for
+    # that same user before the 2FA step is skipped.
+
+    def _purge_expired_trusted_devices(self) -> None:
+        self._conn.execute(
+            "DELETE FROM trusted_devices WHERE expires_at < ?",
+            (int(time.time()),),
+        )
+
+    def create_trusted_device(
+        self, user_id: int, *, user_agent: str | None = None
+    ) -> tuple[str, int]:
+        """Mint a trusted-device token for `user_id`. Returns (raw_token,
+        expires_at); the caller stores the raw token in the device cookie and
+        only the hash ever touches the DB."""
+        token = secrets.token_urlsafe(32)
+        token_hash = self._hash_code(token)
+        now = int(time.time())
+        expires_at = now + self._TRUSTED_DEVICE_TTL_SECONDS
+        ua = (user_agent or "").strip()[:256] or None
+        with self._lock:
+            self._purge_expired_trusted_devices()
+            self._conn.execute(
+                "INSERT OR REPLACE INTO trusted_devices "
+                "(token_hash, user_id, created_at, expires_at, last_used_at, "
+                "user_agent) VALUES (?, ?, ?, ?, ?, ?)",
+                (token_hash, user_id, now, expires_at, now, ua),
+            )
+            # Bound how many live tokens one account can accumulate: keep the
+            # newest _MAX_TRUSTED_DEVICES, evict the rest. Stops an attacker who
+            # has the password from minting an unbounded pile of bypass tokens,
+            # and keeps the table small.
+            # Order by rowid (monotonic insertion order) so the just-inserted
+            # token reliably counts as "newest" even when several are minted
+            # within the same wall-clock second (created_at is second-granular).
+            self._conn.execute(
+                "DELETE FROM trusted_devices WHERE user_id = ? AND token_hash "
+                "NOT IN (SELECT token_hash FROM trusted_devices WHERE user_id = ? "
+                "ORDER BY rowid DESC LIMIT ?)",
+                (user_id, user_id, self._MAX_TRUSTED_DEVICES),
+            )
+            self._conn.commit()
+        return token, expires_at
+
+    def is_trusted_device(self, user_id: int, token: str) -> bool:
+        """True if `token` is a live trusted-device token for `user_id`. On a
+        hit the row's last_used_at is refreshed (for audit/visibility; the
+        expiry is fixed at mint time and not extended). Unknown, mismatched, or
+        expired tokens return False without leaking which."""
+        if not token:
+            return False
+        token_hash = self._hash_code(token)
+        now = int(time.time())
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT user_id, expires_at FROM trusted_devices "
+                "WHERE token_hash = ?",
+                (token_hash,),
+            ).fetchone()
+            if row is None:
+                return False
+            row_user_id, expires_at = row
+            if row_user_id != user_id or expires_at < now:
+                # Mismatched owner or expired — never reusable. Drop expired
+                # rows opportunistically; leave a mismatch alone (it's a live
+                # token for some other account).
+                if expires_at < now:
+                    self._conn.execute(
+                        "DELETE FROM trusted_devices WHERE token_hash = ?",
+                        (token_hash,),
+                    )
+                    self._conn.commit()
+                return False
+            self._conn.execute(
+                "UPDATE trusted_devices SET last_used_at = ? "
+                "WHERE token_hash = ?",
+                (now, token_hash),
+            )
+            self._conn.commit()
+        return True
+
+    def revoke_trusted_device(self, token: str) -> None:
+        """Forget a single trusted device (e.g. on explicit sign-out of this
+        device). No-op if the token is unknown."""
+        if not token:
+            return
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM trusted_devices WHERE token_hash = ?",
+                (self._hash_code(token),),
+            )
+            self._conn.commit()
+
+    def revoke_all_trusted_devices(self, user_id: int) -> int:
+        """Forget every trusted device for an account (e.g. on password change
+        or a "sign out everywhere" action). Returns the number removed."""
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM trusted_devices WHERE user_id = ?", (user_id,)
+            )
+            self._conn.commit()
+        return cur.rowcount
 
     def _consume_verification(
         self, token: str, code: str, expected_purpose: str
@@ -1555,6 +1866,7 @@ class LocalAuthBackend:
             EVENT_LOGIN_UNKNOWN_USER, EVENT_LOGIN_BAD_PASSWORD,
             EVENT_LOGIN_WHILE_LOCKED, EVENT_LOCKOUT_STARTED,
             EVENT_SIGNUP_RATE_LIMITED, EVENT_SIGNUP_FAILED,
+            EVENT_LOGIN_IP_THROTTLED, EVENT_PASSWORD_RESET,
         )}
         for kind, n in rows:
             counts[kind] = n
@@ -1605,9 +1917,31 @@ class IPRateLimiter:
             while q and q[0] < cutoff:
                 q.popleft()
             if len(q) >= self._limit:
+                # Drop the bucket if it only held now-expired hits, so the dict
+                # can't grow without bound as distinct keys (IPs) churn.
+                if not q:
+                    self._hits.pop(key, None)
                 return False
             q.append(now)
             return True
+
+    def blocked(self, key: str) -> bool:
+        """True if `key` is currently at/over the limit, *without* recording a
+        new hit. Lets a caller reject early (e.g. before an expensive password
+        hash) when a key has already tripped the limit via prior failures."""
+        now = time.monotonic()
+        cutoff = now - self._window
+        with self._lock:
+            q = self._hits.get(key)
+            if q is None:
+                return False
+            while q and q[0] < cutoff:
+                q.popleft()
+            if not q:
+                # Fully expired — reclaim the bucket and report not-blocked.
+                self._hits.pop(key, None)
+                return False
+            return len(q) >= self._limit
 
 
 def load_or_create_secret_key(path: str) -> bytes:

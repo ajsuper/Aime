@@ -1,10 +1,20 @@
 """Outbound transactional email — used for the 2FA verification codes sent at
 signup and the first time an existing account adds an email address.
 
-Reads SMTP credentials from the environment (EMAIL_ADDRESS / EMAIL_PASSWORD)
-so deployments can drop them into .env without touching code. Host and port
-default to Gmail's SMTP submission endpoint, the most common case; both can
-be overridden via SMTP_HOST / SMTP_PORT for any other provider.
+Reads SMTP settings from the environment so deployments can drop them into
+.env without touching code:
+
+  SMTP_HOST      server hostname (default: smtp.gmail.com)
+  SMTP_PORT      submission port  (default: 587, STARTTLS)
+  SMTP_USERNAME  login username   (default: EMAIL_ADDRESS)
+  SMTP_PASSWORD  login password   (default: EMAIL_PASSWORD)
+  SMTP_FROM      From address     (default: SMTP_USERNAME / EMAIL_ADDRESS)
+
+The legacy EMAIL_ADDRESS / EMAIL_PASSWORD pair still works on its own — it
+maps onto SMTP_USERNAME / SMTP_PASSWORD (and the From address) so existing
+single-account Gmail setups keep running unchanged. The split lets more
+involved setups use a relay whose login username differs from the visible
+From address (e.g. SendGrid's "apikey" user, or a shared sending domain).
 
 This module never logs the recipient address or the code body.
 """
@@ -45,13 +55,28 @@ def send_email(to_email: str, subject: str, body: str) -> None:
     network error — so the caller can show a soft, user-facing message rather
     than a stack trace.
     """
-    address = os.environ.get("EMAIL_ADDRESS", "").strip()
-    password = os.environ.get("EMAIL_PASSWORD", "").strip()
-    if not address or not password:
+    # SMTP_USERNAME / SMTP_PASSWORD are the login credentials; EMAIL_ADDRESS /
+    # EMAIL_PASSWORD are honoured as fallbacks for existing single-account setups.
+    username = (
+        os.environ.get("SMTP_USERNAME", "").strip()
+        or os.environ.get("EMAIL_ADDRESS", "").strip()
+    )
+    password = (
+        os.environ.get("SMTP_PASSWORD", "").strip()
+        or os.environ.get("EMAIL_PASSWORD", "").strip()
+    )
+    if not username or not password:
         raise EmailSendError(
             "Email sending isn't set up on this server yet. Please ask the "
-            "administrator to configure EMAIL_ADDRESS and EMAIL_PASSWORD."
+            "administrator to configure the SMTP credentials."
         )
+    # The visible From address. Defaults to the login username, which is the
+    # right answer for a plain Gmail account where the two are the same.
+    from_address = (
+        os.environ.get("SMTP_FROM", "").strip()
+        or os.environ.get("EMAIL_ADDRESS", "").strip()
+        or username
+    )
     host = os.environ.get("SMTP_HOST", _DEFAULT_SMTP_HOST).strip() or _DEFAULT_SMTP_HOST
     try:
         port = int(os.environ.get("SMTP_PORT", _DEFAULT_SMTP_PORT))
@@ -60,7 +85,7 @@ def send_email(to_email: str, subject: str, body: str) -> None:
 
     msg = EmailMessage()
     msg["Subject"] = subject
-    msg["From"] = address
+    msg["From"] = from_address
     msg["To"] = to_email
     msg.set_content(body)
 
@@ -70,7 +95,7 @@ def send_email(to_email: str, subject: str, body: str) -> None:
             server.ehlo()
             server.starttls(context=context)
             server.ehlo()
-            server.login(address, password)
+            server.login(username, password)
             server.send_message(msg)
     except (smtplib.SMTPException, OSError) as exc:
         raise EmailSendError(

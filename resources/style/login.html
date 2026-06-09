@@ -90,6 +90,10 @@
     button.submit:hover { background: var(--cta-hover); }
     button.submit:active { transform: translateY(1px); }
     button.submit:disabled { opacity: 0.6; cursor: default; }
+    .forgot-link { display: block; text-align: center; margin-top: 0.8rem;
+                   font-family: var(--font-display); font-size: 0.88rem;
+                   color: var(--accent); text-decoration: none; }
+    .forgot-link:hover { color: var(--text); }
     .name-row { display: flex; gap: 0.6rem; }
     .name-row input { flex: 1; min-width: 0; }
     .optional { color: var(--muted); font-weight: 400; font-style: italic; }
@@ -129,6 +133,7 @@
              autocomplete="current-password" required>
       <p class="error" data-error="login">__LOGIN_ERROR__</p>
       <button class="submit" type="submit">Sign in</button>
+      <a class="forgot-link" data-forgot href="/forgot">Forgot your password?</a>
     </form>
 
     <form data-form="signup" method="post" action="/signup" autocomplete="on">

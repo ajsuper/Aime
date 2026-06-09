@@ -3509,6 +3509,10 @@ _FRAGMENT_SECURITY = """
       title="Accounts that crossed the failure threshold and got locked during this window.">
       <div class="num warn">{{ counts_24h.lockout_started }}</div>
       <div class="lbl">lockouts started (24h)</div></div>
+    <div class="card accent-red"
+      title="Login attempts rejected by the per-IP rate limiter after too many failures from one source IP. A spike means a single host is spraying passwords across accounts.">
+      <div class="num bad">{{ counts_24h.login_ip_throttled }}</div>
+      <div class="lbl">IP-throttled logins (24h)</div></div>
   </div>
 
   <div class="cards">

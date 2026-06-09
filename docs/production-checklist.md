@@ -4,20 +4,28 @@ Things to do before exposing Aime to the open internet. The codebase is
 hardened for local / personal use out of the box; this list covers the gap
 between "runs on 127.0.0.1" and "safe to put behind a public DNS name".
 
-## 1. Run behind TLS and set `AIME_HTTPS=1`
+## 1. Run behind a TLS-terminating proxy (recommended)
 
-The session cookie's `Secure` flag is conditional on this env var. Without
-TLS the cookie travels in cleartext on every request — fine on loopback,
-unsafe on a public host.
+The hardened topology is: a reverse proxy (nginx, Caddy, ALB, Cloudflare)
+terminates TLS for your domain and forwards plain HTTP to the app on
+loopback. In this mode the app runs on **waitress** (a production WSGI
+server) — the built-in development server is never internet-facing.
 
 ```bash
-export AIME_HTTPS=1
+export AIME_HTTPS=0           # app serves HTTP; the proxy does TLS
+export AIME_SECURE_COOKIES=1  # browser-facing connection is HTTPS
+export AIME_TRUSTED_PROXY_HOPS=1   # see §3
 ./scripts/web_app_serve.sh
 ```
 
-Terminate TLS upstream (nginx, Caddy, ALB, Cloudflare) — Flask's built-in
-server is not a production HTTP server and should never face the internet
-directly.
+`AIME_SECURE_COOKIES=1` is what keeps the session cookie's `Secure` flag and
+HSTS on when TLS terminates upstream (they no longer key off `AIME_HTTPS`).
+Without it the cookie can leak over a stray plain-HTTP request. The Docker
+`.env.example` already sets these defaults.
+
+If instead the app must terminate TLS itself (single box, no proxy — e.g. for
+LAN microphone access), set `AIME_HTTPS=1`; that path uses the built-in
+development server and is **not** recommended for internet-facing hosts.
 
 ## 2. Keep the C++ backend off the network
 
