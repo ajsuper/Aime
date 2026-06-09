@@ -4,7 +4,11 @@
 #
 #   1. cp .env.example .env   and fill in ANTHROPIC_API_KEY
 #   2. docker compose up -d
-#   3. open https://localhost:5000   (self-signed cert — expect a warning)
+#   3. open http://localhost:5000
+#
+# Serves plain HTTP via waitress by default — terminate TLS at a reverse proxy
+# in front for any non-localhost access. Set AIME_HTTPS=1 to instead serve
+# direct self-signed TLS from the built-in server (single box, no proxy).
 
 services:
   aime:
@@ -35,7 +39,28 @@ services:
     environment:
       # Defaults shown; override in .env. AIME_BIND stays 0.0.0.0 so the
       # mapped port is reachable from the host.
-      AIME_HTTPS: "${AIME_HTTPS:-1}"
+      #
+      # Server selection hinges on this flag:
+      #   AIME_HTTPS=0 (default) -> app serves plain HTTP via waitress (a
+      #     production WSGI server). This is the recommended topology: terminate
+      #     TLS at a reverse proxy (Caddy/nginx) and forward to it (pairs with
+      #     PROXY_HOPS=1). On a single box, http://localhost:5000 is still a
+      #     browser "secure context", so the microphone works there too.
+      #   AIME_HTTPS=1 -> app terminates its own self-signed TLS via the
+      #     built-in (development) server. Only for reaching the box directly
+      #     by hostname/IP without a proxy (e.g. LAN phone mic); not the
+      #     hardened path.
+      AIME_HTTPS: "${AIME_HTTPS:-0}"
+      # Mark the browser-facing connection as HTTPS so the session cookie gets
+      # its `Secure` flag and HSTS is sent — even though the app itself serves
+      # HTTP (TLS terminates at your proxy). Keep this 1 for any TLS-fronted
+      # deployment; set 0 only for genuinely plain-HTTP access over a
+      # non-localhost address.
+      AIME_SECURE_COOKIES: "${AIME_SECURE_COOKIES:-1}"
+      # Worker-thread pool for the waitress server (AIME_HTTPS=0 path). Each
+      # in-flight /send streams over one thread for the generation's lifetime,
+      # so size this above your expected concurrent chats.
+      AIME_THREADS: "${AIME_THREADS:-16}"
       AIME_BIND: "0.0.0.0"
       AIME_ALLOW_SIGNUP: "${AIME_ALLOW_SIGNUP:-0}"
       # "keys" (safe default) requires an invite key before a user can send;

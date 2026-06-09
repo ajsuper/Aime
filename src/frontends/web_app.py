@@ -197,6 +197,26 @@ _SECRET_KEY = _auth.load_or_create_secret_key(
 # pick the account name being limited.
 _signup_limiter = _auth.IPRateLimiter(limit=5, window_seconds=60 * 60)
 
+# Per-IP throttle on *failed* logins. The auth backend already locks an
+# individual account after 5 bad passwords, but that's per-username — it does
+# nothing against password-spraying, where one host tries one guess each across
+# many accounts. This bounds total failed attempts from a single source IP.
+# Only failures are counted (see login_submit), so a busy household behind one
+# NAT that logs in successfully never trips it; 20 failures / 15 min is well
+# above human fat-fingering but throttles an automated sprayer hard.
+_login_ip_limiter = _auth.IPRateLimiter(limit=20, window_seconds=15 * 60)
+
+# Per-pending-verification throttle on code resends, keyed by the verification
+# token. Stops a logged-in-but-mid-2FA client (or signup flow) from spamming a
+# victim's inbox with codes. 4 resends per 10 minutes is plenty for a slow
+# inbox while capping the bombing volume.
+_resend_limiter = _auth.IPRateLimiter(limit=4, window_seconds=10 * 60)
+
+# Per-IP throttle on password-reset *requests*. Without it, anyone could mail a
+# victim a stream of reset codes by repeatedly POSTing /forgot with their
+# address. 5 per 15 minutes per source IP is ample for a real user.
+_forgot_limiter = _auth.IPRateLimiter(limit=5, window_seconds=15 * 60)
+
 
 def _user_dir(user_id: int) -> str:
     return os.path.join(aime_config.DATABASE_DIR, "users", str(user_id))
@@ -768,18 +788,63 @@ if _TRUSTED_PROXY_HOPS > 0:
         x_proto=_TRUSTED_PROXY_HOPS,
         x_host=_TRUSTED_PROXY_HOPS,
     )
-# Session cookie hardening. `Secure` is conditional so local http://127.0.0.1
-# development still works; flip on AIME_HTTPS=1 when serving behind TLS.
+# Whether the browser-facing connection is HTTPS — which decides the cookie
+# `Secure` flag and HSTS (see _security_headers and the trusted-device cookie).
+# This is distinct from whether *this process* terminates TLS (AIME_HTTPS): a
+# reverse proxy commonly terminates TLS and forwards plain HTTP to us, so the
+# connection is still HTTPS from the browser's view even with AIME_HTTPS=0.
+# Defaults to on whenever the app serves its own TLS; behind a TLS-terminating
+# proxy set AIME_SECURE_COOKIES=1 (the docker/.env defaults do this). Turn it
+# off only for genuinely plain-HTTP access over a non-localhost address.
+# (_env_bool is defined further down; inline the same parse to avoid a
+# forward reference at module-load time.)
+_SECURE_COOKIES = os.environ.get(
+    "AIME_SECURE_COOKIES",
+    "1" if int(os.environ.get("AIME_HTTPS", "0")) else "0",
+).strip() not in ("", "0", "false", "False", "no")
+
+# Session cookie hardening. `Secure`/HSTS follow _SECURE_COOKIES so they stay
+# on behind a TLS proxy (AIME_HTTPS=0) while local plain-HTTP dev still works.
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Strict",
-    SESSION_COOKIE_SECURE=bool(int(os.environ.get("AIME_HTTPS", "0"))),
+    SESSION_COOKIE_SECURE=_SECURE_COOKIES,
     PERMANENT_SESSION_LIFETIME=60 * 60 * 24 * 14,  # 14 days
     # Cap request bodies. Attachments (images, audio) flow through /send and
     # /transcribe; 32 MiB is comfortably above realistic use and bounds the
     # damage from a malicious client uploading multi-GB payloads.
     MAX_CONTENT_LENGTH=32 * 1024 * 1024,
 )
+
+
+# "Remember this device" cookie. Holds a trusted-device token (the raw value;
+# only its hash is stored server-side) that lets a device skip login 2FA until
+# the token expires. Separate from the session cookie so it survives logout —
+# that's the point: the device stays trusted, the session does not. Hardened
+# the same way as the session cookie (HttpOnly, SameSite, Secure-when-HTTPS).
+_TRUSTED_DEVICE_COOKIE = "aime_td"
+
+
+def _issue_trusted_device(resp: Response, user_id: int) -> Response:
+    """Mint a trusted-device token for `user_id` and attach it to `resp` as the
+    remember-this-device cookie. Called from the verify handlers when the user
+    ticks "trust this device". Returns the same response for chaining."""
+    token, expires_at = _auth_backend.create_trusted_device(
+        user_id, user_agent=request.headers.get("User-Agent"),
+    )
+    resp.set_cookie(
+        _TRUSTED_DEVICE_COOKIE, token,
+        max_age=max(0, expires_at - int(time.time())),
+        httponly=True,
+        secure=bool(app.config.get("SESSION_COOKIE_SECURE")),
+        samesite="Strict",
+    )
+    return resp
+
+
+def _wants_trusted_device() -> bool:
+    """True if the current form post asked to remember this device."""
+    return bool(request.form.get("trust_device"))
 
 
 # Content Security Policy. Inline styles are required (Rich produces inline
@@ -806,6 +871,16 @@ def _security_headers(resp):
     resp.headers.setdefault("X-Frame-Options", "DENY")
     resp.headers.setdefault("Referrer-Policy", "same-origin")
     resp.headers.setdefault("Permissions-Policy", "interest-cohort=()")
+    # HSTS: only emit when we're actually serving over TLS (AIME_HTTPS=1). Sent
+    # on plain http it would be ignored by browsers, but advertising it only
+    # under TLS keeps the contract honest. Two years + subdomains is the
+    # commonly-recommended baseline; preload is left off so the operator opts
+    # into that irreversible step deliberately.
+    if app.config.get("SESSION_COOKIE_SECURE"):
+        resp.headers.setdefault(
+            "Strict-Transport-Security",
+            "max-age=63072000; includeSubDomains",
+        )
     return resp
 
 
@@ -825,11 +900,31 @@ _ADD_EMAIL_PAGE_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "resources", "style", "add_email.html",
 )
+_FORGOT_PAGE_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "resources", "style", "forgot_password.html",
+)
+_RESET_PAGE_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "resources", "style", "reset_password.html",
+)
 
 
 def _load_page() -> str:
     with open(_PAGE_PATH) as f:
         return f.read()
+
+
+def _load_forgot_page(error: str = "") -> str:
+    with open(_FORGOT_PAGE_PATH) as f:
+        html = f.read()
+    return html.replace("__ERROR__", _h(error))
+
+
+def _load_reset_page(error: str = "", notice: str = "") -> str:
+    with open(_RESET_PAGE_PATH) as f:
+        html = f.read()
+    return html.replace("__ERROR__", _h(error)).replace("__NOTICE__", _h(notice))
 
 
 # Account creation is gated by AIME_ALLOW_SIGNUP. Default is off ("0") so a
@@ -871,7 +966,10 @@ _SIGNUP_DISABLED_STYLE = (
 _EMAIL_VERIFICATION_DISABLED_STYLE = (
     '<style>'
     'label[for="signup-email"],#signup-email,'
-    'label[for="signup-email"] + #signup-email + .hint'
+    'label[for="signup-email"] + #signup-email + .hint,'
+    # Password reset needs an email on file, which only exists when email 2FA
+    # is on — hide the "Forgot password?" link otherwise.
+    '[data-forgot]'
     '{display:none!important}'
     '</style>'
 )
@@ -1054,13 +1152,43 @@ def login_page():
     return Response(_load_login_page(), mimetype="text/html")
 
 
+def _grant_full_session(user, was_reinitialized: bool) -> Response:
+    """Promote a verified login into a full session and return the redirect to
+    the app. Shared by the no-2FA path and the trusted-device bypass.
+
+    If verify() just auto-upgraded a pre-v2 account it minted a fresh DEK,
+    leaving any stored conversation files unreadable — wipe them the same way
+    the legacy migration path does. (See LEGACY MIGRATION AUTH.)"""
+    session["user_id"] = user.id
+    session.permanent = True
+    if was_reinitialized:
+        g.username = user.username
+        g.user_id = user.id
+        _context_for(user.id).controller.delete_all_sessions()
+    return redirect("/")
+
+
 @app.route("/login", methods=["POST"])
 def login_submit():
+    ip = request.remote_addr or "unknown"
+    # Per-IP brute-force guard: if this source has already burned through the
+    # failed-login budget, reject *before* the expensive Argon2 verify so a
+    # sprayer can't keep us hashing. Checked without recording a hit (only
+    # actual failures below count toward the budget).
+    if _login_ip_limiter.blocked(ip):
+        _auth_backend.log_event(_auth.EVENT_LOGIN_IP_THROTTLED, ip=ip)
+        return Response(
+            _load_login_page(
+                login_error="Too many failed attempts from your network. "
+                "Please wait a few minutes and try again.",
+            ),
+            mimetype="text/html", status=429,
+        )
     username = (request.form.get("username") or "").strip()
     password = request.form.get("password") or ""
     try:
         user, _dek, was_reinitialized = _auth_backend.verify(
-            username, password, ip=request.remote_addr,
+            username, password, ip=ip,
         )
     except _auth.AccountLocked as e:
         return Response(
@@ -1079,6 +1207,10 @@ def login_submit():
             mimetype="text/html", status=200,
         )
     except _auth.AuthError:
+        # Count this failure against the source IP's budget (separate from the
+        # backend's per-account lockout, which can't see a spray across many
+        # usernames). The error stays generic to avoid a username oracle.
+        _login_ip_limiter.hit(ip)
         return Response(
             _load_login_page(login_error="Invalid username or password."),
             mimetype="text/html", status=401,
@@ -1104,6 +1236,12 @@ def login_submit():
     # pending_email_user_id (not user_id) so nothing treats them as logged in
     # mid-challenge; the shared add-email finalizer promotes it on success.
     if _DO_EMAIL_VERIFICATION:
+        # Remember-this-device: if this browser still holds a valid
+        # trusted-device token for the account, the second factor was already
+        # satisfied here recently — skip the emailed code and log straight in.
+        td_token = request.cookies.get(_TRUSTED_DEVICE_COOKIE)
+        if td_token and _auth_backend.is_trusted_device(user.id, td_token):
+            return _grant_full_session(user, was_reinitialized)
         def _challenge_failed():
             # Either the stored address is unusable or mail is down. With 2FA
             # required we can't safely grant the session, so block the login
@@ -1132,20 +1270,10 @@ def login_submit():
         if was_reinitialized:
             session["pending_email_was_reinitialized"] = True
         return redirect(url_for("login_verify_page"))
-    session["user_id"] = user.id
-    session.permanent = True
-    # LEGACY MIGRATION AUTH — verify() auto-upgrades pre-v2 accounts to the
-    # current encryption scheme by minting a fresh DEK, which makes any
-    # existing conversation files on disk unreadable garbage. Wipe them via
-    # the normal delete-all-conversations path. The user database (topics,
-    # calendar, preferences) is untouched. Safe to remove once no rows have
-    # enc_version < 2.
-    if was_reinitialized:
-        g.username = user.username
-        g.user_id = user.id
-        _context_for(user.id).controller.delete_all_sessions()
-    # END LEGACY MIGRATION AUTH
-    return redirect("/")
+    # No email on file path is handled above; here the account simply has email
+    # 2FA disabled server-wide. Grant the session (wiping stale data if verify()
+    # just re-keyed a legacy account).
+    return _grant_full_session(user, was_reinitialized)
 
 
 # ---------------------------------------------------------------------------
@@ -1213,7 +1341,12 @@ def login_verify_submit():
             )
         return _login_verify_render(email, error=str(e))
     _finalize_pending_email_login()
-    return redirect("/")
+    resp = redirect("/")
+    # The second factor was just satisfied — honor "trust this device" so the
+    # next login on this browser can skip the emailed code.
+    if _wants_trusted_device():
+        _issue_trusted_device(resp, uid)
+    return resp
 
 
 @app.route("/login/verify/resend", methods=["POST"])
@@ -1223,6 +1356,15 @@ def login_verify_resend():
     token = session.get("pending_login_token")
     if not token:
         return redirect(url_for("login_page"))
+    if not _resend_limiter.hit(token):
+        email = _auth_backend.verification_email(token)
+        if email is None:
+            return redirect(url_for("login_page"))
+        resp = _login_verify_render(
+            email, error="Please wait a moment before requesting another code.",
+        )
+        resp.status_code = 429
+        return resp
     fresh = _auth_backend.resend_verification_code(token)
     if fresh is None:
         session.pop("pending_login_token", None)
@@ -1240,6 +1382,179 @@ def login_verify_cancel():
     token = session.pop("pending_login_token", None)
     session.pop("pending_email_user_id", None)
     session.pop("pending_email_was_reinitialized", None)
+    if token:
+        _auth_backend.cancel_verification(token)
+    return redirect(url_for("login_page"))
+
+
+# ---------------------------------------------------------------------------
+# Forgot-password / reset flow
+# ---------------------------------------------------------------------------
+#
+# A reset emails a 6-digit code to the address already on file for the account
+# (never to a caller-supplied address), then lets the holder of that code set a
+# new password. Everything is enumeration-safe: whether or not an account
+# matches, the user lands on the same code-entry page and sees the same copy,
+# so the flow never reveals which usernames/emails exist. State is two signed
+# session keys: `reset_in_progress` (a marker set for every request, including
+# decoys) and `pending_reset_token` (only present when a real account matched).
+# Only available when email 2FA is configured — without an email on file there
+# is nowhere to send the code.
+
+
+@app.route("/forgot", methods=["GET"])
+def forgot_page():
+    if not _DO_EMAIL_VERIFICATION:
+        return redirect(url_for("login_page"))
+    return Response(_load_forgot_page(), mimetype="text/html")
+
+
+@app.route("/forgot", methods=["POST"])
+def forgot_submit():
+    if not _DO_EMAIL_VERIFICATION:
+        return redirect(url_for("login_page"))
+    ip = request.remote_addr or "unknown"
+    identifier = (request.form.get("identifier") or "").strip()
+    # Drop any half-finished prior reset before starting a new one.
+    stale = session.pop("pending_reset_token", None)
+    if stale:
+        _auth_backend.cancel_verification(stale)
+    # Mark the flow in progress regardless of outcome so the next page renders
+    # identically whether or not an account matched (enumeration-safe).
+    session["reset_in_progress"] = True
+    # Throttle reset requests per IP so the form can't be used to bomb a
+    # victim's inbox. Over the limit we silently skip sending but still advance
+    # to the same page, so a prober can't distinguish throttle from no-match.
+    if _forgot_limiter.hit(ip):
+        result = _auth_backend.start_password_reset(identifier)
+        if result is not None:
+            token, code, email = result
+            try:
+                _email_send.send_verification_code(email, code)
+                session["pending_reset_token"] = token
+            except _email_send.EmailSendError:
+                # Mail down — drop the pending row. Stay enumeration-safe by
+                # not surfacing the failure; the user can retry.
+                _auth_backend.cancel_verification(token)
+    return redirect(url_for("reset_password_page"))
+
+
+@app.route("/forgot/verify", methods=["GET"])
+def reset_password_page():
+    if not _DO_EMAIL_VERIFICATION:
+        return redirect(url_for("login_page"))
+    if not session.get("reset_in_progress"):
+        return redirect(url_for("forgot_page"))
+    return Response(_load_reset_page(), mimetype="text/html")
+
+
+@app.route("/forgot/verify", methods=["POST"])
+def reset_password_submit():
+    if not _DO_EMAIL_VERIFICATION:
+        return redirect(url_for("login_page"))
+    if not session.get("reset_in_progress"):
+        return redirect(url_for("forgot_page"))
+    code = (request.form.get("code") or "").strip()
+    new_password = request.form.get("password") or ""
+    confirm = request.form.get("password2") or ""
+    token = session.get("pending_reset_token")
+
+    def _err(msg: str, status: int = 400):
+        return Response(
+            _load_reset_page(error=msg), mimetype="text/html", status=status,
+        )
+
+    if new_password != confirm:
+        return _err("Those passwords don't match.")
+    if not token:
+        # Decoy path: no eligible account matched (or mail failed). Fail the
+        # same way a wrong code would, so existence is never revealed.
+        return _err("That code is invalid or has expired. Please start over.")
+    try:
+        user_id = _auth_backend.complete_password_reset(
+            token, code, new_password,
+        )
+    except _auth.WeakPassword as e:
+        return _err(str(e))
+    except _auth.VerificationError as e:
+        # If the pending row is gone (expired / too many attempts) there's
+        # nothing to retry against — send them back to request a fresh code.
+        if _auth_backend.verification_email(token) is None:
+            session.pop("pending_reset_token", None)
+            session.pop("reset_in_progress", None)
+            return Response(
+                _load_login_page(
+                    notice="Your reset code expired. Please request a new one.",
+                ),
+                mimetype="text/html", status=400,
+            )
+        return _err(str(e))
+    # Success. Revoke every trusted device so the reset actually locks out
+    # anyone holding a remember-this-device cookie, clear the flow state, and
+    # send them to sign in fresh with the new password (we deliberately don't
+    # auto-login).
+    _auth_backend.revoke_all_trusted_devices(user_id)
+    session.pop("pending_reset_token", None)
+    session.pop("reset_in_progress", None)
+    return Response(
+        _load_login_page(
+            notice="Your password has been updated. Please sign in.",
+        ),
+        mimetype="text/html",
+    )
+
+
+@app.route("/forgot/verify/resend", methods=["POST"])
+def reset_password_resend():
+    if not _DO_EMAIL_VERIFICATION:
+        return redirect(url_for("login_page"))
+    if not session.get("reset_in_progress"):
+        return redirect(url_for("forgot_page"))
+    token = session.get("pending_reset_token")
+    if not token:
+        # Decoy: no real pending reset, but answer identically.
+        return Response(
+            _load_reset_page(
+                notice="If that account exists, we've sent a new code.",
+            ),
+            mimetype="text/html",
+        )
+    if not _resend_limiter.hit(token):
+        return Response(
+            _load_reset_page(
+                error="Please wait a moment before requesting another code.",
+            ),
+            mimetype="text/html", status=429,
+        )
+    fresh = _auth_backend.resend_verification_code(token)
+    if fresh is None:
+        session.pop("pending_reset_token", None)
+        return Response(
+            _load_reset_page(
+                error="That code expired. Please start over.",
+            ),
+            mimetype="text/html", status=400,
+        )
+    code, email = fresh
+    try:
+        _email_send.send_verification_code(email, code)
+    except _email_send.EmailSendError:
+        return Response(
+            _load_reset_page(
+                error="We couldn't send the code right now. Please try again.",
+            ),
+            mimetype="text/html", status=502,
+        )
+    return Response(
+        _load_reset_page(notice="We sent a fresh code."),
+        mimetype="text/html",
+    )
+
+
+@app.route("/forgot/cancel", methods=["GET"])
+def reset_password_cancel():
+    token = session.pop("pending_reset_token", None)
+    session.pop("reset_in_progress", None)
     if token:
         _auth_backend.cancel_verification(token)
     return redirect(url_for("login_page"))
@@ -1357,7 +1672,12 @@ def add_email_verify_submit():
             mimetype="text/html", status=400,
         )
     _finalize_pending_email_login()
-    return redirect("/")
+    resp = redirect("/")
+    # Email is now verified; honor "trust this device" so the first real login
+    # after setup can skip the 2FA code on this browser.
+    if _wants_trusted_device():
+        _issue_trusted_device(resp, uid)
+    return resp
 
 
 @app.route("/add-email/verify/resend", methods=["POST"])
@@ -1367,6 +1687,22 @@ def add_email_verify_resend():
     token = session.get("pending_email_token")
     if not token:
         return redirect(url_for("add_email_page"))
+    if not _resend_limiter.hit(token):
+        email = _auth_backend.verification_email(token)
+        if email is None:
+            session.pop("pending_email_token", None)
+            return redirect(url_for("add_email_page"))
+        return Response(
+            _load_verify_page(
+                email=email,
+                verify_action=url_for("add_email_verify_submit"),
+                resend_action=url_for("add_email_verify_resend"),
+                cancel_href=url_for("add_email_verify_cancel"),
+                purpose_phrase="finish signing in",
+                error="Please wait a moment before requesting another code.",
+            ),
+            mimetype="text/html", status=429,
+        )
     fresh = _auth_backend.resend_verification_code(token)
     if fresh is None:
         session.pop("pending_email_token", None)
@@ -1582,7 +1918,12 @@ def signup_verify_submit():
     session.clear()
     session["user_id"] = user.id
     session.permanent = True
-    return redirect("/")
+    resp = redirect("/")
+    # The account's email is verified as of now; honor "trust this device" so
+    # this browser skips 2FA on the next login.
+    if _wants_trusted_device():
+        _issue_trusted_device(resp, user.id)
+    return resp
 
 
 @app.route("/signup/verify/resend", methods=["POST"])
@@ -1590,6 +1931,22 @@ def signup_verify_resend():
     token = session.get("pending_signup_token")
     if not token:
         return redirect(url_for("login_page"))
+    if not _resend_limiter.hit(token):
+        email = _auth_backend.verification_email(token)
+        if email is None:
+            session.pop("pending_signup_token", None)
+            return redirect(url_for("login_page"))
+        return Response(
+            _load_verify_page(
+                email=email,
+                verify_action=url_for("signup_verify_submit"),
+                resend_action=url_for("signup_verify_resend"),
+                cancel_href=url_for("signup_verify_cancel"),
+                purpose_phrase="finish creating your account",
+                error="Please wait a moment before requesting another code.",
+            ),
+            mimetype="text/html", status=429,
+        )
     fresh = _auth_backend.resend_verification_code(token)
     if fresh is None:
         session.pop("pending_signup_token", None)
@@ -3749,23 +4106,66 @@ def _load_or_create_tls_context():
     return (cert_path, key_path)
 
 
+def _serve_production(host: str, port: int) -> None:
+    """Serve the app with waitress — a production-grade WSGI server — instead
+    of Werkzeug's development server.
+
+    waitress is deliberately single-process and multi-threaded, which is what
+    this deployment needs: the background scheduler and the in-memory rate
+    limiters both assume exactly one process (a multi-worker server like
+    gunicorn -w N would double-fire the scheduler and split the limiters). It
+    has no built-in TLS, so this path expects to sit behind a TLS-terminating
+    reverse proxy (the documented docker-compose setup); the AIME_HTTPS direct
+    path is handled separately below.
+
+    Thread count matters here because /send streams its reply over a
+    long-lived SSE connection that occupies one worker thread for the whole
+    generation. The pool must comfortably exceed the expected number of
+    concurrent in-flight chats, so the default is generous and tunable via
+    AIME_THREADS. (If you ever outgrow a single process you'd move to an async
+    server, but then the scheduler/limiters need to move to shared state.)
+    """
+    threads = int(os.environ.get("AIME_THREADS", "16"))
+    from waitress import serve as _waitress_serve
+    _waitress_serve(app, host=host, port=port, threads=threads, ident="Aime")
+
+
 if __name__ == "__main__":
-    # threaded=True so the SSE generator and /send can run concurrently.
     # Bind defaults to 127.0.0.1 (loopback only). Set AIME_BIND=0.0.0.0 to
-    # expose the web UI to other devices on the LAN — useful for testing from
-    # a second machine, NOT for production. Anyone on the network will be
-    # able to hit /login, and unless AIME_HTTPS=1 + a TLS terminator is in
-    # front, the session cookie travels in cleartext.
+    # expose the web UI to other devices on the LAN or to a reverse proxy on
+    # another host. Anyone who can reach the bind address will be able to hit
+    # /login, and unless TLS terminates in front of it the session cookie
+    # travels in cleartext — terminate TLS at a proxy (recommended) or use
+    # AIME_HTTPS=1 for the direct self-signed path.
     host = os.environ.get("AIME_BIND", "127.0.0.1")
     port = int(os.environ.get("AIME_PORT", "5000"))
-    # AIME_HTTPS=1 serves over TLS with a persistent self-signed cert. Needed
-    # for microphone/voice input from phones on the LAN (secure-context rule).
-    ssl_context = None
-    if int(os.environ.get("AIME_HTTPS", "0")):
-        ssl_context = _load_or_create_tls_context()
     # Start the background scheduler (scheduled agents + event reminders). Safe
-    # here because the deployment is a single threaded process — one loop, no
+    # here because the deployment is a single process — one loop, no
     # double-fire. Disabled with AIME_SCHEDULER=0.
     _start_scheduler()
-    app.run(host=host, port=port, threaded=True, debug=False,
-            ssl_context=ssl_context)
+    if int(os.environ.get("AIME_HTTPS", "0")):
+        # Direct TLS with a persistent self-signed cert — for microphone/voice
+        # input from phones on the LAN (browsers require a secure context).
+        # waitress can't terminate TLS, so this specific mode uses Werkzeug's
+        # server with threaded=True (a thread per request).
+        ssl_context = _load_or_create_tls_context()
+        app.run(host=host, port=port, threaded=True, debug=False,
+                ssl_context=ssl_context)
+    elif _env_bool("AIME_DEV_SERVER", "0"):
+        # Opt-in escape hatch back to the Werkzeug dev server (e.g. for the
+        # interactive reloader while developing). Not for production.
+        app.run(host=host, port=port, threaded=True, debug=False)
+    else:
+        # Production default: waitress (see _serve_production). Fall back to
+        # the dev server only if waitress isn't installed, with a clear warning
+        # so a prod box doesn't silently run the wrong server.
+        try:
+            _serve_production(host, port)
+        except ImportError:
+            sys.stderr.write(
+                "WARNING: waitress is not installed; falling back to the "
+                "Werkzeug development server, which is not suitable for "
+                "production. Install waitress (pip install waitress) or set "
+                "AIME_DEV_SERVER=1 to silence this.\n"
+            )
+            app.run(host=host, port=port, threaded=True, debug=False)

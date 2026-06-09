@@ -88,9 +88,16 @@ cp .env.example .env       # then edit .env and set ANTHROPIC_API_KEY
 docker compose up -d --build
 ```
 
-Then open <https://localhost:5000>. HTTPS uses a self-signed certificate, so
-your browser will show a one-time warning — that is expected, and HTTPS is
-required for the microphone (voice input) to work.
+Then open <http://localhost:5000>. By default the app serves plain HTTP via
+the production `waitress` server; `http://localhost` is a browser "secure
+context", so the microphone (voice input) works there without a certificate.
+
+For any access beyond the local box, put a reverse proxy (Caddy, nginx) in
+front to terminate TLS for your real domain and forward to `127.0.0.1:5000` —
+this is the recommended production setup. Alternatively, set `AIME_HTTPS=1` in
+`.env` to have the app terminate its own self-signed TLS (a single-box / LAN
+convenience that runs the built-in development server and shows a one-time
+browser certificate warning).
 
 * All settings (`AIME_HTTPS`, `AIME_ALLOW_SIGNUP`, `AIME_USAGE_STATS`, ...)
   are configured in `.env` instead of the interactive prompts.

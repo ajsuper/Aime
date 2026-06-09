@@ -103,8 +103,11 @@ server restart does **not** force re-login — that is the property that
 lets background services run after a restart without operator
 intervention.
 
-`HttpOnly` and `SameSite=Strict` are set on the cookie by default;
-`Secure` is set when `AIME_HTTPS=1`.
+`HttpOnly` and `SameSite=Strict` are set on the cookie by default. `Secure`
+(and HSTS) are sent whenever the browser-facing connection is HTTPS — set
+`AIME_SECURE_COOKIES=1` when TLS terminates at a proxy in front
+(`AIME_HTTPS=0`), or use `AIME_HTTPS=1` when the app terminates TLS itself
+(which implies secure cookies). They are off only for plain-HTTP dev.
 
 ---
 
