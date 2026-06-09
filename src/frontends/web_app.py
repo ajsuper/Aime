@@ -1496,9 +1496,16 @@ def reset_password_submit():
     _auth_backend.revoke_all_trusted_devices(user_id)
     session.pop("pending_reset_token", None)
     session.pop("reset_in_progress", None)
+    # Name the account that was actually reset so the user is never left
+    # guessing which one changed (the code proved control of its inbox, so
+    # this reveals nothing they couldn't already see). Guards against the
+    # confusing case where the entered email belonged to a different account
+    # than the one they had in mind.
+    reset_user = _auth_backend.lookup(user_id)
+    who = f" for {reset_user.username}" if reset_user else ""
     return Response(
         _load_login_page(
-            notice="Your password has been updated. Please sign in.",
+            notice=f"Your password has been updated{who}. Please sign in.",
         ),
         mimetype="text/html",
     )
