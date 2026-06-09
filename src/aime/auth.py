@@ -1376,6 +1376,20 @@ class LocalAuthBackend:
                 return None
             user_id, username, email = row
             self._purge_expired_verifications()
+            # Only one outstanding reset per account: drop any prior 'reset'
+            # rows for this user before inserting the new one. The reset code is
+            # the *single* factor protecting the account (no password is
+            # required), so without this an attacker could open many parallel
+            # reset sessions for one victim, each with its own fresh code and
+            # 5-guess budget, and amplify a brute force against the 6-digit
+            # space. Capping to a single live code bounds the guessable surface
+            # to 5 attempts at any instant, refreshed only by re-mailing the
+            # victim (which is itself rate-limited and noisy).
+            self._conn.execute(
+                "DELETE FROM email_verifications "
+                "WHERE purpose = 'reset' AND user_id = ?",
+                (user_id,),
+            )
             self._conn.execute(
                 "INSERT INTO email_verifications "
                 "(token, purpose, user_id, username, email, code_hash, "
