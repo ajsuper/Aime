@@ -186,7 +186,12 @@ def test_find_graphic_and_all_ids():
 
 
 def test_redact_history_graphics_slims_source_but_keeps_id_and_summary():
-    history = [_graphic_block("fig-1", "mermaid", "graph TD; A-->B", "the flow")]
+    # An older graphic (outside the keep-recent window) is slimmed.
+    history = [
+        _graphic_block("fig-1", "mermaid", "graph TD; A-->B", "the flow"),
+        {"role": "user", "content": [{"type": "text", "text": "thanks"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "welcome"}]},
+    ]
     out = graphics.redact_history_graphics(history)
     # The original history is untouched — full source still there for persistence.
     assert history[0]["content"][0]["input"]["source"] == "graph TD; A-->B"
@@ -195,6 +200,20 @@ def test_redact_history_graphics_slims_source_but_keeps_id_and_summary():
     assert inp["graphic_id"] == "fig-1"             # id retained
     assert inp["summary"] == "the flow"             # summary retained
     assert "fig-1" in inp["source"] and "GetGraphic" in inp["source"]
+
+
+def test_redact_history_keeps_freshest_graphic_intact():
+    # The just-drawn graphic (its tool_result is the last message) keeps its real
+    # source, so the continuation turn never sees a stub where its source was —
+    # which is what stops the spurious "oops, I sent a placeholder" retry.
+    history = [
+        _graphic_block("fig-1", "mermaid", "graph TD; A-->B", "flow"),
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "tu_fig-1",
+             "content": "Rendered as fig-1."}]},
+    ]
+    out = graphics.redact_history_graphics(history)
+    assert out[0]["content"][0]["input"]["source"] == "graph TD; A-->B"
 
 
 def test_redact_history_keeps_loaded_source_only_in_last_message():

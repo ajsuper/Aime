@@ -285,13 +285,20 @@ def loaded_source_result(graphic_id: str, fmt: str, source: str) -> str:
 
 
 def _graphic_placeholder(graphic_id: str, summary: str) -> str:
-    cap = f' (summary: "{summary}")' if summary else ""
+    # This stands in for the model's *own* prior `source` argument, so the wording
+    # matters: a terse "[placeholder]" reads to the model like it mistakenly sent
+    # a stub and triggers a spurious "oops, let me resend" retry. So we (a) tag it
+    # unmistakably as a system action, not the model's content; (b) affirm that
+    # the source it sent was correct and rendered; (c) avoid priming words like
+    # "placeholder"/"don't apologize". The freshest graphic is left intact by
+    # redact_history_graphics, so this is only ever read at conversational
+    # distance, where the system framing lands cleanly.
+    cap = f' — "{summary}"' if summary else ""
     return (
-        f"[Graphic {graphic_id} was rendered to the user successfully{cap}. Its "
-        "source is omitted here to save context — this is expected; do not "
-        "resend it or apologize. To revise this graphic, call GetGraphic with "
-        f'id "{graphic_id}" to load its source, edit that, and call '
-        "CreateGraphics again.]"
+        f"[system: the source you sent for {graphic_id}{cap} was correct and "
+        "rendered to the user; it is kept on file and trimmed from this "
+        f'transcript to save space. To revise it, call GetGraphic("{graphic_id}") '
+        "to reload the exact source, then edit and re-send it.]"
     )
 
 
@@ -306,17 +313,28 @@ def _result_carries_loaded_source(block) -> bool:
     return isinstance(content, str) and content.startswith(_LOADED_SOURCE_OPENER)
 
 
+# Keep the most recently drawn graphic's source intact this many messages back.
+# A freshly rendered graphic sits in the second-to-last message (its tool_result
+# is last), so a window of 2 lets the continuation turn read the *real* source it
+# just produced — which is what stops the model from misreading the placeholder
+# as a stub it sent by mistake and "resending". Older graphics fall outside the
+# window and are slimmed normally.
+_KEEP_RECENT_GRAPHIC_MESSAGES = 2
+
+
 def redact_history_graphics(messages):
     """Return a copy of `messages` slimmed for sending to the model: every
     CreateGraphics `source` becomes a short placeholder (the model keeps the id +
-    summary), and every reloaded GetGraphic source is slimmed too — *except* one
-    in the final message, which the model still needs to read on the editing turn
-    it was loaded for.
+    summary) — *except* the freshest graphic, kept intact through its continuation
+    turn (see `_KEEP_RECENT_GRAPHIC_MESSAGES`) so the model never sees a stub
+    where the source it just wrote should be. Reloaded GetGraphic sources are
+    slimmed too, except one in the final message (the editing turn that needs it).
 
     Pure and non-mutating: only the touched message/content/block dicts are
     copied, so the caller's persisted `self._messages` is untouched and the
     cached prefix stays byte-stable (every placeholder is deterministic)."""
     last_index = len(messages) - 1
+    keep_recent_from = len(messages) - _KEEP_RECENT_GRAPHIC_MESSAGES
     out = list(messages)
     for mi, msg in enumerate(messages):
         if not isinstance(msg, dict):
@@ -331,7 +349,8 @@ def redact_history_graphics(messages):
                 continue
             replacement = None
             if (role == "assistant" and block.get("type") == "tool_use"
-                    and block.get("name") == GRAPHIC_TOOL_NAME):
+                    and block.get("name") == GRAPHIC_TOOL_NAME
+                    and mi < keep_recent_from):
                 inp = block.get("input")
                 if isinstance(inp, dict) and (inp.get("source") or ""):
                     gid = inp.get("graphic_id") or "this graphic"

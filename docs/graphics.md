@@ -101,6 +101,13 @@ copy bound for the API.*
   `input.source` with a short deterministic placeholder (naming the `fig-N` id +
   summary and pointing at GetGraphic) while preserving `format`, `summary`, and
   `graphic_id`.
+- **The freshest graphic is left intact** (a 2-message keep-recent window): a
+  graphic just drawn sits one message back, so its continuation turn reads the
+  *real* source it produced. Without this the model sees a placeholder where its
+  own `source` argument was and misreads it as a stub it sent by mistake — then
+  "resends" with an apology. The placeholder is also voiced as an explicit
+  `[system: …]` elision that affirms the source was correct, not as a terse stub,
+  so the rare older glance-back doesn't trip the same reflex either.
 
 Why send-time and **not** mutating `self._messages` in place: that list *is* the
 persistence + replay store. Redacting it would strip the source from the saved
