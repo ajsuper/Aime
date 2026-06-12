@@ -631,7 +631,11 @@ class UserContext:
             # Reminder tools are client-side (handled in the controller against
             # the ScheduleStore), so they ride alongside the gateway-backed data
             # tools in the model's tool list but are never forwarded to serve.cpp.
-            schema_files=aime_config.SCHEMA_FILES + aime_config.REMINDER_SCHEMA_FILES,
+            schema_files=(
+                aime_config.SCHEMA_FILES
+                + aime_config.REMINDER_SCHEMA_FILES
+                + [aime_config.CREATE_GRAPHICS_SCHEMA]
+            ),
             conversations_dir=conv_dir,
             dek=dek,
             usage_label=username,
@@ -889,6 +893,10 @@ class UserContext:
             "from_replay": event.from_replay,
             "attachments": event.attachments,
         }
+        # Structured payload for events that carry one (e.g. `graphic`, which
+        # holds {format, summary, source} for the frontend to render).
+        if event.payload is not None:
+            payload["payload"] = event.payload
         self._broadcast(payload)
 
         if event.kind == "assistant_text_delta" and partial_full:

@@ -27,6 +27,7 @@ from provider_backend import AgentBackend, BackendEvent, SessionInfo
 from .tool_gateway import ToolGateway
 from .commitments import CommitmentService
 from .services import _events_from
+from . import graphics as _graphics
 from .tool_formatting import (
     format_tool_details,
     format_tool_response,
@@ -65,6 +66,9 @@ CoreEventKind = Literal[
                                 # (emitted only when verbose mode is on)
     "agent_result",             # headless background agent called SubmitResult;
                                 # carries the structured result in `payload`
+    "graphic",                  # CreateGraphics: a chart/diagram/SVG to render
+                                # inline; carries {format, summary, source} in
+                                # `payload`
 ]
 
 
@@ -773,6 +777,13 @@ class ConversationController:
             except Exception as exc:
                 self._emit(CoreEvent(kind="error", text=f"tool result send failed: {exc}"))
             return
+        # CreateGraphics is a client tool (like WebSearch / SendMessage): the
+        # model supplies a chart/diagram/SVG spec, we validate it and emit it
+        # for the frontend to render inline, then keep the bulky source out of
+        # the model's context. Never forwarded to the data backend.
+        if tool_name == "CreateGraphics":
+            self._handle_create_graphics(event, tool_input)
+            return
         # Commitment-pattern tools are computed in Python over get_events (see
         # CommitmentService); they return a ready-to-read text digest, never raw
         # JSON, so they bypass the gateway and format_tool_result_for_model.
@@ -869,6 +880,77 @@ class ConversationController:
             ))
         except Exception as exc:
             self._emit(CoreEvent(kind="error", text=f"tool result send failed: {exc}"))
+
+    def _send_tool_result(self, tool_use_id, text: str) -> None:
+        """Hand a tool_result back to the model, surfacing a transport failure
+        as an error CoreEvent rather than letting it break the turn."""
+        try:
+            self._backend.submit(BackendEvent(
+                kind="tool_send_response",
+                tool_use_id=tool_use_id,
+                tool_result=text,
+            ))
+        except Exception as exc:
+            self._emit(CoreEvent(kind="error", text=f"tool result send failed: {exc}"))
+
+    def _handle_create_graphics(self, event: BackendEvent, tool_input: dict) -> None:
+        """Client tool: the model supplies a chart/diagram/SVG spec; we validate
+        it and emit it for the frontend to render inline in the chat.
+
+        On an invalid spec we hand the error straight back as the tool_result so
+        the model can fix it and call again the same turn — nothing renders.
+
+        On success we emit a `graphic` CoreEvent carrying the structured spec,
+        return a tiny tool_result (the model keeps only the `summary`), and
+        strip the bulky `source` from the stored tool_use input so it never
+        re-enters the model's context. (Phase 1: rendered live only — the strip
+        also keeps it out of the persisted session, so there's no replay yet.)"""
+        payload = tool_input if isinstance(tool_input, dict) else {}
+        tool_name = event.tool_name or "CreateGraphics"
+        fmt = (payload.get("format") or "").strip()
+        source = payload.get("source") or ""
+        summary = (payload.get("summary") or "").strip()
+
+        error = _graphics.validate(fmt, source)
+        if error:
+            self._emit(CoreEvent(
+                kind="tool_result",
+                tool_name=tool_name,
+                tool_result_summary=f"couldn't render: {error}",
+                tool_detail_full=error,
+            ))
+            self._send_tool_result(
+                event.tool_use_id,
+                f"Graphic not rendered. {error} Fix the `source` and call "
+                f"CreateGraphics again.",
+            )
+            return
+
+        # Rendered client-side: emit the structured graphic for the frontend.
+        self._emit(CoreEvent(
+            kind="graphic",
+            tool_name=tool_name,
+            payload={"format": fmt, "summary": summary, "source": source},
+        ))
+        self._emit(CoreEvent(
+            kind="tool_result",
+            tool_name=tool_name,
+            tool_result_summary=f"rendered {fmt} graphic",
+        ))
+        # Keep the bulky source out of the model's context (and, in Phase 1, out
+        # of the persisted session) — the model retains only `summary`.
+        redact = getattr(self._backend, "redact_tool_use_field", None)
+        if callable(redact) and event.tool_use_id:
+            try:
+                redact(event.tool_use_id, "source",
+                       "[rendered graphic — see summary]")
+            except Exception:
+                pass
+        self._send_tool_result(
+            event.tool_use_id,
+            f"Rendered. The user can now see it: {summary}"
+            if summary else "Rendered.",
+        )
 
     def _attach_commitment_histories(self, result, model_result: str) -> str:
         """Append a commitment-history digest for each commitment_id present in a

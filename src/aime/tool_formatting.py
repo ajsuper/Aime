@@ -98,6 +98,12 @@ def format_tool_details(name: str, inp: dict) -> str:
         body = _truncate_for_log(inp.get("text"), 50)
         if body:
             parts.append(f"\"{body}\"")
+    elif name == "CreateGraphics":
+        if inp.get("format"):
+            parts.append(str(inp["format"]))
+        summary = _truncate_for_log(inp.get("summary"), 50)
+        if summary:
+            parts.append(f"\"{summary}\"")
     elif name == "CreateReminder":
         parts.append(f"event #{inp.get('event_id', '?')}")
         days = inp.get("days_before")

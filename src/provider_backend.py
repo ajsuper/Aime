@@ -700,6 +700,43 @@ class AnthropicMessagesBackend:
                 # coerce — drop the write rather than crash the turn.
                 pass
 
+    def redact_tool_use_field(
+        self, tool_use_id: str, field: str, placeholder: str = ""
+    ) -> bool:
+        """Replace one field of a stored tool_use block's `input` with a short
+        placeholder, in place. Used by client tools (CreateGraphics) whose
+        payload is rendered UI-side and must not re-enter the model's context:
+        stripping the bulky value here keeps every later turn from re-sending
+        it and (Phase 1) keeps it out of the persisted session too. The model
+        keeps the block's other fields (e.g. the graphic's `summary`).
+
+        Returns True if a matching block was found and edited; a no-op False for
+        an unknown id. Safe to call from the stream-generator thread: the turn
+        loop is suspended on the tool_use `yield` when the controller calls
+        this, so no other thread is mutating `self._messages`."""
+        edited = False
+        with self._lock:
+            for msg in reversed(self._messages):
+                if msg.get("role") != "assistant":
+                    continue
+                content = msg.get("content")
+                if not isinstance(content, list):
+                    continue
+                for block in content:
+                    if (isinstance(block, dict)
+                            and block.get("type") == "tool_use"
+                            and block.get("id") == tool_use_id):
+                        inp = block.get("input")
+                        if isinstance(inp, dict) and field in inp:
+                            inp[field] = placeholder
+                            edited = True
+                        break
+                if edited:
+                    break
+        if edited:
+            self._persist()
+        return edited
+
     def interrupt_turn(self) -> None:
         """Signal that the in-flight or pending model turn should be
         aborted. Handles three sub-states:

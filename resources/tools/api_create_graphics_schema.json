@@ -1,0 +1,23 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "CreateGraphics",
+  "description": "Render a visual — a chart, a diagram, or a custom drawing — directly into the chat where the user can see it. Reach for it whenever a picture lands better than words: data the user would grasp faster as a bar/line/scatter/pie chart, a process or relationship best shown as a flowchart or diagram, or a layout/mockup worth sketching. Choose `format` by what you're showing — `vega-lite` for data charts (you supply the data plus an encoding), `mermaid` for node-and-edge diagrams (flowchart, sequence, ER, gantt, state), `svg` for mockups or any custom visual. The graphic renders immediately and you do not get to see the result, so build it carefully. Keep `source` focused: only the data and structure the picture needs.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["format", "source", "summary"],
+  "properties": {
+    "format": {
+      "type": "string",
+      "enum": ["vega-lite", "mermaid", "svg"],
+      "description": "How `source` is written. `vega-lite`: a Vega-Lite JSON spec, for data charts (bar/line/scatter/pie/area/histogram). `mermaid`: Mermaid diagram text, for flowcharts, sequence, ER, gantt, or state diagrams. `svg`: raw SVG markup, for mockups or anything custom."
+    },
+    "source": {
+      "type": "string",
+      "description": "The graphic itself, written in the chosen `format`: a Vega-Lite JSON spec, Mermaid diagram text, or an <svg>…</svg> document. Rendered as-is — there is no second pass, so make it complete and correct."
+    },
+    "summary": {
+      "type": "string",
+      "description": "A short, substantive caption — the takeaway, not the medium. Write 'Weekly spend peaked Tuesday at $31' rather than 'a bar chart'. This is what you keep about the graphic afterward, so it must carry the meaning, not just name the picture."
+    }
+  }
+}

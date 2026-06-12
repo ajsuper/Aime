@@ -2168,6 +2168,41 @@
       #side-col.topic-open .topic-content { transform: translateX(0); }
       #side-col.topic-open .topic-back-btn { display: flex; }
     }
+
+    /* Inline graphics (CreateGraphics): a chart / diagram / SVG the model
+       drew, rendered as a card in the transcript. */
+    .msg.graphic { display: block; }
+    .graphic-card {
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: var(--bg-elev);
+      padding: 14px;
+      margin: 4px 0;
+      max-width: 760px;
+      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
+    }
+    .graphic-card .graphic-body {
+      display: flex;
+      justify-content: center;
+      overflow-x: auto;
+    }
+    .graphic-card .graphic-body svg,
+    .graphic-card .graphic-body canvas,
+    .graphic-card .graphic-body img {
+      max-width: 100%;
+      height: auto;
+    }
+    .graphic-card .graphic-caption {
+      margin-top: 10px;
+      color: var(--muted);
+      font-size: 0.82rem;
+      line-height: 1.35;
+    }
+    .graphic-card .graphic-failed {
+      color: var(--muted);
+      font-size: 0.86rem;
+      font-style: italic;
+    }
   </style>
 </head>
 <body>
@@ -3439,6 +3474,114 @@ function appendNotice(text, severity) {
   return div;
 }
 
+// --- Inline graphics (CreateGraphics) -------------------------------------
+// The model draws charts/diagrams/SVG; the server validates and streams them
+// here as a `graphic` event carrying {format, summary, source}. We render the
+// source into a card. Heavy renderers (vega, mermaid) are pulled from CDN on
+// first use only — sessions that never draw pay nothing.
+const _scriptCache = {};
+function loadScript(src) {
+  if (_scriptCache[src]) return _scriptCache[src];
+  _scriptCache[src] = new Promise((resolve, reject) => {
+    const s = document.createElement("script");
+    s.src = src;
+    s.onload = resolve;
+    s.onerror = () => reject(new Error("failed to load " + src));
+    document.head.appendChild(s);
+  });
+  return _scriptCache[src];
+}
+
+let _mermaidReady = null;
+function ensureMermaid() {
+  if (_mermaidReady) return _mermaidReady;
+  _mermaidReady = loadScript(
+    "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"
+  ).then(() => {
+    window.mermaid.initialize({ startOnLoad: false, securityLevel: "strict" });
+    return window.mermaid;
+  });
+  return _mermaidReady;
+}
+
+let _vegaReady = null;
+function ensureVega() {
+  if (_vegaReady) return _vegaReady;
+  // vega-embed needs vega then vega-lite present first; load in order.
+  _vegaReady = loadScript("https://cdn.jsdelivr.net/npm/vega@5")
+    .then(() => loadScript("https://cdn.jsdelivr.net/npm/vega-lite@5"))
+    .then(() => loadScript("https://cdn.jsdelivr.net/npm/vega-embed@6"))
+    .then(() => window.vegaEmbed);
+  return _vegaReady;
+}
+
+let _graphicSeq = 0;
+function renderGraphic(payload) {
+  const fmt = payload.format || "";
+  const source = payload.source || "";
+  const summary = payload.summary || "";
+
+  const card = document.createElement("div");
+  card.className = "msg graphic";
+  const inner = document.createElement("div");
+  inner.className = "graphic-card";
+  const body = document.createElement("div");
+  body.className = "graphic-body";
+  inner.appendChild(body);
+  if (summary) {
+    const cap = document.createElement("div");
+    cap.className = "graphic-caption";
+    cap.textContent = summary;
+    inner.appendChild(cap);
+  }
+  card.appendChild(inner);
+  logInner.appendChild(card);
+  scrollToBottom();
+
+  const fail = (msg) => {
+    body.innerHTML = "";
+    const f = document.createElement("div");
+    f.className = "graphic-failed";
+    f.textContent = "Couldn't render this graphic.";
+    body.appendChild(f);
+    if (msg) console.warn("graphic render failed:", msg);
+  };
+
+  try {
+    if (fmt === "svg") {
+      // DOMPurify with the SVG profile keeps the safe SVG subset and strips
+      // scripts, event handlers, and foreignObject HTML — the real trust
+      // boundary for model-authored markup.
+      body.innerHTML = window.DOMPurify
+        ? window.DOMPurify.sanitize(source, {
+            USE_PROFILES: { svg: true, svgFilters: true },
+          })
+        : "";
+      if (!window.DOMPurify) fail("DOMPurify unavailable");
+      else scrollToBottom();
+    } else if (fmt === "vega-lite") {
+      let spec;
+      try { spec = JSON.parse(source); }
+      catch (err) { return fail(err); }
+      ensureVega()
+        .then((vegaEmbed) =>
+          vegaEmbed(body, spec, { actions: false, renderer: "svg" }))
+        .then(() => scrollToBottom())
+        .catch(fail);
+    } else if (fmt === "mermaid") {
+      const id = "mermaid-" + (++_graphicSeq);
+      ensureMermaid()
+        .then((mermaid) => mermaid.render(id, source))
+        .then(({ svg }) => { body.innerHTML = svg; scrollToBottom(); })
+        .catch(fail);
+    } else {
+      fail("unknown format " + fmt);
+    }
+  } catch (err) {
+    fail(err);
+  }
+}
+
 // Like appendNotice, but when detailText is present renders a native <details>
 // disclosure: the one-line summary stays visible with a dropdown arrow, and
 // clicking it reveals the full tool input/result. Used in Verbose mode so the
@@ -3843,6 +3986,13 @@ es.onmessage = (ev) => {
       } else {  // minimal — a single shared status line
         showWorkingIndicator();
       }
+      break;
+    case "graphic":
+      // A chart / diagram / SVG the model drew with CreateGraphics. Rendered
+      // as a card inline in the transcript, regardless of verbosity.
+      clearThinking();
+      clearWorkingIndicator();
+      renderGraphic(e.payload || {});
       break;
     case "tool_result":
       if (verbosity === "verbose") {
