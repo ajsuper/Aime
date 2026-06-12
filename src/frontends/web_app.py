@@ -323,6 +323,85 @@ _SAFE_URL_RE = re.compile(r"^(?:https?://|mailto:)", re.IGNORECASE)
 _PH = ""
 
 
+# A GFM table delimiter cell: dashes with optional leading/trailing colon for
+# alignment (`:---`, `:--:`, `---:`).
+_TABLE_DELIM_CELL_RE = re.compile(r"^:?-+:?$")
+
+
+def _split_table_row(line: str) -> list[str]:
+    """Split a Markdown table row into trimmed cells on unescaped pipes,
+    dropping the empty cell either side of an optional leading/trailing pipe."""
+    cells = re.split(r"(?<!\\)\|", line.strip())
+    if cells and cells[0].strip() == "":
+        cells = cells[1:]
+    if cells and cells[-1].strip() == "":
+        cells = cells[:-1]
+    return [c.strip().replace("\\|", "|") for c in cells]
+
+
+def _table_alignments(line: str) -> list[str] | None:
+    """If `line` is a valid table delimiter row, return the per-column CSS
+    text-align values ("", "left", "right", "center"); otherwise None."""
+    if "-" not in line or "|" not in line:
+        return None
+    cells = _split_table_row(line)
+    if not cells:
+        return None
+    aligns = []
+    for c in cells:
+        if not _TABLE_DELIM_CELL_RE.match(c):
+            return None
+        left, right = c.startswith(":"), c.endswith(":")
+        aligns.append("center" if left and right
+                      else "right" if right else "left" if left else "")
+    return aligns
+
+
+def _extract_tables(markup: str, final: bool, stash) -> str:
+    """Replace GFM pipe tables (a header row, a `---` delimiter row, then body
+    rows) with placeholders holding rendered <table> HTML. Cell text is run
+    through the full renderer so inline Rich/Markdown inside cells still works.
+    Tolerant while streaming: a half-arrived table renders the rows it has."""
+    lines = markup.split("\n")
+    out: list[str] = []
+    i, n = 0, len(lines)
+    while i < n:
+        line = lines[i]
+        aligns = _table_alignments(lines[i + 1]) if (i + 1 < n) else None
+        if "|" in line and aligns is not None:
+            header = _split_table_row(line)
+            body, j = [], i + 2
+            while j < n and lines[j].strip() and "|" in lines[j]:
+                body.append(_split_table_row(lines[j]))
+                j += 1
+            out.append(stash(_build_table_html(header, aligns, body, final)))
+            i = j
+            continue
+        out.append(line)
+        i += 1
+    return "\n".join(out)
+
+
+def _build_table_html(
+    header: list[str], aligns: list[str], body: list[list[str]], final: bool
+) -> str:
+    cols = len(header)
+
+    def cell(cells: list[str], idx: int, tag: str) -> str:
+        text = cells[idx] if idx < len(cells) else ""
+        align = aligns[idx] if idx < len(aligns) else ""
+        style = f' style="text-align:{align}"' if align else ""
+        return f"<{tag}{style}>{_render_markup_to_html(text, final=final)}</{tag}>"
+
+    def row(cells: list[str], tag: str) -> str:
+        return "<tr>" + "".join(cell(cells, k, tag) for k in range(cols)) + "</tr>"
+
+    head = row(header, "th")
+    rows = "".join(row(r, "td") for r in body)
+    return (f'<table class="md-table"><thead>{head}</thead>'
+            f"<tbody>{rows}</tbody></table>")
+
+
 def _safe_markup_text(markup: str, final: bool = False) -> Text:
     """Forgiving version of `Text.from_markup` — render the markup the model
     *got right* even when part of it is malformed.
@@ -429,6 +508,11 @@ def _md_to_rich(markup: str, final: bool, stash) -> str:
         markup = head + stash(
             f'<pre class="md-code"><code class="md-block{cls}">'
             f'{_h(tail.rstrip(chr(10)))}</code></pre>')
+
+    # Pipe tables → <table>. After code (so a `|` inside a fence is safe) and
+    # before the inline passes (so the table's own `|`/`---`/`*` aren't mangled;
+    # cell contents get the inline treatment via the recursive render instead).
+    markup = _extract_tables(markup, final, stash)
 
     # Inline code, then links — both stashed so their contents stay literal.
     markup = _INLINE_CODE_RE.sub(

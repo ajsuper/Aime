@@ -513,6 +513,24 @@
                       text-decoration-color: color-mix(in srgb,
                         var(--cta, var(--accent)) 45%, transparent); }
     .msg .content a:hover { text-decoration-color: currentColor; }
+    .msg .content table.md-table {
+      border-collapse: collapse; margin: 0.55rem 0; width: auto;
+      max-width: 100%; display: block; overflow-x: auto;
+      font-size: 0.9em; line-height: 1.35;
+    }
+    .msg .content table.md-table th,
+    .msg .content table.md-table td {
+      border: 1px solid var(--border);
+      padding: 0.35rem 0.7rem; text-align: left; vertical-align: top;
+      white-space: normal;
+    }
+    .msg .content table.md-table thead th {
+      background: var(--bg-elev); font-weight: 600;
+    }
+    /* Zebra striping for readability on wider tables. */
+    .msg .content table.md-table tbody tr:nth-child(even) td {
+      background: color-mix(in srgb, var(--bg-elev) 45%, transparent);
+    }
     .msg .content hr.md-hr { border: 0; height: 1px; margin: 0.45rem 0;
                              background: var(--border); }
     .msg .content > p { margin: 0.25rem 0; }
