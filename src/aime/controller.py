@@ -46,6 +46,18 @@ from .onboarding import (
 # long histories. The model can still call GetCommitmentHistory for the full set.
 _AUTO_HISTORY_LIMIT = 10
 
+# What replaces a CreateGraphics `source` in the stored tool_use input once the
+# graphic has rendered. Worded as an explicit *post-render system elision* — the
+# model re-reads its own prior turn, and a terse placeholder like "[see summary]"
+# reads to it like input it forgot to fill in, prompting a spurious "oops, let me
+# resend" retry. This spells out that the render succeeded and the source was
+# removed on purpose.
+_GRAPHIC_SOURCE_PLACEHOLDER = (
+    "[This graphic was rendered to the user successfully. Its source has been "
+    "omitted from the history to save space — this is expected; do not resend "
+    "it or apologize.]"
+)
+
 
 CoreEventKind = Literal[
     "user_message_shown",       # user msg accepted and sent to backend
@@ -942,8 +954,7 @@ class ConversationController:
         redact = getattr(self._backend, "redact_tool_use_field", None)
         if callable(redact) and event.tool_use_id:
             try:
-                redact(event.tool_use_id, "source",
-                       "[rendered graphic — see summary]")
+                redact(event.tool_use_id, "source", _GRAPHIC_SOURCE_PLACEHOLDER)
             except Exception:
                 pass
         self._send_tool_result(

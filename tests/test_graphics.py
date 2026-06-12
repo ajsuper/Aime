@@ -8,7 +8,7 @@ cases per format, especially the SVG safety rejections.
 
 from provider_backend import BackendEvent
 from aime import graphics
-from aime.controller import ConversationController
+from aime.controller import ConversationController, _GRAPHIC_SOURCE_PLACEHOLDER
 
 
 def test_unknown_format_rejected():
@@ -136,7 +136,7 @@ def test_valid_graphic_emits_event_and_strips_source():
         "format": "vega-lite", "summary": "weekly spend", "source": spec,
     }
     # The bulky source is stripped from the stored tool_use input.
-    assert backend.redactions == [("g1", "source", "[rendered graphic — see summary]")]
+    assert backend.redactions == [("g1", "source", _GRAPHIC_SOURCE_PLACEHOLDER)]
     # The model gets a tiny result that carries only the summary, not the spec.
     assert len(backend.responses) == 1
     result = backend.responses[0].tool_result

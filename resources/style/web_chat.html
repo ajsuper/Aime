@@ -3507,12 +3507,27 @@ function ensureMermaid() {
 let _vegaReady = null;
 function ensureVega() {
   if (_vegaReady) return _vegaReady;
-  // vega-embed needs vega then vega-lite present first; load in order.
+  // vega-embed needs vega then vega-lite present first; load in order. We also
+  // load vega-interpreter: our CSP has no 'unsafe-eval', but Vega compiles
+  // expressions with new Function() for every spec — which the browser blocks.
+  // The interpreter evaluates the expression AST instead, so charts render
+  // without loosening the page's script-src.
   _vegaReady = loadScript("https://cdn.jsdelivr.net/npm/vega@5")
     .then(() => loadScript("https://cdn.jsdelivr.net/npm/vega-lite@5"))
     .then(() => loadScript("https://cdn.jsdelivr.net/npm/vega-embed@6"))
+    .then(() => loadScript("https://cdn.jsdelivr.net/npm/vega-interpreter@1"))
     .then(() => window.vegaEmbed);
   return _vegaReady;
+}
+
+// The CSP-safe expression evaluator, resolved across the global names the
+// vega-interpreter UMD build has shipped under. Null if it didn't load — the
+// caller then falls back to the default (eval-based) path.
+function vegaInterpreter() {
+  return (window.vega && window.vega.expressionInterpreter)
+    || (window.vegaInterpreter && window.vegaInterpreter.expressionInterpreter)
+    || window.expressionInterpreter
+    || null;
 }
 
 let _graphicSeq = 0;
@@ -3564,8 +3579,15 @@ function renderGraphic(payload) {
       try { spec = JSON.parse(source); }
       catch (err) { return fail(err); }
       ensureVega()
-        .then((vegaEmbed) =>
-          vegaEmbed(body, spec, { actions: false, renderer: "svg" }))
+        .then((vegaEmbed) => {
+          const opts = { actions: false, renderer: "svg" };
+          // Use the AST interpreter when available so Vega never calls
+          // new Function() (blocked by our CSP); otherwise fall back to the
+          // default path (works only if 'unsafe-eval' is present).
+          const interp = vegaInterpreter();
+          if (interp) { opts.ast = true; opts.expr = interp; }
+          return vegaEmbed(body, spec, opts);
+        })
         .then(() => scrollToBottom())
         .catch(fail);
     } else if (fmt === "mermaid") {
