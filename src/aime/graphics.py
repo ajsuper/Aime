@@ -33,6 +33,21 @@ _SVG_SCRIPT_RE = re.compile(r"<\s*script", re.IGNORECASE)
 _SVG_HANDLER_RE = re.compile(r"\son\w+\s*=", re.IGNORECASE)
 _SVG_JS_URI_RE = re.compile(r"javascript:", re.IGNORECASE)
 
+# A single surrounding markdown code fence (```lang … ```). Models frequently
+# wrap a spec in one even though the field wants raw markup; strip it so the
+# parse/render sees clean content.
+_FENCE_RE = re.compile(r"^\s*```[\w-]*[ \t]*\r?\n?(.*?)\r?\n?\s*```\s*$", re.DOTALL)
+
+
+def strip_code_fence(source: str) -> str:
+    """Drop a single surrounding ```…``` code fence (and outer whitespace) if the
+    model wrapped its spec in one. Returns the source trimmed but otherwise
+    unchanged when there's no fence."""
+    if not isinstance(source, str):
+        return source
+    m = _FENCE_RE.match(source)
+    return m.group(1).strip() if m else source.strip()
+
 
 def validate(fmt: str, source: str) -> str | None:
     """Return a human-readable error if (fmt, source) can't be rendered, else
@@ -48,9 +63,15 @@ def validate(fmt: str, source: str) -> str | None:
         try:
             spec = json.loads(source)
         except ValueError as exc:
-            return f"Invalid Vega-Lite JSON: {exc}."
+            return (
+                f"Invalid Vega-Lite JSON ({exc}). The `source` must be a single "
+                "raw JSON object — start it with `{`, end with `}`, no markdown "
+                "code fences, no comments, and no text around it."
+            )
         if not isinstance(spec, dict):
-            return "A Vega-Lite spec must be a JSON object, not a list or value."
+            return ("A Vega-Lite spec must be a JSON object starting with `{` "
+                    "(a `mark` plus an `encoding`), not a bare array or value. "
+                    "Wrap your data and channels in a spec object.")
         if not any(k in spec for k in _VEGA_SPEC_KEYS):
             return ("This doesn't look like a Vega-Lite spec — it needs a "
                     "`mark` (and usually an `encoding`), or a layer/concat/"

@@ -920,7 +920,10 @@ class ConversationController:
         payload = tool_input if isinstance(tool_input, dict) else {}
         tool_name = event.tool_name or "CreateGraphics"
         fmt = (payload.get("format") or "").strip()
-        source = payload.get("source") or ""
+        # Models often wrap the spec in a markdown code fence; strip it so both
+        # validation and the frontend see clean markup. The cleaned source is
+        # what we render and (on failure) what stays for the model to revise.
+        source = _graphics.strip_code_fence(payload.get("source") or "")
         summary = (payload.get("summary") or "").strip()
 
         error = _graphics.validate(fmt, source)

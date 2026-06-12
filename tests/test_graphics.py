@@ -78,6 +78,24 @@ def test_mermaid_optimistic():
     assert graphics.validate("mermaid", "not really mermaid but non-empty") is None
 
 
+def test_strip_code_fence():
+    assert graphics.strip_code_fence('```json\n{"mark": "bar"}\n```') == '{"mark": "bar"}'
+    assert graphics.strip_code_fence('```\n{"a": 1}\n```') == '{"a": 1}'
+    assert graphics.strip_code_fence('  {"a": 1}  ') == '{"a": 1}'
+    # No fence: trimmed but otherwise untouched.
+    assert graphics.strip_code_fence('{"a": 1}') == '{"a": 1}'
+    # A lone backtick run inside the body must not be mistaken for a fence.
+    svg = "<svg><text>`code`</text></svg>"
+    assert graphics.strip_code_fence(svg) == svg
+
+
+def test_array_source_gives_directive_error():
+    # A bare array (the "Expecting value: line 1 column 2" case) gets a message
+    # telling the model to send an object.
+    err = graphics.validate("vega-lite", "[1, 2, 3]")
+    assert err and "starting with `{`" in err
+
+
 # --- Controller wiring -----------------------------------------------------
 # CreateGraphics is a client tool: the controller validates, emits a `graphic`
 # CoreEvent for the frontend, hands the model a tiny tool_result, and strips the
@@ -141,6 +159,21 @@ def test_valid_graphic_emits_event_and_strips_source():
     assert len(backend.responses) == 1
     result = backend.responses[0].tool_result
     assert "weekly spend" in result and spec not in result
+
+
+def test_fenced_vega_source_is_cleaned_before_render():
+    controller, backend, events = _graphics_controller()
+
+    _fire_graphic(controller, {
+        "format": "vega-lite",
+        "source": '```json\n{"mark": "bar", "encoding": {}}\n```',
+        "summary": "spend",
+    })
+
+    graphic = next(e for e in events if e.kind == "graphic")
+    # The code fence is stripped, so the frontend gets parseable JSON.
+    assert graphic.payload["source"] == '{"mark": "bar", "encoding": {}}'
+    assert backend.redactions  # rendered, so the source was stripped from history
 
 
 def test_invalid_graphic_is_handed_back_without_render_or_strip():

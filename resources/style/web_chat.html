@@ -2169,34 +2169,48 @@
       #side-col.topic-open .topic-back-btn { display: flex; }
     }
 
-    /* Inline graphics (CreateGraphics): a chart / diagram / SVG the model
-       drew, rendered as a card in the transcript. */
-    .msg.graphic { display: block; }
+    /* Inline graphics (CreateGraphics): a chart / diagram / SVG the model drew,
+       rendered as a single rounded card — the visual sits flush in the card
+       (renderers run transparent, see vegaThemeConfig), with the summary as a
+       caption beneath it inside the same card. */
+    .msg.graphic { display: block; padding-left: 1.25rem; }
     .graphic-card {
+      display: inline-block;
       border: 1px solid var(--border);
-      border-radius: 12px;
+      border-radius: 16px;
       background: var(--bg-elev);
-      padding: 14px;
+      padding: 16px;
       margin: 4px 0;
       max-width: 760px;
-      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
     }
     .graphic-card .graphic-body {
       display: flex;
       justify-content: center;
       overflow-x: auto;
+      background: transparent;
     }
     .graphic-card .graphic-body svg,
     .graphic-card .graphic-body canvas,
     .graphic-card .graphic-body img {
       max-width: 100%;
       height: auto;
+      background: transparent;
     }
+    /* Vega-embed wraps the chart in its own div and (when enabled) an actions
+       menu / details summary rendered as a small box in the corner. We pass
+       actions:false, but hide the chrome defensively too so only the chart
+       shows. */
+    .graphic-card .vega-embed { display: inline-block; }
+    .graphic-card .vega-embed summary,
+    .graphic-card .vega-embed details,
+    .graphic-card .vega-embed .vega-actions,
+    .graphic-card .vega-bindings { display: none !important; }
     .graphic-card .graphic-caption {
-      margin-top: 10px;
+      margin-top: 12px;
       color: var(--muted);
       font-size: 0.82rem;
-      line-height: 1.35;
+      line-height: 1.4;
     }
     .graphic-card .graphic-failed {
       color: var(--muted);
@@ -3530,6 +3544,42 @@ function vegaInterpreter() {
     || null;
 }
 
+function _cssVar(name, fallback) {
+  const v = getComputedStyle(document.documentElement)
+    .getPropertyValue(name).trim();
+  return v || fallback;
+}
+
+// A Vega config derived from the live theme, so charts sit in the card instead
+// of a white box: transparent background, themed axes/legend/labels, the page
+// font, and Aime's pastel-rainbow palette for multi-series colour. Spec-level
+// colours the model sets still win; this only changes the defaults.
+function vegaThemeConfig() {
+  const text = _cssVar("--text", "#2C2A24");
+  const muted = _cssVar("--muted", "#8A8273");
+  const border = _cssVar("--border", "#DFD9C8");
+  const accent = _cssVar("--accent", "#E3A4AF");
+  const font = (getComputedStyle(document.body).fontFamily
+    || "system-ui, sans-serif").trim();
+  const palette = ["#E3A4AF", "#E8C49A", "#C9CE8A", "#9FD4B0",
+                   "#9AC6E0", "#B6A8E0", "#E0A6CE"];
+  return {
+    background: "transparent",
+    view: { stroke: "transparent" },
+    title: { color: text, subtitleColor: muted, font: font, fontWeight: 600 },
+    axis: {
+      labelColor: muted, titleColor: text,
+      gridColor: border, domainColor: border, tickColor: border,
+      labelFont: font, titleFont: font,
+    },
+    legend: {
+      labelColor: muted, titleColor: text, labelFont: font, titleFont: font,
+    },
+    range: { category: palette },
+    mark: { color: accent },
+  };
+}
+
 let _graphicSeq = 0;
 function renderGraphic(payload) {
   const fmt = payload.format || "";
@@ -3580,7 +3630,11 @@ function renderGraphic(payload) {
       catch (err) { return fail(err); }
       ensureVega()
         .then((vegaEmbed) => {
-          const opts = { actions: false, renderer: "svg" };
+          const opts = {
+            actions: false,
+            renderer: "svg",
+            config: vegaThemeConfig(),
+          };
           // Use the AST interpreter when available so Vega never calls
           // new Function() (blocked by our CSP); otherwise fall back to the
           // default path (works only if 'unsafe-eval' is present).
