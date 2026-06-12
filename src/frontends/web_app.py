@@ -2602,6 +2602,14 @@ def stream():
     def gen():
         try:
             for payload in snapshot:
+                # Everything in the snapshot is history relative to *this*
+                # connection, even live events from earlier in the session. Force
+                # from_replay so a reconnect (phone wake, network change) renders
+                # them instantly instead of re-running the typewriter / re-flipping
+                # the busy gate. The client also rebuilds its transcript on
+                # reconnect, so these can't duplicate what's already on screen.
+                if not payload.get("from_replay"):
+                    payload = {**payload, "from_replay": True}
                 yield f"data: {json.dumps(payload)}\n\n"
             # Sentinel: from here on, events are live (typewriter eligible).
             # `busy` carries the real turn state so a client that just
