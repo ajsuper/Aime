@@ -301,6 +301,27 @@ _HR_LINE_RE = re.compile(r"(?m)^[ \t]*---[ \t]*$")
 # them for <hr> in the final HTML.
 _HR_SENTINEL = "❦AIMEHR❦"
 
+# --- Markdown layer ---------------------------------------------------------
+# Aime speaks Rich console markup in chat, but the model still reaches for
+# Markdown for code (no Rich equivalent) and occasionally slips a `**bold**` or
+# `[link](url)` in by reflex. We render both: protected constructs (code, links)
+# are pulled out to placeholders that survive Rich's renderer untouched, while
+# inline/Block emphasis is rewritten into the Rich tags Rich already handles.
+_FENCE_RE = re.compile(r"```[ \t]*([A-Za-z0-9_+\-]*)[ \t]*\n(.*?)\n?```", re.DOTALL)
+_INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
+_MD_LINK_RE = re.compile(r"(?<!\\)\[([^\]\n]+)\]\((\S+?)(?:[ \t]+\"[^\"]*\")?\)")
+_MD_BOLD_RE = re.compile(r"(?<!\*)\*\*(?!\s)(.+?)(?<!\s)\*\*(?!\*)", re.DOTALL)
+_MD_ITALIC_RE = re.compile(r"(?<![*\w])\*(?!\s)([^*\n]+?)(?<![\s*])\*(?![*\w])")
+_MD_HEADING_RE = re.compile(r"(?m)^[ \t]*(#{1,6})[ \t]+(.*?)[ \t]*#*[ \t]*$")
+_MD_BULLET_RE = re.compile(r"(?m)^([ \t]*)[-*+][ \t]+")
+# Only http(s) and mailto links become anchors; anything else (notably
+# javascript:) stays literal text so a rendered link can never be an exploit.
+_SAFE_URL_RE = re.compile(r"^(?:https?://|mailto:)", re.IGNORECASE)
+# Placeholder delimiter: a private-use codepoint Rich's HTML export passes
+# through verbatim (it only escapes & < >), so stashed fragments survive the
+# render and can be swapped back in afterwards.
+_PH = ""
+
 
 def _safe_markup_text(markup: str, final: bool = False) -> Text:
     """Forgiving version of `Text.from_markup` — render the markup the model
@@ -379,13 +400,74 @@ def _safe_markup_text(markup: str, final: bool = False) -> Text:
     return text
 
 
-def _render_markup_to_html(markup: str, final: bool = False) -> str:
-    """Convert Rich-style markup to inline-styled HTML spans.
+def _md_to_rich(markup: str, final: bool, stash) -> str:
+    """Fold the Markdown the model emits into the Rich markup pipeline.
 
-    Lines containing only `---` are treated as horizontal rules — the model
-    keeps emitting them as a Markdown reflex even though we render Rich
-    markup, so swap them for actual <hr> elements instead of literal dashes.
+    Code (fenced and inline) and links can't be expressed as Rich tags, so they
+    are rendered to HTML here and parked behind `stash` placeholders that pass
+    through Rich untouched. Emphasis, headings and bullets are rewritten into
+    the Rich tags / glyphs Rich already renders. `final` distinguishes a
+    finished message from a mid-stream partial (an unclosed code fence is a
+    block still being typed, not a mistake — render it as code anyway)."""
+    # Fenced code first, so nothing inside it (Rich tags, ---, **, …) is touched.
+    def _fence(m):
+        lang = (m.group(1) or "").strip().lower()
+        cls = " language-" + _h(lang) if lang else ""
+        body = _h(m.group(2))
+        return stash(f'<pre class="md-code"><code class="md-block{cls}">{body}'
+                     "</code></pre>")
+    markup = _FENCE_RE.sub(_fence, markup)
+    # A fence the model has opened but not yet closed (streaming, or a final
+    # message where it forgot the closer): treat the trailing remainder as code.
+    if "```" in markup:
+        head, _, tail = markup.rpartition("```")
+        lang = ""
+        nl = tail.find("\n")
+        if nl != -1 and re.fullmatch(r"[A-Za-z0-9_+\-]*", tail[:nl].strip()):
+            lang, tail = tail[:nl].strip().lower(), tail[nl + 1:]
+        cls = " language-" + _h(lang) if lang else ""
+        markup = head + stash(
+            f'<pre class="md-code"><code class="md-block{cls}">'
+            f'{_h(tail.rstrip(chr(10)))}</code></pre>')
+
+    # Inline code, then links — both stashed so their contents stay literal.
+    markup = _INLINE_CODE_RE.sub(
+        lambda m: stash('<code class="md-inline">' + _h(m.group(1)) + "</code>"),
+        markup)
+
+    def _link(m):
+        url = m.group(2)
+        if not _SAFE_URL_RE.match(url):
+            return m.group(0)  # leave unsafe / relative links as plain text
+        return stash(f'<a href="{_h(url)}" target="_blank" '
+                     f'rel="noopener noreferrer">{_h(m.group(1))}</a>')
+    markup = _MD_LINK_RE.sub(_link, markup)
+
+    # Stray inline/block Markdown → the Rich equivalents Rich can render.
+    markup = _MD_BOLD_RE.sub(r"[bold]\1[/bold]", markup)
+    markup = _MD_ITALIC_RE.sub(r"[italic]\1[/italic]", markup)
+    markup = _MD_HEADING_RE.sub(lambda m: "[bold]" + m.group(2) + "[/bold]", markup)
+    markup = _MD_BULLET_RE.sub(lambda m: m.group(1) + "• ", markup)
+    return markup
+
+
+def _render_markup_to_html(markup: str, final: bool = False) -> str:
+    """Convert the model's chat output — Rich console markup with a Markdown
+    layer on top — to inline-styled HTML.
+
+    Rich tags drive colour/emphasis; the Markdown layer (`_md_to_rich`) adds
+    code blocks, inline code and links and tolerates accidental `**bold**` /
+    `# headings` / `- bullets`. Lines of only `---` become <hr> (a Markdown
+    reflex the model keeps even in Rich mode).
     """
+    placeholders: list[str] = []
+
+    def stash(fragment: str) -> str:
+        token = f"{_PH}{len(placeholders)}{_PH}"
+        placeholders.append(fragment)
+        return token
+
+    markup = _md_to_rich(markup, final, stash)
     markup = _HR_LINE_RE.sub(_HR_SENTINEL, markup)
 
     console = Console(
@@ -402,6 +484,10 @@ def _render_markup_to_html(markup: str, final: bool = False) -> str:
     console.print(rendered, soft_wrap=True, end="")
     html = console.export_html(inline_styles=True, code_format="{code}")
     html = html.replace(_HR_SENTINEL, '<hr class="md-hr">')
+    # Swap the protected code/link fragments back in. Done after the Rich render
+    # so their HTML is never escaped or wrapped in style spans.
+    for i, fragment in enumerate(placeholders):
+        html = html.replace(f"{_PH}{i}{_PH}", fragment)
     # Collapse runs of blank lines so paragraph separation stays modest under
     # white-space: pre-wrap. Two newlines (one blank line) is the most we ever
     # need visually; longer runs would render as cavernous gaps in the bubble.

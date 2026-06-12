@@ -506,6 +506,13 @@
     .msg .content code { background: var(--bg-elev); padding: 0.1em 0.35em;
                          border-radius: 4px; }
     .msg .content pre code { background: transparent; padding: 0; }
+    .msg .content a { color: var(--cta, var(--accent)); font-weight: 500;
+                      text-decoration: underline;
+                      text-underline-offset: 2px;
+                      text-decoration-thickness: 1px;
+                      text-decoration-color: color-mix(in srgb,
+                        var(--cta, var(--accent)) 45%, transparent); }
+    .msg .content a:hover { text-decoration-color: currentColor; }
     .msg .content hr.md-hr { border: 0; height: 1px; margin: 0.45rem 0;
                              background: var(--border); }
     .msg .content > p { margin: 0.25rem 0; }
@@ -2175,7 +2182,7 @@
           <path d="M4 6h16M4 12h16M4 18h10"/>
         </svg>
       </button>
-      <button class="rail-btn pane-btn advanced-only" data-target="agents"
+      <button class="rail-btn pane-btn" data-target="agents"
               title="Agents" aria-label="Agents">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
              stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -2300,7 +2307,7 @@
         </div>
       </div>
 
-      <!-- Agents pane (Advanced only). A small management dashboard: create,
+      <!-- Agents pane. A small management dashboard: create,
            edit, delete and run saved background agents. Each agent is a card
            that owns its own runs (in a click-to-open disclosure); runs with no
            current agent fall to an "Other runs" section. Definitions persist
@@ -2503,7 +2510,7 @@
     </div>
   </div>
 
-  <!-- Create / edit a saved agent (Advanced only). -->
+  <!-- Create / edit a saved agent. -->
   <div id="agent-edit-backdrop" class="modal-backdrop" role="dialog"
        aria-modal="true" aria-labelledby="agent-edit-title" hidden>
     <div id="agent-edit-modal" class="modal-card">
@@ -4684,7 +4691,7 @@ async function loadAgentRuns() {
 
 // One row in a runs list: agent name + a status pill, clickable to open the
 // run's transcript. Shared by the Verbose conversations section and the
-// Advanced agents pane.
+// agents pane.
 function buildRunItem(run) {
   const item = document.createElement("div");
   item.className = "session-item agent-run-item";
@@ -4700,7 +4707,7 @@ function buildRunItem(run) {
   return item;
 }
 
-// -- Agents pane (Advanced only) ----------------------------------------
+// -- Agents pane --------------------------------------------------------
 // A management dashboard: create, edit, delete and run saved background
 // agents. Definitions persist per-user (CRUD via /agents). Each card owns its
 // own runs (grouped from /agent-runs by agent_id) in a disclosure; runs with no
@@ -7702,9 +7709,6 @@ function applyUiMode(mode) {
       const userBtn = document.querySelector('.settings-tab-btn[data-tab="user"]');
       if (userBtn) userBtn.click();
     }
-    // The Agents pane is Advanced-only; its rail button just vanished, so
-    // close the pane if it was open rather than leaving it stranded.
-    if (activePaneName === "agents") closeSide();
   }
 }
 
