@@ -3534,6 +3534,10 @@ function mermaidThemeConfig() {
   return {
     startOnLoad: false,
     securityLevel: "strict",
+    // Never let Mermaid paint its own "Syntax error … mermaid version" banner
+    // into the page on a bad diagram — we catch the failure and show our own
+    // calm card instead (see renderGraphic). Requires mermaid >= 10.7.
+    suppressErrorRendering: true,
     theme: "base",
     fontFamily: font,
     themeVariables: {
@@ -3629,6 +3633,18 @@ function vegaThemeConfig() {
   };
 }
 
+// Mermaid renders through a temporary node it appends to <body>; on failure
+// (and across some versions even on success) it can leave that node — or, in
+// older builds, an injected error graphic — orphaned at the end of the page.
+// Belt-and-suspenders alongside suppressErrorRendering: sweep any stray node
+// tied to this render id so the user never sees a leftover graphic.
+function cleanupMermaidOrphans(id) {
+  ["d" + id, id].forEach((nid) => {
+    const el = document.getElementById(nid);
+    if (el && el.parentNode === document.body) el.remove();
+  });
+}
+
 let _graphicSeq = 0;
 function renderGraphic(payload) {
   const fmt = payload.format || "";
@@ -3698,10 +3714,21 @@ function renderGraphic(payload) {
       ensureMermaid()
         .then((mermaid) => {
           mermaid.initialize(mermaidThemeConfig());
-          return mermaid.render(id, source);
+          // Validate before rendering. parse({suppressErrors:true}) resolves to
+          // false on a syntax error instead of throwing — and, with
+          // suppressErrorRendering set, neither parse nor render injects
+          // Mermaid's red "Syntax error" bomb into the page. A bad diagram thus
+          // becomes our own calm card, never a banner the user sees.
+          return Promise.resolve(mermaid.parse(source, { suppressErrors: true }))
+            .then((ok) => (ok ? mermaid.render(id, source) : null));
         })
-        .then(({ svg }) => { body.innerHTML = svg; scrollToBottom(); })
-        .catch(fail);
+        .then((res) => {
+          if (!res) { fail("mermaid syntax error"); return; }
+          body.innerHTML = res.svg;
+          scrollToBottom();
+        })
+        .catch(fail)
+        .finally(() => cleanupMermaidOrphans(id));
     } else {
       fail("unknown format " + fmt);
     }

@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "CreateGraphics",
-  "description": "Render a visual — a chart, a diagram, or a custom drawing — directly into the chat where the user can see it. Reach for it whenever a picture lands better than words: data the user would grasp faster as a bar/line/scatter/pie chart, a process or relationship best shown as a flowchart or diagram, or a layout/mockup worth sketching. Choose `format` by what you're showing — `vega-lite` for data charts (you supply the data plus an encoding), `mermaid` for node-and-edge diagrams (flowchart, sequence, ER, gantt, state), `svg` for mockups or any custom visual. The graphic renders immediately and you do not get to see the result, so build it carefully. Keep `source` focused: only the data and structure the picture needs.",
+  "description": "Render a visual — a chart, a diagram, or a custom drawing — directly into the chat where the user can see it. Reach for it whenever a picture lands better than words: data the user would grasp faster as a bar/line/scatter/pie chart, a process or relationship best shown as a flowchart or diagram, or a layout/mockup worth sketching. Choose `format` by what you're showing — `vega-lite` for data charts (you supply the data plus an encoding), `mermaid` for node-and-edge diagrams (flowchart, sequence, ER, gantt, state), `svg` for mockups or any custom visual. The graphic renders immediately and you do not get to see the result, so build it carefully and keep `source` focused on just the data and structure the picture needs. READABILITY IS PART OF THE JOB: keep every label legible and high-contrast against whatever sits behind it, label your axes and series, and don't crowd the canvas. For `vega-lite` and `mermaid`, the chart auto-themes to match the chat (light or dark) — so rely on the default colors for guaranteed contrast and only override them when you have a real reason. For `svg`, the chat theme can be light OR dark, so make the drawing self-contained: paint your own background `<rect>` covering the whole `viewBox` and choose text/line colors that contrast strongly with that fill — never assume a white page.",
   "type": "object",
   "additionalProperties": false,
   "required": ["format", "source", "summary"],
@@ -13,7 +13,7 @@
     },
     "source": {
       "type": "string",
-      "description": "The graphic itself, written in the chosen `format`: a Vega-Lite JSON spec, Mermaid diagram text, or an <svg>…</svg> document. Rendered as-is — there is no second pass, so make it complete and correct."
+      "description": "The graphic itself, written in the chosen `format`, as raw markup with NO surrounding markdown code fence. `vega-lite`: a single JSON object — start with `{`, end with `}`, strict JSON only (double-quoted keys, no comments, no trailing commas). `mermaid`: diagram text whose FIRST line names the type (e.g. `flowchart TD`, `sequenceDiagram`, `erDiagram`); keep node/edge labels short and quote any label containing punctuation. `svg`: one `<svg …>` root with a `viewBox` and an opaque background `<rect>` so it reads on any theme; static only — no `<script>`, event handlers, or `javascript:` URIs. Rendered as-is — there is no second pass, so make it complete and correct."
     },
     "summary": {
       "type": "string",

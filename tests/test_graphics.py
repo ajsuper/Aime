@@ -72,10 +72,29 @@ def test_svg_malformed_xml_rejected():
     assert err and "well-formed" in err
 
 
-def test_mermaid_optimistic():
-    # No server-side validator for Mermaid — any non-empty text passes the gate.
+def test_mermaid_known_types_accepted():
+    # The gate only checks the opening diagram-type keyword; the body is left to
+    # the browser renderer. A real type — even with a directive, comment, or
+    # frontmatter ahead of it — passes.
     assert graphics.validate("mermaid", "graph TD; A-->B") is None
-    assert graphics.validate("mermaid", "not really mermaid but non-empty") is None
+    assert graphics.validate("mermaid", "flowchart LR\n  A --> B") is None
+    assert graphics.validate("mermaid", "sequenceDiagram\n  A->>B: hi") is None
+    assert graphics.validate("mermaid", "stateDiagram-v2\n  [*] --> S") is None
+    assert graphics.validate("mermaid", "xychart-beta\n  bar [1,2,3]") is None
+    assert graphics.validate(
+        "mermaid", "%%{init: {'theme':'base'}}%%\nflowchart TD\n A-->B"
+    ) is None
+    assert graphics.validate(
+        "mermaid", "---\ntitle: Demo\n---\nflowchart TD\n A-->B"
+    ) is None
+
+
+def test_mermaid_non_diagram_rejected():
+    # Prose pasted by mistake, or a missing type line, names no diagram type and
+    # would render to nothing — so the model gets a fixable error instead.
+    err = graphics.validate("mermaid", "not really mermaid but non-empty")
+    assert err and "diagram type" in err
+    assert graphics.validate("mermaid", "   \n  %% just a comment\n")
 
 
 def test_strip_code_fence():
@@ -87,6 +106,39 @@ def test_strip_code_fence():
     # A lone backtick run inside the body must not be mistaken for a fence.
     svg = "<svg><text>`code`</text></svg>"
     assert graphics.strip_code_fence(svg) == svg
+
+
+def test_svg_unbound_xlink_prefix_accepted():
+    # `xlink:href` without an xmlns:xlink declaration is a common, renderable
+    # SVG idiom; the validator binds the prefix for its parse instead of
+    # rejecting the drawing.
+    svg = ('<svg xmlns="http://www.w3.org/2000/svg">'
+           '<use xlink:href="#a"/></svg>')
+    assert graphics.validate("svg", svg) is None
+
+
+def test_svg_non_svg_root_rejected():
+    err = graphics.validate(
+        "svg", '<div xmlns="http://www.w3.org/2000/svg"><rect/></div>'
+    )
+    assert err and "root element" in err
+
+
+def test_normalize_strips_fence_and_trailing_commas():
+    # Trailing commas are tolerated for Vega-Lite — but only because removing
+    # them makes otherwise-invalid JSON parse.
+    out = graphics.normalize(
+        "vega-lite", '```json\n{"mark": "bar", "encoding": {},}\n```'
+    )
+    assert out == '{"mark": "bar", "encoding": {}}'
+    assert graphics.validate("vega-lite", out) is None
+
+
+def test_normalize_leaves_valid_json_untouched():
+    spec = '{"mark": "bar", "data": {"values": [{"a": "x,}"}]}}'
+    # The `,}` lives inside a string; since the spec already parses, normalize
+    # must not touch it.
+    assert graphics.normalize("vega-lite", spec) == spec
 
 
 def test_array_source_gives_directive_error():
