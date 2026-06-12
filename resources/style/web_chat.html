@@ -3509,13 +3509,62 @@ function loadScript(src) {
 let _mermaidReady = null;
 function ensureMermaid() {
   if (_mermaidReady) return _mermaidReady;
+  // Load only — themed initialize happens per render (below) so the diagram
+  // follows the live theme, including switches between graphics.
   _mermaidReady = loadScript(
     "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"
-  ).then(() => {
-    window.mermaid.initialize({ startOnLoad: false, securityLevel: "strict" });
-    return window.mermaid;
-  });
+  ).then(() => window.mermaid);
   return _mermaidReady;
+}
+
+// Mermaid config derived from the live theme. The `base` theme is the one
+// meant to be customized via themeVariables — node fills sit on the page
+// background (subtle contrast against the card), borders/edges use the accent
+// and muted tones, and the diagram background is transparent so the card shows
+// through. Covers flowchart, sequence, and note elements.
+function mermaidThemeConfig() {
+  const text = _cssVar("--text", "#2C2A24");
+  const muted = _cssVar("--muted", "#8A8273");
+  const border = _cssVar("--border", "#DFD9C8");
+  const accent = _cssVar("--accent", "#E3A4AF");
+  const bg = _cssVar("--bg", "#F4F0E6");
+  const bgElev = _cssVar("--bg-elev", "#FBF8F0");
+  const font = (getComputedStyle(document.body).fontFamily
+    || "system-ui, sans-serif").trim();
+  return {
+    startOnLoad: false,
+    securityLevel: "strict",
+    theme: "base",
+    fontFamily: font,
+    themeVariables: {
+      background: "transparent",
+      fontFamily: font,
+      primaryColor: bg,
+      primaryTextColor: text,
+      primaryBorderColor: accent,
+      secondaryColor: bgElev,
+      secondaryTextColor: text,
+      secondaryBorderColor: border,
+      tertiaryColor: bgElev,
+      tertiaryTextColor: text,
+      tertiaryBorderColor: border,
+      mainBkg: bg,
+      nodeBorder: accent,
+      nodeTextColor: text,
+      lineColor: muted,
+      textColor: text,
+      titleColor: text,
+      edgeLabelBackground: bgElev,
+      clusterBkg: bgElev,
+      clusterBorder: border,
+      actorBkg: bg,
+      actorBorder: accent,
+      actorTextColor: text,
+      noteBkgColor: bgElev,
+      noteTextColor: text,
+      noteBorderColor: border,
+    },
+  };
 }
 
 let _vegaReady = null;
@@ -3647,7 +3696,10 @@ function renderGraphic(payload) {
     } else if (fmt === "mermaid") {
       const id = "mermaid-" + (++_graphicSeq);
       ensureMermaid()
-        .then((mermaid) => mermaid.render(id, source))
+        .then((mermaid) => {
+          mermaid.initialize(mermaidThemeConfig());
+          return mermaid.render(id, source);
+        })
         .then(({ svg }) => { body.innerHTML = svg; scrollToBottom(); })
         .catch(fail);
     } else {
