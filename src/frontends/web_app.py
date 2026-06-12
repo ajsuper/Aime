@@ -2616,7 +2616,20 @@ def stream():
                 + "\n\n"
             )
             while True:
-                payload = q.get()
+                try:
+                    payload = q.get(timeout=20)
+                except queue.Empty:
+                    # Heartbeat. Without this, an idle stream parks this
+                    # worker thread in q.get() forever, and a client that
+                    # died silently (phone sleep, closed tab, network drop,
+                    # proxy idle timeout) is never noticed because we only
+                    # learn the socket is dead when a yield tries to write to
+                    # it. Emitting a keepalive comment on idle forces that
+                    # write: if the peer is gone it raises here, the `finally`
+                    # runs, and the waitress thread is reclaimed instead of
+                    # leaking. (16 threads leak over ~a day → queue backs up.)
+                    yield ": keepalive\n\n"
+                    continue
                 yield f"data: {json.dumps(payload)}\n\n"
         finally:
             ctx.detach_client(q)
