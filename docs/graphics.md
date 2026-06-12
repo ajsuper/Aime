@@ -96,9 +96,11 @@ copy bound for the API.*
 
 - `self._messages` (persisted to disk, replayed on reload) keeps the **full
   `source`** → graphics survive reload and appear in session replay.
-- `_cacheable_messages` walks the copy and, for any `tool_use` block whose
-  `name == "CreateGraphics"`, replaces `input.source` with a short placeholder
-  (e.g. `"[rendered — see summary]"`) while preserving `format` and `summary`.
+- `_cacheable_messages` calls `graphics.redact_history_graphics`, which walks the
+  copy and, for any `tool_use` block whose `name == "CreateGraphics"`, replaces
+  `input.source` with a short deterministic placeholder (naming the `fig-N` id +
+  summary and pointing at GetGraphic) while preserving `format`, `summary`, and
+  `graphic_id`.
 
 Why send-time and **not** mutating `self._messages` in place: that list *is* the
 persistence + replay store. Redacting it would strip the source from the saved
@@ -152,9 +154,38 @@ transcript stays readable and the summary still conveys the substance.
 
 No new store. The full `source` rides in `self._messages` (§3), which is already
 persisted per-session and re-enumerated into the transcript on `/load`. The
-frontend's replay path renders the card from the stored `tool_use` block the same
-way it renders a live one. The strip is invisible to persistence because it lives
-only on the API-bound copy.
+strip is invisible to persistence because it lives only on the API-bound copy.
+
+On success the controller calls `backend.register_graphic(tool_use_id, source,
+summary)`, which stamps the stored `tool_use` block with its **cleaned** source
+(what actually renders, post fence/JSON-repair) and a stable **id** (`fig-N`,
+one past the highest already in history). `replay.py` special-cases a
+CreateGraphics block, emitting a `graphic` CoreEvent from the stored spec so the
+card re-renders on `/load` exactly like a live one (GetGraphic reloads are
+skipped — they're internal plumbing, not transcript).
+
+---
+
+## 6a. Editing an existing graphic — the load-back loop
+
+The strip (§3) means that on a later turn the model no longer holds a graphic's
+source — only its `fig-N` id and `summary`. So "make that chart green" can't be
+answered by editing what's in context; the model would have to redraw from the
+summary and get the details wrong. The fix is a companion **`GetGraphic`** client
+tool (`api_get_graphic_schema.json`): given a `fig-N` id, it returns that
+graphic's full source — read from the copy still in `self._messages` — as the
+tool_result, so the model edits the real spec and re-sends it via CreateGraphics.
+
+This preserves the cost guarantee. The source is paid for again only on the
+*editing* turn the model deliberately reloads it; `redact_history_graphics` then
+slims that reloaded GetGraphic result back down on every later turn — **except**
+when it sits in the final message, which is the editing turn that still needs to
+read it. So a reload costs the source once, not forever. The CreateGraphics and
+GetGraphic tool_results both tell the model the id and steer it to reload-before-
+editing rather than redrawing from memory.
+
+A revised graphic is a *new* card with a *new* id (chat is append-only); the old
+card stays in the transcript above it.
 
 ---
 
@@ -199,9 +230,10 @@ case (a report-style result with an embedded chart) appears.
   vendored vs. fetch — vendored avoids a network dependency in the hot path.
 - **Download format**: source-only (smallest, faithful) vs. rasterized PNG
   (shareable, needs a canvas pass per format). Could ship source-only first.
-- **Strip placeholder wording.** What the model reads in place of the stripped
-  source — a bare `"[rendered]"` vs. echoing `summary` inline so a later turn
-  reading old history still has the gist without the bytes. Leaning the latter.
+- **Strip placeholder wording.** *Resolved:* the placeholder echoes the `fig-N`
+  id + summary and tells the model to reload via GetGraphic before editing —
+  enough gist to act on without the bytes, and a pointer to get the bytes back
+  when it genuinely needs them.
 - **Size cap on `source`.** A guard against a pathological multi-thousand-line
   SVG eating the generation turn's output budget — reject over some ceiling with
   a friendly note, or accept and rely on the strip. Probably a soft cap.

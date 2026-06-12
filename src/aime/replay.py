@@ -77,7 +77,31 @@ def replay_messages(messages: list[dict]) -> Iterator[CoreEvent]:
                         yield CoreEvent(
                             kind="assistant_text", text=text, from_replay=True
                         )
+                elif (btype == "tool_use"
+                        and block.get("name") == "CreateGraphics"):
+                    # An inline graphic: its full source is kept in history (only
+                    # the API-bound copy is stripped), so re-render the card from
+                    # the stored spec instead of surfacing a bare tool_call.
+                    inp = block.get("input") or {}
+                    source = inp.get("source") or ""
+                    if source:
+                        yield CoreEvent(
+                            kind="graphic",
+                            tool_name="CreateGraphics",
+                            payload={
+                                "format": inp.get("format") or "",
+                                "summary": inp.get("summary") or "",
+                                "source": source,
+                                "id": inp.get("graphic_id"),
+                            },
+                            from_replay=True,
+                        )
+                    continue
                 elif btype in ("tool_use", "server_tool_use"):
+                    # GetGraphic is an internal reload; don't clutter the replayed
+                    # transcript with it.
+                    if block.get("name") == "GetGraphic":
+                        continue
                     yield CoreEvent(
                         kind="tool_call",
                         tool_name=block.get("name", "tool"),

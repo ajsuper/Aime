@@ -130,6 +130,13 @@ SEND_MESSAGE_SCHEMA = "../resources/tools/api_send_message_schema.json"
 # in a live chat, so background agents don't get it.
 CREATE_GRAPHICS_SCHEMA = "../resources/tools/api_create_graphics_schema.json"
 
+# GetGraphic is the companion reload tool: each graphic's source lives on in the
+# message history (stripped from the model's per-turn context) under a stable id,
+# and GetGraphic hands that source back for one turn so the model can revise an
+# existing graphic accurately instead of redrawing it from the summary. Paired
+# with CreateGraphics; interactive sessions only.
+GET_GRAPHIC_SCHEMA = "../resources/tools/api_get_graphic_schema.json"
+
 
 def load_system_prompt(path: str = SYSTEM_PROMPT_PATH) -> str:
     with open(path) as f:

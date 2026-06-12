@@ -271,6 +271,7 @@ class AgentBackend(Protocol):
 # so the aime package's eager import of controller can resolve them.
 import aime.encryption as _enc
 import aime.dateformat as dateformat
+from aime import graphics as _graphics
 
 
 class AnthropicMessagesBackend:
@@ -700,42 +701,62 @@ class AnthropicMessagesBackend:
                 # coerce — drop the write rather than crash the turn.
                 pass
 
-    def redact_tool_use_field(
-        self, tool_use_id: str, field: str, placeholder: str = ""
-    ) -> bool:
-        """Replace one field of a stored tool_use block's `input` with a short
-        placeholder, in place. Used by client tools (CreateGraphics) whose
-        payload is rendered UI-side and must not re-enter the model's context:
-        stripping the bulky value here keeps every later turn from re-sending
-        it and (Phase 1) keeps it out of the persisted session too. The model
-        keeps the block's other fields (e.g. the graphic's `summary`).
+    def _find_tool_use_block(self, tool_use_id: str) -> dict | None:
+        """The stored assistant `tool_use` block with this id, or None. Caller
+        holds `self._lock`."""
+        for msg in reversed(self._messages):
+            if msg.get("role") != "assistant":
+                continue
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if (isinstance(block, dict)
+                        and block.get("type") == "tool_use"
+                        and block.get("id") == tool_use_id):
+                    return block
+        return None
 
-        Returns True if a matching block was found and edited; a no-op False for
-        an unknown id. Safe to call from the stream-generator thread: the turn
-        loop is suspended on the tool_use `yield` when the controller calls
-        this, so no other thread is mutating `self._messages`."""
-        edited = False
+    def register_graphic(
+        self, tool_use_id: str, source: str, summary: str | None = None
+    ) -> str | None:
+        """Stamp a freshly-drawn CreateGraphics block with a stable id (`fig-N`)
+        and its cleaned, render-ready source, then persist. The full source stays
+        in history so the graphic survives reload (replay) and can be reloaded
+        for editing via GetGraphic; the send-time strip (see _cacheable_messages)
+        keeps it out of the model's per-turn context. Returns the assigned id, or
+        None if the block is gone.
+
+        Safe from the stream-generator thread: the turn loop is suspended on the
+        tool_use `yield` when the controller calls this, so nothing else mutates
+        `self._messages`."""
         with self._lock:
-            for msg in reversed(self._messages):
-                if msg.get("role") != "assistant":
-                    continue
-                content = msg.get("content")
-                if not isinstance(content, list):
-                    continue
-                for block in content:
-                    if (isinstance(block, dict)
-                            and block.get("type") == "tool_use"
-                            and block.get("id") == tool_use_id):
-                        inp = block.get("input")
-                        if isinstance(inp, dict) and field in inp:
-                            inp[field] = placeholder
-                            edited = True
-                        break
-                if edited:
-                    break
-        if edited:
-            self._persist()
-        return edited
+            gid = _graphics.next_graphic_id(self._messages)
+            block = self._find_tool_use_block(tool_use_id)
+            if block is None:
+                return None
+            inp = block.get("input")
+            if not isinstance(inp, dict):
+                inp = {}
+                block["input"] = inp
+            inp["source"] = source
+            inp["graphic_id"] = gid
+            if summary is not None:
+                inp["summary"] = summary
+        self._persist()
+        return gid
+
+    def get_graphic(self, graphic_id: str) -> dict | None:
+        """The stored graphic with this id — ``{'id','format','source','summary'}``
+        — reading the full source kept in history, or None. Backs the GetGraphic
+        reload tool."""
+        with self._lock:
+            return _graphics.find_graphic(self._messages, graphic_id)
+
+    def graphic_ids(self) -> list[str]:
+        """Every assigned graphic id in history, in draw order."""
+        with self._lock:
+            return _graphics.all_graphic_ids(self._messages)
 
     def interrupt_turn(self) -> None:
         """Signal that the in-flight or pending model turn should be
@@ -1405,6 +1426,13 @@ class AnthropicMessagesBackend:
         fresh user turn."""
         if not messages:
             return messages
+        # Slim every inline-graphic source down to a short, deterministic
+        # placeholder (the model keeps each graphic's id + summary, and reloads
+        # the source on demand via GetGraphic). Non-mutating: the full source
+        # stays in self._messages for persistence, replay, and editing — only
+        # this API-bound copy is stripped. Done before the cache breakpoint so
+        # the slimmed tail is what gets cached.
+        messages = _graphics.redact_history_graphics(messages)
         out = list(messages)
         last = out[-1]
         content = last.get("content")

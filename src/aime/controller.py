@@ -46,19 +46,6 @@ from .onboarding import (
 # long histories. The model can still call GetCommitmentHistory for the full set.
 _AUTO_HISTORY_LIMIT = 10
 
-# What replaces a CreateGraphics `source` in the stored tool_use input once the
-# graphic has rendered. Worded as an explicit *post-render system elision* — the
-# model re-reads its own prior turn, and a terse placeholder like "[see summary]"
-# reads to it like input it forgot to fill in, prompting a spurious "oops, let me
-# resend" retry. This spells out that the render succeeded and the source was
-# removed on purpose.
-_GRAPHIC_SOURCE_PLACEHOLDER = (
-    "[This graphic was rendered to the user successfully. Its source has been "
-    "omitted from the history to save space — this is expected; do not resend "
-    "it or apologize.]"
-)
-
-
 CoreEventKind = Literal[
     "user_message_shown",       # user msg accepted and sent to backend
     "user_message_queued",      # user msg queued (backend was busy)
@@ -79,8 +66,8 @@ CoreEventKind = Literal[
     "agent_result",             # headless background agent called SubmitResult;
                                 # carries the structured result in `payload`
     "graphic",                  # CreateGraphics: a chart/diagram/SVG to render
-                                # inline; carries {format, summary, source} in
-                                # `payload`
+                                # inline; carries {format, summary, source, id}
+                                # in `payload`
 ]
 
 
@@ -796,6 +783,13 @@ class ConversationController:
         if tool_name == "CreateGraphics":
             self._handle_create_graphics(event, tool_input)
             return
+        # GetGraphic is the companion reload tool: it returns the full source of
+        # a graphic the model drew earlier (by its `fig-N` id) so the model can
+        # revise it accurately instead of guessing from the summary. The source
+        # is paid for only on this editing turn, then stripped from history again.
+        if tool_name == "GetGraphic":
+            self._handle_get_graphic(event, tool_input)
+            return
         # Commitment-pattern tools are computed in Python over get_events (see
         # CommitmentService); they return a ready-to-read text digest, never raw
         # JSON, so they bypass the gateway and format_tool_result_for_model.
@@ -912,18 +906,20 @@ class ConversationController:
         On an invalid spec we hand the error straight back as the tool_result so
         the model can fix it and call again the same turn — nothing renders.
 
-        On success we emit a `graphic` CoreEvent carrying the structured spec,
-        return a tiny tool_result (the model keeps only the `summary`), and
-        strip the bulky `source` from the stored tool_use input so it never
-        re-enters the model's context. (Phase 1: rendered live only — the strip
-        also keeps it out of the persisted session, so there's no replay yet.)"""
+        On success we register the graphic — stamping its stored tool_use block
+        with a stable id (`fig-N`) and its cleaned source — then emit a `graphic`
+        CoreEvent for the frontend and hand the model a tiny tool_result naming
+        the id. The full source stays in history (so the graphic survives reload
+        and can be reloaded for editing via GetGraphic), but the send-time strip
+        keeps it out of the model's per-turn context — the model carries only the
+        id + summary until it deliberately reloads."""
         payload = tool_input if isinstance(tool_input, dict) else {}
         tool_name = event.tool_name or "CreateGraphics"
         fmt = (payload.get("format") or "").strip()
         # Models often wrap the spec in a code fence (and slip a trailing comma
         # into Vega-Lite JSON); normalize repairs those so both validation and
         # the frontend see clean, renderable markup. The cleaned source is what
-        # we render and (on failure) what stays for the model to revise.
+        # we render, store, and (on failure) hand back for the model to revise.
         source = _graphics.normalize(fmt, payload.get("source") or "")
         summary = (payload.get("summary") or "").strip()
 
@@ -942,29 +938,89 @@ class ConversationController:
             )
             return
 
+        # Persist the cleaned source in history and assign a stable id, so the
+        # graphic survives reload and can be reloaded for editing. The send-time
+        # strip (provider_backend) keeps the source out of the model's context.
+        graphic_id = None
+        register = getattr(self._backend, "register_graphic", None)
+        if callable(register) and event.tool_use_id:
+            try:
+                graphic_id = register(event.tool_use_id, source, summary)
+            except Exception:
+                graphic_id = None
+
         # Rendered client-side: emit the structured graphic for the frontend.
         self._emit(CoreEvent(
             kind="graphic",
             tool_name=tool_name,
-            payload={"format": fmt, "summary": summary, "source": source},
+            payload={
+                "format": fmt, "summary": summary, "source": source,
+                "id": graphic_id,
+            },
         ))
         self._emit(CoreEvent(
             kind="tool_result",
             tool_name=tool_name,
-            tool_result_summary=f"rendered {fmt} graphic",
+            tool_result_summary=(
+                f"rendered {fmt} graphic ({graphic_id})"
+                if graphic_id else f"rendered {fmt} graphic"
+            ),
         ))
-        # Keep the bulky source out of the model's context (and, in Phase 1, out
-        # of the persisted session) — the model retains only `summary`.
-        redact = getattr(self._backend, "redact_tool_use_field", None)
-        if callable(redact) and event.tool_use_id:
-            try:
-                redact(event.tool_use_id, "source", _GRAPHIC_SOURCE_PLACEHOLDER)
-            except Exception:
-                pass
+        if graphic_id:
+            seen = f"The user can now see it: {summary}" if summary else \
+                "The user can now see it."
+            self._send_tool_result(
+                event.tool_use_id,
+                f"Rendered as {graphic_id}. {seen} To revise this graphic later, "
+                f'call GetGraphic with id "{graphic_id}" to load its source '
+                "first — don't redraw it from memory.",
+            )
+        else:
+            self._send_tool_result(
+                event.tool_use_id,
+                f"Rendered. The user can now see it: {summary}"
+                if summary else "Rendered.",
+            )
+
+    def _handle_get_graphic(self, event: BackendEvent, tool_input: dict) -> None:
+        """Client tool: reload a previously-drawn graphic's full source by its
+        `fig-N` id so the model can revise it accurately. The source re-enters
+        context only for this turn — the send-time strip slims the reloaded
+        result back down once the editing turn has passed."""
+        payload = tool_input if isinstance(tool_input, dict) else {}
+        tool_name = event.tool_name or "GetGraphic"
+        graphic_id = (payload.get("id") or "").strip()
+
+        getter = getattr(self._backend, "get_graphic", None)
+        graphic = getter(graphic_id) if (callable(getter) and graphic_id) else None
+        if not graphic or not graphic.get("source"):
+            ids_fn = getattr(self._backend, "graphic_ids", None)
+            known = ids_fn() if callable(ids_fn) else []
+            hint = (f" Graphics drawn so far: {', '.join(known)}."
+                    if known else " No graphics have been drawn yet.")
+            msg = (f"No graphic with id {graphic_id!r} was found.{hint}"
+                   if graphic_id else
+                   "Provide the `id` of the graphic to load (e.g. \"fig-1\").")
+            self._emit(CoreEvent(
+                kind="tool_result",
+                tool_name=tool_name,
+                tool_result_summary=f"no graphic {graphic_id}".strip(),
+                tool_detail_full=msg,
+            ))
+            self._send_tool_result(event.tool_use_id, msg)
+            return
+
+        self._emit(CoreEvent(
+            kind="tool_result",
+            tool_name=tool_name,
+            tool_result_summary=f"loaded {graphic_id} source",
+        ))
         self._send_tool_result(
             event.tool_use_id,
-            f"Rendered. The user can now see it: {summary}"
-            if summary else "Rendered.",
+            _graphics.loaded_source_result(
+                graphic_id, graphic.get("format") or "",
+                graphic.get("source") or "",
+            ),
         )
 
     def _attach_commitment_histories(self, result, model_result: str) -> str:

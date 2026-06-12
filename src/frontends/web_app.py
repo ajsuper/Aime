@@ -634,7 +634,8 @@ class UserContext:
             schema_files=(
                 aime_config.SCHEMA_FILES
                 + aime_config.REMINDER_SCHEMA_FILES
-                + [aime_config.CREATE_GRAPHICS_SCHEMA]
+                + [aime_config.CREATE_GRAPHICS_SCHEMA,
+                   aime_config.GET_GRAPHIC_SCHEMA]
             ),
             conversations_dir=conv_dir,
             dek=dek,
