@@ -4088,7 +4088,7 @@ def _safe_filename(name: str, fallback: str) -> str:
     return cleaned or fallback
 
 
-@app.route("/topics/<topic_id>/export")
+@app.route("/topics/<topic_id>/export", methods=["GET", "POST"])
 @login_required
 def topic_export(topic_id: str):
     try:
@@ -4100,8 +4100,19 @@ def topic_export(topic_id: str):
         return jsonify({"ok": False, "error": "unsupported format"}), 400
     target, ext, mime = _EXPORT_FORMATS[fmt]
     ctx = _context_for(owner_id)
+    # The client may POST a rendered copy of the body to embed in the document —
+    # e.g. with each [graphic-…] tag swapped for an inline PNG data URI, which
+    # only the browser can rasterize (mermaid/vega need a DOM). When absent we
+    # export the stored body verbatim. Either way the reader must have view
+    # access (checked above), and the title always comes from metadata.
+    override_md = None
+    if request.method == "POST":
+        body = request.get_json(silent=True) or {}
+        if isinstance(body.get("markdown"), str):
+            override_md = body["markdown"]
     try:
-        markdown = ctx.topic_service.get_topic_contents(tid)
+        markdown = (override_md if override_md is not None
+                    else ctx.topic_service.get_topic_contents(tid))
         # Title comes from the topics list — get_topic_contents only returns
         # the body, not metadata. A small list scan is fine (topics are tens,
         # not thousands) and keeps this route independent of how the gateway
