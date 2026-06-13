@@ -975,28 +975,23 @@ class ConversationController:
             except Exception:
                 pass
 
-        # Rendered client-side at the call site: emit the structured graphic.
-        self._emit(CoreEvent(
-            kind="graphic",
-            tool_name=tool_name,
-            payload={
-                "format": fmt, "summary": summary, "source": source,
-                "id": graphic_id,
-            },
-        ))
+        # Nothing is shown yet: the graphic is a stored asset, displayed wherever
+        # its `[graphic-N]` tag appears. The model places that tag in its reply
+        # (chat) and/or a topic body; the frontend resolves it through the same
+        # renderer for both. A status line for the verbose tool view only.
         self._emit(CoreEvent(
             kind="tool_result",
             tool_name=tool_name,
-            tool_result_summary=f"rendered {fmt} graphic ({graphic_id})",
+            tool_result_summary=f"saved {fmt} graphic ({graphic_id})",
         ))
-        seen = f"The user can now see it: {summary}" if summary else \
-            "The user can now see it."
+        cap = f" ({summary})" if summary else ""
         self._send_tool_result(
             event.tool_use_id,
-            f"Rendered as {graphic_id} in the chat. {seen} To place this same "
-            f"graphic in a topic, write [{graphic_id}] in the topic body. To "
-            f'revise it later, call GetGraphic with id "{graphic_id}" to load its '
-            "source first — don't redraw it from memory.",
+            f"Saved as {graphic_id}{cap}. It is NOT shown to the user yet — "
+            f"display it by writing the tag [{graphic_id}] in your reply where you "
+            "want it to appear (and/or in a topic body); it renders inline wherever "
+            f'that tag appears. To revise it later, call GetGraphic with id '
+            f'"{graphic_id}" to load its source first — don\'t redraw it from memory.',
         )
 
     def _handle_get_graphic(self, event: BackendEvent, tool_input: dict) -> None:

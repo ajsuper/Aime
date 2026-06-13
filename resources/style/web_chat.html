@@ -3408,6 +3408,7 @@ function typewriterUpdate(bubble, html, finalize) {
   if (typewriter.bubble !== bubble) {
     if (typewriter.bubble && typewriter.target) {
       typewriter.bubble._content.innerHTML = typewriter.target;
+      resolveGraphicTags(typewriter.bubble._content);
     }
     if (typewriter.rafId != null) {
       cancelAnimationFrame(typewriter.rafId);
@@ -3435,6 +3436,7 @@ function typewriterStep() {
       // Lock in the full HTML — guards against any subtle whitespace
       // discrepancy between our walker and innerHTML.
       bubble._content.innerHTML = typewriter.target;
+      resolveGraphicTags(bubble._content);
       typewriter.bubble = null;
       scrollToBottom();
     }
@@ -4196,6 +4198,7 @@ es.onmessage = (ev) => {
         typewriterUpdate(target, e.text, /*finalize=*/true);
       } else {
         target._content.innerHTML = e.text;
+        resolveGraphicTags(target._content);
       }
       pendingHtmlTarget = null;
       currentAssistant = null;

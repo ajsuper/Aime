@@ -271,18 +271,14 @@ def test_valid_graphic_stores_and_reports_id(tmp_path):
         "format": "vega-lite", "source": spec, "summary": "weekly spend",
     })
 
-    # A `graphic` event carrying the full spec and its id reaches the frontend.
-    graphic = next(e for e in events if e.kind == "graphic")
-    assert graphic.payload == {
-        "format": "vega-lite", "summary": "weekly spend",
-        "source": spec, "id": "graphic-1",
-    }
+    # No auto-card: the graphic is a stored asset, displayed only via its tag.
+    assert not any(e.kind == "graphic" for e in events)
     # The canonical copy landed in the store, and the history stamp kept the
     # source for replay.
     assert controller._graphic_store.load("graphic-1")["source"] == spec
     assert backend.stamped["graphic-1"]["source"] == spec
-    # The model's result names the id, the [graphic-N] tag, and GetGraphic — and
-    # never echoes the spec back.
+    # The model's result names the id, steers it to write the [graphic-N] tag to
+    # display it, points at GetGraphic — and never echoes the spec back.
     assert len(backend.responses) == 1
     result = backend.responses[0].tool_result
     assert "graphic-1" in result and "[graphic-1]" in result
@@ -298,11 +294,10 @@ def test_fenced_vega_source_is_cleaned_before_store(tmp_path):
         "summary": "spend",
     })
 
-    graphic = next(e for e in events if e.kind == "graphic")
-    # The code fence is stripped, so the frontend, store, and history get clean JSON.
-    assert graphic.payload["source"] == '{"mark": "bar", "encoding": {}}'
+    # The code fence is stripped, so the store (and the history stamp) get clean JSON.
     assert controller._graphic_store.load("graphic-1")["source"] == \
         '{"mark": "bar", "encoding": {}}'
+    assert backend.stamped["graphic-1"]["source"] == '{"mark": "bar", "encoding": {}}'
 
 
 def test_invalid_graphic_is_handed_back_without_render_or_store(tmp_path):

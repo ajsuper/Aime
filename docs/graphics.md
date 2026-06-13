@@ -173,13 +173,17 @@ account-wide (not per-conversation, not per-topic). This is **not** in serve.cpp
 On success the controller saves the cleaned source to the store (which allocates
 the id), then calls `backend.register_graphic(tool_use_id, graphic_id, source,
 summary)` to *stamp* the history `tool_use` block with that id + cleaned source.
-The store is the source of truth; the history stamp exists only so (a) `replay.py`
-can re-emit a `graphic` CoreEvent per CreateGraphics block on `/load` (GetGraphic
-reloads are skipped — internal plumbing, not transcript) and (b) the §3 strip can
-reference the id. The full `source` still rides in `self._messages` (persisted
-per-session) for that replay path; the strip is invisible to persistence because
-it lives only on the API-bound copy. Because chat is append-only and edits make a
-*new* id, the store copy and the history stamp never drift.
+The store is the source of truth; the history stamp exists only so the §3 strip
+can reference the id (and as a redundant on-disk copy). The full `source` still
+rides in `self._messages` (persisted per-session); the strip is invisible to
+persistence because it lives only on the API-bound copy. Because chat is
+append-only and edits make a *new* id, the store copy and the stamp never drift.
+
+Replay is **tag-driven**: a graphic re-renders on `/load` from the `[graphic-N]`
+tag the model wrote into its own assistant text (resolved against the store, §6b),
+not from the tool_call — so `replay.py` skips both CreateGraphics and GetGraphic
+`tool_use` blocks as internal plumbing, and the asset shows up exactly where the
+model placed its tag.
 
 ---
 
@@ -208,22 +212,27 @@ card stays in the transcript above it.
 
 ## 6b. The `[graphic-N]` tag — one render path for chat and topics
 
-Because a graphic is a stored asset, the model references it the same way
-everywhere: the tag **`[graphic-N]`**. This unifies what used to be a chat-only
-card with topic embedding — one tag, one resolver, one store behind both.
+Because a graphic is a stored asset, the model displays it the same way
+everywhere: it writes the tag **`[graphic-N]`** in its text, and the tag renders
+inline wherever it appears. **Creating a graphic does not display it** — the
+`CreateGraphics` tool only saves the asset and returns the id; the model then
+writes `[graphic-N]` in its reply (chat) and/or a topic body to show it. One tag,
+one resolver (`resolveGraphicTags`), one store — no separate card path, so chat
+and topics behave identically and a graphic can never render twice.
 
-- **Chat.** `CreateGraphics` renders at the call site: the controller emits a
-  `graphic` CoreEvent carrying `{id, format, summary, source}` and the frontend
-  draws the card immediately (no behavior change from the card-only era). The
-  model doesn't need to write the tag in chat — it renders automatically — but
-  the id it gets back is the same one a topic uses.
+- **Chat.** The frontend resolves `[graphic-N]` in the model's assistant text the
+  moment a bubble's HTML is finalized — the typewriter lock-in for live turns, the
+  direct `innerHTML` set for replay/history. Chat HTML is rendered server-side, so
+  the tag arrives as literal text and `resolveGraphicTags` swaps it in place.
 - **Topics.** The model writes `[graphic-N]` into a topic body (authored via
-  `replace_topic_contents` / `create_topic`). `renderTopicMarkdown` resolves it
-  *after* `marked` + `DOMPurify`, walking **text nodes only** (never re-parsing
-  HTML, so it can't reintroduce unsafe markup): each `[graphic-N]` token is
-  swapped for a card whose source is fetched from `GET /graphics/<id>` and
-  rendered through the **same** `renderGraphicInto(body, fmt, source)` the chat
-  card uses. A stale/forbidden id degrades to a calm "couldn't load" card.
+  `replace_topic_contents` / `create_topic`). `renderTopicMarkdown` runs the same
+  resolver *after* `marked` + `DOMPurify`.
+
+In both surfaces `resolveGraphicTags` walks **text nodes only** (never re-parsing
+HTML, so it can't reintroduce unsafe markup): each `[graphic-N]` token is swapped
+for a card whose source is fetched from `GET /graphics/<id>` and rendered through
+`renderGraphicInto(body, fmt, source)`. A stale/forbidden id degrades to a calm
+"couldn't load" card.
 - **The route.** `GET /graphics/<id>` (`web_app.py`, `@login_required`) returns
   `{format, source, summary}` from the user's `GraphicStore`. **Owner-scoped:** a
   user reads only their own assets; missing reads as 404. Cross-user resolution
