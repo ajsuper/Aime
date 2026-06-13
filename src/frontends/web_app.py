@@ -86,6 +86,7 @@ from aime.scheduling import (
 from aime import auth as _auth
 from aime import encryption as _enc
 from aime import backup as _backup
+from aime.graphics_store import GraphicStore
 from aime import email_send as _email_send
 from aime import topic_shares as _topic_shares
 from aime.tool_formatting import TOOL_NAME_MAP
@@ -244,6 +245,13 @@ def _schedules_dir(user_id: int) -> str:
     """Where ``ScheduleStore`` keeps this user's encrypted schedule records
     (scheduled agents + event reminders). Sibling of ``agents/``."""
     return os.path.join(_user_dir(user_id), "schedules")
+
+
+def _graphics_dir(user_id: int) -> str:
+    """Where ``GraphicStore`` keeps this user's encrypted graphic assets — the
+    canonical home for everything CreateGraphics draws, that `[graphic-N]` tags
+    in chat and topics resolve against. Sibling of ``schedules/``."""
+    return os.path.join(_user_dir(user_id), "graphics")
 
 
 # LEGACY MIGRATION — pre-multi-user installs kept all conversations in a
@@ -699,6 +707,7 @@ class UserContext:
             message_recipient=messaging_contact,
             reminder_service=reminder_service,
             record_sync=self.record_sync,
+            graphic_store=GraphicStore(_graphics_dir(user_id), dek),
         )
 
         # Seed the session with the user's last-seen zone so any turn that runs
@@ -3938,6 +3947,28 @@ def topics():
     except Exception:
         pass
     return jsonify({"topics": items})
+
+
+@app.route("/graphics/<graphic_id>")
+@login_required
+def graphic_asset(graphic_id: str):
+    """Return one of the logged-in user's stored graphic assets — the source a
+    `[graphic-N]` tag (placed in a topic body, or rendered in chat) resolves to.
+    Owner-scoped: a user only reads their own graphics. Missing/unreadable reads
+    as 404 so a stale tag degrades to a calm 'couldn't load' card, not an error."""
+    try:
+        store = GraphicStore(
+            _graphics_dir(g.user_id), _auth_backend.get_dek(g.user_id))
+        record = store.load(graphic_id)
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    if not record:
+        return jsonify({"ok": False, "error": "not found"}), 404
+    return jsonify({
+        "format": record.get("format") or "",
+        "source": record.get("source") or "",
+        "summary": record.get("summary") or "",
+    })
 
 
 @app.route("/topics/<topic_id>")

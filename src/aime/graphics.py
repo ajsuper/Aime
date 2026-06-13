@@ -196,83 +196,23 @@ def validate(fmt: str, source: str) -> str | None:
     return None
 
 
-# --- Graphic identity, history persistence, and the context strip ----------
-# A graphic's bulky `source` lives in the message history — so it persists, is
-# replayed on reload, and can be reloaded for editing — but is stripped from the
-# copy sent to the model each turn (the model pays for it once, at draw time).
-# Each graphic carries a short, stable id (`fig-1`, `fig-2`, …) the model uses to
-# reload its source via the GetGraphic tool before revising it. This is what lets
-# the model edit a graphic accurately instead of guessing from the summary alone.
+# --- History persistence and the context strip -----------------------------
+# A graphic's canonical copy lives in the user's GraphicStore (graphics_store.py),
+# keyed by a per-user id (`graphic-1`, `graphic-2`, …). A *stamped copy* of the
+# cleaned source + that id also rides in the message history, for two reasons:
+# replay re-renders a session's graphics from it on /load, and the source-strip
+# below references the id. But the model never pays for that source per-turn —
+# the strip replaces it with a short placeholder on the copy sent to the API
+# (the model pays for the source once, as output, on the turn it draws it), and
+# reloads the real source from the store via GetGraphic only when it edits.
 
 GRAPHIC_TOOL_NAME = "CreateGraphics"
 GET_GRAPHIC_TOOL_NAME = "GetGraphic"
-GRAPHIC_ID_PREFIX = "fig-"
 
 # Opening line of a GetGraphic result that carries a reloaded source. Doubles as
 # the sentinel the strip matches to slim that result back down once the editing
 # turn it was loaded for has passed.
 _LOADED_SOURCE_OPENER = "[Loaded source of "
-
-
-def make_graphic_id(n: int) -> str:
-    return f"{GRAPHIC_ID_PREFIX}{n}"
-
-
-def _iter_tool_use_blocks(messages):
-    """Yield every assistant `tool_use` block across a messages snapshot."""
-    for msg in messages:
-        if not isinstance(msg, dict) or msg.get("role") != "assistant":
-            continue
-        content = msg.get("content")
-        if isinstance(content, list):
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "tool_use":
-                    yield block
-
-
-def next_graphic_id(messages) -> str:
-    """The id to assign the next graphic: one past the highest `fig-N` already in
-    history, so ids stay unique and stable across a reloaded session."""
-    highest = 0
-    for block in _iter_tool_use_blocks(messages):
-        if block.get("name") != GRAPHIC_TOOL_NAME:
-            continue
-        gid = (block.get("input") or {}).get("graphic_id")
-        if isinstance(gid, str) and gid.startswith(GRAPHIC_ID_PREFIX):
-            try:
-                highest = max(highest, int(gid[len(GRAPHIC_ID_PREFIX):]))
-            except ValueError:
-                pass
-    return make_graphic_id(highest + 1)
-
-
-def find_graphic(messages, graphic_id: str):
-    """Return ``{'id','format','source','summary'}`` for the stored graphic with
-    this id (reading the full source kept in history), or None if there's none."""
-    for block in _iter_tool_use_blocks(messages):
-        if block.get("name") != GRAPHIC_TOOL_NAME:
-            continue
-        inp = block.get("input") or {}
-        if inp.get("graphic_id") == graphic_id:
-            return {
-                "id": graphic_id,
-                "format": inp.get("format") or "",
-                "source": inp.get("source") or "",
-                "summary": inp.get("summary") or "",
-            }
-    return None
-
-
-def all_graphic_ids(messages) -> list[str]:
-    """Every assigned graphic id in history, in draw order — for a 'which one?'
-    hint when GetGraphic is handed an id that doesn't exist."""
-    ids = []
-    for block in _iter_tool_use_blocks(messages):
-        if block.get("name") == GRAPHIC_TOOL_NAME:
-            gid = (block.get("input") or {}).get("graphic_id")
-            if isinstance(gid, str):
-                ids.append(gid)
-    return ids
 
 
 def loaded_source_result(graphic_id: str, fmt: str, source: str) -> str:

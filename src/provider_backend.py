@@ -718,45 +718,34 @@ class AnthropicMessagesBackend:
         return None
 
     def register_graphic(
-        self, tool_use_id: str, source: str, summary: str | None = None
-    ) -> str | None:
-        """Stamp a freshly-drawn CreateGraphics block with a stable id (`fig-N`)
-        and its cleaned, render-ready source, then persist. The full source stays
-        in history so the graphic survives reload (replay) and can be reloaded
-        for editing via GetGraphic; the send-time strip (see _cacheable_messages)
-        keeps it out of the model's per-turn context. Returns the assigned id, or
-        None if the block is gone.
+        self, tool_use_id: str, graphic_id: str, source: str,
+        summary: str | None = None,
+    ) -> bool:
+        """Stamp a freshly-drawn CreateGraphics block with its store id and the
+        cleaned, render-ready source, then persist. The canonical copy lives in
+        the user's GraphicStore (which allocated ``graphic_id``); this history
+        stamp is what replay re-renders a session's graphics from on /load, and
+        what the send-time strip (see _cacheable_messages) references by id while
+        keeping the source out of the model's per-turn context. Returns False if
+        the block is gone.
 
         Safe from the stream-generator thread: the turn loop is suspended on the
         tool_use `yield` when the controller calls this, so nothing else mutates
         `self._messages`."""
         with self._lock:
-            gid = _graphics.next_graphic_id(self._messages)
             block = self._find_tool_use_block(tool_use_id)
             if block is None:
-                return None
+                return False
             inp = block.get("input")
             if not isinstance(inp, dict):
                 inp = {}
                 block["input"] = inp
             inp["source"] = source
-            inp["graphic_id"] = gid
+            inp["graphic_id"] = graphic_id
             if summary is not None:
                 inp["summary"] = summary
         self._persist()
-        return gid
-
-    def get_graphic(self, graphic_id: str) -> dict | None:
-        """The stored graphic with this id — ``{'id','format','source','summary'}``
-        — reading the full source kept in history, or None. Backs the GetGraphic
-        reload tool."""
-        with self._lock:
-            return _graphics.find_graphic(self._messages, graphic_id)
-
-    def graphic_ids(self) -> list[str]:
-        """Every assigned graphic id in history, in draw order."""
-        with self._lock:
-            return _graphics.all_graphic_ids(self._messages)
+        return True
 
     def interrupt_turn(self) -> None:
         """Signal that the in-flight or pending model turn should be

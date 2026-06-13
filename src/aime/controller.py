@@ -189,10 +189,19 @@ class ConversationController:
         message_recipient: str | None = None,
         reminder_service=None,
         record_sync=None,
+        graphic_store=None,
     ):
         self._backend = backend
         self._tools = tool_gateway
         self._spawn_worker = worker_spawner
+        # Optional per-user GraphicStore (aime.graphics_store). The canonical
+        # home for graphics the model draws with CreateGraphics: it allocates the
+        # `graphic-N` id, holds the source, and is what GetGraphic reloads from
+        # and what `[graphic-N]` tags (in chat or a topic body) resolve against.
+        # None for the TUI / background agents — there CreateGraphics degrades to
+        # a friendly "not available here" result, since a graphic only renders in
+        # an interactive web chat.
+        self._graphic_store = graphic_store
         # Optional cross-user record-sync bridge (built by the web layer, which
         # owns the grant store and per-owner gateways). When set it lets the
         # model see and open topics shared *with* this user, flags the user's own
@@ -784,7 +793,7 @@ class ConversationController:
             self._handle_create_graphics(event, tool_input)
             return
         # GetGraphic is the companion reload tool: it returns the full source of
-        # a graphic the model drew earlier (by its `fig-N` id) so the model can
+        # a graphic the model drew earlier (by its `graphic-N` id) so the model can
         # revise it accurately instead of guessing from the summary. The source
         # is paid for only on this editing turn, then stripped from history again.
         if tool_name == "GetGraphic":
@@ -901,18 +910,21 @@ class ConversationController:
 
     def _handle_create_graphics(self, event: BackendEvent, tool_input: dict) -> None:
         """Client tool: the model supplies a chart/diagram/SVG spec; we validate
-        it and emit it for the frontend to render inline in the chat.
+        it, store it as a reusable asset, and emit it for the frontend to render
+        inline in the chat at the call site.
 
         On an invalid spec we hand the error straight back as the tool_result so
         the model can fix it and call again the same turn — nothing renders.
 
-        On success we register the graphic — stamping its stored tool_use block
-        with a stable id (`fig-N`) and its cleaned source — then emit a `graphic`
-        CoreEvent for the frontend and hand the model a tiny tool_result naming
-        the id. The full source stays in history (so the graphic survives reload
-        and can be reloaded for editing via GetGraphic), but the send-time strip
-        keeps it out of the model's per-turn context — the model carries only the
-        id + summary until it deliberately reloads."""
+        On success we save the spec to the user's GraphicStore (the canonical
+        copy), which allocates a stable `graphic-N` id; stamp that id + cleaned
+        source onto the history block (so the graphic replays on /load and the
+        send-time strip can reference it); emit a `graphic` CoreEvent the frontend
+        renders at the call site; and hand the model a tiny tool_result naming the
+        id and the `[graphic-N]` tag it can drop into a topic to place the same
+        graphic there. The model carries only the id + summary afterward — the
+        strip keeps the source out of its per-turn context until it reloads via
+        GetGraphic to edit."""
         payload = tool_input if isinstance(tool_input, dict) else {}
         tool_name = event.tool_name or "CreateGraphics"
         fmt = (payload.get("format") or "").strip()
@@ -922,6 +934,14 @@ class ConversationController:
         # we render, store, and (on failure) hand back for the model to revise.
         source = _graphics.normalize(fmt, payload.get("source") or "")
         summary = (payload.get("summary") or "").strip()
+
+        if self._graphic_store is None:
+            self._send_tool_result(
+                event.tool_use_id,
+                "Graphics aren't available in this session — they render only in "
+                "an interactive chat. Describe it in words instead.",
+            )
+            return
 
         error = _graphics.validate(fmt, source)
         if error:
@@ -938,18 +958,24 @@ class ConversationController:
             )
             return
 
-        # Persist the cleaned source in history and assign a stable id, so the
-        # graphic survives reload and can be reloaded for editing. The send-time
-        # strip (provider_backend) keeps the source out of the model's context.
-        graphic_id = None
+        # Save the canonical asset (allocates the id), then stamp the history
+        # block so the graphic replays on /load and the strip can reference it.
+        record = self._graphic_store.create(fmt, source, summary)
+        if not record:
+            self._send_tool_result(
+                event.tool_use_id,
+                "Couldn't save the graphic just now. Try CreateGraphics again.",
+            )
+            return
+        graphic_id = record["id"]
         register = getattr(self._backend, "register_graphic", None)
         if callable(register) and event.tool_use_id:
             try:
-                graphic_id = register(event.tool_use_id, source, summary)
+                register(event.tool_use_id, graphic_id, source, summary)
             except Exception:
-                graphic_id = None
+                pass
 
-        # Rendered client-side: emit the structured graphic for the frontend.
+        # Rendered client-side at the call site: emit the structured graphic.
         self._emit(CoreEvent(
             kind="graphic",
             tool_name=tool_name,
@@ -961,46 +987,38 @@ class ConversationController:
         self._emit(CoreEvent(
             kind="tool_result",
             tool_name=tool_name,
-            tool_result_summary=(
-                f"rendered {fmt} graphic ({graphic_id})"
-                if graphic_id else f"rendered {fmt} graphic"
-            ),
+            tool_result_summary=f"rendered {fmt} graphic ({graphic_id})",
         ))
-        if graphic_id:
-            seen = f"The user can now see it: {summary}" if summary else \
-                "The user can now see it."
-            self._send_tool_result(
-                event.tool_use_id,
-                f"Rendered as {graphic_id}. {seen} To revise this graphic later, "
-                f'call GetGraphic with id "{graphic_id}" to load its source '
-                "first — don't redraw it from memory.",
-            )
-        else:
-            self._send_tool_result(
-                event.tool_use_id,
-                f"Rendered. The user can now see it: {summary}"
-                if summary else "Rendered.",
-            )
+        seen = f"The user can now see it: {summary}" if summary else \
+            "The user can now see it."
+        self._send_tool_result(
+            event.tool_use_id,
+            f"Rendered as {graphic_id} in the chat. {seen} To place this same "
+            f"graphic in a topic, write [{graphic_id}] in the topic body. To "
+            f'revise it later, call GetGraphic with id "{graphic_id}" to load its '
+            "source first — don't redraw it from memory.",
+        )
 
     def _handle_get_graphic(self, event: BackendEvent, tool_input: dict) -> None:
         """Client tool: reload a previously-drawn graphic's full source by its
-        `fig-N` id so the model can revise it accurately. The source re-enters
-        context only for this turn — the send-time strip slims the reloaded
-        result back down once the editing turn has passed."""
+        `graphic-N` id (from the user's GraphicStore) so the model can revise it
+        accurately. The source re-enters context only for this turn — the
+        send-time strip slims the reloaded result back down once the editing turn
+        has passed."""
         payload = tool_input if isinstance(tool_input, dict) else {}
         tool_name = event.tool_name or "GetGraphic"
         graphic_id = (payload.get("id") or "").strip()
 
-        getter = getattr(self._backend, "get_graphic", None)
-        graphic = getter(graphic_id) if (callable(getter) and graphic_id) else None
+        graphic = (self._graphic_store.load(graphic_id)
+                   if (self._graphic_store is not None and graphic_id) else None)
         if not graphic or not graphic.get("source"):
-            ids_fn = getattr(self._backend, "graphic_ids", None)
-            known = ids_fn() if callable(ids_fn) else []
+            known = ([g["id"] for g in self._graphic_store.list_graphics()]
+                     if self._graphic_store is not None else [])
             hint = (f" Graphics drawn so far: {', '.join(known)}."
                     if known else " No graphics have been drawn yet.")
             msg = (f"No graphic with id {graphic_id!r} was found.{hint}"
                    if graphic_id else
-                   "Provide the `id` of the graphic to load (e.g. \"fig-1\").")
+                   "Provide the `id` of the graphic to load (e.g. \"graphic-1\").")
             self._emit(CoreEvent(
                 kind="tool_result",
                 tool_name=tool_name,

@@ -8,6 +8,8 @@ cases per format, especially the SVG safety rejections.
 
 from provider_backend import BackendEvent
 from aime import graphics
+from aime import graphics_store
+from aime import encryption as enc
 from aime.controller import ConversationController
 
 
@@ -148,9 +150,10 @@ def test_array_source_gives_directive_error():
     assert err and "starting with `{`" in err
 
 
-# --- History store: ids, lookup, and the context strip ---------------------
-# The full source lives in the message history (so graphics survive reload and
-# can be reloaded for editing); the strip slims only the API-bound copy.
+# --- History stamp + the context strip -------------------------------------
+# The canonical source lives in the per-user GraphicStore; a stamped copy (id +
+# cleaned source) also rides in the message history so the session replays on
+# /load. The strip slims only the API-bound copy of that stamp.
 
 
 def _graphic_block(gid, fmt, source, summary):
@@ -164,31 +167,10 @@ def _graphic_block(gid, fmt, source, summary):
     }
 
 
-def test_next_graphic_id_counts_from_history():
-    assert graphics.next_graphic_id([]) == "fig-1"
-    history = [_graphic_block("fig-1", "mermaid", "graph TD; A-->B", "flow")]
-    assert graphics.next_graphic_id(history) == "fig-2"
-    # Gaps / out-of-order ids: one past the highest, not the count.
-    history.append(_graphic_block("fig-5", "svg", "<svg/>", "x"))
-    assert graphics.next_graphic_id(history) == "fig-6"
-
-
-def test_find_graphic_and_all_ids():
-    history = [
-        _graphic_block("fig-1", "mermaid", "graph TD; A-->B", "flow"),
-        _graphic_block("fig-2", "svg", "<svg/>", "logo"),
-    ]
-    assert graphics.all_graphic_ids(history) == ["fig-1", "fig-2"]
-    found = graphics.find_graphic(history, "fig-2")
-    assert found == {"id": "fig-2", "format": "svg",
-                     "source": "<svg/>", "summary": "logo"}
-    assert graphics.find_graphic(history, "fig-9") is None
-
-
 def test_redact_history_graphics_slims_source_but_keeps_id_and_summary():
     # An older graphic (outside the keep-recent window) is slimmed.
     history = [
-        _graphic_block("fig-1", "mermaid", "graph TD; A-->B", "the flow"),
+        _graphic_block("graphic-1", "mermaid", "graph TD; A-->B", "the flow"),
         {"role": "user", "content": [{"type": "text", "text": "thanks"}]},
         {"role": "assistant", "content": [{"type": "text", "text": "welcome"}]},
     ]
@@ -197,9 +179,9 @@ def test_redact_history_graphics_slims_source_but_keeps_id_and_summary():
     assert history[0]["content"][0]["input"]["source"] == "graph TD; A-->B"
     inp = out[0]["content"][0]["input"]
     assert "graph TD" not in inp["source"]          # source slimmed away
-    assert inp["graphic_id"] == "fig-1"             # id retained
+    assert inp["graphic_id"] == "graphic-1"         # id retained
     assert inp["summary"] == "the flow"             # summary retained
-    assert "fig-1" in inp["source"] and "GetGraphic" in inp["source"]
+    assert "graphic-1" in inp["source"] and "GetGraphic" in inp["source"]
 
 
 def test_redact_history_keeps_freshest_graphic_intact():
@@ -207,17 +189,17 @@ def test_redact_history_keeps_freshest_graphic_intact():
     # source, so the continuation turn never sees a stub where its source was —
     # which is what stops the spurious "oops, I sent a placeholder" retry.
     history = [
-        _graphic_block("fig-1", "mermaid", "graph TD; A-->B", "flow"),
+        _graphic_block("graphic-1", "mermaid", "graph TD; A-->B", "flow"),
         {"role": "user", "content": [
-            {"type": "tool_result", "tool_use_id": "tu_fig-1",
-             "content": "Rendered as fig-1."}]},
+            {"type": "tool_result", "tool_use_id": "tu_graphic-1",
+             "content": "Rendered as graphic-1."}]},
     ]
     out = graphics.redact_history_graphics(history)
     assert out[0]["content"][0]["input"]["source"] == "graph TD; A-->B"
 
 
 def test_redact_history_keeps_loaded_source_only_in_last_message():
-    loaded = graphics.loaded_source_result("fig-1", "mermaid", "graph TD; A-->B")
+    loaded = graphics.loaded_source_result("graphic-1", "mermaid", "graph TD; A-->B")
     older = {"role": "user", "content": [
         {"type": "tool_result", "tool_use_id": "t1", "content": loaded}]}
     latest = {"role": "user", "content": [
@@ -230,53 +212,42 @@ def test_redact_history_keeps_loaded_source_only_in_last_message():
 
 
 # --- Controller wiring -----------------------------------------------------
-# CreateGraphics is a client tool: the controller validates, registers the
-# graphic (id + cleaned source kept in history), emits a `graphic` CoreEvent for
-# the frontend, and hands the model a tiny tool_result naming the id. GetGraphic
-# reloads a stored source by id.
+# CreateGraphics is a client tool: the controller validates, saves the graphic to
+# the user's GraphicStore (which allocates the `graphic-N` id), stamps the history
+# block via register_graphic (for replay), emits a `graphic` CoreEvent for the
+# frontend, and hands the model a tool_result naming the id + its [graphic-N] tag.
+# GetGraphic reloads a stored source by id from the same store.
 
 
 class _RecordingBackend:
-    """Stand-in for the real backend: stores registered graphics in a tiny dict
-    so the controller's register/get round-trip can be exercised."""
+    """Stand-in for the real backend: records the history stamp the controller
+    makes via register_graphic so we can assert the source was kept for replay."""
 
     conversations_dir = None
 
     def __init__(self):
         self.responses = []
-        self.graphics = {}   # id -> {format, source, summary}
-        self._seq = 0
+        self.stamped = {}   # id -> {source, summary}
 
     def submit(self, event: BackendEvent):
         if event.kind == "tool_send_response":
             self.responses.append(event)
 
-    def register_graphic(self, tool_use_id, source, summary=None):
-        self._seq += 1
-        gid = f"fig-{self._seq}"
-        # Format is unknown to this stub; the controller test sets it via the
-        # graphic event, so store source/summary only.
-        self.graphics[gid] = {"source": source, "summary": summary}
-        return gid
-
-    def get_graphic(self, graphic_id):
-        g = self.graphics.get(graphic_id)
-        if not g:
-            return None
-        return {"id": graphic_id, "format": "vega-lite",
-                "source": g["source"], "summary": g["summary"]}
-
-    def graphic_ids(self):
-        return list(self.graphics)
+    def register_graphic(self, tool_use_id, graphic_id, source, summary=None):
+        self.stamped[graphic_id] = {"source": source, "summary": summary}
+        return True
 
 
-def _graphics_controller():
+def _graphics_controller(tmp_path):
     backend = _RecordingBackend()
     events = []
+    store = graphics_store.GraphicStore(str(tmp_path / "graphics"),
+                                        enc.generate_dek())
     controller = ConversationController(
         backend=backend,
         tool_gateway=object(),  # never touched — CreateGraphics is client-side
         worker_spawner=lambda fn: None,
+        graphic_store=store,
     )
     controller.subscribe(events.append)
     return controller, backend, events
@@ -292,8 +263,8 @@ def _fire_tool(controller, name, tool_input, tool_use_id="g1"):
     ))
 
 
-def test_valid_graphic_registers_and_reports_id():
-    controller, backend, events = _graphics_controller()
+def test_valid_graphic_stores_and_reports_id(tmp_path):
+    controller, backend, events = _graphics_controller(tmp_path)
     spec = '{"mark": "bar", "encoding": {}}'
 
     _fire_tool(controller, "CreateGraphics", {
@@ -304,19 +275,22 @@ def test_valid_graphic_registers_and_reports_id():
     graphic = next(e for e in events if e.kind == "graphic")
     assert graphic.payload == {
         "format": "vega-lite", "summary": "weekly spend",
-        "source": spec, "id": "fig-1",
+        "source": spec, "id": "graphic-1",
     }
-    # The source was registered into history (not redacted away).
-    assert backend.graphics["fig-1"]["source"] == spec
-    # The model's result names the id and points at GetGraphic for edits — and
+    # The canonical copy landed in the store, and the history stamp kept the
+    # source for replay.
+    assert controller._graphic_store.load("graphic-1")["source"] == spec
+    assert backend.stamped["graphic-1"]["source"] == spec
+    # The model's result names the id, the [graphic-N] tag, and GetGraphic — and
     # never echoes the spec back.
     assert len(backend.responses) == 1
     result = backend.responses[0].tool_result
-    assert "fig-1" in result and "GetGraphic" in result and spec not in result
+    assert "graphic-1" in result and "[graphic-1]" in result
+    assert "GetGraphic" in result and spec not in result
 
 
-def test_fenced_vega_source_is_cleaned_before_render():
-    controller, backend, events = _graphics_controller()
+def test_fenced_vega_source_is_cleaned_before_store(tmp_path):
+    controller, backend, events = _graphics_controller(tmp_path)
 
     _fire_tool(controller, "CreateGraphics", {
         "format": "vega-lite",
@@ -325,47 +299,49 @@ def test_fenced_vega_source_is_cleaned_before_render():
     })
 
     graphic = next(e for e in events if e.kind == "graphic")
-    # The code fence is stripped, so the frontend (and history) get clean JSON.
+    # The code fence is stripped, so the frontend, store, and history get clean JSON.
     assert graphic.payload["source"] == '{"mark": "bar", "encoding": {}}'
-    assert backend.graphics["fig-1"]["source"] == '{"mark": "bar", "encoding": {}}'
+    assert controller._graphic_store.load("graphic-1")["source"] == \
+        '{"mark": "bar", "encoding": {}}'
 
 
-def test_invalid_graphic_is_handed_back_without_render_or_register():
-    controller, backend, events = _graphics_controller()
+def test_invalid_graphic_is_handed_back_without_render_or_store(tmp_path):
+    controller, backend, events = _graphics_controller(tmp_path)
 
     _fire_tool(controller, "CreateGraphics", {
         "format": "vega-lite", "source": "{not json", "summary": "x",
     })
 
-    # Nothing rendered, nothing registered — the model must fix and retry.
+    # Nothing rendered, nothing stored — the model must fix and retry.
     assert not any(e.kind == "graphic" for e in events)
-    assert backend.graphics == {}
+    assert controller._graphic_store.list_graphics() == []
     assert len(backend.responses) == 1
     result = backend.responses[0].tool_result
     assert "not rendered" in result.lower()
     assert "CreateGraphics again" in result
 
 
-def test_get_graphic_returns_stored_source():
-    controller, backend, events = _graphics_controller()
+def test_get_graphic_returns_stored_source(tmp_path):
+    controller, backend, events = _graphics_controller(tmp_path)
     spec = '{"mark": "line", "encoding": {}}'
     _fire_tool(controller, "CreateGraphics",
                {"format": "vega-lite", "source": spec, "summary": "trend"})
 
-    _fire_tool(controller, "GetGraphic", {"id": "fig-1"}, tool_use_id="g2")
+    _fire_tool(controller, "GetGraphic", {"id": "graphic-1"}, tool_use_id="g2")
 
     result = backend.responses[-1].tool_result
     assert spec in result                      # full source handed back to edit
-    assert "fig-1" in result and "CreateGraphics" in result
+    assert "graphic-1" in result and "CreateGraphics" in result
 
 
-def test_get_graphic_unknown_id_lists_available():
-    controller, backend, events = _graphics_controller()
+def test_get_graphic_unknown_id_lists_available(tmp_path):
+    controller, backend, events = _graphics_controller(tmp_path)
     _fire_tool(controller, "CreateGraphics",
                {"format": "vega-lite", "source": '{"mark": "bar"}',
                 "summary": "s"})
 
-    _fire_tool(controller, "GetGraphic", {"id": "fig-9"}, tool_use_id="g2")
+    _fire_tool(controller, "GetGraphic", {"id": "graphic-9"}, tool_use_id="g2")
 
     result = backend.responses[-1].tool_result
-    assert "fig-9" in result and "fig-1" in result  # not found + what does exist
+    # not found + what does exist
+    assert "graphic-9" in result and "graphic-1" in result

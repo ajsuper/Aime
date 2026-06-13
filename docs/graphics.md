@@ -157,19 +157,29 @@ transcript stays readable and the summary still conveys the substance.
 
 ---
 
-## 6. Persistence & replay
+## 6. Persistence, the asset store, and replay
 
-No new store. The full `source` rides in `self._messages` (§3), which is already
-persisted per-session and re-enumerated into the transcript on `/load`. The
-strip is invisible to persistence because it lives only on the API-bound copy.
+A graphic is a **reusable asset**, not a one-shot card: the model draws it once
+and can then place it — by its id, `[graphic-N]` — in a chat reply *or* a topic
+body, as many times as it likes. That makes the canonical home a dedicated
+per-user **`GraphicStore`** (`aime/graphics_store.py`), a near-exact clone of
+`ScheduleStore`/`AgentDefinitionStore`: one DEK-encrypted file per asset under
+`users/<id>/graphics/` (id as AEAD associated data, atomic tmp-then-`os.replace`,
+best-effort IO). Ids are per-user monotonic — `graphic-1`, `graphic-2`, … —
+allocated one past the highest on disk, so the same tag means the same picture
+account-wide (not per-conversation, not per-topic). This is **not** in serve.cpp
+(the C++ gateway) — same Python-sidecar pattern as the other stores.
 
-On success the controller calls `backend.register_graphic(tool_use_id, source,
-summary)`, which stamps the stored `tool_use` block with its **cleaned** source
-(what actually renders, post fence/JSON-repair) and a stable **id** (`fig-N`,
-one past the highest already in history). `replay.py` special-cases a
-CreateGraphics block, emitting a `graphic` CoreEvent from the stored spec so the
-card re-renders on `/load` exactly like a live one (GetGraphic reloads are
-skipped — they're internal plumbing, not transcript).
+On success the controller saves the cleaned source to the store (which allocates
+the id), then calls `backend.register_graphic(tool_use_id, graphic_id, source,
+summary)` to *stamp* the history `tool_use` block with that id + cleaned source.
+The store is the source of truth; the history stamp exists only so (a) `replay.py`
+can re-emit a `graphic` CoreEvent per CreateGraphics block on `/load` (GetGraphic
+reloads are skipped — internal plumbing, not transcript) and (b) the §3 strip can
+reference the id. The full `source` still rides in `self._messages` (persisted
+per-session) for that replay path; the strip is invisible to persistence because
+it lives only on the API-bound copy. Because chat is append-only and edits make a
+*new* id, the store copy and the history stamp never drift.
 
 ---
 
@@ -179,8 +189,8 @@ The strip (§3) means that on a later turn the model no longer holds a graphic's
 source — only its `fig-N` id and `summary`. So "make that chart green" can't be
 answered by editing what's in context; the model would have to redraw from the
 summary and get the details wrong. The fix is a companion **`GetGraphic`** client
-tool (`api_get_graphic_schema.json`): given a `fig-N` id, it returns that
-graphic's full source — read from the copy still in `self._messages` — as the
+tool (`api_get_graphic_schema.json`): given a `graphic-N` id, it returns that
+graphic's full source — read from the **`GraphicStore`** (§6) — as the
 tool_result, so the model edits the real spec and re-sends it via CreateGraphics.
 
 This preserves the cost guarantee. The source is paid for again only on the
@@ -193,6 +203,39 @@ editing rather than redrawing from memory.
 
 A revised graphic is a *new* card with a *new* id (chat is append-only); the old
 card stays in the transcript above it.
+
+---
+
+## 6b. The `[graphic-N]` tag — one render path for chat and topics
+
+Because a graphic is a stored asset, the model references it the same way
+everywhere: the tag **`[graphic-N]`**. This unifies what used to be a chat-only
+card with topic embedding — one tag, one resolver, one store behind both.
+
+- **Chat.** `CreateGraphics` renders at the call site: the controller emits a
+  `graphic` CoreEvent carrying `{id, format, summary, source}` and the frontend
+  draws the card immediately (no behavior change from the card-only era). The
+  model doesn't need to write the tag in chat — it renders automatically — but
+  the id it gets back is the same one a topic uses.
+- **Topics.** The model writes `[graphic-N]` into a topic body (authored via
+  `replace_topic_contents` / `create_topic`). `renderTopicMarkdown` resolves it
+  *after* `marked` + `DOMPurify`, walking **text nodes only** (never re-parsing
+  HTML, so it can't reintroduce unsafe markup): each `[graphic-N]` token is
+  swapped for a card whose source is fetched from `GET /graphics/<id>` and
+  rendered through the **same** `renderGraphicInto(body, fmt, source)` the chat
+  card uses. A stale/forbidden id degrades to a calm "couldn't load" card.
+- **The route.** `GET /graphics/<id>` (`web_app.py`, `@login_required`) returns
+  `{format, source, summary}` from the user's `GraphicStore`. **Owner-scoped:** a
+  user reads only their own assets; missing reads as 404. Cross-user resolution
+  for a graphic embedded in a *shared* topic routes through the `topic_shares`
+  owner bridge (server-side `get_dek(owner_id)`, only for ids referenced in the
+  shared body) — see [[scheduling-pipeline-plan]]'s sibling trust boundary; this
+  is the remaining slice, not yet wired.
+
+Why text-node-only resolution and a fetch (not inlining the source into the topic
+markdown): the body stays small and the bulky source never lives in two places —
+the store is the single source of truth, and an edited graphic (new id) can't
+leave a stale copy baked into a topic.
 
 ---
 

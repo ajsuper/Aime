@@ -2206,6 +2206,13 @@
     .graphic-card .vega-embed details,
     .graphic-card .vega-embed .vega-actions,
     .graphic-card .vega-bindings { display: none !important; }
+    /* A graphic resolved from a [graphic-N] tag inside a topic body. Same card,
+       but it sits in flowing prose, so give it its own block and breathing room
+       rather than the inline-block the chat card uses. */
+    .graphic-card.graphic-inline {
+      display: block;
+      margin: 12px 0;
+    }
     .graphic-card .graphic-caption {
       margin-top: 12px;
       color: var(--muted);
@@ -3646,28 +3653,16 @@ function cleanupMermaidOrphans(id) {
 }
 
 let _graphicSeq = 0;
-function renderGraphic(payload) {
-  const fmt = payload.format || "";
-  const source = payload.source || "";
-  const summary = payload.summary || "";
 
-  const card = document.createElement("div");
-  card.className = "msg graphic";
-  const inner = document.createElement("div");
-  inner.className = "graphic-card";
-  const body = document.createElement("div");
-  body.className = "graphic-body";
-  inner.appendChild(body);
-  if (summary) {
-    const cap = document.createElement("div");
-    cap.className = "graphic-caption";
-    cap.textContent = summary;
-    inner.appendChild(cap);
-  }
-  card.appendChild(inner);
-  logInner.appendChild(card);
-  scrollToBottom();
-
+// Render one graphic (format + source) into `body`, an element already in the
+// DOM. Shared by the chat card (renderGraphic) and the inline `[graphic-N]` tags
+// resolved in topic bodies (resolveGraphicTags), so both paths render — and fail
+// — identically. `onRender` fires after a successful render (the chat path uses
+// it to scroll); failures swap in a calm "couldn't render" card, never a banner.
+function renderGraphicInto(body, fmt, source, onRender) {
+  fmt = fmt || "";
+  source = source || "";
+  const done = onRender || function () {};
   const fail = (msg) => {
     body.innerHTML = "";
     const f = document.createElement("div");
@@ -3688,7 +3683,7 @@ function renderGraphic(payload) {
           })
         : "";
       if (!window.DOMPurify) fail("DOMPurify unavailable");
-      else scrollToBottom();
+      else done();
     } else if (fmt === "vega-lite") {
       let spec;
       try { spec = JSON.parse(source); }
@@ -3707,7 +3702,7 @@ function renderGraphic(payload) {
           if (interp) { opts.ast = true; opts.expr = interp; }
           return vegaEmbed(body, spec, opts);
         })
-        .then(() => scrollToBottom())
+        .then(() => done())
         .catch(fail);
     } else if (fmt === "mermaid") {
       const id = "mermaid-" + (++_graphicSeq);
@@ -3725,7 +3720,7 @@ function renderGraphic(payload) {
         .then((res) => {
           if (!res) { fail("mermaid syntax error"); return; }
           body.innerHTML = res.svg;
-          scrollToBottom();
+          done();
         })
         .catch(fail)
         .finally(() => cleanupMermaidOrphans(id));
@@ -3735,6 +3730,105 @@ function renderGraphic(payload) {
   } catch (err) {
     fail(err);
   }
+}
+
+function renderGraphic(payload) {
+  const card = document.createElement("div");
+  card.className = "msg graphic";
+  const inner = document.createElement("div");
+  inner.className = "graphic-card";
+  const body = document.createElement("div");
+  body.className = "graphic-body";
+  inner.appendChild(body);
+  const summary = payload.summary || "";
+  if (summary) {
+    const cap = document.createElement("div");
+    cap.className = "graphic-caption";
+    cap.textContent = summary;
+    inner.appendChild(cap);
+  }
+  card.appendChild(inner);
+  logInner.appendChild(card);
+  scrollToBottom();
+  renderGraphicInto(body, payload.format, payload.source, scrollToBottom);
+}
+
+// In-flight/lookup cache for `[graphic-N]` tag resolution, so the same id placed
+// twice in a body fetches once.
+const _graphicAssetCache = {};
+function fetchGraphicAsset(id) {
+  if (!_graphicAssetCache[id]) {
+    _graphicAssetCache[id] = fetch("/graphics/" + encodeURIComponent(id),
+      { credentials: "same-origin" })
+      .then((r) => (r.ok ? r.json() : Promise.reject(r.status)));
+  }
+  return _graphicAssetCache[id];
+}
+
+// A `[graphic-N]` token references a stored graphic asset by id (the same asset
+// CreateGraphics drew in chat). Find those tokens in already-sanitized topic HTML
+// and swap each for a rendered graphic, fetching its source from /graphics/<id>.
+// We only walk text nodes (never re-parse HTML), so this can't introduce markup.
+const _GRAPHIC_TAG_RE = /\[(graphic-\d+)\]/g;
+const _GRAPHIC_TAG_TEST = /\[graphic-\d+\]/;  // non-global: stateless .test()
+function resolveGraphicTags(root) {
+  if (!root) return;
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+    // Use the non-global regex here: a global regex's .test() advances lastIndex
+    // and would make acceptNode stateful across nodes (skipping real matches).
+    acceptNode: (n) =>
+      _GRAPHIC_TAG_TEST.test(n.nodeValue)
+        ? NodeFilter.FILTER_ACCEPT
+        : NodeFilter.FILTER_REJECT,
+  });
+  const hits = [];
+  let n;
+  while ((n = walker.nextNode())) hits.push(n);
+
+  hits.forEach((node) => {
+    const frag = document.createDocumentFragment();
+    let last = 0;
+    const text = node.nodeValue;
+    _GRAPHIC_TAG_RE.lastIndex = 0;
+    let m;
+    while ((m = _GRAPHIC_TAG_RE.exec(text))) {
+      if (m.index > last) {
+        frag.appendChild(document.createTextNode(text.slice(last, m.index)));
+      }
+      frag.appendChild(makeGraphicMount(m[1]));
+      last = m.index + m[0].length;
+    }
+    if (last < text.length) {
+      frag.appendChild(document.createTextNode(text.slice(last)));
+    }
+    node.parentNode.replaceChild(frag, node);
+  });
+}
+
+function makeGraphicMount(id) {
+  const card = document.createElement("div");
+  card.className = "graphic-card graphic-inline";
+  const body = document.createElement("div");
+  body.className = "graphic-body";
+  card.appendChild(body);
+  fetchGraphicAsset(id)
+    .then((g) => {
+      renderGraphicInto(body, g.format, g.source);
+      if (g.summary) {
+        const cap = document.createElement("div");
+        cap.className = "graphic-caption";
+        cap.textContent = g.summary;
+        card.appendChild(cap);
+      }
+    })
+    .catch(() => {
+      body.innerHTML = "";
+      const f = document.createElement("div");
+      f.className = "graphic-failed";
+      f.textContent = "Couldn't load this graphic.";
+      body.appendChild(f);
+    });
+  return card;
 }
 
 // Like appendNotice, but when detailText is present renders a native <details>
@@ -7558,6 +7652,10 @@ function renderTopicMarkdown(md) {
     box.dataset.taskIndex = String(idx);
     box.addEventListener("change", onTopicCheckboxToggle);
   });
+  // Resolve any `[graphic-N]` tags the model placed in the body into rendered
+  // graphics, pulling each asset's source from the store. Runs after sanitize,
+  // walking text only, so it never reintroduces unsafe markup.
+  resolveGraphicTags(topicBodyEl);
 }
 
 // Acquire / refresh / release the advisory edit-lock. Acquire is best-effort:
