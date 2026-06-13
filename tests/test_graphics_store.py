@@ -125,6 +125,26 @@ def test_parse_graphic_id_legacy_bare_is_personal():
     assert gs.parse_graphic_id("graphic-7") == ("0", 7)
 
 
+def test_id_handle_is_absolute_for_topics_and_zero_for_personal(tmp_path, dek):
+    base = str(tmp_path / "graphics")
+    assert gs.GraphicStore(base, dek, owner_id=1, topic_id=0).id_handle == "0"
+    assert gs.GraphicStore(base, dek, owner_id=1, topic_id=7).id_handle == "1:7"
+    assert gs.GraphicStore(base, dek, owner_id=4, topic_id=5).id_handle == "4:5"
+
+
+def test_tag_handle_scope():
+    # A bare topic handle belongs to the topic's owner (passed in).
+    assert gs.tag_handle_scope("5", 4) == (4, 5)
+    # An explicit O:T names its own owner, regardless of the topic owner arg.
+    assert gs.tag_handle_scope("4:5", 4) == (4, 5)
+    assert gs.tag_handle_scope("3:9", 4) == (3, 9)
+    # Personal (and legacy bare, which collapses to "0") is never a topic graphic.
+    assert gs.tag_handle_scope("0", 4) is None
+    # Garbage handles resolve to nothing rather than raising.
+    assert gs.tag_handle_scope("a", 4) is None
+    assert gs.tag_handle_scope("1:2:3", 4) is None
+
+
 def test_parse_graphic_id_rejects_garbage():
     assert gs.parse_graphic_id("fig-1:2") is None
     assert gs.parse_graphic_id("graphic-") is None

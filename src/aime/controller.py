@@ -1003,8 +1003,12 @@ class ConversationController:
                 "Couldn't save the graphic just now. Try CreateGraphics again.",
             )
             return
+        # Stamp the *absolute* id (owner always baked in for a topic graphic) so
+        # the tag the model writes resolves the same in a topic body and in a
+        # chat reply, for the owner and any recipient — never the reader-relative
+        # bare form, which flips meaning when moved between those contexts.
         graphic_id = _graphics_store.format_graphic_id(
-            handle, _graphics_store.graphic_id_ordinal(record["id"]))
+            store.id_handle, _graphics_store.graphic_id_ordinal(record["id"]))
         register = getattr(self._backend, "register_graphic", None)
         if callable(register) and event.tool_use_id:
             try:
@@ -1057,13 +1061,15 @@ class ConversationController:
         reference only graphics that belong to *that* topic. Returns an
         ``{"error": …}`` dict to block the write, or None to allow it.
 
-        Resolves the topic being saved and every embedded `[graphic-…]` tag
-        through the same provider (so authorization is the acting user's, exactly
-        as the topic layer would), and requires each tag to resolve to the saved
-        topic's ``(owner, topic)``. A personal `graphic-0:n`, another topic's id,
-        or (for a recipient) a bare `graphic-T:n` all resolve elsewhere and are
-        rejected. No provider (TUI / agents) or an unresolved target ⇒ skip; the
-        downstream write path owns the topic-access refusal in that case."""
+        Resolves the topic being saved to its ``(owner, topic)`` (through the
+        provider, so it's authorized for this user), then requires every embedded
+        `[graphic-…]` tag to denote that same topic. Each tag is judged the way it
+        *renders* — a bare ``graphic-T:n`` belongs to the topic's owner, an
+        explicit ``graphic-O:T:n`` names its owner — not by the saver's identity;
+        that's what lets a recipient save a shared body that still carries the
+        owner's bare tags, while still rejecting a personal `graphic-0:n` or any
+        other topic's graphic. No provider (TUI / agents) or an unresolved
+        target ⇒ skip; the downstream write path owns the access refusal then."""
         if self._graphic_store_provider is None:
             return None
         if tool_name not in ("ReplaceTopicContents", "EditTopicContents"):
@@ -1078,8 +1084,7 @@ class ConversationController:
             return None
         scope = (target.owner_id, target.topic_id)
         for handle in handles:
-            store = self._graphic_store_for(handle, "view")
-            if store is None or (store.owner_id, store.topic_id) != scope:
+            if _graphics_store.tag_handle_scope(handle, target.owner_id) != scope:
                 return {"error": _graphics.foreign_graphic_tag_message(handle)}
         return None
 
@@ -1097,18 +1102,18 @@ class ConversationController:
             return None
 
     @staticmethod
-    def _known_graphic_ids(store, handle: str) -> list[str]:
-        """Full ids of every graphic in `store`, for the not-found hint. Empty if
-        there is no store. Each bare-stem record is re-expressed in the reader's
-        `handle` form (`graphic-<handle>:N`) — the same way the model addresses
-        it."""
+    def _known_graphic_ids(store) -> list[str]:
+        """Full, absolute ids of every graphic in `store`, for the not-found
+        hint. Empty if there is no store. Each bare-stem record is re-expressed in
+        the store's own `id_handle` form — the exact id the model addresses it
+        by."""
         if store is None:
             return []
         out = []
         for g in store.list_graphics():
             n = _graphics_store.graphic_id_ordinal(g.get("id") or "")
             if n is not None:
-                out.append(_graphics_store.format_graphic_id(handle, n))
+                out.append(_graphics_store.format_graphic_id(store.id_handle, n))
         return out
 
     def _handle_get_graphic(self, event: BackendEvent, tool_input: dict) -> None:
@@ -1132,11 +1137,8 @@ class ConversationController:
             # Best-effort "known ids" hint: list the resolved target store, or
             # fall back to the personal store so a bad/garbled id still gets a
             # useful pointer to the chat graphics.
-            hint_handle = parsed[0] if parsed is not None else "0"
             hint_store = store if store is not None else self._graphic_store_for("0", "edit")
-            if store is None:
-                hint_handle = "0"
-            known = self._known_graphic_ids(hint_store, hint_handle)
+            known = self._known_graphic_ids(hint_store)
             hint = (f" Graphics drawn so far: {', '.join(known)}."
                     if known else " No graphics have been drawn yet.")
             msg = (f"No graphic with id {graphic_id_raw!r} was found.{hint}"
@@ -1151,7 +1153,10 @@ class ConversationController:
             self._send_tool_result(event.tool_use_id, msg)
             return
 
-        graphic_id = _graphics_store.format_graphic_id(parsed[0], parsed[1])
+        # Echo the absolute id (from the resolved store), so a revise round-trip
+        # always carries the owner-qualified form even if the model passed a
+        # looser one.
+        graphic_id = _graphics_store.format_graphic_id(store.id_handle, parsed[1])
         self._emit(CoreEvent(
             kind="tool_result",
             tool_name=tool_name,

@@ -234,6 +234,54 @@ def test_foreign_graphic_tag_message_mentions_handle():
     assert "graphic-4:7" in msg and "CreateGraphics" in msg
 
 
+def test_write_rule_accepts_in_topic_tags(tmp_path):
+    # Owner saving their own topic 5 with that topic's bare tag.
+    controller, backend, events, provider = _graphics_controller(tmp_path)
+    err = controller._reject_foreign_graphic_tags(
+        "ReplaceTopicContents", {"id": "5", "contents": "chart: [graphic-5:1]"})
+    assert err is None
+
+
+def test_write_rule_recipient_keeps_owner_bare_tag(tmp_path):
+    # A recipient editing shared topic "4:5" saves the body verbatim — it still
+    # carries the owner's bare [graphic-5:1]. The bare tag belongs to the topic's
+    # owner (4), so it denotes this very topic and the save is accepted.
+    controller, backend, events, provider = _graphics_controller(tmp_path)
+    err = controller._reject_foreign_graphic_tags(
+        "ReplaceTopicContents", {"id": "4:5", "contents": "see [graphic-5:1]"})
+    assert err is None
+    # The explicit form the recipient's own CreateGraphics would emit also passes.
+    err2 = controller._reject_foreign_graphic_tags(
+        "ReplaceTopicContents", {"id": "4:5", "contents": "[graphic-4:5:2]"})
+    assert err2 is None
+
+
+def test_write_rule_rejects_personal_and_other_topic_tags(tmp_path):
+    controller, backend, events, provider = _graphics_controller(tmp_path)
+    # A personal graphic can't be embedded in a topic.
+    assert controller._reject_foreign_graphic_tags(
+        "ReplaceTopicContents", {"id": "4:5", "contents": "[graphic-0:1]"}) is not None
+    # Another topic's graphic (different topic id) is foreign.
+    assert controller._reject_foreign_graphic_tags(
+        "ReplaceTopicContents", {"id": "4:5", "contents": "[graphic-4:9:1]"}) is not None
+    # A bare tag for a different topic number is foreign too.
+    assert controller._reject_foreign_graphic_tags(
+        "ReplaceTopicContents", {"id": "5", "contents": "[graphic-7:1]"}) is not None
+
+
+def test_write_rule_scans_edit_patches(tmp_path):
+    # EditTopicContents introduces tags via patch `replace` text.
+    controller, backend, events, provider = _graphics_controller(tmp_path)
+    ok = controller._reject_foreign_graphic_tags(
+        "EditTopicContents",
+        {"id": "4:5", "patches": [{"find": "x", "replace": "[graphic-5:1]"}]})
+    assert ok is None
+    bad = controller._reject_foreign_graphic_tags(
+        "EditTopicContents",
+        {"id": "4:5", "patches": [{"find": "x", "replace": "[graphic-0:3]"}]})
+    assert bad is not None
+
+
 # --- Controller wiring -----------------------------------------------------
 # CreateGraphics is a client tool: the controller validates, resolves the target
 # topic store through the injected provider, saves the graphic (which allocates
@@ -268,22 +316,29 @@ class _StoreProvider:
     that own topic. A handle listed in ``denied`` resolves to None (stands in for
     a view-only or unshared topic), so the controller takes the refusal path."""
 
-    def __init__(self, base, dek, denied=()):
+    def __init__(self, base, dek, denied=(), me=1):
         self._base = base
         self._dek = dek
         self._denied = set(denied)
+        self._me = me           # the acting user (own-topic / personal owner)
         self._stores = {}
 
     def __call__(self, handle, need="edit"):
         if handle in self._denied:
             return None
         if handle not in self._stores:
+            parts = str(handle).split(":")
             try:
-                tid = 0 if handle == "0" else int(handle)
+                if len(parts) == 1:
+                    owner, tid = self._me, (0 if parts[0] == "0" else int(parts[0]))
+                elif len(parts) == 2:        # shared "O:T"
+                    owner, tid = int(parts[0]), int(parts[1])
+                else:
+                    return None
             except ValueError:
                 return None
             self._stores[handle] = graphics_store.GraphicStore(
-                self._base, self._dek, owner_id=1, topic_id=tid)
+                self._base, self._dek, owner_id=owner, topic_id=tid)
         return self._stores[handle]
 
 
@@ -334,7 +389,9 @@ def test_valid_graphic_stores_and_reports_id(tmp_path):
     assert "GetGraphic" in result and spec not in result
 
 
-def test_graphic_into_topic_uses_topic_store_and_handle(tmp_path):
+def test_graphic_into_own_topic_uses_absolute_id(tmp_path):
+    # Acting user is 1; targeting their own topic 7. The emitted id is absolute —
+    # owner (1) baked in — so the tag resolves the same in chat and in the body.
     controller, backend, events, provider = _graphics_controller(tmp_path)
     spec = '{"mark": "bar", "encoding": {}}'
 
@@ -343,11 +400,26 @@ def test_graphic_into_topic_uses_topic_store_and_handle(tmp_path):
         "topic": "7",
     })
 
-    # Lives in topic 7's store, and the id + tag carry the topic handle.
+    # Lives in topic 7's store; the id + tag carry the absolute owner:topic.
     assert provider("7").load("graphic-1")["source"] == spec
     assert provider("0").load("graphic-1") is None  # not the personal store
     result = backend.responses[0].tool_result
-    assert "graphic-7:1" in result and "[graphic-7:1]" in result
+    assert "graphic-1:7:1" in result and "[graphic-1:7:1]" in result
+
+
+def test_graphic_into_shared_topic_bakes_in_owner_id(tmp_path):
+    # Acting user is 1, drawing into topic 5 of owner 4 (shared, edit grant). The
+    # id carries owner 4 — exactly so the recipient can drop the tag into chat and
+    # it still resolves to the owner's topic, not "my topic 5".
+    controller, backend, events, provider = _graphics_controller(tmp_path)
+
+    _fire_tool(controller, "CreateGraphics", {
+        "format": "vega-lite", "source": '{"mark": "bar", "encoding": {}}',
+        "summary": "shared", "topic": "4:5",
+    })
+
+    result = backend.responses[0].tool_result
+    assert "graphic-4:5:1" in result and "[graphic-4:5:1]" in result
 
 
 def test_graphic_into_unauthorized_topic_is_refused(tmp_path):

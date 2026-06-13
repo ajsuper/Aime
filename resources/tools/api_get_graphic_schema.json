@@ -8,7 +8,7 @@
   "properties": {
     "id": {
       "type": "string",
-      "description": "The id of the graphic to load, exactly as given when it was created (e.g. \"graphic-0:1\" for a chat graphic, \"graphic-7:2\" for one in topic 7, \"graphic-4:7:2\" for one in a shared topic)."
+      "description": "The id of the graphic to load, exactly as given when it was created (the whole thing, including any owner number) — e.g. \"graphic-0:1\" for a chat graphic, or \"graphic-4:7:2\" for one in topic 7 owned by user 4. If you see a tag like [graphic-4:7:2] in a topic body, pass that same id here."
     }
   }
 }

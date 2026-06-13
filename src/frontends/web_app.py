@@ -87,7 +87,7 @@ from aime import auth as _auth
 from aime import encryption as _enc
 from aime import backup as _backup
 from aime.graphics_store import (
-    GraphicStore, parse_graphic_id, make_graphic_id,
+    GraphicStore, parse_graphic_id, make_graphic_id, tag_handle_scope,
 )
 from aime import graphics as _graphics
 from aime import email_send as _email_send
@@ -3563,20 +3563,18 @@ def _resolve_topic(handle: str, need: str) -> tuple[int, int]:
     return _resolve_topic_as(g.user_id, handle, need)
 
 
-def _foreign_graphic_tag(contents: str, saver_id: int,
-                         owner_id: int, topic_id: int) -> str | None:
+def _foreign_graphic_tag(contents: str, owner_id: int,
+                         topic_id: int) -> str | None:
     """The write rule (docs/graphics-sharing.md §3b) for a topic-body save:
     return the handle of the first `[graphic-…]` tag that doesn't belong to this
-    topic, or None if every tag is in-scope. Each tag's handle is resolved *as
-    the saver* and must land on this exact ``(owner, topic)`` — so a personal
-    graphic, another topic's graphic, or (from a recipient) a bare own-topic
-    handle is all rejected, exactly as the model-side rule in the controller."""
+    topic, or None if every tag is in-scope. A tag is judged exactly as it
+    renders — a bare `graphic-T:n` belongs to the topic's owner, an explicit
+    `graphic-O:T:n` names its owner — and must denote this same ``(owner,
+    topic)``. A personal graphic or another topic's graphic is rejected; a
+    recipient can save a shared body that still carries the owner's bare tags.
+    Mirrors the model-side rule in the controller."""
     for handle in _graphics.graphic_tag_handles(contents):
-        try:
-            ro, rt = _resolve_topic_as(saver_id, handle, "view")
-        except _ShareAccessError:
-            return handle
-        if (ro, rt) != (owner_id, topic_id):
+        if tag_handle_scope(handle, owner_id) != (owner_id, topic_id):
             return handle
     return None
 
@@ -4200,8 +4198,9 @@ def topic_contents_save(topic_id: str):
     if len(contents.encode("utf-8")) > 2 * 1024 * 1024:
         return jsonify({"ok": False, "error": "contents too large (max 2 MiB)"}), 413
     # Write rule: a topic body may embed only its own graphics. Reject any
-    # [graphic-…] tag that doesn't resolve (as this saver) to this topic.
-    bad = _foreign_graphic_tag(contents, g.user_id, owner_id, tid)
+    # [graphic-…] tag that doesn't denote this topic (bare tags belong to the
+    # topic's owner, so a recipient may keep the owner's bare tags).
+    bad = _foreign_graphic_tag(contents, owner_id, tid)
     if bad is not None:
         return jsonify(
             {"ok": False, "error": _graphics.foreign_graphic_tag_message(bad)}), 400

@@ -78,6 +78,32 @@ def format_graphic_id(handle: str, n: int) -> str:
     return f"{_ID_PREFIX}{handle}:{n}"
 
 
+def tag_handle_scope(handle: str, topic_owner_id: int) -> tuple[int, int] | None:
+    """The ``(owner_id, topic_id)`` a topic-embedded `[graphic-…]` tag denotes,
+    given the owner of the topic the tag sits in. The write rule uses this to
+    check that an embedded graphic belongs to its topic, interpreting the handle
+    *exactly as the renderer does* (ownerContext = the topic's owner):
+
+    * a bare ``"T"`` belongs to the topic's owner — ``(topic_owner_id, T)`` — so
+      the owner's own ``graphic-T:n`` and a recipient's view of that same body
+      both judge it as "this topic's", just as both render it that way;
+    * an explicit ``"O:T"`` names its owner — ``(O, T)``;
+    * a personal ``"0"`` (or legacy bare) is never a topic graphic → ``None``.
+
+    Returning the owner-relative scope (not the *saver's*) is what lets a
+    recipient save a shared body that still carries the owner's bare tags."""
+    parts = str(handle).split(":")
+    try:
+        if len(parts) == 1:
+            t = int(parts[0])
+            return None if t == 0 else (topic_owner_id, t)
+        if len(parts) == 2:
+            return (int(parts[0]), int(parts[1]))
+    except ValueError:
+        return None
+    return None
+
+
 def parse_graphic_id(graphic_id: str) -> tuple[str, int] | None:
     """Split a full id into ``(handle, n)``, or ``None`` if it isn't a graphic
     id. A legacy bare ``graphic-N`` (no colon) reads as personal ``("0", N)`` so
@@ -113,6 +139,16 @@ class GraphicStore:
         self.topic_id = topic_id or 0
         self._dir = (graphics_dir if not self.topic_id
                      else os.path.join(graphics_dir, f"topic-{self.topic_id}"))
+
+    @property
+    def id_handle(self) -> str:
+        """The handle baked into this store's full graphic ids. For a topic store
+        it is the **absolute** ``"<owner>:<topic>"`` — the owner is always present
+        so the id means the same graphic in any context (a topic body *and* a
+        chat reply, for the owner *and* a recipient), with no reader-relative
+        reinterpretation. The personal/chat store is ``"0"`` (always self, never
+        shared, so never ambiguous)."""
+        return "0" if not self.topic_id else f"{self.owner_id}:{self.topic_id}"
 
     def _path(self, graphic_id: str) -> str:
         return os.path.join(self._dir, f"{graphic_id}{_SUFFIX}")
