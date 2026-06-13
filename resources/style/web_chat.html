@@ -1330,7 +1330,12 @@
                   border-bottom: 1px solid var(--border); }
     .topic-item:hover { background: rgba(124, 140, 255, 0.08); }
     .topic-item.active { background: rgba(124, 140, 255, 0.18); color: var(--accent); }
-    .topic-item .cat { color: var(--muted); font-size: 0.7rem; margin-top: 0.1rem; }
+    .topic-item .cat { color: var(--muted); font-size: 0.7rem; }
+    /* Category/share chip + dimmed ID share one row under the title. */
+    .topic-item .topic-meta { display: flex; align-items: baseline;
+                              gap: 0.5rem; margin-top: 0.12rem; flex-wrap: wrap; }
+    .topic-item .topic-id { color: var(--muted); font-size: 0.66rem;
+                            opacity: 0.65; margin-left: auto; white-space: nowrap; }
     /* Shared-with-me topics: dimmed, with a small "(Shared)" / owner tag.
        Pending invites are dimmed further and italicised — they're not yet
        openable, just a prompt to accept or decline. */
@@ -2223,6 +2228,13 @@
       color: var(--muted);
       font-size: 0.86rem;
       font-style: italic;
+    }
+    .graphic-card .graphic-id {
+      margin-top: 8px;
+      color: var(--muted);
+      opacity: 0.65;
+      font-size: 0.72rem;
+      white-space: nowrap;
     }
   </style>
 </head>
@@ -3749,6 +3761,14 @@ function renderGraphic(payload) {
     cap.textContent = summary;
     inner.appendChild(cap);
   }
+  // Dimmed ID badge, matching the inline tag path, when the payload names one.
+  const gid = payload.id || payload.graphic_id || "";
+  if (gid) {
+    const idTag = document.createElement("div");
+    idTag.className = "graphic-id";
+    idTag.textContent = "ID: " + String(gid).replace(/^graphic-/, "");
+    inner.appendChild(idTag);
+  }
   card.appendChild(inner);
   logInner.appendChild(card);
   scrollToBottom();
@@ -3831,6 +3851,12 @@ function makeGraphicMount(id) {
   const body = document.createElement("div");
   body.className = "graphic-body";
   card.appendChild(body);
+  // Dimmed ID badge so the user can reference this graphic by its handle:
+  // "<owner_id>:<topic_id>:<graphic_id>" (the `graphic-` tag prefix dropped).
+  const idTag = document.createElement("div");
+  idTag.className = "graphic-id";
+  idTag.textContent = "ID: " + id.replace(/^graphic-/, "");
+  card.appendChild(idTag);
   fetchGraphicAsset(id)
     .then((g) => {
       renderGraphicInto(body, g.format, g.source);
@@ -3838,7 +3864,7 @@ function makeGraphicMount(id) {
         const cap = document.createElement("div");
         cap.className = "graphic-caption";
         cap.textContent = g.summary;
-        card.appendChild(cap);
+        card.insertBefore(cap, idTag);
       }
     })
     .catch(() => {
@@ -7319,21 +7345,32 @@ function buildTopicItem(t) {
   const title = document.createElement("div");
   title.textContent = t.title || t.name || "(untitled)";
   item.appendChild(title);
+  // Meta row: the category chip (own topics) or share tag (shared topics), plus
+  // a dimmed topic ID so the user can reference a topic by its handle —
+  // "<topic_id>" for own topics, "<owner_id>:<topic_id>" for shared ones (the
+  // same `tid` used everywhere else).
+  const meta = document.createElement("div");
+  meta.className = "topic-meta";
   if (t.shared) {
     // Shared topics show owner + access instead of the #category color chip.
-    const tag = document.createElement("div");
+    const tag = document.createElement("span");
     tag.className = "share-tag";
     const perm = t.permission === "edit" ? "can edit" : "view only";
     tag.innerHTML = t.status === "pending"
       ? `Shared by ${escapeHtml(t.owner || "?")} — tap to respond`
       : `Shared by ${escapeHtml(t.owner || "?")} · <span class="perm">${perm}</span>`;
-    item.appendChild(tag);
+    meta.appendChild(tag);
   } else if (t.category) {
-    const c = document.createElement("div");
+    const c = document.createElement("span");
     c.className = "cat";
     c.textContent = "#" + t.category;
-    item.appendChild(c);
+    meta.appendChild(c);
   }
+  const idTag = document.createElement("span");
+  idTag.className = "topic-id";
+  idTag.textContent = "ID: " + tid;
+  meta.appendChild(idTag);
+  item.appendChild(meta);
   item.addEventListener("click", () => selectTopic(tid, item));
   return item;
 }
