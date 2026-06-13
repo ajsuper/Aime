@@ -1,14 +1,14 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "GetGraphic",
-  "description": "Load the full source of a graphic you drew earlier with CreateGraphics, so you can revise it accurately. After a graphic renders, its bulky source is dropped from your context to save space and you keep only its id (e.g. `graphic-2`) and summary — so you no longer know exactly what you drew. Whenever the user asks to change, tweak, fix, recolor, or extend an existing graphic, call GetGraphic FIRST with that graphic's id to reload its exact source, edit that source, and re-send it via CreateGraphics. Never redraw an existing graphic from memory — you will get the details wrong. This returns the source for one turn only; it's dropped again afterward, so make your edit in the same turn.",
+  "description": "Load the full source of a graphic you drew earlier with CreateGraphics, so you can revise it accurately. After a graphic renders, its bulky source is dropped from your context to save space and you keep only its id (e.g. `graphic-0:2` for a chat graphic, `graphic-7:2` for one in a topic) and summary — so you no longer know exactly what you drew. Whenever the user asks to change, tweak, fix, recolor, or extend an existing graphic, call GetGraphic FIRST with that graphic's id to reload its exact source, edit that source, and re-send it via CreateGraphics (pass the same `topic` so the revision lands in the same place). Never redraw an existing graphic from memory — you will get the details wrong. This returns the source for one turn only; it's dropped again afterward, so make your edit in the same turn.",
   "type": "object",
   "additionalProperties": false,
   "required": ["id"],
   "properties": {
     "id": {
       "type": "string",
-      "description": "The id of the graphic to load, as given when it was created (e.g. \"graphic-1\", \"graphic-2\")."
+      "description": "The id of the graphic to load, exactly as given when it was created (e.g. \"graphic-0:1\" for a chat graphic, \"graphic-7:2\" for one in topic 7, \"graphic-4:7:2\" for one in a shared topic)."
     }
   }
 }

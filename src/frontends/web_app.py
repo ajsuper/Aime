@@ -86,7 +86,10 @@ from aime.scheduling import (
 from aime import auth as _auth
 from aime import encryption as _enc
 from aime import backup as _backup
-from aime.graphics_store import GraphicStore
+from aime.graphics_store import (
+    GraphicStore, parse_graphic_id, make_graphic_id,
+)
+from aime import graphics as _graphics
 from aime import email_send as _email_send
 from aime import topic_shares as _topic_shares
 from aime.tool_formatting import TOOL_NAME_MAP
@@ -249,9 +252,27 @@ def _schedules_dir(user_id: int) -> str:
 
 def _graphics_dir(user_id: int) -> str:
     """Where ``GraphicStore`` keeps this user's encrypted graphic assets — the
-    canonical home for everything CreateGraphics draws, that `[graphic-N]` tags
-    in chat and topics resolve against. Sibling of ``schedules/``."""
+    canonical home for everything CreateGraphics draws, that `[graphic-…]` tags
+    in chat and topics resolve against. Personal/chat graphics sit here directly;
+    a topic's graphics nest under ``topic-<T>/``. Sibling of ``schedules/``."""
     return os.path.join(_user_dir(user_id), "graphics")
+
+
+def _delete_topic_graphics(owner_id: int, topic_id: int) -> None:
+    """Remove a topic's graphics directory (``…/graphics/topic-<T>/``) and
+    everything in it. The lifecycle companion to deleting topic ``topic_id``: its
+    graphics live only in this owner-scoped, per-topic dir (never in anyone's
+    personal store), so dropping the dir is the whole cleanup — un-sharing touches
+    no graphics, and a recipient never held a copy. Best-effort: a missing dir is
+    a no-op. Call this wherever a topic is destroyed, beside
+    ``_share_store.revoke_all_for_topic``."""
+    if not topic_id:
+        return  # topic 0 is the personal store, not a topic; never delete it
+    path = os.path.join(_graphics_dir(owner_id), f"topic-{topic_id}")
+    try:
+        shutil.rmtree(path)
+    except (OSError, FileNotFoundError):
+        pass
 
 
 # LEGACY MIGRATION — pre-multi-user installs kept all conversations in a
@@ -707,7 +728,7 @@ class UserContext:
             message_recipient=messaging_contact,
             reminder_service=reminder_service,
             record_sync=self.record_sync,
-            graphic_store=GraphicStore(_graphics_dir(user_id), dek),
+            graphic_store_provider=_make_graphic_store_provider(user_id),
         )
 
         # Seed the session with the user's last-seen zone so any turn that runs
@@ -3514,9 +3535,11 @@ def _parse_topic_handle(handle: str) -> tuple[int | None, int]:
     raise _ShareAccessError(400, "invalid topic id")
 
 
-def _resolve_topic(handle: str, need: str) -> tuple[int, int]:
-    """Resolve a topic handle from the current user to (effective_owner_id,
-    topic_id), enforcing access. `need` is "view" or "edit".
+def _resolve_topic_as(user_id: int, handle: str, need: str) -> tuple[int, int]:
+    """Resolve a topic handle *as `user_id`* to (effective_owner_id, topic_id),
+    enforcing access. `need` is "view" or "edit". The g-free core of
+    :func:`_resolve_topic`, so it can run off the request thread — e.g. from the
+    graphic-store provider a model turn calls on a worker thread.
 
     For the user's own topics this is the identity mapping. For a shared topic
     it verifies an *accepted* grant exists (and that it carries edit rights when
@@ -3524,14 +3547,61 @@ def _resolve_topic(handle: str, need: str) -> tuple[int, int]:
     The owner id is taken from _share_store, never trusted from the client, so a
     forged handle can't reach a topic that wasn't actually shared."""
     owner_id, topic_id = _parse_topic_handle(handle)
-    if owner_id is None or owner_id == g.user_id:
-        return g.user_id, topic_id
-    share = _share_store.get(owner_id, topic_id, g.user_id)
+    if owner_id is None or owner_id == user_id:
+        return user_id, topic_id
+    share = _share_store.get(owner_id, topic_id, user_id)
     if share is None or share.status != _topic_shares.STATUS_ACCEPTED:
         raise _ShareAccessError(403, "this topic isn't shared with you")
     if need == "edit" and share.permission != _topic_shares.PERM_EDIT:
         raise _ShareAccessError(403, "you have view-only access to this topic")
     return owner_id, topic_id
+
+
+def _resolve_topic(handle: str, need: str) -> tuple[int, int]:
+    """Resolve a topic handle from the *current request's* user. Thin wrapper
+    over :func:`_resolve_topic_as` bound to ``g.user_id``."""
+    return _resolve_topic_as(g.user_id, handle, need)
+
+
+def _foreign_graphic_tag(contents: str, saver_id: int,
+                         owner_id: int, topic_id: int) -> str | None:
+    """The write rule (docs/graphics-sharing.md §3b) for a topic-body save:
+    return the handle of the first `[graphic-…]` tag that doesn't belong to this
+    topic, or None if every tag is in-scope. Each tag's handle is resolved *as
+    the saver* and must land on this exact ``(owner, topic)`` — so a personal
+    graphic, another topic's graphic, or (from a recipient) a bare own-topic
+    handle is all rejected, exactly as the model-side rule in the controller."""
+    for handle in _graphics.graphic_tag_handles(contents):
+        try:
+            ro, rt = _resolve_topic_as(saver_id, handle, "view")
+        except _ShareAccessError:
+            return handle
+        if (ro, rt) != (owner_id, topic_id):
+            return handle
+    return None
+
+
+def _make_graphic_store_provider(user_id: int):
+    """Build the graphic-store provider for `user_id`: a closure that maps a
+    topic handle ("0" personal, "T" own, "O:T" shared) to the scoped GraphicStore
+    backing it, or None if `user_id` may not write/read that target.
+
+    It is just :func:`_resolve_topic_as` plus a store: the resolve enforces the
+    grant (and edit right when asked), then the store is opened in the *owner's*
+    silo under the owner's DEK — the server writing on the recipient's behalf,
+    exactly as a shared topic's *text* edits already land. Captures `user_id` so
+    it is safe to call off the request thread (the controller runs on a worker).
+    Handed to the controller, which never reaches across the trust boundary
+    itself."""
+    def provider(handle: str, need: str = "edit"):
+        try:
+            owner_id, topic_id = _resolve_topic_as(user_id, handle, need)
+        except _ShareAccessError:
+            return None
+        return GraphicStore(
+            _graphics_dir(owner_id), _auth_backend.get_dek(owner_id),
+            owner_id, topic_id)
+    return provider
 
 
 def _user_owns_topic(user_id: int, topic_id: int) -> bool:
@@ -3952,14 +4022,29 @@ def topics():
 @app.route("/graphics/<graphic_id>")
 @login_required
 def graphic_asset(graphic_id: str):
-    """Return one of the logged-in user's stored graphic assets — the source a
-    `[graphic-N]` tag (placed in a topic body, or rendered in chat) resolves to.
-    Owner-scoped: a user only reads their own graphics. Missing/unreadable reads
-    as 404 so a stale tag degrades to a calm 'couldn't load' card, not an error."""
+    """Return one stored graphic asset — the source a `[graphic-<handle>:N]` tag
+    (placed in a topic body, or rendered in chat) resolves to.
+
+    The id *is* a topic handle plus an ordinal, so authorization is topic
+    authorization: parse it, resolve the handle with `_resolve_topic("view")`
+    (own topic ⇒ self; shared ⇒ an accepted grant; personal `0` ⇒ self only),
+    then open the (owner, topic) store under the owner's DEK. A legacy bare
+    `graphic-N` reads as personal `graphic-0:N`. Anything that doesn't
+    resolve — bad id, no grant, missing file — collapses to 404, so a stale tag
+    degrades to a calm 'couldn't load' card and existence is never leaked."""
+    parsed = parse_graphic_id(graphic_id)
+    if parsed is None:
+        return jsonify({"ok": False, "error": "not found"}), 404
+    handle, n = parsed
+    try:
+        owner_id, topic_id = _resolve_topic(handle, "view")
+    except _ShareAccessError:
+        return jsonify({"ok": False, "error": "not found"}), 404
     try:
         store = GraphicStore(
-            _graphics_dir(g.user_id), _auth_backend.get_dek(g.user_id))
-        record = store.load(graphic_id)
+            _graphics_dir(owner_id), _auth_backend.get_dek(owner_id),
+            owner_id, topic_id)
+        record = store.load(make_graphic_id(n))
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 500
     if not record:
@@ -4114,6 +4199,12 @@ def topic_contents_save(topic_id: str):
     # from filling the disk via repeated PUTs.
     if len(contents.encode("utf-8")) > 2 * 1024 * 1024:
         return jsonify({"ok": False, "error": "contents too large (max 2 MiB)"}), 413
+    # Write rule: a topic body may embed only its own graphics. Reject any
+    # [graphic-…] tag that doesn't resolve (as this saver) to this topic.
+    bad = _foreign_graphic_tag(contents, g.user_id, owner_id, tid)
+    if bad is not None:
+        return jsonify(
+            {"ok": False, "error": _graphics.foreign_graphic_tag_message(bad)}), 400
     # Edits always land in the owner's silo (owner_id == g.user_id for own
     # topics; the topic owner for a shared one).
     ctx = _context_for(owner_id)

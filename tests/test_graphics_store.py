@@ -106,3 +106,69 @@ def test_id_ordinal_helpers():
     assert gs.graphic_id_ordinal("fig-7") is None
     assert gs.graphic_id_ordinal("graphic-") is None
     assert gs.graphic_id_ordinal(None) is None
+
+
+def test_format_graphic_id():
+    assert gs.format_graphic_id("0", 3) == "graphic-0:3"
+    assert gs.format_graphic_id("5", 3) == "graphic-5:3"
+    assert gs.format_graphic_id("4:5", 3) == "graphic-4:5:3"
+
+
+def test_parse_graphic_id_full_forms():
+    assert gs.parse_graphic_id("graphic-0:3") == ("0", 3)
+    assert gs.parse_graphic_id("graphic-5:3") == ("5", 3)
+    assert gs.parse_graphic_id("graphic-4:5:3") == ("4:5", 3)
+
+
+def test_parse_graphic_id_legacy_bare_is_personal():
+    # A legacy bare graphic-N (no colon) reads as personal graphic-0:N.
+    assert gs.parse_graphic_id("graphic-7") == ("0", 7)
+
+
+def test_parse_graphic_id_rejects_garbage():
+    assert gs.parse_graphic_id("fig-1:2") is None
+    assert gs.parse_graphic_id("graphic-") is None
+    assert gs.parse_graphic_id("graphic-a:1") is None
+    assert gs.parse_graphic_id("graphic-1:b") is None
+    assert gs.parse_graphic_id("graphic-1:2:3:4") is None
+    assert gs.parse_graphic_id(None) is None
+
+
+def test_topic_scoped_store_nests_in_subdir(tmp_path, dek):
+    base = str(tmp_path / "graphics")
+    store = gs.GraphicStore(base, dek, owner_id=10, topic_id=5)
+    rec = store.create("mermaid", "flowchart TD\nA-->B", "in topic")
+    assert rec["id"] == "graphic-1"
+    # Lives under topic-5/, not the personal base dir.
+    assert (tmp_path / "graphics" / "topic-5" / "graphic-1.json.enc").exists()
+    assert not (tmp_path / "graphics" / "graphic-1.json.enc").exists()
+    assert store.load("graphic-1") == rec
+
+
+def test_personal_and_topic_stores_allocate_independently(tmp_path, dek):
+    base = str(tmp_path / "graphics")
+    personal = gs.GraphicStore(base, dek, owner_id=10, topic_id=0)
+    topic = gs.GraphicStore(base, dek, owner_id=10, topic_id=5)
+    a = personal.create("mermaid", "graph TD\nA-->B", "")
+    b = topic.create("mermaid", "graph TD\nX-->Y", "")
+    # Each scope has its own ordinal sequence starting at 1.
+    assert a["id"] == "graphic-1"
+    assert b["id"] == "graphic-1"
+
+
+def test_create_rejects_bad_format(store):
+    assert store.create("png", "x", "") is None
+
+
+def test_concurrent_creates_get_distinct_ids(tmp_path, dek):
+    # Two stores over the same scope (separate handles, as different writers /
+    # processes would have) must never collide on an ordinal.
+    base = str(tmp_path / "graphics")
+    s1 = gs.GraphicStore(base, dek, owner_id=10, topic_id=5)
+    s2 = gs.GraphicStore(base, dek, owner_id=10, topic_id=5)
+    ids = set()
+    for i in range(20):
+        store = s1 if i % 2 == 0 else s2
+        rec = store.create("mermaid", f"graph TD\nA{i}-->B", "")
+        ids.add(rec["id"])
+    assert len(ids) == 20

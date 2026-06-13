@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "CreateGraphics",
-  "description": "Draw a chart, diagram, or custom visual when a picture beats words. Pick `format`: `vega-lite` for data charts (bar/line/scatter/pie/area — you give data + an encoding), `mermaid` for node-edge diagrams (flowchart, sequence, ER, gantt, state), `svg` for mockups or anything custom. Calling this SAVES the graphic and returns an id (`graphic-1`, `graphic-2`, …) but does NOT display it — to show it, write its tag `[graphic-1]` in your reply (or a topic body); it renders inline wherever the tag appears, and the same tag reuses the same graphic anywhere. You don't see the result, so build it carefully and keep labels legible, high-contrast, and uncrowded with axes/series labelled. `vega-lite` and `mermaid` auto-theme to the chat — rely on default colors unless you have a real reason. `svg` must be self-contained: paint a background `<rect>` over the whole `viewBox` and pick colors that contrast it (the theme may be light or dark). To change a graphic later, GetGraphic its id to reload the source, edit it, and call CreateGraphics again (new id) — never redraw from memory.",
+  "description": "Draw a chart, diagram, or custom visual when a picture beats words. Pick `format`: `vega-lite` for data charts (bar/line/scatter/pie/area — you give data + an encoding), `mermaid` for node-edge diagrams (flowchart, sequence, ER, gantt, state), `svg` for mockups or anything custom. Calling this SAVES the graphic into a target (a chat graphic by default, or a topic if you pass `topic`) and returns an id (`graphic-0:1` for chat, `graphic-<topic>:1` for a topic) but does NOT display it — to show it, write its tag `[graphic-0:1]` in your reply, or `[graphic-<topic>:1]` in that topic's body; it renders inline wherever the tag appears, and the same tag reuses the same graphic anywhere. A graphic can be embedded ONLY in the target it was created in: to put a chart in a topic, create it with that `topic`; a plain chat graphic can't be tagged into a topic (re-create it into the topic instead). You don't see the result, so build it carefully and keep labels legible, high-contrast, and uncrowded with axes/series labelled. `vega-lite` and `mermaid` auto-theme to the chat — rely on default colors unless you have a real reason. `svg` must be self-contained: paint a background `<rect>` over the whole `viewBox` and pick colors that contrast it (the theme may be light or dark). To change a graphic later, GetGraphic its id to reload the source, edit it, and call CreateGraphics again (new id, same target) — never redraw from memory.",
   "type": "object",
   "additionalProperties": false,
   "required": ["format", "source", "summary"],
@@ -18,6 +18,10 @@
     "summary": {
       "type": "string",
       "description": "A short, substantive caption — the takeaway, not the medium. Write 'Weekly spend peaked Tuesday at $31' rather than 'a bar chart'. This is what you keep about the graphic afterward, so it must carry the meaning, not just name the picture."
+    },
+    "topic": {
+      "type": "string",
+      "description": "Optional. The topic to create this graphic INTO, as that topic's handle — the exact same handle you address it by elsewhere (a bare id like \"7\" for your own topic, or \"<owner>:<topic>\" like \"4:7\" for one shared with you). Omit (or leave empty) for a normal chat graphic. The graphic can only be embedded in this topic's body, and you must have edit access to a shared topic. Use this when the user wants a chart saved in a topic rather than just shown in chat."
     }
   }
 }

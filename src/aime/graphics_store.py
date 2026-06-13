@@ -1,23 +1,31 @@
-"""Per-user persistence for graphic assets — the single source of truth.
+"""Persistence for graphic assets — the single source of truth, scoped to a
+topic.
 
 A *graphic asset* is one drawing the model produced via ``CreateGraphics``: its
 ``format`` (``vega-lite`` / ``mermaid`` / ``svg``), the full ``source`` that
 renders it, and a short ``summary``. This store is what makes a graphic a
 first-class, reusable asset rather than a one-shot card: the model creates it
-once and then references it by id — ``[graphic:N]`` — anywhere it likes, in a
-chat reply or inside a topic body. Chat replay, topic rendering, and shares all
-resolve that tag against this one store.
+once and then references it by id — ``[graphic-<handle>:N]`` — anywhere it
+likes, in a chat reply or inside a topic body. Chat replay, topic rendering, and
+shares all resolve that tag against this one store.
 
-:class:`GraphicStore` is a near-exact clone of
-``scheduling.store.ScheduleStore`` / ``agents.AgentDefinitionStore``: one
-encrypted file per asset under the user's ``graphics/`` dir, sealed with the
-user's DEK and the asset id as AEAD associated data, all IO best-effort (a
-failed write returns ``False``; an unreadable file is skipped on listing).
+A store is scoped to an ``(owner_id, topic_id)`` pair (see docs/graphics-sharing
+.md): personal/chat graphics live in ``users/<owner>/graphics/`` (``topic_id 0``,
+the legacy layout, unchanged); a topic's graphics live in
+``users/<owner>/graphics/topic-<T>/``. The *directory* supplies the owner+topic
+scope, so the on-disk filename stem and AEAD associated data stay the bare
+``graphic-<n>`` form — existing personal files decrypt unchanged and are simply
+reinterpreted as ``graphic-0:N``. The full, addressable id
+(``graphic-<handle>:<n>``) is reconstructed by the caller from the store's scope
+plus the ordinal; the store itself only ever deals in bare ordinals on disk.
 
-Ids are per-user monotonic — ``graphic-1``, ``graphic-2``, … — allocated one
-past the highest already on disk so they stay stable and unique across a user's
-whole account (not per-conversation, not per-topic), which is what lets the same
-``[graphic:N]`` tag mean the same picture wherever it appears.
+:class:`GraphicStore` mirrors ``scheduling.store.ScheduleStore`` /
+``agents.AgentDefinitionStore``: one encrypted file per asset, sealed with the
+owner's DEK and the bare stem as AEAD associated data, all IO best-effort (a
+failed write returns ``None``/``False``; an unreadable file is skipped on
+listing). Allocation is **atomic** (``O_EXCL`` create-and-retry) so a topic
+store with several writers — owner + edit-recipients, possibly across processes
+— never hands out the same ordinal twice.
 """
 
 import datetime
@@ -33,6 +41,14 @@ from . import graphics as _graphics
 _SUFFIX = ".json.enc"
 _ID_PREFIX = "graphic-"
 _ID_RE = re.compile(rf"^{_ID_PREFIX}(\d+)$")
+# A topic handle: a bare topic id ``T`` (own / personal ``0``) or an
+# owner-qualified ``O:T`` (a shared topic). Used to validate the handle half of
+# a full graphic id; the topic layer re-validates it for authorization.
+_HANDLE_RE = re.compile(r"^\d+(?::\d+)?$")
+# How many times allocation retries when it loses the O_EXCL race for an
+# ordinal. Far more than the realistic number of concurrent writers on one
+# topic; a runaway just returns None rather than spinning.
+_MAX_ALLOC_RETRIES = 50
 
 
 def _utc_now_iso() -> str:
@@ -40,16 +56,43 @@ def _utc_now_iso() -> str:
 
 
 def make_graphic_id(n: int) -> str:
-    """The canonical asset id for ordinal ``n`` (also the filename stem)."""
+    """The bare on-disk stem for ordinal ``n`` (also the AEAD associated data)."""
     return f"{_ID_PREFIX}{n}"
 
 
 def graphic_id_ordinal(graphic_id: str) -> int | None:
-    """The integer ``N`` inside a ``graphic-N`` id, or None if it isn't one."""
+    """The integer ``N`` inside a bare ``graphic-N`` stem, or None if it isn't
+    one. (For a full ``graphic-<handle>:N`` id use :func:`parse_graphic_id`.)"""
     if not isinstance(graphic_id, str):
         return None
     m = _ID_RE.match(graphic_id)
     return int(m.group(1)) if m else None
+
+
+def format_graphic_id(handle: str, n: int) -> str:
+    """The full, addressable id for ordinal ``n`` in topic ``handle`` —
+    ``graphic-<handle>:<n>``. ``handle`` is a topic handle (``"0"`` personal,
+    ``"T"`` an own topic, ``"O:T"`` a shared one); the same picture is thus
+    ``graphic-T:n`` to its owner and ``graphic-O:T:n`` to a recipient, exactly
+    as a topic is ``T`` vs ``O:T``."""
+    return f"{_ID_PREFIX}{handle}:{n}"
+
+
+def parse_graphic_id(graphic_id: str) -> tuple[str, int] | None:
+    """Split a full id into ``(handle, n)``, or ``None`` if it isn't a graphic
+    id. A legacy bare ``graphic-N`` (no colon) reads as personal ``("0", N)`` so
+    old chats and topic bodies keep resolving; ``graphic-<handle>:<n>`` returns
+    that handle verbatim for the topic layer to authorize."""
+    if not isinstance(graphic_id, str) or not graphic_id.startswith(_ID_PREFIX):
+        return None
+    rest = graphic_id[len(_ID_PREFIX):]
+    if ":" not in rest:
+        # Legacy bare graphic-N -> personal graphic-0:N.
+        return ("0", int(rest)) if rest.isdigit() else None
+    handle, _, n_s = rest.rpartition(":")
+    if not n_s.isdigit() or not _HANDLE_RE.match(handle):
+        return None
+    return (handle, int(n_s))
 
 
 class GraphicStore:
@@ -60,15 +103,22 @@ class GraphicStore:
     can't take down a request handler — a failed write returns ``False`` and an
     unreadable file is skipped on listing."""
 
-    def __init__(self, graphics_dir: str, dek: bytes):
-        self._dir = graphics_dir
+    def __init__(self, graphics_dir: str, dek: bytes,
+                 owner_id: int | None = None, topic_id: int = 0):
+        # The owner's base graphics dir; a topic store nests one level under it
+        # so the directory itself carries the (owner, topic) scope. ``topic_id``
+        # 0 is the personal/chat store at the base dir (the legacy layout).
         self._dek = dek
+        self.owner_id = owner_id
+        self.topic_id = topic_id or 0
+        self._dir = (graphics_dir if not self.topic_id
+                     else os.path.join(graphics_dir, f"topic-{self.topic_id}"))
 
     def _path(self, graphic_id: str) -> str:
         return os.path.join(self._dir, f"{graphic_id}{_SUFFIX}")
 
-    def _next_id(self) -> str:
-        """One past the highest ``graphic-N`` already on disk. Unreadable or
+    def _next_n(self) -> int:
+        """One past the highest ordinal already on disk. Unreadable or
         oddly-named files are ignored for the high-water mark — only files that
         match the id pattern count, so a stray file can't break allocation."""
         highest = 0
@@ -82,23 +132,55 @@ class GraphicStore:
             n = graphic_id_ordinal(name[: -len(_SUFFIX)])
             if n is not None:
                 highest = max(highest, n)
-        return make_graphic_id(highest + 1)
+        return highest + 1
 
     def create(self, fmt: str, source: str, summary: str) -> dict | None:
-        """Allocate the next id, persist a fresh asset, and return the stored
-        record (``{id, format, source, summary, created_at, updated_at}``). The
-        ``source`` should already be ``graphics.normalize``-cleaned by the caller
-        (the controller), since this is the canonical copy everything renders
-        from. Returns None if the write fails."""
-        record = {
-            "id": self._next_id(),
-            "format": fmt,
-            "source": source,
-            "summary": summary or "",
-            "created_at": _utc_now_iso(),
-            "updated_at": _utc_now_iso(),
-        }
-        return record if self.save(record) else None
+        """Atomically allocate the next ordinal, persist a fresh asset, and
+        return the stored record (``{id, format, source, summary, created_at,
+        updated_at}`` — ``id`` is the bare stem; the caller builds the full
+        ``graphic-<handle>:<n>`` id from the store's scope). The ``source``
+        should already be ``graphics.normalize``-cleaned by the caller (the
+        controller), since this is the canonical copy everything renders from.
+
+        Allocation is race-safe across writers and processes: the file is
+        created with ``O_EXCL`` (``"xb"``), and on a collision — another writer
+        took that ordinal first — the next ordinal is recomputed and retried.
+        Returns ``None`` if the format is unusable or the write fails."""
+        if fmt not in _graphics.ALLOWED_FORMATS:
+            return None
+        try:
+            os.makedirs(self._dir, exist_ok=True)
+        except OSError:
+            return None
+        for _ in range(_MAX_ALLOC_RETRIES):
+            stem = make_graphic_id(self._next_n())
+            record = {
+                "id": stem,
+                "format": fmt,
+                "source": source,
+                "summary": summary or "",
+                "created_at": _utc_now_iso(),
+                "updated_at": _utc_now_iso(),
+            }
+            try:
+                blob = _enc.encrypt_blob(
+                    self._dek, json.dumps(record).encode("utf-8"),
+                    aad=stem.encode("utf-8"))
+            except (TypeError, ValueError):
+                return None
+            try:
+                # O_EXCL: we own this ordinal only if the create succeeds; a
+                # concurrent writer that got there first raises FileExistsError
+                # and we take the next ordinal instead. No lock, correct across
+                # processes (the web sidecar may run several).
+                with open(self._path(stem), "xb") as f:
+                    f.write(blob)
+            except FileExistsError:
+                continue
+            except OSError:
+                return None
+            return record
+        return None
 
     def save(self, record: dict) -> bool:
         """Persist a record (refreshing ``updated_at``). Returns ``False`` on any

@@ -28,6 +28,7 @@ from .tool_gateway import ToolGateway
 from .commitments import CommitmentService
 from .services import _events_from
 from . import graphics as _graphics
+from . import graphics_store as _graphics_store
 from .tool_formatting import (
     format_tool_details,
     format_tool_response,
@@ -189,19 +190,24 @@ class ConversationController:
         message_recipient: str | None = None,
         reminder_service=None,
         record_sync=None,
-        graphic_store=None,
+        graphic_store_provider=None,
     ):
         self._backend = backend
         self._tools = tool_gateway
         self._spawn_worker = worker_spawner
-        # Optional per-user GraphicStore (aime.graphics_store). The canonical
-        # home for graphics the model draws with CreateGraphics: it allocates the
-        # `graphic-N` id, holds the source, and is what GetGraphic reloads from
-        # and what `[graphic-N]` tags (in chat or a topic body) resolve against.
+        # Optional graphic-store *provider* (built by the web layer). Given a
+        # topic handle ("0" personal, "T" an own topic, "O:T" a shared one) and a
+        # need ("view"/"edit"), it returns the scoped GraphicStore for that
+        # target — or None if the acting user may not write/read it. This is the
+        # canonical home for graphics the model draws with CreateGraphics: the
+        # store allocates the ordinal, holds the source, and is what GetGraphic
+        # reloads from and what `[graphic-<handle>:N]` tags resolve against. The
+        # provider routes through the topic layer's authorization so a graphic
+        # inherits topics' ownership wholesale (see docs/graphics-sharing.md).
         # None for the TUI / background agents — there CreateGraphics degrades to
         # a friendly "not available here" result, since a graphic only renders in
         # an interactive web chat.
-        self._graphic_store = graphic_store
+        self._graphic_store_provider = graphic_store_provider
         # Optional cross-user record-sync bridge (built by the web layer, which
         # owns the grant store and per-owner gateways). When set it lets the
         # model see and open topics shared *with* this user, flags the user's own
@@ -845,7 +851,13 @@ class ConversationController:
         # one of this user's own topics and runs normally. FilterTopics runs
         # normally and is then enriched with the user's shared topics + "shared
         # with" flags. With no bridge wired this is all the plain path.
-        if self._record_sync is not None and tool_name in _SHAREABLE_TOPIC_TOOLS:
+        # Write rule: a topic body may embed only its *own* graphics. Reject a
+        # content write whose [graphic-…] tags don't all resolve to the topic
+        # being saved (from this user's identity), before it executes anywhere.
+        graphic_tag_error = self._reject_foreign_graphic_tags(tool_name, tool_input)
+        if graphic_tag_error is not None:
+            result = graphic_tag_error
+        elif self._record_sync is not None and tool_name in _SHAREABLE_TOPIC_TOOLS:
             tool_input = _normalize_topic_id(tool_input)
             result = self._record_sync.run_if_shared(tool_name, tool_input)
             if result is None:
@@ -916,15 +928,21 @@ class ConversationController:
         On an invalid spec we hand the error straight back as the tool_result so
         the model can fix it and call again the same turn — nothing renders.
 
-        On success we save the spec to the user's GraphicStore (the canonical
-        copy), which allocates a stable `graphic-N` id; stamp that id + cleaned
-        source onto the history block (so the graphic replays on /load and the
-        send-time strip can reference it); emit a `graphic` CoreEvent the frontend
-        renders at the call site; and hand the model a tiny tool_result naming the
-        id and the `[graphic-N]` tag it can drop into a topic to place the same
-        graphic there. The model carries only the id + summary afterward — the
-        strip keeps the source out of its per-turn context until it reloads via
-        GetGraphic to edit."""
+        On success we save the spec to the target topic's GraphicStore (the
+        canonical copy), which atomically allocates the ordinal; build the full
+        `graphic-<handle>:N` id from the target handle + ordinal; stamp that id +
+        cleaned source onto the history block (so the graphic replays on /load
+        and the send-time strip can reference it); and hand the model a tiny
+        tool_result naming the id and the `[graphic-<handle>:N]` tag it writes to
+        place the graphic. The model carries only the id + summary afterward —
+        the strip keeps the source out of its per-turn context until it reloads
+        via GetGraphic to edit.
+
+        The target is the optional `topic` handle ("T" an own topic, "O:T" a
+        shared one; omitted ⇒ personal chat graphic, handle "0"). The graphic can
+        be written *only* to that target: the provider routes through the topic
+        layer's auth, so a view-only or forged handle yields no store and a
+        friendly refusal — never a write into the wrong silo."""
         payload = tool_input if isinstance(tool_input, dict) else {}
         tool_name = event.tool_name or "CreateGraphics"
         fmt = (payload.get("format") or "").strip()
@@ -934,8 +952,11 @@ class ConversationController:
         # we render, store, and (on failure) hand back for the model to revise.
         source = _graphics.normalize(fmt, payload.get("source") or "")
         summary = (payload.get("summary") or "").strip()
+        # The target topic handle: "T"/"O:T" for a topic graphic, "0" (or
+        # omitted) for a personal chat graphic.
+        handle = (payload.get("topic") or "").strip() or "0"
 
-        if self._graphic_store is None:
+        if self._graphic_store_provider is None:
             self._send_tool_result(
                 event.tool_use_id,
                 "Graphics aren't available in this session — they render only in "
@@ -958,16 +979,32 @@ class ConversationController:
             )
             return
 
-        # Save the canonical asset (allocates the id), then stamp the history
-        # block so the graphic replays on /load and the strip can reference it.
-        record = self._graphic_store.create(fmt, source, summary)
+        # Resolve the target store through the provider (topic-layer auth). None
+        # means view-only on a shared topic, an unshared/forged handle, or a
+        # malformed one — a recoverable refusal, no write attempted.
+        store = self._graphic_store_for(handle, "edit")
+        if store is None:
+            self._send_tool_result(
+                event.tool_use_id,
+                "I couldn't add a graphic to that topic. You either have "
+                "view-only access to it, or the topic handle is off. Leave "
+                "`topic` empty for a personal chat graphic, or use the topic's "
+                "exact handle (the same one you address it by) to draw into it.",
+            )
+            return
+
+        # Save the canonical asset (allocates the ordinal), then stamp the
+        # history block so the graphic replays on /load and the strip can
+        # reference it. The full id pins the ordinal to its topic handle.
+        record = store.create(fmt, source, summary)
         if not record:
             self._send_tool_result(
                 event.tool_use_id,
                 "Couldn't save the graphic just now. Try CreateGraphics again.",
             )
             return
-        graphic_id = record["id"]
+        graphic_id = _graphics_store.format_graphic_id(
+            handle, _graphics_store.graphic_id_ordinal(record["id"]))
         register = getattr(self._backend, "register_graphic", None)
         if callable(register) and event.tool_use_id:
             try:
@@ -976,9 +1013,9 @@ class ConversationController:
                 pass
 
         # Nothing is shown yet: the graphic is a stored asset, displayed wherever
-        # its `[graphic-N]` tag appears. The model places that tag in its reply
-        # (chat) and/or a topic body; the frontend resolves it through the same
-        # renderer for both. A status line for the verbose tool view only.
+        # its `[graphic-<handle>:N]` tag appears. The model places that tag in its
+        # reply (chat) and/or the matching topic body; the frontend resolves it
+        # through the same renderer for both. A status line for the verbose view.
         self._emit(CoreEvent(
             kind="tool_result",
             tool_name=tool_name,
@@ -989,40 +1026,132 @@ class ConversationController:
             event.tool_use_id,
             f"Saved as {graphic_id}{cap}. It is NOT shown to the user yet — "
             f"display it by writing the tag [{graphic_id}] in your reply where you "
-            "want it to appear (and/or in a topic body); it renders inline wherever "
-            f'that tag appears. To revise it later, call GetGraphic with id '
-            f'"{graphic_id}" to load its source first — don\'t redraw it from memory.',
+            "want it to appear (and/or in that topic's body); it renders inline "
+            f'wherever that tag appears. To revise it later, call GetGraphic with '
+            f'id "{graphic_id}" to load its source first — don\'t redraw it from '
+            "memory.",
         )
+
+    @staticmethod
+    def _topic_write_body_text(tool_name: str, tool_input: dict) -> str:
+        """The text a topic-content write would introduce, for the write-rule
+        scan. ReplaceTopicContents carries the whole new body; EditTopicContents
+        carries find/replace patches, and any *newly-added* graphic tag must
+        appear in a `replace` (you can't add text any other way), so scanning the
+        replacements catches every new tag. Anything else contributes no body."""
+        inp = tool_input or {}
+        if tool_name == "ReplaceTopicContents":
+            body = inp.get("contents")
+            return body if isinstance(body, str) else ""
+        if tool_name == "EditTopicContents":
+            patches = inp.get("patches")
+            if isinstance(patches, list):
+                return "\n".join(
+                    p["replace"] for p in patches
+                    if isinstance(p, dict) and isinstance(p.get("replace"), str)
+                )
+        return ""
+
+    def _reject_foreign_graphic_tags(self, tool_name: str, tool_input: dict):
+        """Enforce the write rule (docs/graphics-sharing.md §3b): a topic body may
+        reference only graphics that belong to *that* topic. Returns an
+        ``{"error": …}`` dict to block the write, or None to allow it.
+
+        Resolves the topic being saved and every embedded `[graphic-…]` tag
+        through the same provider (so authorization is the acting user's, exactly
+        as the topic layer would), and requires each tag to resolve to the saved
+        topic's ``(owner, topic)``. A personal `graphic-0:n`, another topic's id,
+        or (for a recipient) a bare `graphic-T:n` all resolve elsewhere and are
+        rejected. No provider (TUI / agents) or an unresolved target ⇒ skip; the
+        downstream write path owns the topic-access refusal in that case."""
+        if self._graphic_store_provider is None:
+            return None
+        if tool_name not in ("ReplaceTopicContents", "EditTopicContents"):
+            return None
+        body = self._topic_write_body_text(tool_name, tool_input)
+        handles = _graphics.graphic_tag_handles(body)
+        if not handles:
+            return None
+        target = self._graphic_store_for(
+            str((tool_input or {}).get("id") or ""), "edit")
+        if target is None:
+            return None
+        scope = (target.owner_id, target.topic_id)
+        for handle in handles:
+            store = self._graphic_store_for(handle, "view")
+            if store is None or (store.owner_id, store.topic_id) != scope:
+                return {"error": _graphics.foreign_graphic_tag_message(handle)}
+        return None
+
+    def _graphic_store_for(self, handle: str, need: str):
+        """Resolve the scoped GraphicStore for a topic `handle` ("0" personal,
+        "T" own, "O:T" shared) via the injected provider, or None when there is
+        no provider (TUI / background agents) or the acting user may not access
+        that target. The provider routes through the topic layer's auth, so this
+        is the single owner-routing + IDOR check the graphic layer needs."""
+        if self._graphic_store_provider is None:
+            return None
+        try:
+            return self._graphic_store_provider(handle, need)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _known_graphic_ids(store, handle: str) -> list[str]:
+        """Full ids of every graphic in `store`, for the not-found hint. Empty if
+        there is no store. Each bare-stem record is re-expressed in the reader's
+        `handle` form (`graphic-<handle>:N`) — the same way the model addresses
+        it."""
+        if store is None:
+            return []
+        out = []
+        for g in store.list_graphics():
+            n = _graphics_store.graphic_id_ordinal(g.get("id") or "")
+            if n is not None:
+                out.append(_graphics_store.format_graphic_id(handle, n))
+        return out
 
     def _handle_get_graphic(self, event: BackendEvent, tool_input: dict) -> None:
         """Client tool: reload a previously-drawn graphic's full source by its
-        `graphic-N` id (from the user's GraphicStore) so the model can revise it
-        accurately. The source re-enters context only for this turn — the
-        send-time strip slims the reloaded result back down once the editing turn
-        has passed."""
+        full `graphic-<handle>:N` id so the model can revise it accurately. The
+        id's handle is fed to the provider (so a recipient can reload a shared
+        topic's graphic, but only with an accepted-edit grant); the source then
+        re-enters context only for this turn — the send-time strip slims the
+        reloaded result back down once the editing turn has passed."""
         payload = tool_input if isinstance(tool_input, dict) else {}
         tool_name = event.tool_name or "GetGraphic"
-        graphic_id = (payload.get("id") or "").strip()
+        graphic_id_raw = (payload.get("id") or "").strip()
+        parsed = _graphics_store.parse_graphic_id(graphic_id_raw)
 
-        graphic = (self._graphic_store.load(graphic_id)
-                   if (self._graphic_store is not None and graphic_id) else None)
+        store = None
+        if parsed is not None:
+            store = self._graphic_store_for(parsed[0], "edit")
+        graphic = (store.load(_graphics_store.make_graphic_id(parsed[1]))
+                   if (store is not None and parsed is not None) else None)
         if not graphic or not graphic.get("source"):
-            known = ([g["id"] for g in self._graphic_store.list_graphics()]
-                     if self._graphic_store is not None else [])
+            # Best-effort "known ids" hint: list the resolved target store, or
+            # fall back to the personal store so a bad/garbled id still gets a
+            # useful pointer to the chat graphics.
+            hint_handle = parsed[0] if parsed is not None else "0"
+            hint_store = store if store is not None else self._graphic_store_for("0", "edit")
+            if store is None:
+                hint_handle = "0"
+            known = self._known_graphic_ids(hint_store, hint_handle)
             hint = (f" Graphics drawn so far: {', '.join(known)}."
                     if known else " No graphics have been drawn yet.")
-            msg = (f"No graphic with id {graphic_id!r} was found.{hint}"
-                   if graphic_id else
-                   "Provide the `id` of the graphic to load (e.g. \"graphic-1\").")
+            msg = (f"No graphic with id {graphic_id_raw!r} was found.{hint}"
+                   if graphic_id_raw else
+                   "Provide the `id` of the graphic to load (e.g. \"graphic-0:1\").")
             self._emit(CoreEvent(
                 kind="tool_result",
                 tool_name=tool_name,
-                tool_result_summary=f"no graphic {graphic_id}".strip(),
+                tool_result_summary=f"no graphic {graphic_id_raw}".strip(),
                 tool_detail_full=msg,
             ))
             self._send_tool_result(event.tool_use_id, msg)
             return
 
+        graphic_id = _graphics_store.format_graphic_id(parsed[0], parsed[1])
         self._emit(CoreEvent(
             kind="tool_result",
             tool_name=tool_name,

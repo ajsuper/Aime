@@ -3767,13 +3767,31 @@ function fetchGraphicAsset(id) {
   return _graphicAssetCache[id];
 }
 
-// A `[graphic-N]` token references a stored graphic asset by id (the same asset
-// CreateGraphics drew in chat). Find those tokens in already-sanitized topic HTML
-// and swap each for a rendered graphic, fetching its source from /graphics/<id>.
-// We only walk text nodes (never re-parse HTML), so this can't introduce markup.
-const _GRAPHIC_TAG_RE = /\[(graphic-\d+)\]/g;
-const _GRAPHIC_TAG_TEST = /\[graphic-\d+\]/;  // non-global: stateless .test()
-function resolveGraphicTags(root) {
+// A `[graphic-…]` token references a stored graphic asset by id. The id is a
+// topic handle plus an ordinal: `graphic-<handle>:<n>` where the handle is `T`
+// (own topic) or `O:T` (shared), plus the legacy bare `graphic-N` (read as the
+// personal `graphic-0:N`). Find those tokens in already-sanitized HTML and swap
+// each for a rendered graphic, fetching its source from /graphics/<id>. We only
+// walk text nodes (never re-parse HTML), so this can't introduce markup.
+const _GRAPHIC_TAG_RE = /\[(graphic-(?:\d+:){1,2}\d+|graphic-\d+)\]/g;
+const _GRAPHIC_TAG_TEST = /\[graphic-(?:\d+:){1,2}\d+\]|\[graphic-\d+\]/;  // non-global
+
+// Normalize a tag id to the fully-qualified form the route expects, given the
+// render context's owner (`ownerId`: the topic owner for a topic body; null/
+// undefined in chat, i.e. self). A bare `graphic-T:n` is owner-relative, so in a
+// shared-topic context (ownerId set) it gets the owner prefixed —
+// `graphic-O:T:n` — exactly as the same topic is `O:T` to a recipient. Explicit
+// `graphic-O:T:n`, personal `graphic-0:n`, and legacy bare ids pass through.
+function normalizeGraphicId(id, ownerId) {
+  const rest = id.slice("graphic-".length);
+  const parts = rest.split(":");
+  if (parts.length === 2 && parts[0] !== "0" && ownerId != null) {
+    return "graphic-" + ownerId + ":" + rest;
+  }
+  return id;
+}
+
+function resolveGraphicTags(root, ownerId) {
   if (!root) return;
   const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
     // Use the non-global regex here: a global regex's .test() advances lastIndex
@@ -3797,7 +3815,7 @@ function resolveGraphicTags(root) {
       if (m.index > last) {
         frag.appendChild(document.createTextNode(text.slice(last, m.index)));
       }
-      frag.appendChild(makeGraphicMount(m[1]));
+      frag.appendChild(makeGraphicMount(normalizeGraphicId(m[1], ownerId)));
       last = m.index + m[0].length;
     }
     if (last < text.length) {
@@ -7655,10 +7673,21 @@ function renderTopicMarkdown(md) {
     box.dataset.taskIndex = String(idx);
     box.addEventListener("change", onTopicCheckboxToggle);
   });
-  // Resolve any `[graphic-N]` tags the model placed in the body into rendered
+  // Resolve any `[graphic-…]` tags the model placed in the body into rendered
   // graphics, pulling each asset's source from the store. Runs after sanitize,
-  // walking text only, so it never reintroduces unsafe markup.
-  resolveGraphicTags(topicBodyEl);
+  // walking text only, so it never reintroduces unsafe markup. The render
+  // context's owner (the topic's owner for a shared `O:T` handle, else self)
+  // lets a bare `graphic-T:n` written by the owner resolve cross-account.
+  resolveGraphicTags(topicBodyEl, topicHandleOwner(selectedTopicId));
+}
+
+// The owner id encoded in a topic handle: `O` for a shared `"O:T"` handle, or
+// null for a bare own-topic handle (self is the render owner). Mirrors the
+// server's _parse_topic_handle.
+function topicHandleOwner(handle) {
+  const s = String(handle == null ? "" : handle);
+  const i = s.indexOf(":");
+  return i > 0 ? s.slice(0, i) : null;
 }
 
 // Acquire / refresh / release the advisory edit-lock. Acquire is best-effort:

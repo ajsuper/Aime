@@ -209,6 +209,37 @@ def validate(fmt: str, source: str) -> str | None:
 GRAPHIC_TOOL_NAME = "CreateGraphics"
 GET_GRAPHIC_TOOL_NAME = "GetGraphic"
 
+# A `[graphic-…]` tag in a chat reply or topic body. Matches the addressable
+# grammar — `graphic-<handle>:<n>` where the handle is `T` or `O:T` — plus the
+# legacy bare `graphic-N` (read as personal `graphic-0:N`). Kept in step with the
+# frontend resolver's regex (web_chat.html) and graphics_store.parse_graphic_id.
+_GRAPHIC_TAG_HANDLE_RE = re.compile(r"\[graphic-((?:\d+:){1,2}\d+|\d+)\]")
+
+
+def graphic_tag_handles(text: str) -> list[str]:
+    """Every topic handle referenced by a `[graphic-…]` tag in `text`, in order
+    (duplicates kept). The handle is the part *before* the trailing `:n`: a bare
+    legacy `[graphic-N]` yields personal `"0"`, `[graphic-T:n]` yields `"T"`, and
+    `[graphic-O:T:n]` yields `"O:T"`. Used by the topic write rule to check every
+    embedded graphic belongs to the topic being saved."""
+    out: list[str] = []
+    for m in _GRAPHIC_TAG_HANDLE_RE.finditer(text or ""):
+        parts = m.group(1).split(":")
+        out.append("0" if len(parts) == 1 else ":".join(parts[:-1]))
+    return out
+
+
+def foreign_graphic_tag_message(handle: str) -> str:
+    """Friendly refusal when a topic body embeds a graphic that isn't its own.
+    Steers toward the fix — (re)create the graphic into this topic — rather than
+    naming an internal rule (see friendly-error-messaging)."""
+    return (
+        f"This topic can't show [graphic-{handle}:…]: a topic only displays "
+        "graphics that were created in it. Make the graphic in this topic first "
+        "(CreateGraphics with this topic's handle, or reload the original with "
+        "GetGraphic and re-create it here), then place its new tag."
+    )
+
 # Opening line of a GetGraphic result that carries a reloaded source. Doubles as
 # the sentinel the strip matches to slim that result back down once the editing
 # turn it was loaded for has passed.

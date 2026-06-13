@@ -211,12 +211,36 @@ def test_redact_history_keeps_loaded_source_only_in_last_message():
     assert "graph TD" in out[1]["content"][0]["content"]
 
 
+# --- Tag scanning / write rule helpers -------------------------------------
+
+
+def test_graphic_tag_handles_extracts_every_form():
+    body = (
+        "intro [graphic-0:1] mid [graphic-7:2] and [graphic-4:7:3] "
+        "plus a legacy [graphic-5] tail"
+    )
+    assert graphics.graphic_tag_handles(body) == ["0", "7", "4:7", "0"]
+
+
+def test_graphic_tag_handles_ignores_non_tags():
+    # A plain word, an unmatched bracket, and non-graphic text contribute nothing.
+    assert graphics.graphic_tag_handles("nothing here") == []
+    assert graphics.graphic_tag_handles("[graphic-]") == []
+    assert graphics.graphic_tag_handles("[fig-1:2]") == []
+
+
+def test_foreign_graphic_tag_message_mentions_handle():
+    msg = graphics.foreign_graphic_tag_message("4:7")
+    assert "graphic-4:7" in msg and "CreateGraphics" in msg
+
+
 # --- Controller wiring -----------------------------------------------------
-# CreateGraphics is a client tool: the controller validates, saves the graphic to
-# the user's GraphicStore (which allocates the `graphic-N` id), stamps the history
-# block via register_graphic (for replay), emits a `graphic` CoreEvent for the
-# frontend, and hands the model a tool_result naming the id + its [graphic-N] tag.
-# GetGraphic reloads a stored source by id from the same store.
+# CreateGraphics is a client tool: the controller validates, resolves the target
+# topic store through the injected provider, saves the graphic (which allocates
+# the ordinal), builds the full `graphic-<handle>:N` id, stamps the history block
+# via register_graphic (for replay), and hands the model a tool_result naming the
+# id + its [graphic-<handle>:N] tag. GetGraphic reloads a stored source by id
+# through the same provider.
 
 
 class _RecordingBackend:
@@ -238,19 +262,44 @@ class _RecordingBackend:
         return True
 
 
-def _graphics_controller(tmp_path):
+class _StoreProvider:
+    """Test graphic-store provider: maps a topic handle to a scoped store, all
+    under one owner. ``"0"`` is the personal/chat store; a bare numeric handle is
+    that own topic. A handle listed in ``denied`` resolves to None (stands in for
+    a view-only or unshared topic), so the controller takes the refusal path."""
+
+    def __init__(self, base, dek, denied=()):
+        self._base = base
+        self._dek = dek
+        self._denied = set(denied)
+        self._stores = {}
+
+    def __call__(self, handle, need="edit"):
+        if handle in self._denied:
+            return None
+        if handle not in self._stores:
+            try:
+                tid = 0 if handle == "0" else int(handle)
+            except ValueError:
+                return None
+            self._stores[handle] = graphics_store.GraphicStore(
+                self._base, self._dek, owner_id=1, topic_id=tid)
+        return self._stores[handle]
+
+
+def _graphics_controller(tmp_path, denied=()):
     backend = _RecordingBackend()
     events = []
-    store = graphics_store.GraphicStore(str(tmp_path / "graphics"),
-                                        enc.generate_dek())
+    provider = _StoreProvider(str(tmp_path / "graphics"),
+                              enc.generate_dek(), denied=denied)
     controller = ConversationController(
         backend=backend,
         tool_gateway=object(),  # never touched — CreateGraphics is client-side
         worker_spawner=lambda fn: None,
-        graphic_store=store,
+        graphic_store_provider=provider,
     )
     controller.subscribe(events.append)
-    return controller, backend, events
+    return controller, backend, events, provider
 
 
 def _fire_tool(controller, name, tool_input, tool_use_id="g1"):
@@ -264,7 +313,7 @@ def _fire_tool(controller, name, tool_input, tool_use_id="g1"):
 
 
 def test_valid_graphic_stores_and_reports_id(tmp_path):
-    controller, backend, events = _graphics_controller(tmp_path)
+    controller, backend, events, provider = _graphics_controller(tmp_path)
     spec = '{"mark": "bar", "encoding": {}}'
 
     _fire_tool(controller, "CreateGraphics", {
@@ -273,20 +322,53 @@ def test_valid_graphic_stores_and_reports_id(tmp_path):
 
     # No auto-card: the graphic is a stored asset, displayed only via its tag.
     assert not any(e.kind == "graphic" for e in events)
-    # The canonical copy landed in the store, and the history stamp kept the
-    # source for replay.
-    assert controller._graphic_store.load("graphic-1")["source"] == spec
-    assert backend.stamped["graphic-1"]["source"] == spec
-    # The model's result names the id, steers it to write the [graphic-N] tag to
-    # display it, points at GetGraphic — and never echoes the spec back.
+    # The canonical copy landed in the personal ("0") store under its bare stem,
+    # and the history stamp kept the source for replay under the full id.
+    assert provider("0").load("graphic-1")["source"] == spec
+    assert backend.stamped["graphic-0:1"]["source"] == spec
+    # The model's result names the full id, steers it to write the
+    # [graphic-0:1] tag to display it, points at GetGraphic — never echoes spec.
     assert len(backend.responses) == 1
     result = backend.responses[0].tool_result
-    assert "graphic-1" in result and "[graphic-1]" in result
+    assert "graphic-0:1" in result and "[graphic-0:1]" in result
     assert "GetGraphic" in result and spec not in result
 
 
+def test_graphic_into_topic_uses_topic_store_and_handle(tmp_path):
+    controller, backend, events, provider = _graphics_controller(tmp_path)
+    spec = '{"mark": "bar", "encoding": {}}'
+
+    _fire_tool(controller, "CreateGraphics", {
+        "format": "vega-lite", "source": spec, "summary": "in topic 7",
+        "topic": "7",
+    })
+
+    # Lives in topic 7's store, and the id + tag carry the topic handle.
+    assert provider("7").load("graphic-1")["source"] == spec
+    assert provider("0").load("graphic-1") is None  # not the personal store
+    result = backend.responses[0].tool_result
+    assert "graphic-7:1" in result and "[graphic-7:1]" in result
+
+
+def test_graphic_into_unauthorized_topic_is_refused(tmp_path):
+    # Topic "9" is view-only / unshared for this user: the provider returns None.
+    controller, backend, events, provider = _graphics_controller(
+        tmp_path, denied={"9"})
+
+    _fire_tool(controller, "CreateGraphics", {
+        "format": "vega-lite", "source": '{"mark": "bar", "encoding": {}}',
+        "summary": "x", "topic": "9",
+    })
+
+    # Nothing stored anywhere; the model gets a calm, recoverable refusal.
+    assert provider("9") is None
+    result = backend.responses[0].tool_result
+    assert "view-only" in result.lower() or "couldn't add" in result.lower()
+    assert "graphic-9" not in result  # no id minted
+
+
 def test_fenced_vega_source_is_cleaned_before_store(tmp_path):
-    controller, backend, events = _graphics_controller(tmp_path)
+    controller, backend, events, provider = _graphics_controller(tmp_path)
 
     _fire_tool(controller, "CreateGraphics", {
         "format": "vega-lite",
@@ -295,13 +377,13 @@ def test_fenced_vega_source_is_cleaned_before_store(tmp_path):
     })
 
     # The code fence is stripped, so the store (and the history stamp) get clean JSON.
-    assert controller._graphic_store.load("graphic-1")["source"] == \
+    assert provider("0").load("graphic-1")["source"] == \
         '{"mark": "bar", "encoding": {}}'
-    assert backend.stamped["graphic-1"]["source"] == '{"mark": "bar", "encoding": {}}'
+    assert backend.stamped["graphic-0:1"]["source"] == '{"mark": "bar", "encoding": {}}'
 
 
 def test_invalid_graphic_is_handed_back_without_render_or_store(tmp_path):
-    controller, backend, events = _graphics_controller(tmp_path)
+    controller, backend, events, provider = _graphics_controller(tmp_path)
 
     _fire_tool(controller, "CreateGraphics", {
         "format": "vega-lite", "source": "{not json", "summary": "x",
@@ -309,7 +391,7 @@ def test_invalid_graphic_is_handed_back_without_render_or_store(tmp_path):
 
     # Nothing rendered, nothing stored — the model must fix and retry.
     assert not any(e.kind == "graphic" for e in events)
-    assert controller._graphic_store.list_graphics() == []
+    assert provider("0").list_graphics() == []
     assert len(backend.responses) == 1
     result = backend.responses[0].tool_result
     assert "not rendered" in result.lower()
@@ -317,26 +399,26 @@ def test_invalid_graphic_is_handed_back_without_render_or_store(tmp_path):
 
 
 def test_get_graphic_returns_stored_source(tmp_path):
-    controller, backend, events = _graphics_controller(tmp_path)
+    controller, backend, events, provider = _graphics_controller(tmp_path)
     spec = '{"mark": "line", "encoding": {}}'
     _fire_tool(controller, "CreateGraphics",
                {"format": "vega-lite", "source": spec, "summary": "trend"})
 
-    _fire_tool(controller, "GetGraphic", {"id": "graphic-1"}, tool_use_id="g2")
+    _fire_tool(controller, "GetGraphic", {"id": "graphic-0:1"}, tool_use_id="g2")
 
     result = backend.responses[-1].tool_result
     assert spec in result                      # full source handed back to edit
-    assert "graphic-1" in result and "CreateGraphics" in result
+    assert "graphic-0:1" in result and "CreateGraphics" in result
 
 
 def test_get_graphic_unknown_id_lists_available(tmp_path):
-    controller, backend, events = _graphics_controller(tmp_path)
+    controller, backend, events, provider = _graphics_controller(tmp_path)
     _fire_tool(controller, "CreateGraphics",
                {"format": "vega-lite", "source": '{"mark": "bar"}',
                 "summary": "s"})
 
-    _fire_tool(controller, "GetGraphic", {"id": "graphic-9"}, tool_use_id="g2")
+    _fire_tool(controller, "GetGraphic", {"id": "graphic-0:9"}, tool_use_id="g2")
 
     result = backend.responses[-1].tool_result
-    # not found + what does exist
-    assert "graphic-9" in result and "graphic-1" in result
+    # not found + what does exist (in full-id form)
+    assert "graphic-0:9" in result and "graphic-0:1" in result
