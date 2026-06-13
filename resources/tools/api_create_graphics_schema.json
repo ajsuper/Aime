@@ -1,0 +1,27 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "CreateGraphics",
+  "description": "Draw a chart, diagram, or custom visual when a picture beats words. Pick `format`: `vega-lite` for data charts (bar/line/scatter/pie/area — you give data + an encoding), `mermaid` for node-edge diagrams (flowchart, sequence, ER, gantt, state), `svg` for mockups or anything custom. Calling this SAVES the graphic into a target (a chat graphic by default, or a topic if you pass `topic`) and returns an id — `graphic-0:1` for a chat graphic, or `graphic-<owner>:<topic>:1` for a topic graphic — but does NOT display it. To show it, write its tag (the WHOLE returned id in square brackets, e.g. `[graphic-0:1]` or `[graphic-4:7:1]`) in your reply and/or in that topic's body; it renders inline wherever the tag appears, and the same tag reuses the same graphic anywhere. ALWAYS use the id exactly as returned — never shorten it or drop the owner number; a topic graphic's id includes its owner so the tag also works in chat (including topics shared with you). A graphic can be embedded ONLY in the target it was created in: to put a chart in a topic, create it with that `topic`; a plain chat graphic can't be tagged into a topic (re-create it into the topic instead). You don't see the result, so build it carefully and keep labels legible, high-contrast, and uncrowded with axes/series labelled. `vega-lite` and `mermaid` auto-theme to the chat — rely on default colors unless you have a real reason. `svg` must be self-contained: paint a background `<rect>` over the whole `viewBox` and pick colors that contrast it (the theme may be light or dark). To change a graphic later, GetGraphic its id to reload the source, edit it, and call CreateGraphics again (new id, same `topic`) — never redraw from memory.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["format", "source", "summary"],
+  "properties": {
+    "format": {
+      "type": "string",
+      "enum": ["vega-lite", "mermaid", "svg"],
+      "description": "How `source` is written. `vega-lite`: a Vega-Lite JSON spec, for data charts (bar/line/scatter/pie/area/histogram). `mermaid`: Mermaid diagram text, for flowcharts, sequence, ER, gantt, or state diagrams. `svg`: raw SVG markup, for mockups or anything custom."
+    },
+    "source": {
+      "type": "string",
+      "description": "The graphic itself, written in the chosen `format`, as raw markup with NO surrounding markdown code fence. `vega-lite`: a single JSON object — start with `{`, end with `}`, strict JSON only (double-quoted keys, no comments, no trailing commas). `mermaid`: diagram text whose FIRST line names the type (e.g. `flowchart TD`, `sequenceDiagram`, `erDiagram`); keep node/edge labels short and quote any label containing punctuation. `svg`: one `<svg …>` root with a `viewBox` and an opaque background `<rect>` so it reads on any theme; static only — no `<script>`, event handlers, or `javascript:` URIs. Rendered as-is — there is no second pass, so make it complete and correct."
+    },
+    "summary": {
+      "type": "string",
+      "description": "A short, substantive caption — the takeaway, not the medium. Write 'Weekly spend peaked Tuesday at $31' rather than 'a bar chart'. This is what you keep about the graphic afterward, so it must carry the meaning, not just name the picture."
+    },
+    "topic": {
+      "type": "string",
+      "description": "Optional. The topic to create this graphic INTO, as that topic's handle — the exact same handle you address it by elsewhere (a bare id like \"7\" for your own topic, or \"<owner>:<topic>\" like \"4:7\" for one shared with you). Omit (or leave empty) for a normal chat graphic. The graphic can only be embedded in this topic's body, and you must have edit access to a shared topic. Use this when the user wants a chart saved in a topic rather than just shown in chat."
+    }
+  }
+}

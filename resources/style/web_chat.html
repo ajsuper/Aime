@@ -443,6 +443,25 @@
     .msg.notice.warning { color: var(--warning); }
     .msg.notice.error   { color: var(--error); }
     .msg.notice.success { color: var(--success); }
+    /* "Aime is responding" indicator: three dots that breathe in sequence,
+       shown the moment a turn starts so there's no dead air before the first
+       token. Hidden the instant any assistant text or tool activity arrives. */
+    .msg.notice.thinking::before { display: none; }
+    .thinking-dots { display: inline-flex; gap: 0.28rem; align-items: center; }
+    .thinking-dots span {
+      width: 5px; height: 5px; border-radius: 50%;
+      background: var(--cta, var(--accent, var(--muted)));
+      opacity: 0.35; animation: think-pulse 1.2s ease-in-out infinite;
+    }
+    .thinking-dots span:nth-child(2) { animation-delay: 0.18s; }
+    .thinking-dots span:nth-child(3) { animation-delay: 0.36s; }
+    @keyframes think-pulse {
+      0%, 80%, 100% { opacity: 0.3; transform: translateY(0); }
+      40% { opacity: 0.9; transform: translateY(-2px); }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .thinking-dots span { animation: none; opacity: 0.6; }
+    }
     /* The "loaded conversation" line: centered, no bullet dot, and fades out
        once the user sends a message so the transcript reads as one
        continuous conversation. */
@@ -487,6 +506,31 @@
     .msg .content code { background: var(--bg-elev); padding: 0.1em 0.35em;
                          border-radius: 4px; }
     .msg .content pre code { background: transparent; padding: 0; }
+    .msg .content a { color: var(--cta, var(--accent)); font-weight: 500;
+                      text-decoration: underline;
+                      text-underline-offset: 2px;
+                      text-decoration-thickness: 1px;
+                      text-decoration-color: color-mix(in srgb,
+                        var(--cta, var(--accent)) 45%, transparent); }
+    .msg .content a:hover { text-decoration-color: currentColor; }
+    .msg .content table.md-table {
+      border-collapse: collapse; margin: 0.55rem 0; width: auto;
+      max-width: 100%; display: block; overflow-x: auto;
+      font-size: 0.9em; line-height: 1.35;
+    }
+    .msg .content table.md-table th,
+    .msg .content table.md-table td {
+      border: 1px solid var(--border);
+      padding: 0.35rem 0.7rem; text-align: left; vertical-align: top;
+      white-space: normal;
+    }
+    .msg .content table.md-table thead th {
+      background: var(--bg-elev); font-weight: 600;
+    }
+    /* Zebra striping for readability on wider tables. */
+    .msg .content table.md-table tbody tr:nth-child(even) td {
+      background: color-mix(in srgb, var(--bg-elev) 45%, transparent);
+    }
     .msg .content hr.md-hr { border: 0; height: 1px; margin: 0.45rem 0;
                              background: var(--border); }
     .msg .content > p { margin: 0.25rem 0; }
@@ -1286,7 +1330,12 @@
                   border-bottom: 1px solid var(--border); }
     .topic-item:hover { background: rgba(124, 140, 255, 0.08); }
     .topic-item.active { background: rgba(124, 140, 255, 0.18); color: var(--accent); }
-    .topic-item .cat { color: var(--muted); font-size: 0.7rem; margin-top: 0.1rem; }
+    .topic-item .cat { color: var(--muted); font-size: 0.7rem; }
+    /* Category/share chip + dimmed ID share one row under the title. */
+    .topic-item .topic-meta { display: flex; align-items: baseline;
+                              gap: 0.5rem; margin-top: 0.12rem; flex-wrap: wrap; }
+    .topic-item .topic-id { color: var(--muted); font-size: 0.66rem;
+                            opacity: 0.65; margin-left: auto; white-space: nowrap; }
     /* Shared-with-me topics: dimmed, with a small "(Shared)" / owner tag.
        Pending invites are dimmed further and italicised — they're not yet
        openable, just a prompt to accept or decline. */
@@ -2124,6 +2173,69 @@
       #side-col.topic-open .topic-content { transform: translateX(0); }
       #side-col.topic-open .topic-back-btn { display: flex; }
     }
+
+    /* Inline graphics (CreateGraphics): a chart / diagram / SVG the model drew,
+       rendered as a single rounded card — the visual sits flush in the card
+       (renderers run transparent, see vegaThemeConfig), with the summary as a
+       caption beneath it inside the same card. */
+    .msg.graphic { display: block; padding-left: 1.25rem; }
+    .graphic-card {
+      display: inline-block;
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      background: var(--bg-elev);
+      padding: 16px;
+      margin: 4px 0;
+      max-width: 760px;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
+    }
+    .graphic-card .graphic-body {
+      display: flex;
+      justify-content: center;
+      overflow-x: auto;
+      background: transparent;
+    }
+    .graphic-card .graphic-body svg,
+    .graphic-card .graphic-body canvas,
+    .graphic-card .graphic-body img {
+      max-width: 100%;
+      height: auto;
+      background: transparent;
+    }
+    /* Vega-embed wraps the chart in its own div and (when enabled) an actions
+       menu / details summary rendered as a small box in the corner. We pass
+       actions:false, but hide the chrome defensively too so only the chart
+       shows. */
+    .graphic-card .vega-embed { display: inline-block; }
+    .graphic-card .vega-embed summary,
+    .graphic-card .vega-embed details,
+    .graphic-card .vega-embed .vega-actions,
+    .graphic-card .vega-bindings { display: none !important; }
+    /* A graphic resolved from a [graphic-N] tag inside a topic body. Same card,
+       but it sits in flowing prose, so give it its own block and breathing room
+       rather than the inline-block the chat card uses. */
+    .graphic-card.graphic-inline {
+      display: block;
+      margin: 12px 0;
+    }
+    .graphic-card .graphic-caption {
+      margin-top: 12px;
+      color: var(--muted);
+      font-size: 0.82rem;
+      line-height: 1.4;
+    }
+    .graphic-card .graphic-failed {
+      color: var(--muted);
+      font-size: 0.86rem;
+      font-style: italic;
+    }
+    .graphic-card .graphic-id {
+      margin-top: 8px;
+      color: var(--muted);
+      opacity: 0.65;
+      font-size: 0.72rem;
+      white-space: nowrap;
+    }
   </style>
 </head>
 <body>
@@ -2156,7 +2268,7 @@
           <path d="M4 6h16M4 12h16M4 18h10"/>
         </svg>
       </button>
-      <button class="rail-btn pane-btn advanced-only" data-target="agents"
+      <button class="rail-btn pane-btn" data-target="agents"
               title="Agents" aria-label="Agents">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
              stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -2281,7 +2393,7 @@
         </div>
       </div>
 
-      <!-- Agents pane (Advanced only). A small management dashboard: create,
+      <!-- Agents pane. A small management dashboard: create,
            edit, delete and run saved background agents. Each agent is a card
            that owns its own runs (in a click-to-open disclosure); runs with no
            current agent fall to an "Other runs" section. Definitions persist
@@ -2484,7 +2596,7 @@
     </div>
   </div>
 
-  <!-- Create / edit a saved agent (Advanced only). -->
+  <!-- Create / edit a saved agent. -->
   <div id="agent-edit-backdrop" class="modal-backdrop" role="dialog"
        aria-modal="true" aria-labelledby="agent-edit-title" hidden>
     <div id="agent-edit-modal" class="modal-card">
@@ -3308,6 +3420,7 @@ function typewriterUpdate(bubble, html, finalize) {
   if (typewriter.bubble !== bubble) {
     if (typewriter.bubble && typewriter.target) {
       typewriter.bubble._content.innerHTML = typewriter.target;
+      resolveGraphicTags(typewriter.bubble._content);
     }
     if (typewriter.rafId != null) {
       cancelAnimationFrame(typewriter.rafId);
@@ -3335,6 +3448,7 @@ function typewriterStep() {
       // Lock in the full HTML — guards against any subtle whitespace
       // discrepancy between our walker and innerHTML.
       bubble._content.innerHTML = typewriter.target;
+      resolveGraphicTags(bubble._content);
       typewriter.bubble = null;
       scrollToBottom();
     }
@@ -3393,6 +3507,374 @@ function appendNotice(text, severity) {
   logInner.appendChild(div);
   scrollToBottom();
   return div;
+}
+
+// --- Inline graphics (CreateGraphics) -------------------------------------
+// The model draws charts/diagrams/SVG; the server validates and streams them
+// here as a `graphic` event carrying {format, summary, source}. We render the
+// source into a card. Heavy renderers (vega, mermaid) are pulled from CDN on
+// first use only — sessions that never draw pay nothing.
+const _scriptCache = {};
+function loadScript(src) {
+  if (_scriptCache[src]) return _scriptCache[src];
+  _scriptCache[src] = new Promise((resolve, reject) => {
+    const s = document.createElement("script");
+    s.src = src;
+    s.onload = resolve;
+    s.onerror = () => reject(new Error("failed to load " + src));
+    document.head.appendChild(s);
+  });
+  return _scriptCache[src];
+}
+
+let _mermaidReady = null;
+function ensureMermaid() {
+  if (_mermaidReady) return _mermaidReady;
+  // Load only — themed initialize happens per render (below) so the diagram
+  // follows the live theme, including switches between graphics.
+  _mermaidReady = loadScript(
+    "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"
+  ).then(() => window.mermaid);
+  return _mermaidReady;
+}
+
+// Mermaid config derived from the live theme. The `base` theme is the one
+// meant to be customized via themeVariables — node fills sit on the page
+// background (subtle contrast against the card), borders/edges use the accent
+// and muted tones, and the diagram background is transparent so the card shows
+// through. Covers flowchart, sequence, and note elements.
+function mermaidThemeConfig() {
+  const text = _cssVar("--text", "#2C2A24");
+  const muted = _cssVar("--muted", "#8A8273");
+  const border = _cssVar("--border", "#DFD9C8");
+  const accent = _cssVar("--accent", "#E3A4AF");
+  const bg = _cssVar("--bg", "#F4F0E6");
+  const bgElev = _cssVar("--bg-elev", "#FBF8F0");
+  const font = (getComputedStyle(document.body).fontFamily
+    || "system-ui, sans-serif").trim();
+  return {
+    startOnLoad: false,
+    securityLevel: "strict",
+    // Never let Mermaid paint its own "Syntax error … mermaid version" banner
+    // into the page on a bad diagram — we catch the failure and show our own
+    // calm card instead (see renderGraphic). Requires mermaid >= 10.7.
+    suppressErrorRendering: true,
+    theme: "base",
+    fontFamily: font,
+    themeVariables: {
+      background: "transparent",
+      fontFamily: font,
+      primaryColor: bg,
+      primaryTextColor: text,
+      primaryBorderColor: accent,
+      secondaryColor: bgElev,
+      secondaryTextColor: text,
+      secondaryBorderColor: border,
+      tertiaryColor: bgElev,
+      tertiaryTextColor: text,
+      tertiaryBorderColor: border,
+      mainBkg: bg,
+      nodeBorder: accent,
+      nodeTextColor: text,
+      lineColor: muted,
+      textColor: text,
+      titleColor: text,
+      edgeLabelBackground: bgElev,
+      clusterBkg: bgElev,
+      clusterBorder: border,
+      actorBkg: bg,
+      actorBorder: accent,
+      actorTextColor: text,
+      noteBkgColor: bgElev,
+      noteTextColor: text,
+      noteBorderColor: border,
+    },
+  };
+}
+
+let _vegaReady = null;
+function ensureVega() {
+  if (_vegaReady) return _vegaReady;
+  // vega-embed needs vega then vega-lite present first; load in order. We also
+  // load vega-interpreter: our CSP has no 'unsafe-eval', but Vega compiles
+  // expressions with new Function() for every spec — which the browser blocks.
+  // The interpreter evaluates the expression AST instead, so charts render
+  // without loosening the page's script-src.
+  _vegaReady = loadScript("https://cdn.jsdelivr.net/npm/vega@5")
+    .then(() => loadScript("https://cdn.jsdelivr.net/npm/vega-lite@5"))
+    .then(() => loadScript("https://cdn.jsdelivr.net/npm/vega-embed@6"))
+    .then(() => loadScript("https://cdn.jsdelivr.net/npm/vega-interpreter@1"))
+    .then(() => window.vegaEmbed);
+  return _vegaReady;
+}
+
+// The CSP-safe expression evaluator, resolved across the global names the
+// vega-interpreter UMD build has shipped under. Null if it didn't load — the
+// caller then falls back to the default (eval-based) path.
+function vegaInterpreter() {
+  return (window.vega && window.vega.expressionInterpreter)
+    || (window.vegaInterpreter && window.vegaInterpreter.expressionInterpreter)
+    || window.expressionInterpreter
+    || null;
+}
+
+function _cssVar(name, fallback) {
+  const v = getComputedStyle(document.documentElement)
+    .getPropertyValue(name).trim();
+  return v || fallback;
+}
+
+// A Vega config derived from the live theme, so charts sit in the card instead
+// of a white box: transparent background, themed axes/legend/labels, the page
+// font, and Aime's pastel-rainbow palette for multi-series colour. Spec-level
+// colours the model sets still win; this only changes the defaults.
+function vegaThemeConfig() {
+  const text = _cssVar("--text", "#2C2A24");
+  const muted = _cssVar("--muted", "#8A8273");
+  const border = _cssVar("--border", "#DFD9C8");
+  const accent = _cssVar("--accent", "#E3A4AF");
+  const font = (getComputedStyle(document.body).fontFamily
+    || "system-ui, sans-serif").trim();
+  const palette = ["#E3A4AF", "#E8C49A", "#C9CE8A", "#9FD4B0",
+                   "#9AC6E0", "#B6A8E0", "#E0A6CE"];
+  return {
+    background: "transparent",
+    view: { stroke: "transparent" },
+    title: { color: text, subtitleColor: muted, font: font, fontWeight: 600 },
+    axis: {
+      labelColor: muted, titleColor: text,
+      gridColor: border, domainColor: border, tickColor: border,
+      labelFont: font, titleFont: font,
+    },
+    legend: {
+      labelColor: muted, titleColor: text, labelFont: font, titleFont: font,
+    },
+    range: { category: palette },
+    mark: { color: accent },
+  };
+}
+
+// Mermaid renders through a temporary node it appends to <body>; on failure
+// (and across some versions even on success) it can leave that node — or, in
+// older builds, an injected error graphic — orphaned at the end of the page.
+// Belt-and-suspenders alongside suppressErrorRendering: sweep any stray node
+// tied to this render id so the user never sees a leftover graphic.
+function cleanupMermaidOrphans(id) {
+  ["d" + id, id].forEach((nid) => {
+    const el = document.getElementById(nid);
+    if (el && el.parentNode === document.body) el.remove();
+  });
+}
+
+let _graphicSeq = 0;
+
+// Render one graphic (format + source) into `body`, an element already in the
+// DOM. Shared by the chat card (renderGraphic) and the inline `[graphic-N]` tags
+// resolved in topic bodies (resolveGraphicTags), so both paths render — and fail
+// — identically. `onRender` fires after a successful render (the chat path uses
+// it to scroll); failures swap in a calm "couldn't render" card, never a banner.
+function renderGraphicInto(body, fmt, source, onRender) {
+  fmt = fmt || "";
+  source = source || "";
+  const done = onRender || function () {};
+  const fail = (msg) => {
+    body.innerHTML = "";
+    const f = document.createElement("div");
+    f.className = "graphic-failed";
+    f.textContent = "Couldn't render this graphic.";
+    body.appendChild(f);
+    if (msg) console.warn("graphic render failed:", msg);
+  };
+
+  try {
+    if (fmt === "svg") {
+      // DOMPurify with the SVG profile keeps the safe SVG subset and strips
+      // scripts, event handlers, and foreignObject HTML — the real trust
+      // boundary for model-authored markup.
+      body.innerHTML = window.DOMPurify
+        ? window.DOMPurify.sanitize(source, {
+            USE_PROFILES: { svg: true, svgFilters: true },
+          })
+        : "";
+      if (!window.DOMPurify) fail("DOMPurify unavailable");
+      else done();
+    } else if (fmt === "vega-lite") {
+      let spec;
+      try { spec = JSON.parse(source); }
+      catch (err) { return fail(err); }
+      ensureVega()
+        .then((vegaEmbed) => {
+          const opts = {
+            actions: false,
+            renderer: "svg",
+            config: vegaThemeConfig(),
+          };
+          // Use the AST interpreter when available so Vega never calls
+          // new Function() (blocked by our CSP); otherwise fall back to the
+          // default path (works only if 'unsafe-eval' is present).
+          const interp = vegaInterpreter();
+          if (interp) { opts.ast = true; opts.expr = interp; }
+          return vegaEmbed(body, spec, opts);
+        })
+        .then(() => done())
+        .catch(fail);
+    } else if (fmt === "mermaid") {
+      const id = "mermaid-" + (++_graphicSeq);
+      ensureMermaid()
+        .then((mermaid) => {
+          mermaid.initialize(mermaidThemeConfig());
+          // Validate before rendering. parse({suppressErrors:true}) resolves to
+          // false on a syntax error instead of throwing — and, with
+          // suppressErrorRendering set, neither parse nor render injects
+          // Mermaid's red "Syntax error" bomb into the page. A bad diagram thus
+          // becomes our own calm card, never a banner the user sees.
+          return Promise.resolve(mermaid.parse(source, { suppressErrors: true }))
+            .then((ok) => (ok ? mermaid.render(id, source) : null));
+        })
+        .then((res) => {
+          if (!res) { fail("mermaid syntax error"); return; }
+          body.innerHTML = res.svg;
+          done();
+        })
+        .catch(fail)
+        .finally(() => cleanupMermaidOrphans(id));
+    } else {
+      fail("unknown format " + fmt);
+    }
+  } catch (err) {
+    fail(err);
+  }
+}
+
+function renderGraphic(payload) {
+  const card = document.createElement("div");
+  card.className = "msg graphic";
+  const inner = document.createElement("div");
+  inner.className = "graphic-card";
+  const body = document.createElement("div");
+  body.className = "graphic-body";
+  inner.appendChild(body);
+  const summary = payload.summary || "";
+  if (summary) {
+    const cap = document.createElement("div");
+    cap.className = "graphic-caption";
+    cap.textContent = summary;
+    inner.appendChild(cap);
+  }
+  // Dimmed ID badge, matching the inline tag path, when the payload names one.
+  const gid = payload.id || payload.graphic_id || "";
+  if (gid) {
+    const idTag = document.createElement("div");
+    idTag.className = "graphic-id";
+    idTag.textContent = "ID: " + String(gid).replace(/^graphic-/, "");
+    inner.appendChild(idTag);
+  }
+  card.appendChild(inner);
+  logInner.appendChild(card);
+  scrollToBottom();
+  renderGraphicInto(body, payload.format, payload.source, scrollToBottom);
+}
+
+// In-flight/lookup cache for `[graphic-N]` tag resolution, so the same id placed
+// twice in a body fetches once.
+const _graphicAssetCache = {};
+function fetchGraphicAsset(id) {
+  if (!_graphicAssetCache[id]) {
+    _graphicAssetCache[id] = fetch("/graphics/" + encodeURIComponent(id),
+      { credentials: "same-origin" })
+      .then((r) => (r.ok ? r.json() : Promise.reject(r.status)));
+  }
+  return _graphicAssetCache[id];
+}
+
+// A `[graphic-…]` token references a stored graphic asset by id. The id is a
+// topic handle plus an ordinal: `graphic-<handle>:<n>` where the handle is `T`
+// (own topic) or `O:T` (shared), plus the legacy bare `graphic-N` (read as the
+// personal `graphic-0:N`). Find those tokens in already-sanitized HTML and swap
+// each for a rendered graphic, fetching its source from /graphics/<id>. We only
+// walk text nodes (never re-parse HTML), so this can't introduce markup.
+const _GRAPHIC_TAG_RE = /\[(graphic-(?:\d+:){1,2}\d+|graphic-\d+)\]/g;
+const _GRAPHIC_TAG_TEST = /\[graphic-(?:\d+:){1,2}\d+\]|\[graphic-\d+\]/;  // non-global
+
+// Normalize a tag id to the fully-qualified form the route expects, given the
+// render context's owner (`ownerId`: the topic owner for a topic body; null/
+// undefined in chat, i.e. self). A bare `graphic-T:n` is owner-relative, so in a
+// shared-topic context (ownerId set) it gets the owner prefixed —
+// `graphic-O:T:n` — exactly as the same topic is `O:T` to a recipient. Explicit
+// `graphic-O:T:n`, personal `graphic-0:n`, and legacy bare ids pass through.
+function normalizeGraphicId(id, ownerId) {
+  const rest = id.slice("graphic-".length);
+  const parts = rest.split(":");
+  if (parts.length === 2 && parts[0] !== "0" && ownerId != null) {
+    return "graphic-" + ownerId + ":" + rest;
+  }
+  return id;
+}
+
+function resolveGraphicTags(root, ownerId) {
+  if (!root) return;
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+    // Use the non-global regex here: a global regex's .test() advances lastIndex
+    // and would make acceptNode stateful across nodes (skipping real matches).
+    acceptNode: (n) =>
+      _GRAPHIC_TAG_TEST.test(n.nodeValue)
+        ? NodeFilter.FILTER_ACCEPT
+        : NodeFilter.FILTER_REJECT,
+  });
+  const hits = [];
+  let n;
+  while ((n = walker.nextNode())) hits.push(n);
+
+  hits.forEach((node) => {
+    const frag = document.createDocumentFragment();
+    let last = 0;
+    const text = node.nodeValue;
+    _GRAPHIC_TAG_RE.lastIndex = 0;
+    let m;
+    while ((m = _GRAPHIC_TAG_RE.exec(text))) {
+      if (m.index > last) {
+        frag.appendChild(document.createTextNode(text.slice(last, m.index)));
+      }
+      frag.appendChild(makeGraphicMount(normalizeGraphicId(m[1], ownerId)));
+      last = m.index + m[0].length;
+    }
+    if (last < text.length) {
+      frag.appendChild(document.createTextNode(text.slice(last)));
+    }
+    node.parentNode.replaceChild(frag, node);
+  });
+}
+
+function makeGraphicMount(id) {
+  const card = document.createElement("div");
+  card.className = "graphic-card graphic-inline";
+  const body = document.createElement("div");
+  body.className = "graphic-body";
+  card.appendChild(body);
+  // Dimmed ID badge so the user can reference this graphic by its handle:
+  // "<owner_id>:<topic_id>:<graphic_id>" (the `graphic-` tag prefix dropped).
+  const idTag = document.createElement("div");
+  idTag.className = "graphic-id";
+  idTag.textContent = "ID: " + id.replace(/^graphic-/, "");
+  card.appendChild(idTag);
+  fetchGraphicAsset(id)
+    .then((g) => {
+      renderGraphicInto(body, g.format, g.source);
+      if (g.summary) {
+        const cap = document.createElement("div");
+        cap.className = "graphic-caption";
+        cap.textContent = g.summary;
+        card.insertBefore(cap, idTag);
+      }
+    })
+    .catch(() => {
+      body.innerHTML = "";
+      const f = document.createElement("div");
+      f.className = "graphic-failed";
+      f.textContent = "Couldn't load this graphic.";
+      body.appendChild(f);
+    });
+  return card;
 }
 
 // Like appendNotice, but when detailText is present renders a native <details>
@@ -3493,6 +3975,29 @@ function clearWorkingIndicator() {
   if (workingIndicator) {
     workingIndicator.remove();
     workingIndicator = null;
+  }
+}
+
+// Turn-start "responding" indicator. Shown the moment a turn begins (a live
+// user message lands) so the user gets immediate feedback during the gap
+// before the first token — which, with model routing deciding up front, can
+// be a second or two of otherwise-dead air. Cleared by the first sign of
+// assistant activity (text, tool call) or by turn end.
+let thinkingIndicator = null;
+function showThinking() {
+  if (!thinkingIndicator) {
+    thinkingIndicator = document.createElement("div");
+    thinkingIndicator.className = "msg notice thinking";
+    thinkingIndicator.innerHTML =
+      '<span class="thinking-dots"><span></span><span></span><span></span></span>';
+  }
+  logInner.appendChild(thinkingIndicator);  // append, or move existing to end
+  scrollToBottom();
+}
+function clearThinking() {
+  if (thinkingIndicator) {
+    thinkingIndicator.remove();
+    thinkingIndicator = null;
   }
 }
 
@@ -3619,7 +4124,41 @@ function clearOptimisticUserMessage() {
   }
 }
 
+// Tear down the rendered transcript and all per-turn streaming state so it can
+// be rebuilt cleanly from a fresh server snapshot. Used on reconnect (below).
+// Deliberately leaves the composer and any queued draft alone — those are
+// client-only and unrelated to the replayed history — and leaves modelBusy for
+// the authoritative `history_done` to set.
+function clearTranscriptView() {
+  logInner.innerHTML = "";
+  workingIndicator = null;
+  thinkingIndicator = null;
+  loadedNotice = null;
+  newSessionSplash = null;
+  currentAssistant = null;
+  pendingHtmlTarget = null;
+  pendingSendBubble = null;
+  if (typewriter.rafId != null) cancelAnimationFrame(typewriter.rafId);
+  typewriter.bubble = null;
+  typewriter.rafId = null;
+}
+
 const es = new EventSource("/stream");
+
+// The browser's EventSource silently auto-reconnects after the connection
+// drops (phone/laptop sleep, Wi-Fi↔cellular handoff, a proxy idle timeout).
+// On every (re)connect the server replays the full history snapshot, so a
+// naive reconnect would append a second copy of the whole conversation — and,
+// with liveMode still true, re-run the typewriter over all of it. Guard both:
+// reset liveMode so the snapshot renders instantly until `history_done`, and on
+// a *reconnect* wipe the transcript first so the snapshot rebuilds it in place
+// instead of duplicating it.
+let streamConnectedOnce = false;
+es.onopen = () => {
+  liveMode = false;
+  if (streamConnectedOnce) clearTranscriptView();
+  streamConnectedOnce = true;
+};
 es.onmessage = (ev) => {
   const e = JSON.parse(ev.data);
   switch (e.kind) {
@@ -3654,6 +4193,10 @@ es.onmessage = (ev) => {
         newSessionSplash = null;
         // Snap to the message even if the user had scrolled up.
         scrollToBottom(true);
+        // Immediate "Aime is responding" feedback for the gap before the
+        // first token. Mirrors on every device viewing this account, since it
+        // rides the same live user_message_shown event.
+        showThinking();
       }
       break;
     }
@@ -3663,6 +4206,7 @@ es.onmessage = (ev) => {
       // itself in #queued-bar. Ignore.
       break;
     case "assistant_text":
+      clearThinking();
       ensureAssistant()._content.appendChild(document.createTextNode(e.text));
       pendingHtmlTarget = currentAssistant;
       currentAssistant = null;
@@ -3671,6 +4215,7 @@ es.onmessage = (ev) => {
     case "assistant_text_delta":
       // Don't append raw text — the typewriter is driven by the formatted
       // HTML companion (assistant_html_partial) that follows each delta.
+      clearThinking();
       ensureAssistant();
       break;
     case "assistant_text_end":
@@ -3678,6 +4223,7 @@ es.onmessage = (ev) => {
       currentAssistant = null;
       break;
     case "assistant_html_partial": {
+      clearThinking();
       const bubble = ensureAssistant();
       if (liveMode && !e.from_replay) {
         typewriterUpdate(bubble, e.text, /*finalize=*/false);
@@ -3687,6 +4233,7 @@ es.onmessage = (ev) => {
       break;
     }
     case "assistant_html": {
+      clearThinking();
       // Final/full render. On history replay we have no streaming bubble — make
       // one and skip the typewriter entirely (replay should appear instantly).
       let target = pendingHtmlTarget || currentAssistant;
@@ -3695,6 +4242,7 @@ es.onmessage = (ev) => {
         typewriterUpdate(target, e.text, /*finalize=*/true);
       } else {
         target._content.innerHTML = e.text;
+        resolveGraphicTags(target._content);
       }
       pendingHtmlTarget = null;
       currentAssistant = null;
@@ -3720,6 +4268,9 @@ es.onmessage = (ev) => {
       }
       break;
     case "tool_call":
+      // First activity of the turn may be a tool call rather than text; the
+      // per-verbosity tool affordance below takes over the "working" feedback.
+      clearThinking();
       if (verbosity === "verbose") {
         // Collapsed dropdown: one-line summary + an arrow to expand the full
         // tool input.
@@ -3731,6 +4282,13 @@ es.onmessage = (ev) => {
       } else {  // minimal — a single shared status line
         showWorkingIndicator();
       }
+      break;
+    case "graphic":
+      // A chart / diagram / SVG the model drew with CreateGraphics. Rendered
+      // as a card inline in the transcript, regardless of verbosity.
+      clearThinking();
+      clearWorkingIndicator();
+      renderGraphic(e.payload || {});
       break;
     case "tool_result":
       if (verbosity === "verbose") {
@@ -3774,6 +4332,9 @@ es.onmessage = (ev) => {
       handleTopicLockEvent(e);
       break;
     case "turn_end":
+      // Safety net: clear the responding indicator in case the turn ended
+      // without ever emitting text or a tool call (e.g. an immediate stop).
+      clearThinking();
       if (verbosity === "minimal") freezeWorkingIndicator();
       else clearWorkingIndicator();
       // Catches title-refresh, which runs in a background Haiku thread on
@@ -3842,22 +4403,15 @@ es.onmessage = (ev) => {
       }
       break;
     case "session_restart":
-      logInner.innerHTML = "";
+      clearTranscriptView();
       // Drop the onboarding nudge on any transcript clear; if onboarding
       // re-fires (e.g. /reset for a not-yet-onboarded user) the server re-emits
       // the "onboarding" signal right after and re-adds it.
       document.body.classList.remove("onboarding");
-      workingIndicator = null;
-      loadedNotice = null;
-      newSessionSplash = null;
-      currentAssistant = null;
-      pendingHtmlTarget = null;
-      pendingSendBubble = null;
+      // Unlike a reconnect, a real session switch also drops the busy gate and
+      // any held draft — this is a different conversation.
       modelBusy = false;
       clearQueuedDraft();
-      if (typewriter.rafId != null) cancelAnimationFrame(typewriter.rafId);
-      typewriter.bubble = null;
-      typewriter.rafId = null;
       following = true;
       updateScrollBtn();
       // The chats list may now include a new entry; refresh.
@@ -4601,7 +5155,7 @@ async function loadAgentRuns() {
 
 // One row in a runs list: agent name + a status pill, clickable to open the
 // run's transcript. Shared by the Verbose conversations section and the
-// Advanced agents pane.
+// agents pane.
 function buildRunItem(run) {
   const item = document.createElement("div");
   item.className = "session-item agent-run-item";
@@ -4617,7 +5171,7 @@ function buildRunItem(run) {
   return item;
 }
 
-// -- Agents pane (Advanced only) ----------------------------------------
+// -- Agents pane --------------------------------------------------------
 // A management dashboard: create, edit, delete and run saved background
 // agents. Definitions persist per-user (CRUD via /agents). Each card owns its
 // own runs (grouped from /agent-runs by agent_id) in a disclosure; runs with no
@@ -6791,21 +7345,32 @@ function buildTopicItem(t) {
   const title = document.createElement("div");
   title.textContent = t.title || t.name || "(untitled)";
   item.appendChild(title);
+  // Meta row: the category chip (own topics) or share tag (shared topics), plus
+  // a dimmed topic ID so the user can reference a topic by its handle —
+  // "<topic_id>" for own topics, "<owner_id>:<topic_id>" for shared ones (the
+  // same `tid` used everywhere else).
+  const meta = document.createElement("div");
+  meta.className = "topic-meta";
   if (t.shared) {
     // Shared topics show owner + access instead of the #category color chip.
-    const tag = document.createElement("div");
+    const tag = document.createElement("span");
     tag.className = "share-tag";
     const perm = t.permission === "edit" ? "can edit" : "view only";
     tag.innerHTML = t.status === "pending"
       ? `Shared by ${escapeHtml(t.owner || "?")} — tap to respond`
       : `Shared by ${escapeHtml(t.owner || "?")} · <span class="perm">${perm}</span>`;
-    item.appendChild(tag);
+    meta.appendChild(tag);
   } else if (t.category) {
-    const c = document.createElement("div");
+    const c = document.createElement("span");
     c.className = "cat";
     c.textContent = "#" + t.category;
-    item.appendChild(c);
+    meta.appendChild(c);
   }
+  const idTag = document.createElement("span");
+  idTag.className = "topic-id";
+  idTag.textContent = "ID: " + tid;
+  meta.appendChild(idTag);
+  item.appendChild(meta);
   item.addEventListener("click", () => selectTopic(tid, item));
   return item;
 }
@@ -7145,6 +7710,21 @@ function renderTopicMarkdown(md) {
     box.dataset.taskIndex = String(idx);
     box.addEventListener("change", onTopicCheckboxToggle);
   });
+  // Resolve any `[graphic-…]` tags the model placed in the body into rendered
+  // graphics, pulling each asset's source from the store. Runs after sanitize,
+  // walking text only, so it never reintroduces unsafe markup. The render
+  // context's owner (the topic's owner for a shared `O:T` handle, else self)
+  // lets a bare `graphic-T:n` written by the owner resolve cross-account.
+  resolveGraphicTags(topicBodyEl, topicHandleOwner(selectedTopicId));
+}
+
+// The owner id encoded in a topic handle: `O` for a shared `"O:T"` handle, or
+// null for a bare own-topic handle (self is the render owner). Mirrors the
+// server's _parse_topic_handle.
+function topicHandleOwner(handle) {
+  const s = String(handle == null ? "" : handle);
+  const i = s.indexOf(":");
+  return i > 0 ? s.slice(0, i) : null;
 }
 
 // Acquire / refresh / release the advisory edit-lock. Acquire is best-effort:
@@ -7619,9 +8199,6 @@ function applyUiMode(mode) {
       const userBtn = document.querySelector('.settings-tab-btn[data-tab="user"]');
       if (userBtn) userBtn.click();
     }
-    // The Agents pane is Advanced-only; its rail button just vanished, so
-    // close the pane if it was open rather than leaving it stranded.
-    if (activePaneName === "agents") closeSide();
   }
 }
 

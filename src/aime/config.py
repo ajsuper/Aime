@@ -122,6 +122,21 @@ WEB_SEARCH_ENABLED = _env_flag("AIME_WEB_SEARCH", True)
 # rather than absent.
 SEND_MESSAGE_SCHEMA = "../resources/tools/api_send_message_schema.json"
 
+# CreateGraphics is a client tool (handled in the controller like WebSearch /
+# SendMessage, never forwarded to serve.cpp): the model supplies a chart /
+# diagram / SVG spec, the controller validates it and emits it to the frontend
+# to render inline in the chat, and the bulky `source` is kept out of the
+# model's ongoing context. Interactive sessions only — a graphic only renders
+# in a live chat, so background agents don't get it.
+CREATE_GRAPHICS_SCHEMA = "../resources/tools/api_create_graphics_schema.json"
+
+# GetGraphic is the companion reload tool: each graphic's source lives on in the
+# message history (stripped from the model's per-turn context) under a stable id,
+# and GetGraphic hands that source back for one turn so the model can revise an
+# existing graphic accurately instead of redrawing it from the summary. Paired
+# with CreateGraphics; interactive sessions only.
+GET_GRAPHIC_SCHEMA = "../resources/tools/api_get_graphic_schema.json"
+
 
 def load_system_prompt(path: str = SYSTEM_PROMPT_PATH) -> str:
     with open(path) as f:

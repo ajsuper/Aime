@@ -86,6 +86,10 @@ from aime.scheduling import (
 from aime import auth as _auth
 from aime import encryption as _enc
 from aime import backup as _backup
+from aime.graphics_store import (
+    GraphicStore, parse_graphic_id, make_graphic_id, tag_handle_scope,
+)
+from aime import graphics as _graphics
 from aime import email_send as _email_send
 from aime import topic_shares as _topic_shares
 from aime.tool_formatting import TOOL_NAME_MAP
@@ -246,6 +250,31 @@ def _schedules_dir(user_id: int) -> str:
     return os.path.join(_user_dir(user_id), "schedules")
 
 
+def _graphics_dir(user_id: int) -> str:
+    """Where ``GraphicStore`` keeps this user's encrypted graphic assets — the
+    canonical home for everything CreateGraphics draws, that `[graphic-…]` tags
+    in chat and topics resolve against. Personal/chat graphics sit here directly;
+    a topic's graphics nest under ``topic-<T>/``. Sibling of ``schedules/``."""
+    return os.path.join(_user_dir(user_id), "graphics")
+
+
+def _delete_topic_graphics(owner_id: int, topic_id: int) -> None:
+    """Remove a topic's graphics directory (``…/graphics/topic-<T>/``) and
+    everything in it. The lifecycle companion to deleting topic ``topic_id``: its
+    graphics live only in this owner-scoped, per-topic dir (never in anyone's
+    personal store), so dropping the dir is the whole cleanup — un-sharing touches
+    no graphics, and a recipient never held a copy. Best-effort: a missing dir is
+    a no-op. Call this wherever a topic is destroyed, beside
+    ``_share_store.revoke_all_for_topic``."""
+    if not topic_id:
+        return  # topic 0 is the personal store, not a topic; never delete it
+    path = os.path.join(_graphics_dir(owner_id), f"topic-{topic_id}")
+    try:
+        shutil.rmtree(path)
+    except (OSError, FileNotFoundError):
+        pass
+
+
 # LEGACY MIGRATION — pre-multi-user installs kept all conversations in a
 # single shared directory (~/.local/share/aime-assistant/conversations).
 # On startup, move any *.json files from there into user 1's per-user
@@ -300,6 +329,106 @@ _HR_LINE_RE = re.compile(r"(?m)^[ \t]*---[ \t]*$")
 # used to mark horizontal-rule positions through Rich's renderer so we can swap
 # them for <hr> in the final HTML.
 _HR_SENTINEL = "❦AIMEHR❦"
+
+# --- Markdown layer ---------------------------------------------------------
+# Aime speaks Rich console markup in chat, but the model still reaches for
+# Markdown for code (no Rich equivalent) and occasionally slips a `**bold**` or
+# `[link](url)` in by reflex. We render both: protected constructs (code, links)
+# are pulled out to placeholders that survive Rich's renderer untouched, while
+# inline/Block emphasis is rewritten into the Rich tags Rich already handles.
+_FENCE_RE = re.compile(r"```[ \t]*([A-Za-z0-9_+\-]*)[ \t]*\n(.*?)\n?```", re.DOTALL)
+_INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
+_MD_LINK_RE = re.compile(r"(?<!\\)\[([^\]\n]+)\]\((\S+?)(?:[ \t]+\"[^\"]*\")?\)")
+_MD_BOLD_RE = re.compile(r"(?<!\*)\*\*(?!\s)(.+?)(?<!\s)\*\*(?!\*)", re.DOTALL)
+_MD_ITALIC_RE = re.compile(r"(?<![*\w])\*(?!\s)([^*\n]+?)(?<![\s*])\*(?![*\w])")
+_MD_HEADING_RE = re.compile(r"(?m)^[ \t]*(#{1,6})[ \t]+(.*?)[ \t]*#*[ \t]*$")
+_MD_BULLET_RE = re.compile(r"(?m)^([ \t]*)[-*+][ \t]+")
+# Only http(s) and mailto links become anchors; anything else (notably
+# javascript:) stays literal text so a rendered link can never be an exploit.
+_SAFE_URL_RE = re.compile(r"^(?:https?://|mailto:)", re.IGNORECASE)
+# Placeholder delimiter: a private-use codepoint Rich's HTML export passes
+# through verbatim (it only escapes & < >), so stashed fragments survive the
+# render and can be swapped back in afterwards.
+_PH = ""
+
+
+# A GFM table delimiter cell: dashes with optional leading/trailing colon for
+# alignment (`:---`, `:--:`, `---:`).
+_TABLE_DELIM_CELL_RE = re.compile(r"^:?-+:?$")
+
+
+def _split_table_row(line: str) -> list[str]:
+    """Split a Markdown table row into trimmed cells on unescaped pipes,
+    dropping the empty cell either side of an optional leading/trailing pipe."""
+    cells = re.split(r"(?<!\\)\|", line.strip())
+    if cells and cells[0].strip() == "":
+        cells = cells[1:]
+    if cells and cells[-1].strip() == "":
+        cells = cells[:-1]
+    return [c.strip().replace("\\|", "|") for c in cells]
+
+
+def _table_alignments(line: str) -> list[str] | None:
+    """If `line` is a valid table delimiter row, return the per-column CSS
+    text-align values ("", "left", "right", "center"); otherwise None."""
+    if "-" not in line or "|" not in line:
+        return None
+    cells = _split_table_row(line)
+    if not cells:
+        return None
+    aligns = []
+    for c in cells:
+        if not _TABLE_DELIM_CELL_RE.match(c):
+            return None
+        left, right = c.startswith(":"), c.endswith(":")
+        aligns.append("center" if left and right
+                      else "right" if right else "left" if left else "")
+    return aligns
+
+
+def _extract_tables(markup: str, final: bool, stash) -> str:
+    """Replace GFM pipe tables (a header row, a `---` delimiter row, then body
+    rows) with placeholders holding rendered <table> HTML. Cell text is run
+    through the full renderer so inline Rich/Markdown inside cells still works.
+    Tolerant while streaming: a half-arrived table renders the rows it has."""
+    lines = markup.split("\n")
+    out: list[str] = []
+    i, n = 0, len(lines)
+    while i < n:
+        line = lines[i]
+        aligns = _table_alignments(lines[i + 1]) if (i + 1 < n) else None
+        if "|" in line and aligns is not None:
+            header = _split_table_row(line)
+            body, j = [], i + 2
+            while j < n and lines[j].strip() and "|" in lines[j]:
+                body.append(_split_table_row(lines[j]))
+                j += 1
+            out.append(stash(_build_table_html(header, aligns, body, final)))
+            i = j
+            continue
+        out.append(line)
+        i += 1
+    return "\n".join(out)
+
+
+def _build_table_html(
+    header: list[str], aligns: list[str], body: list[list[str]], final: bool
+) -> str:
+    cols = len(header)
+
+    def cell(cells: list[str], idx: int, tag: str) -> str:
+        text = cells[idx] if idx < len(cells) else ""
+        align = aligns[idx] if idx < len(aligns) else ""
+        style = f' style="text-align:{align}"' if align else ""
+        return f"<{tag}{style}>{_render_markup_to_html(text, final=final)}</{tag}>"
+
+    def row(cells: list[str], tag: str) -> str:
+        return "<tr>" + "".join(cell(cells, k, tag) for k in range(cols)) + "</tr>"
+
+    head = row(header, "th")
+    rows = "".join(row(r, "td") for r in body)
+    return (f'<table class="md-table"><thead>{head}</thead>'
+            f"<tbody>{rows}</tbody></table>")
 
 
 def _safe_markup_text(markup: str, final: bool = False) -> Text:
@@ -379,13 +508,79 @@ def _safe_markup_text(markup: str, final: bool = False) -> Text:
     return text
 
 
-def _render_markup_to_html(markup: str, final: bool = False) -> str:
-    """Convert Rich-style markup to inline-styled HTML spans.
+def _md_to_rich(markup: str, final: bool, stash) -> str:
+    """Fold the Markdown the model emits into the Rich markup pipeline.
 
-    Lines containing only `---` are treated as horizontal rules — the model
-    keeps emitting them as a Markdown reflex even though we render Rich
-    markup, so swap them for actual <hr> elements instead of literal dashes.
+    Code (fenced and inline) and links can't be expressed as Rich tags, so they
+    are rendered to HTML here and parked behind `stash` placeholders that pass
+    through Rich untouched. Emphasis, headings and bullets are rewritten into
+    the Rich tags / glyphs Rich already renders. `final` distinguishes a
+    finished message from a mid-stream partial (an unclosed code fence is a
+    block still being typed, not a mistake — render it as code anyway)."""
+    # Fenced code first, so nothing inside it (Rich tags, ---, **, …) is touched.
+    def _fence(m):
+        lang = (m.group(1) or "").strip().lower()
+        cls = " language-" + _h(lang) if lang else ""
+        body = _h(m.group(2))
+        return stash(f'<pre class="md-code"><code class="md-block{cls}">{body}'
+                     "</code></pre>")
+    markup = _FENCE_RE.sub(_fence, markup)
+    # A fence the model has opened but not yet closed (streaming, or a final
+    # message where it forgot the closer): treat the trailing remainder as code.
+    if "```" in markup:
+        head, _, tail = markup.rpartition("```")
+        lang = ""
+        nl = tail.find("\n")
+        if nl != -1 and re.fullmatch(r"[A-Za-z0-9_+\-]*", tail[:nl].strip()):
+            lang, tail = tail[:nl].strip().lower(), tail[nl + 1:]
+        cls = " language-" + _h(lang) if lang else ""
+        markup = head + stash(
+            f'<pre class="md-code"><code class="md-block{cls}">'
+            f'{_h(tail.rstrip(chr(10)))}</code></pre>')
+
+    # Pipe tables → <table>. After code (so a `|` inside a fence is safe) and
+    # before the inline passes (so the table's own `|`/`---`/`*` aren't mangled;
+    # cell contents get the inline treatment via the recursive render instead).
+    markup = _extract_tables(markup, final, stash)
+
+    # Inline code, then links — both stashed so their contents stay literal.
+    markup = _INLINE_CODE_RE.sub(
+        lambda m: stash('<code class="md-inline">' + _h(m.group(1)) + "</code>"),
+        markup)
+
+    def _link(m):
+        url = m.group(2)
+        if not _SAFE_URL_RE.match(url):
+            return m.group(0)  # leave unsafe / relative links as plain text
+        return stash(f'<a href="{_h(url)}" target="_blank" '
+                     f'rel="noopener noreferrer">{_h(m.group(1))}</a>')
+    markup = _MD_LINK_RE.sub(_link, markup)
+
+    # Stray inline/block Markdown → the Rich equivalents Rich can render.
+    markup = _MD_BOLD_RE.sub(r"[bold]\1[/bold]", markup)
+    markup = _MD_ITALIC_RE.sub(r"[italic]\1[/italic]", markup)
+    markup = _MD_HEADING_RE.sub(lambda m: "[bold]" + m.group(2) + "[/bold]", markup)
+    markup = _MD_BULLET_RE.sub(lambda m: m.group(1) + "• ", markup)
+    return markup
+
+
+def _render_markup_to_html(markup: str, final: bool = False) -> str:
+    """Convert the model's chat output — Rich console markup with a Markdown
+    layer on top — to inline-styled HTML.
+
+    Rich tags drive colour/emphasis; the Markdown layer (`_md_to_rich`) adds
+    code blocks, inline code and links and tolerates accidental `**bold**` /
+    `# headings` / `- bullets`. Lines of only `---` become <hr> (a Markdown
+    reflex the model keeps even in Rich mode).
     """
+    placeholders: list[str] = []
+
+    def stash(fragment: str) -> str:
+        token = f"{_PH}{len(placeholders)}{_PH}"
+        placeholders.append(fragment)
+        return token
+
+    markup = _md_to_rich(markup, final, stash)
     markup = _HR_LINE_RE.sub(_HR_SENTINEL, markup)
 
     console = Console(
@@ -402,6 +597,10 @@ def _render_markup_to_html(markup: str, final: bool = False) -> str:
     console.print(rendered, soft_wrap=True, end="")
     html = console.export_html(inline_styles=True, code_format="{code}")
     html = html.replace(_HR_SENTINEL, '<hr class="md-hr">')
+    # Swap the protected code/link fragments back in. Done after the Rich render
+    # so their HTML is never escaped or wrapped in style spans.
+    for i, fragment in enumerate(placeholders):
+        html = html.replace(f"{_PH}{i}{_PH}", fragment)
     # Collapse runs of blank lines so paragraph separation stays modest under
     # white-space: pre-wrap. Two newlines (one blank line) is the most we ever
     # need visually; longer runs would render as cavernous gaps in the bubble.
@@ -461,7 +660,12 @@ class UserContext:
             # Reminder tools are client-side (handled in the controller against
             # the ScheduleStore), so they ride alongside the gateway-backed data
             # tools in the model's tool list but are never forwarded to serve.cpp.
-            schema_files=aime_config.SCHEMA_FILES + aime_config.REMINDER_SCHEMA_FILES,
+            schema_files=(
+                aime_config.SCHEMA_FILES
+                + aime_config.REMINDER_SCHEMA_FILES
+                + [aime_config.CREATE_GRAPHICS_SCHEMA,
+                   aime_config.GET_GRAPHIC_SCHEMA]
+            ),
             conversations_dir=conv_dir,
             dek=dek,
             usage_label=username,
@@ -524,6 +728,7 @@ class UserContext:
             message_recipient=messaging_contact,
             reminder_service=reminder_service,
             record_sync=self.record_sync,
+            graphic_store_provider=_make_graphic_store_provider(user_id),
         )
 
         # Seed the session with the user's last-seen zone so any turn that runs
@@ -719,6 +924,10 @@ class UserContext:
             "from_replay": event.from_replay,
             "attachments": event.attachments,
         }
+        # Structured payload for events that carry one (e.g. `graphic`, which
+        # holds {format, summary, source} for the frontend to render).
+        if event.payload is not None:
+            payload["payload"] = event.payload
         self._broadcast(payload)
 
         if event.kind == "assistant_text_delta" and partial_full:
@@ -2602,6 +2811,14 @@ def stream():
     def gen():
         try:
             for payload in snapshot:
+                # Everything in the snapshot is history relative to *this*
+                # connection, even live events from earlier in the session. Force
+                # from_replay so a reconnect (phone wake, network change) renders
+                # them instantly instead of re-running the typewriter / re-flipping
+                # the busy gate. The client also rebuilds its transcript on
+                # reconnect, so these can't duplicate what's already on screen.
+                if not payload.get("from_replay"):
+                    payload = {**payload, "from_replay": True}
                 yield f"data: {json.dumps(payload)}\n\n"
             # Sentinel: from here on, events are live (typewriter eligible).
             # `busy` carries the real turn state so a client that just
@@ -3318,9 +3535,11 @@ def _parse_topic_handle(handle: str) -> tuple[int | None, int]:
     raise _ShareAccessError(400, "invalid topic id")
 
 
-def _resolve_topic(handle: str, need: str) -> tuple[int, int]:
-    """Resolve a topic handle from the current user to (effective_owner_id,
-    topic_id), enforcing access. `need` is "view" or "edit".
+def _resolve_topic_as(user_id: int, handle: str, need: str) -> tuple[int, int]:
+    """Resolve a topic handle *as `user_id`* to (effective_owner_id, topic_id),
+    enforcing access. `need` is "view" or "edit". The g-free core of
+    :func:`_resolve_topic`, so it can run off the request thread — e.g. from the
+    graphic-store provider a model turn calls on a worker thread.
 
     For the user's own topics this is the identity mapping. For a shared topic
     it verifies an *accepted* grant exists (and that it carries edit rights when
@@ -3328,14 +3547,59 @@ def _resolve_topic(handle: str, need: str) -> tuple[int, int]:
     The owner id is taken from _share_store, never trusted from the client, so a
     forged handle can't reach a topic that wasn't actually shared."""
     owner_id, topic_id = _parse_topic_handle(handle)
-    if owner_id is None or owner_id == g.user_id:
-        return g.user_id, topic_id
-    share = _share_store.get(owner_id, topic_id, g.user_id)
+    if owner_id is None or owner_id == user_id:
+        return user_id, topic_id
+    share = _share_store.get(owner_id, topic_id, user_id)
     if share is None or share.status != _topic_shares.STATUS_ACCEPTED:
         raise _ShareAccessError(403, "this topic isn't shared with you")
     if need == "edit" and share.permission != _topic_shares.PERM_EDIT:
         raise _ShareAccessError(403, "you have view-only access to this topic")
     return owner_id, topic_id
+
+
+def _resolve_topic(handle: str, need: str) -> tuple[int, int]:
+    """Resolve a topic handle from the *current request's* user. Thin wrapper
+    over :func:`_resolve_topic_as` bound to ``g.user_id``."""
+    return _resolve_topic_as(g.user_id, handle, need)
+
+
+def _foreign_graphic_tag(contents: str, owner_id: int,
+                         topic_id: int) -> str | None:
+    """The write rule (docs/graphics-sharing.md §3b) for a topic-body save:
+    return the handle of the first `[graphic-…]` tag that doesn't belong to this
+    topic, or None if every tag is in-scope. A tag is judged exactly as it
+    renders — a bare `graphic-T:n` belongs to the topic's owner, an explicit
+    `graphic-O:T:n` names its owner — and must denote this same ``(owner,
+    topic)``. A personal graphic or another topic's graphic is rejected; a
+    recipient can save a shared body that still carries the owner's bare tags.
+    Mirrors the model-side rule in the controller."""
+    for handle in _graphics.graphic_tag_handles(contents):
+        if tag_handle_scope(handle, owner_id) != (owner_id, topic_id):
+            return handle
+    return None
+
+
+def _make_graphic_store_provider(user_id: int):
+    """Build the graphic-store provider for `user_id`: a closure that maps a
+    topic handle ("0" personal, "T" own, "O:T" shared) to the scoped GraphicStore
+    backing it, or None if `user_id` may not write/read that target.
+
+    It is just :func:`_resolve_topic_as` plus a store: the resolve enforces the
+    grant (and edit right when asked), then the store is opened in the *owner's*
+    silo under the owner's DEK — the server writing on the recipient's behalf,
+    exactly as a shared topic's *text* edits already land. Captures `user_id` so
+    it is safe to call off the request thread (the controller runs on a worker).
+    Handed to the controller, which never reaches across the trust boundary
+    itself."""
+    def provider(handle: str, need: str = "edit"):
+        try:
+            owner_id, topic_id = _resolve_topic_as(user_id, handle, need)
+        except _ShareAccessError:
+            return None
+        return GraphicStore(
+            _graphics_dir(owner_id), _auth_backend.get_dek(owner_id),
+            owner_id, topic_id)
+    return provider
 
 
 def _user_owns_topic(user_id: int, topic_id: int) -> bool:
@@ -3753,6 +4017,43 @@ def topics():
     return jsonify({"topics": items})
 
 
+@app.route("/graphics/<graphic_id>")
+@login_required
+def graphic_asset(graphic_id: str):
+    """Return one stored graphic asset — the source a `[graphic-<handle>:N]` tag
+    (placed in a topic body, or rendered in chat) resolves to.
+
+    The id *is* a topic handle plus an ordinal, so authorization is topic
+    authorization: parse it, resolve the handle with `_resolve_topic("view")`
+    (own topic ⇒ self; shared ⇒ an accepted grant; personal `0` ⇒ self only),
+    then open the (owner, topic) store under the owner's DEK. A legacy bare
+    `graphic-N` reads as personal `graphic-0:N`. Anything that doesn't
+    resolve — bad id, no grant, missing file — collapses to 404, so a stale tag
+    degrades to a calm 'couldn't load' card and existence is never leaked."""
+    parsed = parse_graphic_id(graphic_id)
+    if parsed is None:
+        return jsonify({"ok": False, "error": "not found"}), 404
+    handle, n = parsed
+    try:
+        owner_id, topic_id = _resolve_topic(handle, "view")
+    except _ShareAccessError:
+        return jsonify({"ok": False, "error": "not found"}), 404
+    try:
+        store = GraphicStore(
+            _graphics_dir(owner_id), _auth_backend.get_dek(owner_id),
+            owner_id, topic_id)
+        record = store.load(make_graphic_id(n))
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    if not record:
+        return jsonify({"ok": False, "error": "not found"}), 404
+    return jsonify({
+        "format": record.get("format") or "",
+        "source": record.get("source") or "",
+        "summary": record.get("summary") or "",
+    })
+
+
 @app.route("/topics/<topic_id>")
 @login_required
 def topic_contents(topic_id: str):
@@ -3896,6 +4197,13 @@ def topic_contents_save(topic_id: str):
     # from filling the disk via repeated PUTs.
     if len(contents.encode("utf-8")) > 2 * 1024 * 1024:
         return jsonify({"ok": False, "error": "contents too large (max 2 MiB)"}), 413
+    # Write rule: a topic body may embed only its own graphics. Reject any
+    # [graphic-…] tag that doesn't denote this topic (bare tags belong to the
+    # topic's owner, so a recipient may keep the owner's bare tags).
+    bad = _foreign_graphic_tag(contents, owner_id, tid)
+    if bad is not None:
+        return jsonify(
+            {"ok": False, "error": _graphics.foreign_graphic_tag_message(bad)}), 400
     # Edits always land in the owner's silo (owner_id == g.user_id for own
     # topics; the topic owner for a shared one).
     ctx = _context_for(owner_id)
