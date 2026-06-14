@@ -3635,11 +3635,32 @@ function vegaInterpreter() {
     || null;
 }
 
+// When set (a {"--name": "value"} map), these win over the live theme. Used to
+// rasterize graphics for document export in a fixed light palette regardless of
+// the user's chosen theme — see graphicToPngDataUrl / _EXPORT_GRAPHIC_THEME.
+let _cssVarOverride = null;
+
 function _cssVar(name, fallback) {
+  if (_cssVarOverride && name in _cssVarOverride) return _cssVarOverride[name];
   const v = getComputedStyle(document.documentElement)
     .getPropertyValue(name).trim();
   return v || fallback;
 }
+
+// Fixed light palette for graphics rasterized into exported documents. The page
+// they land on stays white, so we render the graphic as a soft-grey card with
+// dark text/lines — readable contrast on white no matter the app theme (a dark
+// theme would otherwise bake light text onto a near-invisible dark tile). These
+// keys mirror the CSS-var names every renderer reads through _cssVar:
+// mermaidThemeConfig, vegaThemeConfig and the canvas fill in _svgToCanvas.
+const _EXPORT_GRAPHIC_THEME = {
+  "--bg": "#ffffff",       // node / element fills sit a touch brighter than card
+  "--bg-elev": "#f1f1f3",  // the card / canvas background (the grey)
+  "--text": "#1b1b1b",
+  "--muted": "#555555",
+  "--border": "#c8c8cc",
+  "--accent": "#4b5bb0",
+};
 
 // A Vega config derived from the live theme, so charts sit in the card instead
 // of a white box: transparent background, themed axes/legend/labels, the page
@@ -3918,13 +3939,27 @@ function graphicToPngDataUrl(format, source) {
   return new Promise((resolve) => {
     const holder = document.createElement("div");
     holder.className = "graphic-body";
+    // Pin the export palette onto the holder as real CSS custom properties plus
+    // a `color`, so a raw model-authored SVG that leans on the cascade
+    // (`var(--text)`, `currentColor`) renders light too — the JS _cssVar
+    // override below only covers the vega/mermaid config reads, not the CSS
+    // cascade a detached SVG resolves against :root.
+    const paletteCss = Object.entries(_EXPORT_GRAPHIC_THEME)
+      .map(([k, v]) => k + ":" + v).join(";");
     holder.style.cssText =
-      "position:fixed;left:-99999px;top:0;background:transparent;";
+      "position:fixed;left:-99999px;top:0;background:transparent;color:"
+      + _EXPORT_GRAPHIC_THEME["--text"] + ";" + paletteCss + ";";
     document.body.appendChild(holder);
     let settled = false;
+    // Force the light export palette for the whole render+rasterize cycle so
+    // the graphic (and the canvas background painted behind it) come out dark-
+    // on-grey, then restore the live theme no matter how we exit.
+    const prevOverride = _cssVarOverride;
+    _cssVarOverride = _EXPORT_GRAPHIC_THEME;
     const finish = (val) => {
       if (settled) return;
       settled = true;
+      _cssVarOverride = prevOverride;
       holder.remove();
       resolve(val);
     };
@@ -7540,17 +7575,8 @@ async function exportTopic(fmt) {
     try { postMarkdown = await buildTopicMarkdownWithGraphics(); }
     catch (_) { postMarkdown = null; }
   }
-  let exportUrl = "/topics/" + encodeURIComponent(selectedTopicId)
+  const exportUrl = "/topics/" + encodeURIComponent(selectedTopicId)
     + "/export?format=" + encodeURIComponent(fmt);
-  // For PDF (the one format we rasterize to a fixed page ourselves) hand the
-  // server the live theme colours so the sheet matches the app instead of
-  // defaulting to white. We send `--bg-elev` — the very colour graphics are
-  // rasterized over — so embedded graphic PNGs blend into the page seamlessly,
-  // plus `--text` so body copy stays readable on a dark theme.
-  if (fmt === "pdf") {
-    exportUrl += "&bg=" + encodeURIComponent(_cssVar("--bg-elev", ""))
-      + "&fg=" + encodeURIComponent(_cssVar("--text", ""));
-  }
   try {
     const r = postMarkdown != null
       ? await fetch(exportUrl, {
