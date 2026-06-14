@@ -4750,14 +4750,27 @@ function clientTimeFormat() {
   }
 }
 
+// The topic the user is currently looking at, if any. We report it only when
+// the topics pane is the open side panel AND a topic is selected — i.e. the
+// topic is actually on screen. When the side panel is closed (user is on the
+// chat) or showing another pane, this returns null and nothing is sent.
+function viewingTopic() {
+  if (activePaneName !== "topics" || !selectedTopicId) return null;
+  const t = topicByHandle(selectedTopicId) || {};
+  return {id: String(selectedTopicId), title: t.title || t.name || ""};
+}
+
 async function sendText(text, images) {
   let r;
   try {
+    const vt = viewingTopic();
     r = await fetch("/send", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify({text, images: images || [], tz: clientTimezone(),
-        date_format: clientDateFormat(), time_format: clientTimeFormat()}),
+        date_format: clientDateFormat(), time_format: clientTimeFormat(),
+        viewing_topic: vt ? vt.id : null,
+        viewing_topic_title: vt ? vt.title : null}),
     });
   } catch (e) {
     // Network failure before the request landed — drop the "Sending…"
@@ -7527,8 +7540,17 @@ async function exportTopic(fmt) {
     try { postMarkdown = await buildTopicMarkdownWithGraphics(); }
     catch (_) { postMarkdown = null; }
   }
-  const exportUrl = "/topics/" + encodeURIComponent(selectedTopicId)
+  let exportUrl = "/topics/" + encodeURIComponent(selectedTopicId)
     + "/export?format=" + encodeURIComponent(fmt);
+  // For PDF (the one format we rasterize to a fixed page ourselves) hand the
+  // server the live theme colours so the sheet matches the app instead of
+  // defaulting to white. We send `--bg-elev` — the very colour graphics are
+  // rasterized over — so embedded graphic PNGs blend into the page seamlessly,
+  // plus `--text` so body copy stays readable on a dark theme.
+  if (fmt === "pdf") {
+    exportUrl += "&bg=" + encodeURIComponent(_cssVar("--bg-elev", ""))
+      + "&fg=" + encodeURIComponent(_cssVar("--text", ""));
+  }
   try {
     const r = postMarkdown != null
       ? await fetch(exportUrl, {

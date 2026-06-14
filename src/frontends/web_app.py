@@ -2738,6 +2738,29 @@ def upload():
                     "oversized": oversized})
 
 
+def _viewing_topic_tag(data: dict) -> str:
+    """Build a `<viewing_topic>` tag naming the topic the user currently has
+    open on screen, so the model knows what they're looking at when they speak.
+    The browser sends the open topic's handle + title with each /send (and
+    nulls when the chat or another pane is showing). Returns "" when none.
+
+    Format: `<viewing_topic id="t7">grocery list</viewing_topic>` — out-of-band
+    context, ridden in on the hidden prefix like the <stale> tag, so it never
+    shows in the user's own chat bubble. Title/id are sanitised so a stray
+    angle bracket can't break the tag, and capped to stay token-cheap."""
+    tid = data.get("viewing_topic")
+    if not isinstance(tid, str) or not tid.strip():
+        return ""
+    tid = tid.strip().translate({ord("<"): None, ord(">"): None,
+                                  ord('"'): None})[:128]
+    if not tid:
+        return ""
+    title = data.get("viewing_topic_title")
+    title = title if isinstance(title, str) else ""
+    title = " ".join(title.split()).replace("<", "").replace(">", "")[:120]
+    return f'<viewing_topic id="{tid}">{title}</viewing_topic>'
+
+
 @app.route("/send", methods=["POST"])
 @login_required
 @api_access_required
@@ -2780,9 +2803,13 @@ def send():
     if (df, tf) != ctx._persisted_date_prefs:
         if _auth_backend.set_date_prefs(g.user_id, df, tf):
             ctx._persisted_date_prefs = (df, tf)
-    stale_tag = ctx.drain_stale_tag()
+    # Out-of-band context the model sees but the chat bubble doesn't: the
+    # <stale> tag (records that changed mid-turn) and the topic the user
+    # currently has open. Joined with a newline so multiple tags stay legible.
+    hidden_parts = [t for t in (ctx.drain_stale_tag(),
+                                _viewing_topic_tag(data)) if t]
     should_quit = ctx.controller.dispatch_input(
-        text, images=images or None, hidden_prefix=stale_tag,
+        text, images=images or None, hidden_prefix="\n".join(hidden_parts),
     )
     return jsonify({"ok": True, "quit": should_quit})
 
@@ -4088,6 +4115,65 @@ def _safe_filename(name: str, fallback: str) -> str:
     return cleaned or fallback
 
 
+# Accept only a CSS colour we can safely interpolate into a <style> block the
+# client supplies (theme bg/fg for PDF export): a #hex literal (3/4/6/8 digits)
+# or an rgb()/rgba() with nothing but digits, spaces, commas, dots, % and the
+# parens. Anything else (so no `;`, `}`, `url(...)`, etc.) returns None and the
+# colour is simply dropped — no way to break out of the rule.
+_CSS_HEX_RE = re.compile(r"#(?:[0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$")
+_CSS_RGB_RE = re.compile(r"rgba?\([0-9.,%\s]+\)$")
+
+
+def _safe_css_color(value) -> str | None:
+    if not isinstance(value, str):
+        return None
+    v = value.strip()
+    if not v or len(v) > 32:
+        return None
+    if _CSS_HEX_RE.match(v) or _CSS_RGB_RE.match(v):
+        return v
+    return None
+
+
+def _pdf_export_css(bg, fg) -> str:
+    """A <style> block layered on top of pandoc's standalone template for PDF
+    export. Pandoc's default CSS centres the body in a 36em column with 50px
+    padding on a near-white page, which on an A4 sheet reads as a huge margin on
+    every side over a white background. We override that: a tighter page margin,
+    a full-width body, and — when the client passes its live theme colours — a
+    page/text colour that matches the app (and the graphics rasterized into it)
+    instead of white. Colours are validated; bad input falls back to white."""
+    bg = _safe_css_color(bg)
+    fg = _safe_css_color(fg)
+    rules = [
+        "@page { size: A4; margin: 1.3cm; }",
+        "body { max-width: none !important; margin: 0 !important; "
+        "padding: 0 !important; }",
+    ]
+    if bg:
+        # The root background propagates to the whole page canvas in WeasyPrint,
+        # so this colours the margin area too — not just the content box.
+        rules.append(f"html, body {{ background: {bg} !important; }}")
+    if fg:
+        rules.append(f"body {{ color: {fg} !important; }}")
+    if bg or fg:
+        # Keep code blocks legible on either a light or dark themed page without
+        # needing to know the exact theme: a neutral translucent panel.
+        rules.append(
+            "pre, code { background: rgba(127,127,127,0.14) !important; }")
+    return "<style>\n" + "\n".join(rules) + "\n</style>"
+
+
+def _inject_head_css(html: str, style: str) -> str:
+    """Drop `style` in just before </head> so it wins over pandoc's template
+    styles (same specificity, later in source). Falls back to prepending if the
+    document has no head."""
+    idx = html.lower().rfind("</head>")
+    if idx == -1:
+        return style + html
+    return html[:idx] + style + html[idx:]
+
+
 @app.route("/topics/<topic_id>/export", methods=["GET", "POST"])
 @login_required
 def topic_export(topic_id: str):
@@ -4149,6 +4235,14 @@ def topic_export(topic_id: str):
                 html = _pypandoc.convert_text(
                     markdown, "html5", format="md",
                     extra_args=["--standalone"],
+                )
+                # Tighten pandoc's wide default margins and, when the client
+                # sent its theme colours, paint the page to match the app (and
+                # the graphics embedded in it) instead of defaulting to white.
+                html = _inject_head_css(
+                    html,
+                    _pdf_export_css(request.args.get("bg"),
+                                    request.args.get("fg")),
                 )
                 data = _WeasyHTML(string=html).write_pdf()
             elif target in ("docx", "odt", "epub"):
