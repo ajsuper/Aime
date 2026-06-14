@@ -1458,6 +1458,13 @@
     #topic-download-btn { display: inline-flex; align-items: center;
                           padding: 0.25rem 0.45rem; }
     #topic-download-btn svg { display: block; }
+    /* While an export is converting, the icon button is swapped for a short
+       "Converting to <Format>…" label so the click clearly registered. It's
+       inert during this state — keep the resting (non-hover) colour. */
+    #topic-download-btn.converting { cursor: default; white-space: nowrap;
+                                     font-size: 0.82rem; color: var(--muted); }
+    #topic-download-btn.converting:hover { background: transparent;
+                                           color: var(--muted); }
     .topic-download-menu { position: absolute; top: calc(100% + 4px); left: 0;
                            min-width: 11rem; background: var(--bg-elev);
                            border: 1px solid var(--border); border-radius: 8px;
@@ -7517,13 +7524,43 @@ topicDownloadBtn.addEventListener("click", (e) => {
   topicDownloadMenu.hidden = !opening;
   topicDownloadBtn.setAttribute("aria-expanded", opening ? "true" : "false");
 });
-topicDownloadMenu.addEventListener("click", (e) => {
+// Swap the icon button for a "Converting to <Format>…" label (or restore it) so
+// the user gets immediate feedback that their click landed while the export
+// fetches, converts and downloads — which can take a beat. The original icon
+// markup is stashed and put back verbatim when done.
+let _downloadBtnHtml = null;
+function setDownloadConverting(label) {
+  if (label) {
+    if (_downloadBtnHtml === null) _downloadBtnHtml = topicDownloadBtn.innerHTML;
+    topicDownloadBtn.classList.add("converting");
+    topicDownloadBtn.disabled = true;
+    topicDownloadBtn.setAttribute("aria-busy", "true");
+    topicDownloadBtn.textContent = "Converting to " + label + "…";
+  } else {
+    if (_downloadBtnHtml !== null) {
+      topicDownloadBtn.innerHTML = _downloadBtnHtml;
+      _downloadBtnHtml = null;
+    }
+    topicDownloadBtn.classList.remove("converting");
+    topicDownloadBtn.disabled = false;
+    topicDownloadBtn.removeAttribute("aria-busy");
+  }
+}
+
+topicDownloadMenu.addEventListener("click", async (e) => {
   const btn = e.target.closest("button[data-format]");
   if (!btn) return;
   e.stopPropagation();
   const fmt = btn.dataset.format;
+  // The menu label ("PDF", "Word (.docx)", …) reads better than the raw format.
+  const label = (btn.textContent || fmt).trim();
   closeDownloadMenu();
-  exportTopic(fmt);
+  setDownloadConverting(label);
+  try {
+    await exportTopic(fmt);
+  } finally {
+    setDownloadConverting(null);
+  }
 });
 
 // Formats whose documents can embed images. For these we inline any
