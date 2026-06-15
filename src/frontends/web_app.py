@@ -2738,6 +2738,29 @@ def upload():
                     "oversized": oversized})
 
 
+def _viewing_topic_tag(data: dict) -> str:
+    """Build a `<viewing_topic>` tag naming the topic the user currently has
+    open on screen, so the model knows what they're looking at when they speak.
+    The browser sends the open topic's handle + title with each /send (and
+    nulls when the chat or another pane is showing). Returns "" when none.
+
+    Format: `<viewing_topic id="t7">grocery list</viewing_topic>` — out-of-band
+    context, ridden in on the hidden prefix like the <stale> tag, so it never
+    shows in the user's own chat bubble. Title/id are sanitised so a stray
+    angle bracket can't break the tag, and capped to stay token-cheap."""
+    tid = data.get("viewing_topic")
+    if not isinstance(tid, str) or not tid.strip():
+        return ""
+    tid = tid.strip().translate({ord("<"): None, ord(">"): None,
+                                  ord('"'): None})[:128]
+    if not tid:
+        return ""
+    title = data.get("viewing_topic_title")
+    title = title if isinstance(title, str) else ""
+    title = " ".join(title.split()).replace("<", "").replace(">", "")[:120]
+    return f'<viewing_topic id="{tid}">{title}</viewing_topic>'
+
+
 @app.route("/send", methods=["POST"])
 @login_required
 @api_access_required
@@ -2780,9 +2803,13 @@ def send():
     if (df, tf) != ctx._persisted_date_prefs:
         if _auth_backend.set_date_prefs(g.user_id, df, tf):
             ctx._persisted_date_prefs = (df, tf)
-    stale_tag = ctx.drain_stale_tag()
+    # Out-of-band context the model sees but the chat bubble doesn't: the
+    # <stale> tag (records that changed mid-turn) and the topic the user
+    # currently has open. Joined with a newline so multiple tags stay legible.
+    hidden_parts = [t for t in (ctx.drain_stale_tag(),
+                                _viewing_topic_tag(data)) if t]
     should_quit = ctx.controller.dispatch_input(
-        text, images=images or None, hidden_prefix=stale_tag,
+        text, images=images or None, hidden_prefix="\n".join(hidden_parts),
     )
     return jsonify({"ok": True, "quit": should_quit})
 
@@ -4088,7 +4115,32 @@ def _safe_filename(name: str, fallback: str) -> str:
     return cleaned or fallback
 
 
-@app.route("/topics/<topic_id>/export")
+def _pdf_export_css() -> str:
+    """A <style> block layered on top of pandoc's standalone template for PDF
+    export. Pandoc's default CSS centres the body in a 36em column with 50px
+    padding, which on an A4 sheet reads as a huge margin on every side. We
+    override that with a tighter page margin and a full-width body. The page
+    stays white; graphics are rendered light-themed client-side so they read
+    well on it (see graphicToPngDataUrl)."""
+    rules = [
+        "@page { size: A4; margin: 1.3cm; }",
+        "body { max-width: none !important; margin: 0 !important; "
+        "padding: 0 !important; }",
+    ]
+    return "<style>\n" + "\n".join(rules) + "\n</style>"
+
+
+def _inject_head_css(html: str, style: str) -> str:
+    """Drop `style` in just before </head> so it wins over pandoc's template
+    styles (same specificity, later in source). Falls back to prepending if the
+    document has no head."""
+    idx = html.lower().rfind("</head>")
+    if idx == -1:
+        return style + html
+    return html[:idx] + style + html[idx:]
+
+
+@app.route("/topics/<topic_id>/export", methods=["GET", "POST"])
 @login_required
 def topic_export(topic_id: str):
     try:
@@ -4100,8 +4152,19 @@ def topic_export(topic_id: str):
         return jsonify({"ok": False, "error": "unsupported format"}), 400
     target, ext, mime = _EXPORT_FORMATS[fmt]
     ctx = _context_for(owner_id)
+    # The client may POST a rendered copy of the body to embed in the document —
+    # e.g. with each [graphic-…] tag swapped for an inline PNG data URI, which
+    # only the browser can rasterize (mermaid/vega need a DOM). When absent we
+    # export the stored body verbatim. Either way the reader must have view
+    # access (checked above), and the title always comes from metadata.
+    override_md = None
+    if request.method == "POST":
+        body = request.get_json(silent=True) or {}
+        if isinstance(body.get("markdown"), str):
+            override_md = body["markdown"]
     try:
-        markdown = ctx.topic_service.get_topic_contents(tid)
+        markdown = (override_md if override_md is not None
+                    else ctx.topic_service.get_topic_contents(tid))
         # Title comes from the topics list — get_topic_contents only returns
         # the body, not metadata. A small list scan is fine (topics are tens,
         # not thousands) and keeps this route independent of how the gateway
@@ -4139,6 +4202,8 @@ def topic_export(topic_id: str):
                     markdown, "html5", format="md",
                     extra_args=["--standalone"],
                 )
+                # Tighten pandoc's wide default margins (the page stays white).
+                html = _inject_head_css(html, _pdf_export_css())
                 data = _WeasyHTML(string=html).write_pdf()
             elif target in ("docx", "odt", "epub"):
                 with tempfile.NamedTemporaryFile(

@@ -204,13 +204,22 @@
         err.textContent = "Passwords do not match.";
       }
     });
+    let tabFromError = false;
     const errs = document.querySelectorAll(".error");
     for (const e of errs) {
       if (e.textContent.trim()) {
         const target = e.dataset.error;
         document.querySelector(`.tab[data-tab="${target}"]`).click();
+        tabFromError = true;
         break;
       }
+    }
+    // Deep-link: /login#signup opens the Create account tab (skipped when a
+    // server error already chose a tab, or when signup is disabled and the
+    // tab is hidden).
+    if (!tabFromError && location.hash === "#signup") {
+      const signupTab = document.querySelector('.tab[data-tab="signup"]');
+      if (signupTab && signupTab.offsetParent !== null) signupTab.click();
     }
     const recover = document.querySelector(".recover");
     if (recover && recover.dataset.recoverUsername.trim()) {

@@ -1334,8 +1334,10 @@
     /* Category/share chip + dimmed ID share one row under the title. */
     .topic-item .topic-meta { display: flex; align-items: baseline;
                               gap: 0.5rem; margin-top: 0.12rem; flex-wrap: wrap; }
-    .topic-item .topic-id { color: var(--muted); font-size: 0.66rem;
-                            opacity: 0.65; margin-left: auto; white-space: nowrap; }
+    .topic-item .topic-id { display: inline-flex; align-items: center;
+                            gap: 0.15rem; font-size: 0.66rem; margin-left: auto;
+                            white-space: nowrap; }
+    .topic-item .topic-id-text { color: var(--muted); opacity: 0.65; }
     /* Shared-with-me topics: dimmed, with a small "(Shared)" / owner tag.
        Pending invites are dimmed further and italicised — they're not yet
        openable, just a prompt to accept or decline. */
@@ -1456,6 +1458,13 @@
     #topic-download-btn { display: inline-flex; align-items: center;
                           padding: 0.25rem 0.45rem; }
     #topic-download-btn svg { display: block; }
+    /* While an export is converting, the icon button is swapped for a short
+       "Converting to <Format>…" label so the click clearly registered. It's
+       inert during this state — keep the resting (non-hover) colour. */
+    #topic-download-btn.converting { cursor: default; white-space: nowrap;
+                                     font-size: 0.82rem; color: var(--muted); }
+    #topic-download-btn.converting:hover { background: transparent;
+                                           color: var(--muted); }
     .topic-download-menu { position: absolute; top: calc(100% + 4px); left: 0;
                            min-width: 11rem; background: var(--bg-elev);
                            border: 1px solid var(--border); border-radius: 8px;
@@ -2230,12 +2239,27 @@
       font-style: italic;
     }
     .graphic-card .graphic-id {
+      display: flex;
+      align-items: center;
+      gap: 0.3rem;
       margin-top: 8px;
-      color: var(--muted);
-      opacity: 0.65;
       font-size: 0.72rem;
       white-space: nowrap;
     }
+    .graphic-card .graphic-id-text { color: var(--muted); opacity: 0.65; }
+    /* Small inline icon buttons next to an ID: copy-to-clipboard and (graphics
+       only) download-as-PNG. Dimmed until hovered. */
+    .id-copy-btn, .id-dl-btn {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 1.15rem; height: 1.15rem; padding: 0; flex: 0 0 auto;
+      border: none; border-radius: 5px; background: transparent;
+      color: var(--muted); opacity: 0.6; cursor: pointer; line-height: 0;
+    }
+    .id-copy-btn:hover, .id-dl-btn:hover {
+      opacity: 1; color: var(--accent); background: rgba(124, 140, 255, 0.12);
+    }
+    .id-copy-btn.copied { opacity: 1; color: var(--accent); }
+    .id-copy-btn svg, .id-dl-btn svg { width: 0.9em; height: 0.9em; display: block; }
   </style>
 </head>
 <body>
@@ -3618,11 +3642,32 @@ function vegaInterpreter() {
     || null;
 }
 
+// When set (a {"--name": "value"} map), these win over the live theme. Used to
+// rasterize graphics for document export in a fixed light palette regardless of
+// the user's chosen theme — see graphicToPngDataUrl / _EXPORT_GRAPHIC_THEME.
+let _cssVarOverride = null;
+
 function _cssVar(name, fallback) {
+  if (_cssVarOverride && name in _cssVarOverride) return _cssVarOverride[name];
   const v = getComputedStyle(document.documentElement)
     .getPropertyValue(name).trim();
   return v || fallback;
 }
+
+// Fixed light palette for graphics rasterized into exported documents. The page
+// they land on stays white, so we render the graphic as a soft-grey card with
+// dark text/lines — readable contrast on white no matter the app theme (a dark
+// theme would otherwise bake light text onto a near-invisible dark tile). These
+// keys mirror the CSS-var names every renderer reads through _cssVar:
+// mermaidThemeConfig, vegaThemeConfig and the canvas fill in _svgToCanvas.
+const _EXPORT_GRAPHIC_THEME = {
+  "--bg": "#ffffff",       // node / element fills sit a touch brighter than card
+  "--bg-elev": "#f1f1f3",  // the card / canvas background (the grey)
+  "--text": "#1b1b1b",
+  "--muted": "#555555",
+  "--border": "#c8c8cc",
+  "--accent": "#4b5bb0",
+};
 
 // A Vega config derived from the live theme, so charts sit in the card instead
 // of a white box: transparent background, themed axes/legend/labels, the page
@@ -3746,6 +3791,215 @@ function renderGraphicInto(body, fmt, source, onRender) {
   }
 }
 
+// --- Small inline action buttons (copy an ID, download a graphic) ----------
+// 16px line icons, stroke=currentColor so they inherit the button's color.
+const _ICON_COPY =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"' +
+  ' stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13"' +
+  ' height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0' +
+  ' 1 2 2v1"/></svg>';
+const _ICON_CHECK =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"' +
+  ' stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>';
+const _ICON_DOWNLOAD =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"' +
+  ' stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2' +
+  ' 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12"' +
+  ' y1="15" x2="12" y2="3"/></svg>';
+
+function makeIconButton(svg, className, title) {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = className;
+  btn.title = title;
+  btn.setAttribute("aria-label", title);
+  btn.innerHTML = svg;
+  return btn;
+}
+
+// Copy `text` to the clipboard, falling back to a hidden-textarea execCommand
+// where the async Clipboard API isn't available. Resolves to true on success.
+function copyTextToClipboard(text) {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    return navigator.clipboard.writeText(text)
+      .then(() => true)
+      .catch(() => _fallbackCopy(text));
+  }
+  return Promise.resolve(_fallbackCopy(text));
+}
+function _fallbackCopy(text) {
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand("copy");
+    ta.remove();
+    return ok;
+  } catch { return false; }
+}
+
+// A tiny "copy" button that copies `text` and briefly flashes a check. Stops
+// propagation so it never triggers an enclosing row's click (e.g. selecting a
+// topic in the sidebar).
+function makeCopyButton(text, label) {
+  const btn = makeIconButton(_ICON_COPY, "id-copy-btn", label || "Copy");
+  btn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    e.preventDefault();
+    copyTextToClipboard(text).then((ok) => {
+      if (!ok) return;
+      const prev = btn.innerHTML;
+      btn.innerHTML = _ICON_CHECK;
+      btn.classList.add("copied");
+      setTimeout(() => { btn.innerHTML = prev; btn.classList.remove("copied"); },
+                 1200);
+    });
+  });
+  return btn;
+}
+
+// Trigger a browser download of `blob` as `filename` (same pattern as the topic
+// export path).
+function saveBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+// Rasterize a rendered graphic to a PNG and download it. Every format we render
+// (svg / vega-lite / mermaid) ends up as an inline <svg> in `body`, so we
+// serialize that, paint it onto a canvas over the card background (the renderers
+// run transparent), and export. A stray <canvas> is handled directly as a
+// defensive fallback.
+function exportGraphicPng(body, filename) {
+  const svg = body && body.querySelector("svg");
+  if (svg) { _svgToPng(svg, filename); return; }
+  const canvasEl = body && body.querySelector("canvas");
+  if (canvasEl) {
+    try { canvasEl.toBlob((b) => { if (b) saveBlob(b, filename); }, "image/png"); }
+    catch (e) { console.warn("PNG export failed:", e); }
+    return;
+  }
+  console.warn("PNG export: nothing renderable to export");
+}
+
+// Paint a rendered <svg> onto a canvas (over the card background, since the
+// renderers run transparent) and resolve with it. Shared by the file download
+// and the data-URI path used to inline graphics into topic exports.
+function _svgToCanvas(svg) {
+  return new Promise((resolve, reject) => {
+    const rect = svg.getBoundingClientRect();
+    let w = Math.ceil(rect.width), h = Math.ceil(rect.height);
+    if (!w || !h) {
+      const vb = svg.viewBox && svg.viewBox.baseVal;
+      if (vb && vb.width && vb.height) { w = Math.ceil(vb.width); h = Math.ceil(vb.height); }
+    }
+    if (!w || !h) { w = 800; h = 600; }
+    const clone = svg.cloneNode(true);
+    clone.setAttribute("width", w);
+    clone.setAttribute("height", h);
+    clone.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+    const xml = new XMLSerializer().serializeToString(clone);
+    const url = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(xml);
+    // 2× (or device pixel ratio) for a crisp export, capped so huge diagrams
+    // don't blow up the canvas.
+    const scale = Math.min(3, Math.max(2, window.devicePixelRatio || 1));
+    const bg = _cssVar("--bg-elev", "#ffffff");
+    const image = new Image();
+    image.onload = () => {
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.max(1, Math.round(w * scale));
+      canvas.height = Math.max(1, Math.round(h * scale));
+      const ctx = canvas.getContext("2d");
+      ctx.fillStyle = bg;
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
+      resolve(canvas);
+    };
+    image.onerror = (e) => reject(e || new Error("SVG failed to load"));
+    image.src = url;
+  });
+}
+
+function _svgToPng(svg, filename) {
+  _svgToCanvas(svg)
+    .then((canvas) => {
+      try { canvas.toBlob((blob) => { if (blob) saveBlob(blob, filename); }, "image/png"); }
+      catch (e) { console.warn("PNG export failed:", e); }
+    })
+    .catch((e) => console.warn("PNG export: SVG failed to load", e));
+}
+
+// Render a graphic (format + source) off-screen and resolve with a PNG data URI,
+// or null if it can't be rasterized. Used to inline graphics into a topic export
+// — the render must happen in the DOM (mermaid/vega lay out via the browser),
+// so we mount a hidden node, rasterize, and tear it down.
+function graphicToPngDataUrl(format, source) {
+  return new Promise((resolve) => {
+    const holder = document.createElement("div");
+    holder.className = "graphic-body";
+    // Pin the export palette onto the holder as real CSS custom properties plus
+    // a `color`, so a raw model-authored SVG that leans on the cascade
+    // (`var(--text)`, `currentColor`) renders light too — the JS _cssVar
+    // override below only covers the vega/mermaid config reads, not the CSS
+    // cascade a detached SVG resolves against :root.
+    const paletteCss = Object.entries(_EXPORT_GRAPHIC_THEME)
+      .map(([k, v]) => k + ":" + v).join(";");
+    holder.style.cssText =
+      "position:fixed;left:-99999px;top:0;background:transparent;color:"
+      + _EXPORT_GRAPHIC_THEME["--text"] + ";" + paletteCss + ";";
+    document.body.appendChild(holder);
+    let settled = false;
+    // Force the light export palette for the whole render+rasterize cycle so
+    // the graphic (and the canvas background painted behind it) come out dark-
+    // on-grey, then restore the live theme no matter how we exit.
+    const prevOverride = _cssVarOverride;
+    _cssVarOverride = _EXPORT_GRAPHIC_THEME;
+    const finish = (val) => {
+      if (settled) return;
+      settled = true;
+      _cssVarOverride = prevOverride;
+      holder.remove();
+      resolve(val);
+    };
+    try {
+      renderGraphicInto(holder, format, source, () => {
+        const svg = holder.querySelector("svg");
+        if (!svg) return finish(null);
+        _svgToCanvas(svg)
+          .then((canvas) => {
+            try { finish(canvas.toDataURL("image/png")); }
+            catch (e) { finish(null); }
+          })
+          .catch(() => finish(null));
+      });
+    } catch (e) { finish(null); }
+    // A graphic that fails to render never calls onRender — bail out so the
+    // export isn't blocked waiting on it.
+    setTimeout(() => finish(null), 8000);
+  });
+}
+
+// A "download as PNG" button bound to a graphic's rendered `body`. Reads the SVG
+// at click time, so it only needs the body to be rendered by then.
+function makeGraphicDownloadButton(body, baseName) {
+  const btn = makeIconButton(_ICON_DOWNLOAD, "id-dl-btn", "Download as PNG");
+  btn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    e.preventDefault();
+    exportGraphicPng(body, (baseName || "graphic") + ".png");
+  });
+  return btn;
+}
+
 function renderGraphic(payload) {
   const card = document.createElement("div");
   card.className = "msg graphic";
@@ -3761,18 +4015,30 @@ function renderGraphic(payload) {
     cap.textContent = summary;
     inner.appendChild(cap);
   }
-  // Dimmed ID badge, matching the inline tag path, when the payload names one.
+  // Actions row: the dimmed ID + copy button (when the payload names one) and a
+  // "download as PNG" button added once the graphic has actually rendered.
   const gid = payload.id || payload.graphic_id || "";
-  if (gid) {
-    const idTag = document.createElement("div");
-    idTag.className = "graphic-id";
-    idTag.textContent = "ID: " + String(gid).replace(/^graphic-/, "");
-    inner.appendChild(idTag);
+  const display = gid ? String(gid).replace(/^graphic-/, "") : "";
+  const idBar = document.createElement("div");
+  idBar.className = "graphic-id";
+  if (display) {
+    const idText = document.createElement("span");
+    idText.className = "graphic-id-text";
+    idText.textContent = "ID: " + display;
+    idBar.appendChild(idText);
+    idBar.appendChild(makeCopyButton(display, "Copy graphic ID"));
   }
+  inner.appendChild(idBar);
   card.appendChild(inner);
   logInner.appendChild(card);
   scrollToBottom();
-  renderGraphicInto(body, payload.format, payload.source, scrollToBottom);
+  renderGraphicInto(body, payload.format, payload.source, () => {
+    scrollToBottom();
+    if (!idBar.querySelector(".id-dl-btn")) {
+      idBar.appendChild(makeGraphicDownloadButton(
+        body, display ? "graphic-" + display.replace(/:/g, "-") : "graphic"));
+    }
+  });
 }
 
 // In-flight/lookup cache for `[graphic-N]` tag resolution, so the same id placed
@@ -3852,19 +4118,30 @@ function makeGraphicMount(id) {
   body.className = "graphic-body";
   card.appendChild(body);
   // Dimmed ID badge so the user can reference this graphic by its handle:
-  // "<owner_id>:<topic_id>:<graphic_id>" (the `graphic-` tag prefix dropped).
-  const idTag = document.createElement("div");
-  idTag.className = "graphic-id";
-  idTag.textContent = "ID: " + id.replace(/^graphic-/, "");
-  card.appendChild(idTag);
+  // "<owner_id>:<topic_id>:<graphic_id>" (the `graphic-` tag prefix dropped),
+  // with a copy button and a "download as PNG" button added once it renders.
+  const display = id.replace(/^graphic-/, "");
+  const idBar = document.createElement("div");
+  idBar.className = "graphic-id";
+  const idText = document.createElement("span");
+  idText.className = "graphic-id-text";
+  idText.textContent = "ID: " + display;
+  idBar.appendChild(idText);
+  idBar.appendChild(makeCopyButton(display, "Copy graphic ID"));
+  card.appendChild(idBar);
   fetchGraphicAsset(id)
     .then((g) => {
-      renderGraphicInto(body, g.format, g.source);
+      renderGraphicInto(body, g.format, g.source, () => {
+        if (!idBar.querySelector(".id-dl-btn")) {
+          idBar.appendChild(makeGraphicDownloadButton(
+            body, "graphic-" + display.replace(/:/g, "-")));
+        }
+      });
       if (g.summary) {
         const cap = document.createElement("div");
         cap.className = "graphic-caption";
         cap.textContent = g.summary;
-        card.insertBefore(cap, idTag);
+        card.insertBefore(cap, idBar);
       }
     })
     .catch(() => {
@@ -4515,14 +4792,27 @@ function clientTimeFormat() {
   }
 }
 
+// The topic the user is currently looking at, if any. We report it only when
+// the topics pane is the open side panel AND a topic is selected — i.e. the
+// topic is actually on screen. When the side panel is closed (user is on the
+// chat) or showing another pane, this returns null and nothing is sent.
+function viewingTopic() {
+  if (activePaneName !== "topics" || !selectedTopicId) return null;
+  const t = topicByHandle(selectedTopicId) || {};
+  return {id: String(selectedTopicId), title: t.title || t.name || ""};
+}
+
 async function sendText(text, images) {
   let r;
   try {
+    const vt = viewingTopic();
     r = await fetch("/send", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify({text, images: images || [], tz: clientTimezone(),
-        date_format: clientDateFormat(), time_format: clientTimeFormat()}),
+        date_format: clientDateFormat(), time_format: clientTimeFormat(),
+        viewing_topic: vt ? vt.id : null,
+        viewing_topic_title: vt ? vt.title : null}),
     });
   } catch (e) {
     // Network failure before the request landed — drop the "Sending…"
@@ -7234,18 +7524,104 @@ topicDownloadBtn.addEventListener("click", (e) => {
   topicDownloadMenu.hidden = !opening;
   topicDownloadBtn.setAttribute("aria-expanded", opening ? "true" : "false");
 });
+// Swap the icon button for a "Converting to <Format>…" label (or restore it) so
+// the user gets immediate feedback that their click landed while the export
+// fetches, converts and downloads — which can take a beat. The original icon
+// markup is stashed and put back verbatim when done.
+let _downloadBtnHtml = null;
+function setDownloadConverting(label) {
+  if (label) {
+    if (_downloadBtnHtml === null) _downloadBtnHtml = topicDownloadBtn.innerHTML;
+    topicDownloadBtn.classList.add("converting");
+    topicDownloadBtn.disabled = true;
+    topicDownloadBtn.setAttribute("aria-busy", "true");
+    topicDownloadBtn.textContent = "Converting to " + label + "…";
+  } else {
+    if (_downloadBtnHtml !== null) {
+      topicDownloadBtn.innerHTML = _downloadBtnHtml;
+      _downloadBtnHtml = null;
+    }
+    topicDownloadBtn.classList.remove("converting");
+    topicDownloadBtn.disabled = false;
+    topicDownloadBtn.removeAttribute("aria-busy");
+  }
+}
+
 topicDownloadMenu.addEventListener("click", async (e) => {
   const btn = e.target.closest("button[data-format]");
   if (!btn) return;
   e.stopPropagation();
   const fmt = btn.dataset.format;
+  // The menu label ("PDF", "Word (.docx)", …) reads better than the raw format.
+  const label = (btn.textContent || fmt).trim();
   closeDownloadMenu();
-  if (!selectedTopicId) return;
+  setDownloadConverting(label);
   try {
-    const r = await fetch(
-      "/topics/" + encodeURIComponent(selectedTopicId)
-      + "/export?format=" + encodeURIComponent(fmt)
-    );
+    await exportTopic(fmt);
+  } finally {
+    setDownloadConverting(null);
+  }
+});
+
+// Formats whose documents can embed images. For these we inline any
+// [graphic-…] tags as PNGs so the pictures travel with the file; plain-text
+// formats (md, txt) keep the literal tags.
+const _IMAGE_EXPORT_FORMATS = new Set(["pdf", "docx", "odt", "epub", "rtf", "html"]);
+
+// Unique [graphic-…] tag bodies (e.g. "graphic-3:5:2") in source order.
+function _uniqueGraphicTags(md) {
+  const out = [];
+  const seen = new Set();
+  _GRAPHIC_TAG_RE.lastIndex = 0;
+  let m;
+  while ((m = _GRAPHIC_TAG_RE.exec(md))) {
+    if (!seen.has(m[1])) { seen.add(m[1]); out.push(m[1]); }
+  }
+  return out;
+}
+
+// Build a copy of the open topic's markdown with each [graphic-…] tag replaced
+// by an embedded PNG (markdown image with a data URI). Returns null when there's
+// nothing to embed (no tags) so the caller can use the plain export path. A tag
+// whose asset is missing or can't be rasterized is left untouched.
+async function buildTopicMarkdownWithGraphics() {
+  const res = await fetch("/topics/" + encodeURIComponent(selectedTopicId));
+  const data = await res.json();
+  let md = data.contents || "";
+  const tags = _uniqueGraphicTags(md);
+  if (!tags.length) return null;
+  const ownerId = topicHandleOwner(selectedTopicId);
+  for (const tag of tags) {
+    let g;
+    try { g = await fetchGraphicAsset(normalizeGraphicId(tag, ownerId)); }
+    catch (_) { continue; }
+    const dataUrl = await graphicToPngDataUrl(g.format, g.source);
+    if (!dataUrl) continue;
+    const alt = ((g.summary || tag).replace(/[\[\]\r\n]+/g, " ").trim()) || tag;
+    md = md.split("[" + tag + "]").join("![" + alt + "](" + dataUrl + ")");
+  }
+  return md;
+}
+
+async function exportTopic(fmt) {
+  if (!selectedTopicId) return;
+  // Image-capable formats embed graphics as PNGs; fall back to the plain
+  // server-side export if there are none or the rendering fails.
+  let postMarkdown = null;
+  if (_IMAGE_EXPORT_FORMATS.has(fmt)) {
+    try { postMarkdown = await buildTopicMarkdownWithGraphics(); }
+    catch (_) { postMarkdown = null; }
+  }
+  const exportUrl = "/topics/" + encodeURIComponent(selectedTopicId)
+    + "/export?format=" + encodeURIComponent(fmt);
+  try {
+    const r = postMarkdown != null
+      ? await fetch(exportUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ markdown: postMarkdown }),
+        })
+      : await fetch(exportUrl);
     if (!r.ok) {
       let msg = "Couldn't export this topic.";
       try {
@@ -7262,18 +7638,11 @@ topicDownloadMenu.addEventListener("click", async (e) => {
     const cd = r.headers.get("Content-Disposition") || "";
     const m = /filename="([^"]+)"/.exec(cd);
     if (m) filename = m[1];
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    saveBlob(blob, filename);
   } catch (err) {
     appendNotice("Download failed: " + err, "error");
   }
-});
+}
 // Click outside / Escape to close.
 document.addEventListener("click", (e) => {
   if (topicDownloadMenu.hidden) return;
@@ -7368,7 +7737,11 @@ function buildTopicItem(t) {
   }
   const idTag = document.createElement("span");
   idTag.className = "topic-id";
-  idTag.textContent = "ID: " + tid;
+  const idText = document.createElement("span");
+  idText.className = "topic-id-text";
+  idText.textContent = "ID: " + tid;
+  idTag.appendChild(idText);
+  idTag.appendChild(makeCopyButton(String(tid), "Copy topic ID"));
   meta.appendChild(idTag);
   item.appendChild(meta);
   item.addEventListener("click", () => selectTopic(tid, item));
