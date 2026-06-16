@@ -2300,6 +2300,46 @@ _FRAGMENT_OVERVIEW = """<div class="meta">
       {% endfor %}
     </tbody>
   </table>
+
+  <h2 title="How well each usage tier fits its users: how much of the daily allowance they consume, and how many exceed it, how often. Drives tier sizing — see docs/usage-limits.md.">Tiers</h2>
+  {% if anonymized %}
+  <p class="note">User linkage is off (AIME_USAGE_LINK_USERS=0), so spend can't be attributed to a user or tier. Turn it on to populate this section.</p>
+  {% endif %}
+  {% if not tier_rows %}
+  <p class="empty">No tier data in this window.</p>
+  {% else %}
+  <table>
+    <thead>
+      <tr>
+        <th title="Usage-limit tier. '(unknown)' is spend from accounts not currently on a known tier (e.g. since-deleted).">Tier</th>
+        <th title="Daily cost allowance for this tier.">Daily cap</th>
+        <th title="Accounts currently on this tier.">Users</th>
+        <th title="Users on this tier with any spend in the window.">Active</th>
+        <th title="Average cost per active user-day.">Avg $/day</th>
+        <th title="Average daily spend as a percent of the tier's daily allowance. Over 100% means the typical active day exceeds the cap — the tier may be undersized.">Avg utilization</th>
+        <th title="Distinct users who exceeded the daily allowance on at least one day in the window.">Users over</th>
+        <th title="Active user-days that exceeded the daily allowance, out of all active user-days (and the rate). Note the bucket banks several days, so a day over the cap is not necessarily a blocked day.">Days over</th>
+        <th title="Most expensive single user-day on this tier.">Peak day</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for t in tier_rows %}
+      <tr>
+        <td>{{ t.tier }}</td>
+        <td>{% if t.cap %}${{ "%.2f"|format(t.cap) }}{% else %}—{% endif %}</td>
+        <td>{{ t.n_users }}</td>
+        <td>{{ t.n_active }}</td>
+        <td class="cost">${{ "%.4f"|format(t.avg_daily) }}</td>
+        <td class="{{ 'bad' if t.avg_util_pct > 100 else ('good' if t.avg_util_pct else '') }}">{{ t.avg_util_pct|round|int }}%</td>
+        <td class="{{ 'bad' if t.users_over else '' }}">{{ t.users_over }}</td>
+        <td>{% if t.user_days %}{{ t.over_days }} / {{ t.user_days }} ({{ t.over_rate_pct|round|int }}%){% else %}—{% endif %}</td>
+        <td class="cost">${{ "%.2f"|format(t.max_day) }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p class="note">"Over" compares each user's daily spend to their tier's daily allowance. Tier reflects each account's current tier; mid-window changes aren't back-applied.</p>
+  {% endif %}
   {% endif %}"""
 
 
@@ -3649,7 +3689,7 @@ _FRAGMENT_ACCOUNTS = """
         <th title="Account username.">Username</th>
         <th title="The api_access flag: whether this user may send messages through the paid model backend.">Send access</th>
         <th title="Usage-limit plan. Sets the daily cost allowance; change it to move the user between tiers.">Tier</th>
-        <th title="Remaining daily allowance (a banked token bucket). Shown as days banked, or % of one day's allowance when below a day.">Usage</th>
+        <th title="Remaining budget as a percent of the full bank (the 7-day ceiling), with days banked in parentheses.">Usage</th>
         <th title="Grant/revoke send access, or soft-delete the account.">Actions</th>
       </tr>
     </thead>
@@ -3671,8 +3711,8 @@ _FRAGMENT_ACCOUNTS = """
             <noscript><button type="submit">Set</button></noscript>
           </form>
         </td>
-        <td class="{{ 'bad' if usage[u.username].over else '' }}" title="Daily cap ${{ '%.2f'|format(usage[u.username].daily_cap) }}; balance ${{ '%.2f'|format(usage[u.username].balance) }}">
-          {% if usage[u.username].over %}out{% elif usage[u.username].days_banked >= 1 %}{{ '%.1f'|format(usage[u.username].days_banked) }}d{% else %}{{ usage[u.username].pct_of_day|round|int }}%{% endif %}
+        <td class="{{ 'bad' if usage[u.username].over else '' }}" title="Daily cap ${{ '%.2f'|format(usage[u.username].daily_cap) }}; balance ${{ '%.2f'|format(usage[u.username].balance) }}; {{ '%.1f'|format(usage[u.username].days_banked) }} days banked">
+          {% if usage[u.username].over %}0% (out){% else %}{{ usage[u.username].pct_full|round|int }}%{% if usage[u.username].days_banked >= 1 %} ({{ '%.1f'|format(usage[u.username].days_banked) }}d){% endif %}{% endif %}
         </td>
         <td class="actions">
           <form method="post" action="accounts/access">
@@ -4391,6 +4431,93 @@ def _refresh_seconds(args) -> int:
     return val if val in _REFRESH_CHOICES else _REFRESH_DEFAULT
 
 
+def _aggregate_tiers(records, user_tiers):
+    """Tier-fit analytics from the windowed api records, joined with each user's
+    current tier (``user_tiers``: username -> tier).
+
+    Answers the tier-system questions: how much of each tier's daily allowance
+    its users actually consume, how many exceed it, and how often. The
+    comparison is against the **daily cap** (not the banked bucket): for tier
+    *sizing*, "on what fraction of active days does a user blow past the daily
+    allowance?" is the useful signal. (A day over the cap isn't necessarily a
+    blocked day — the bucket banks several days — but a high over-rate says the
+    tier is undersized for that cohort.)
+
+    Users in the log but not in ``user_tiers`` (e.g. since-deleted) bucket under
+    "(unknown)". Tier is the user's *current* tier; mid-window changes are not
+    back-applied.
+    """
+    # Cost per (user, day).
+    ud: dict = {}
+    for rec in records:
+        if rec.get("kind") != "api":
+            continue
+        user = rec.get("user") or "(anonymous)"
+        day = str(rec.get("ts", ""))[:10]
+        if not day:
+            continue
+        ud[(user, day)] = ud.get((user, day), 0.0) + _report._api_cost(rec)
+
+    tiers: dict = {}
+    for (user, day), cost in ud.items():
+        tier = user_tiers.get(user, "(unknown)")
+        cap = _config.tier_daily_cap(tier) if tier in _config.USAGE_TIERS else 0.0
+        t = tiers.setdefault(tier, {
+            "users": set(), "user_days": 0, "total_cost": 0.0,
+            "over_days": 0, "users_over": set(), "util_sum": 0.0, "max_day": 0.0,
+            "cap": cap,
+        })
+        t["users"].add(user)
+        t["user_days"] += 1
+        t["total_cost"] += cost
+        t["max_day"] = max(t["max_day"], cost)
+        if cap > 0:
+            t["util_sum"] += cost / cap
+            if cost > cap:
+                t["over_days"] += 1
+                t["users_over"].add(user)
+
+    # Tier populations (so the user count reflects everyone on a tier, not just
+    # those active in the window).
+    population: dict = {}
+    for user, tier in user_tiers.items():
+        population.setdefault(tier, set()).add(user)
+
+    rows = []
+    seen = set()
+    for tier, t in tiers.items():
+        seen.add(tier)
+        ud_n = t["user_days"]
+        rows.append({
+            "tier": tier,
+            "cap": t["cap"],
+            "n_users": len(population.get(tier, set())) or len(t["users"]),
+            "n_active": len(t["users"]),
+            "avg_daily": (t["total_cost"] / ud_n) if ud_n else 0.0,
+            "avg_util_pct": (100.0 * t["util_sum"] / ud_n) if ud_n else 0.0,
+            "users_over": len(t["users_over"]),
+            "over_days": t["over_days"],
+            "user_days": ud_n,
+            "over_rate_pct": (100.0 * t["over_days"] / ud_n) if ud_n else 0.0,
+            "max_day": t["max_day"],
+        })
+    # Tiers with population but no activity in the window still get a row.
+    for tier, members in population.items():
+        if tier in seen:
+            continue
+        rows.append({
+            "tier": tier, "cap": _config.tier_daily_cap(tier),
+            "n_users": len(members), "n_active": 0, "avg_daily": 0.0,
+            "avg_util_pct": 0.0, "users_over": 0, "over_days": 0,
+            "user_days": 0, "over_rate_pct": 0.0, "max_day": 0.0,
+        })
+    # Configured tier order first (light, power, ...), unknown/extras last.
+    order = list(_config.USAGE_TIERS.keys())
+    rows.sort(key=lambda r: (order.index(r["tier"]) if r["tier"] in order
+                             else len(order), r["tier"]))
+    return rows
+
+
 def _compute(args):
     """Build the template context for the current filter query args."""
     path = _log_path()
@@ -4457,6 +4584,17 @@ def _compute(args):
         return True
 
     records = [r for r in all_records if _keep(r)]
+
+    # Tier-fit analytics: each active user's current tier (from auth) joined
+    # against their per-day spend. Best-effort — a missing auth backend just
+    # yields an empty mapping (every user buckets under "(unknown)").
+    user_tiers: dict = {}
+    try:
+        for u in _auth_backend().list_users():
+            user_tiers[u.username] = u.tier
+    except Exception:
+        pass
+    tier_rows = _aggregate_tiers(records, user_tiers)
 
     # --- Overview aggregations ---
     users = _report.aggregate(records)
@@ -4774,6 +4912,7 @@ def _compute(args):
         curr=curr_p,
         prev=prev_p,
         prev_window=overview_prev_window,
+        tier_rows=tier_rows,
         # conversations
         sessions=sessions,
         session_count=len(sessions),

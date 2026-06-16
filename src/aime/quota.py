@@ -89,11 +89,19 @@ def make_status(balance: float, daily_cap: float, ceiling: float) -> dict:
     else:
         pct_of_day = 0.0
         days_banked = 0.0
+    # A stable 0–100% "fullness" gauge: how full the bank is relative to its
+    # ceiling. Unlike pct_of_day (which reads up to 700% when banked) this is the
+    # intuitive battery-style percentage shown to the user and the admin.
+    if ceiling > 0:
+        pct_full = min(100.0, max(0.0, balance) / ceiling * 100.0)
+    else:
+        pct_full = 0.0
     return {
         "balance": round(balance, 6),
         "daily_cap": daily_cap,
         "ceiling": ceiling,
         "pct_of_day": round(pct_of_day, 1),
+        "pct_full": round(pct_full, 1),
         "days_banked": round(days_banked, 2),
         "over": balance <= 0,
         "decision": enforcement_decision(balance, daily_cap).value,

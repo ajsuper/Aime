@@ -25,9 +25,11 @@ nor clips your busy ones, while still **guaranteeing a daily refill** (so you ca
 always use Aime each day) and bounding exposure (the ceiling stops anyone
 hoarding a month and dumping it at once).
 
-The user never sees dollars. The account meter shows the balance as a percentage
-of *one day's* allowance (100% = a full day; reads higher when banked) and a
-plain "≈ N days banked".
+The user never sees dollars. The account meter leads with a **battery-style
+percentage** — `pct_full`, the balance as a fraction of the full bank (the 7-day
+ceiling), always 0–100% — with the banked days in parentheses (e.g. "68%
+(≈ 4.8 days)"). The snapshot also carries `pct_of_day` (balance ÷ one day's
+allowance, which reads above 100% when banked) for callers that want it.
 
 ## Tiers
 
@@ -84,7 +86,13 @@ Usage limits are **not** a separate flag. They arm exactly like the `/send`
 
 - **Web dashboard** (`src/frontends/usage_dashboard.py`, password-gated):
   - **Accounts** tab — a **Tier** dropdown per user (instant change) and a
-    **Usage** column showing each account's remaining allowance.
+    **Usage** column showing each account's remaining allowance (% of full bank).
+  - **Costs** tab — a **Tiers** section (tier-fit analytics): per tier, the user
+    count, average daily spend, average **utilization** of the daily allowance,
+    how many users went **over** it, and on what fraction of active user-days.
+    Utilization over 100% (or a high over-rate) flags a tier that's undersized
+    for its cohort. Computed from `usage.jsonl` joined with each user's current
+    tier; requires `AIME_USAGE_LINK_USERS=1`.
   - **Billing** tab — placeholder documenting the current tiers and the Stripe
     drop-in point.
 - **CLI** — `scripts/access_keys.py tier <username> <light|power>`, at parity

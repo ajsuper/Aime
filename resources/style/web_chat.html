@@ -8866,12 +8866,14 @@ function applyUsageMeter(armed, usage) {
   usageRow.style.display = "";
   let text, color = "var(--text)";
   if (usage.over) {
-    text = "Out for now — refills hourly";
+    text = "0% — refills hourly";
     color = "var(--error)";
-  } else if (usage.days_banked >= 1) {
-    text = "≈ " + usage.days_banked.toFixed(1) + " days banked";
   } else {
-    text = Math.round(usage.pct_of_day) + "% of today left";
+    // Lead with the battery-style fullness %, with the banked days as context.
+    text = Math.round(usage.pct_full) + "%";
+    if (usage.days_banked >= 1) {
+      text += " (≈ " + usage.days_banked.toFixed(1) + " days)";
+    }
     if (usage.decision === "notify_low") color = "var(--error)";
   }
   usagePctEl.textContent = text;

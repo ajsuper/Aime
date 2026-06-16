@@ -100,8 +100,20 @@ def test_make_status_clamps_negative_for_display():
     st = quota.make_status(-3.0, 1.50, 10.5)
     assert st["balance"] == pytest.approx(-3.0)  # raw kept for admins
     assert st["pct_of_day"] == 0.0               # display never goes negative
+    assert st["pct_full"] == 0.0
     assert st["days_banked"] == 0.0
     assert st["over"] is True
+
+
+def test_make_status_pct_full_is_a_0_to_100_gauge():
+    cap, ceiling = 1.50, 10.5
+    # Half a bank -> 50% full; pct_of_day reads as 350% at the same balance.
+    half = quota.make_status(ceiling / 2, cap, ceiling)
+    assert half["pct_full"] == pytest.approx(50.0)
+    assert half["pct_of_day"] == pytest.approx(350.0)
+    # A full bank caps at 100% even if balance somehow exceeds the ceiling.
+    full = quota.make_status(ceiling * 2, cap, ceiling)
+    assert full["pct_full"] == 100.0
 
 
 # --- pricing parity ---------------------------------------------------------
