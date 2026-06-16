@@ -92,6 +92,7 @@ from aime.graphics_store import (
 from aime import graphics as _graphics
 from aime import email_send as _email_send
 from aime import topic_shares as _topic_shares
+from aime import quota as _quota
 from aime.tool_formatting import TOOL_NAME_MAP
 
 from . import stt as _stt
@@ -129,6 +130,12 @@ _auth_backend = _auth.LocalAuthBackend(
 # at the root next to auth.sql, not in any one user's silo.
 _share_store = _topic_shares.ShareStore(
     os.path.join(aime_config.DATABASE_DIR, "topic_shares.sql")
+)
+# Per-user usage budget (aime.quota). Cross-user, root-level beside auth.sql.
+# Only touched when usage limits are armed (see _usage_limits_armed); in "open"
+# mode no meter is attached so this file is never written.
+_quota_store = _quota.QuotaStore(
+    os.path.join(aime_config.DATABASE_DIR, "quota.sql")
 )
 
 
@@ -640,6 +647,19 @@ class UserContext:
         # contact. Kept separate so the controller can distinguish "not set up on
         # the server" from "no contact connected" (see _deliver_message).
         messenger = _aime_messaging.get_messenger()
+
+        # Per-user usage budget. Only built when limits are armed (keys/billing);
+        # in "open" mode it stays None and nothing is metered. The cap resolver
+        # re-reads the user's tier on every debit so an admin tier change takes
+        # effect live, without restarting the session.
+        quota_meter = None
+        if _usage_limits_armed():
+            def _resolve_daily_cap(uid=user_id):
+                rec = _auth_backend.lookup(uid)
+                return aime_config.tier_daily_cap(rec.tier if rec else None)
+            quota_meter = _quota.QuotaMeter(_quota_store, username, _resolve_daily_cap)
+        self.quota_meter = quota_meter
+
         router = ModelRouter(
             haiku_model=aime_config.HAIKU_MODEL,
             sonnet_model=aime_config.SONNET_MODEL,
@@ -653,6 +673,7 @@ class UserContext:
             tool_version=aime_config.WEB_SEARCH_TOOL_VERSION,
             usage_label=username,
             record_api=_aime_usage.record_api,
+            quota_debit=(quota_meter.debit if quota_meter is not None else None),
         ) if aime_config.WEB_SEARCH_ENABLED else None
         backend = AnthropicMessagesBackend(
             system_prompt=aime_config.load_system_prompt(),
@@ -674,6 +695,7 @@ class UserContext:
                 aime_config.WEB_SEARCH_SCHEMA if aime_config.WEB_SEARCH_ENABLED else None
             ),
             terminal_tool_schema=aime_config.ONBOARDING_TOOL_SCHEMA,
+            quota=quota_meter,
         )
         backend.new_session()
 
@@ -844,6 +866,10 @@ class UserContext:
                 "assistant_html_partial", "turn_end", "ready",
                 "remote_edit", "agent_run_update", "share_update",
                 "topic_lock",
+                # Transient budget nudge — replaying it on reconnect would
+                # re-pop a stale "running low" banner. The live /me meter is the
+                # durable surface for budget state.
+                "usage_notice",
             ):
                 self._history.append(payload)
         with self._subscribers_lock:
@@ -1144,11 +1170,26 @@ _ALLOW_SIGNUP = bool(int(os.environ.get("AIME_ALLOW_SIGNUP", "0")))
 
 # Access mode — see docs/access-control.md. "keys" (the default) gates /send
 # behind each user's api_access flag; new accounts start with no send access
-# and must redeem an invite key. "open" disarms the gate entirely. An
-# unrecognised value is treated as "keys" so a typo fails closed.
+# and must redeem an invite key. "open" disarms the gate entirely. "billing"
+# behaves like "keys" for the send gate (api_access is set by the — deferred —
+# billing system) and likewise arms usage limits. An unrecognised value is
+# treated as "keys" so a typo fails closed.
 _ACCESS_MODE = os.environ.get("AIME_ACCESS_MODE", "keys").strip().lower()
-if _ACCESS_MODE not in ("keys", "open"):
+if _ACCESS_MODE not in ("keys", "open", "billing"):
     _ACCESS_MODE = "keys"
+
+
+def _send_gate_armed() -> bool:
+    """True when /send is gated behind each user's api_access flag. Armed in
+    "keys" and "billing"; disarmed in "open" (trusted local use)."""
+    return _ACCESS_MODE in ("keys", "billing")
+
+
+def _usage_limits_armed() -> bool:
+    """True when the per-user usage budget (aime.quota) is metered and notified.
+    Mirrors the send gate: armed in "keys"/"billing", off in "open". The single
+    switch that turns the whole usage-limit system on or off."""
+    return _ACCESS_MODE in ("keys", "billing")
 
 # Toggle for the email 2FA flow. Off by default so a fresh install behaves
 # like it did before the feature shipped — handy for dev, demos, and anyone
@@ -1323,11 +1364,11 @@ def login_required(view):
 def api_access_required(view):
     """Gate a route behind the user's send access. Applies *under*
     login_required (which populates g.api_access). In "open" access mode the
-    gate is disarmed and this is a pass-through; in "keys" mode a user without
-    api_access gets a 403 telling them to redeem an invite key."""
+    gate is disarmed and this is a pass-through; in "keys"/"billing" mode a user
+    without api_access gets a 403 telling them to redeem an invite key."""
     @wraps(view)
     def wrapper(*args, **kwargs):
-        if _ACCESS_MODE == "keys" and not g.get("api_access", False):
+        if _send_gate_armed() and not g.get("api_access", False):
             return jsonify({
                 "ok": False,
                 "error": "no_access",
@@ -2018,6 +2059,7 @@ def signup_submit():
             user, _dek = _auth_backend.create(
                 username, password, api_access=(_ACCESS_MODE == "open"),
                 first_name=first_name, last_name=last_name,
+                tier=aime_config.USAGE_DEFAULT_TIER,
             )
         except _auth.UsernameTaken:
             return _signup_err("That username is already taken.", status=409)
@@ -2129,6 +2171,13 @@ def signup_verify_submit():
             ),
             mimetype="text/html", status=409,
         )
+
+    # Stamp the default usage tier on the freshly-verified account. The
+    # email-verification create path goes through the pending row (which doesn't
+    # carry a tier), so the column defaults to 'light'; re-stamp here so a
+    # non-default AIME_USAGE_DEFAULT_TIER is honored on this path too.
+    if aime_config.USAGE_DEFAULT_TIER != "light":
+        _auth_backend.set_tier(user.id, aime_config.USAGE_DEFAULT_TIER)
 
     # Promote: clear the pending state, log the new account in.
     session.clear()
@@ -2247,6 +2296,16 @@ def me():
     # access_mode + api_access let the frontend show the invite-key field in
     # profile settings and disable the composer when sending is gated.
     user = _auth_backend.lookup(g.user_id)
+    # Usage budget snapshot for the account meter. Computed straight off the
+    # store (no per-session meter needed) so /me stays cheap. None when limits
+    # are disarmed (open mode) — the frontend then hides the meter entirely.
+    usage = None
+    tier = user.tier if user else None
+    if _usage_limits_armed():
+        cap = aime_config.tier_daily_cap(tier)
+        ceiling = cap * aime_config.USAGE_BANK_DAYS
+        balance = _quota_store.read(g.username, cap, ceiling)
+        usage = _quota.make_status(balance, cap, ceiling)
     return jsonify({
         "id": g.user_id,
         "username": g.username,
@@ -2256,6 +2315,9 @@ def me():
         "last_name": user.last_name if user else None,
         "access_mode": _ACCESS_MODE,
         "api_access": g.api_access,
+        "tier": tier,
+        "usage_limits_armed": _usage_limits_armed(),
+        "usage": usage,
     })
 
 
@@ -2779,6 +2841,14 @@ def send():
     if not text and not images:
         return jsonify({"ok": False, "error": "empty"}), 400
     ctx = _context_for(g.user_id)
+    # FUTURE hard-block seam: when usage limits are armed and the user's budget
+    # is spent, this is where a turn would be refused (and turned into a calm
+    # "you're out for today" response). The enforcement *action* is deliberately
+    # deferred — today the budget only notifies (see aime.quota and the
+    # usage_notice event), so we never block here. To enable a hard stop, gate on
+    #   _usage_limits_armed() and ctx.quota_meter and
+    #   ctx.quota_meter.status()["over"]
+    # and return a 402/403 the frontend renders gently.
     # The browser sends its IANA timezone (e.g. "America/New_York") with each
     # message so per-turn timestamps the model sees track the user's local
     # time. Refreshed every send — self-corrects if the user travels.

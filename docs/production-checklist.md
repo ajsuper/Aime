@@ -80,7 +80,21 @@ There is no "forgot password" flow. If you go public you'll want one —
 build it before launch, not after a user gets locked out. The pluggable
 `AuthBackend` interface is the right seam to add reset tokens to.
 
-## 8. Conscious tradeoffs to revisit
+## 8. Usage limits and cost control
+
+In `keys` / `billing` access mode, per-user **usage limits** are armed: a banked
+daily cost allowance (token bucket) per tier, metered against real Anthropic
+cost. See [usage-limits.md](usage-limits.md). Before going public:
+
+- Pick tier caps (`AIME_TIER_LIGHT` / `AIME_TIER_POWER`) and the bank ceiling
+  (`AIME_USAGE_BANK_DAYS`) for your budget — the defaults are tuned to the
+  current cohort's averages.
+- Decide the **enforcement action** at an empty balance. Today the budget only
+  *notifies*; the hard-block seam in `web_app.py`'s `/send` is left off so a
+  blocked turn never surprises users. Turn it on deliberately.
+- `open` mode disarms limits entirely — never use it internet-facing.
+
+## 9. Conscious tradeoffs to revisit
 
 These are acceptable for personal scale; reconsider before going public:
 

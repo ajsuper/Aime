@@ -61,6 +61,7 @@ import usage_report as _report  # noqa: E402
 from aime import config as _config  # noqa: E402
 from aime import auth as _auth  # noqa: E402
 from aime import accounts as _accounts  # noqa: E402
+from aime import quota as _quota  # noqa: E402
 
 app = Flask(__name__)
 
@@ -176,6 +177,20 @@ def _auth_backend() -> _auth.LocalAuthBackend:
             os.path.join(_config.DATABASE_DIR, "auth.sql")
         )
     return _auth_backend_singleton
+
+
+# Lazily-built usage-budget store (aime.quota), opened only when the Accounts
+# tab renders the per-user usage column or a tier is changed.
+_quota_store_singleton: _quota.QuotaStore | None = None
+
+
+def _quota_store() -> _quota.QuotaStore:
+    global _quota_store_singleton
+    if _quota_store_singleton is None:
+        _quota_store_singleton = _quota.QuotaStore(
+            os.path.join(_config.DATABASE_DIR, "quota.sql")
+        )
+    return _quota_store_singleton
 
 
 def _log_path() -> str:
@@ -3589,6 +3604,36 @@ _FRAGMENT_SECURITY = """
   {% endif %}"""
 
 
+# Billing placeholder. The drop-in point for a future Stripe integration: a
+# webhook will set api_access + tier together (see docs/access-control.md and
+# docs/usage-limits.md). Until then this tab documents the current state — tiers
+# are assigned by an admin on the Accounts tab; access mode and tier caps are
+# read from the environment.
+_FRAGMENT_BILLING = """
+  <h2>Billing</h2>
+  <p class="empty" style="text-align:left;max-width:60ch">
+    Billing is not wired up yet. Usage limits and tiers run independently of
+    payment: the access mode is <code>{{ access_mode }}</code>, and the per-day
+    cost allowance per tier is:
+  </p>
+  <table>
+    <thead><tr><th>Tier</th><th>Daily allowance</th><th>Max banked ({{ bank_days }} days)</th></tr></thead>
+    <tbody>
+      {% for t, cap in tiers.items() %}
+      <tr><td>{{ t }}</td><td>${{ '%.2f'|format(cap) }}/day</td><td>${{ '%.2f'|format(cap * bank_days) }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p class="note" style="max-width:60ch">
+    To connect Stripe later: have the subscription webhook call
+    <code>set_tier</code> + <code>set_api_access</code> on a user, and run the
+    app with <code>AIME_ACCESS_MODE=billing</code>. No metering or enforcement
+    code changes — tiers and the usage budget already work today. Assign tiers
+    manually from the <strong>Accounts</strong> tab in the meantime.
+  </p>
+"""
+
+
 # Accounts admin. A web equivalent of scripts/access_keys.py (grant/revoke,
 # revoke-all) + scripts/manage_users.py (delete/restore/purge). Every form
 # carries the session CSRF token.
@@ -3603,6 +3648,8 @@ _FRAGMENT_ACCOUNTS = """
         <th title="Internal account id.">ID</th>
         <th title="Account username.">Username</th>
         <th title="The api_access flag: whether this user may send messages through the paid model backend.">Send access</th>
+        <th title="Usage-limit plan. Sets the daily cost allowance; change it to move the user between tiers.">Tier</th>
+        <th title="Remaining daily allowance (a banked token bucket). Shown as days banked, or % of one day's allowance when below a day.">Usage</th>
         <th title="Grant/revoke send access, or soft-delete the account.">Actions</th>
       </tr>
     </thead>
@@ -3612,6 +3659,21 @@ _FRAGMENT_ACCOUNTS = """
         <td>#{{ u.id }}</td>
         <td>{{ u.username }}</td>
         <td class="{{ 'good' if u.api_access else 'bad' }}">{{ 'yes' if u.api_access else 'no' }}</td>
+        <td>
+          <form method="post" action="accounts/set-tier" class="inline-action">
+            <input type="hidden" name="csrf" value="{{ csrf }}">
+            <input type="hidden" name="username" value="{{ u.username }}">
+            <select name="tier" onchange="this.form.submit()">
+              {% for t in tiers %}
+              <option value="{{ t }}" {{ 'selected' if u.tier == t else '' }}>{{ t }}</option>
+              {% endfor %}
+            </select>
+            <noscript><button type="submit">Set</button></noscript>
+          </form>
+        </td>
+        <td class="{{ 'bad' if usage[u.username].over else '' }}" title="Daily cap ${{ '%.2f'|format(usage[u.username].daily_cap) }}; balance ${{ '%.2f'|format(usage[u.username].balance) }}">
+          {% if usage[u.username].over %}out{% elif usage[u.username].days_banked >= 1 %}{{ '%.1f'|format(usage[u.username].days_banked) }}d{% else %}{{ usage[u.username].pct_of_day|round|int }}%{% endif %}
+        </td>
         <td class="actions">
           <form method="post" action="accounts/access">
             <input type="hidden" name="csrf" value="{{ csrf }}">
@@ -4056,6 +4118,8 @@ _PAGE = """<!doctype html>
       title="List, grant/revoke, soft-delete, restore and purge accounts.">Accounts</a>
     <a href="/?{{ qs_keys }}" class="{{ 'active' if tab == 'keys' else '' }}"
       title="Mint and revoke invite keys.">Keys</a>
+    <a href="/?{{ qs_billing }}" class="{{ 'active' if tab == 'billing' else '' }}"
+      title="Subscription billing — placeholder for the future Stripe integration.">Billing</a>
     <a href="/?{{ qs_system }}" class="{{ 'active' if tab == 'system' else '' }}"
       title="Operator health — account/key counts, storage per user, log size.">System</a>
     <a href="/?{{ qs_security }}" class="{{ 'active' if tab == 'security' else '' }}"
@@ -4807,8 +4871,21 @@ def _accounts_context() -> dict:
     soft-deleted ones annotated with their purge countdown."""
     backend = _auth_backend()
     pending = _accounts.list_pending(backend, grace_days=_GRACE_DAYS)
+    active = backend.list_users()
+    # Per-user usage-budget snapshot (read-only; never writes the store) so the
+    # admin sees each account's remaining daily allowance alongside its tier.
+    store = _quota_store()
+    usage = {}
+    for u in active:
+        cap = _config.tier_daily_cap(u.tier)
+        ceiling = cap * _config.USAGE_BANK_DAYS
+        usage[u.username] = _quota.make_status(
+            store.read(u.username, cap, ceiling), cap, ceiling
+        )
     return dict(
-        active_users=backend.list_users(),
+        active_users=active,
+        usage=usage,
+        tiers=list(_config.USAGE_TIERS.keys()),
         pending=pending,
         expired_count=sum(1 for p in pending if p.expired),
         grace_days=_GRACE_DAYS,
@@ -4818,6 +4895,16 @@ def _accounts_context() -> dict:
 def _keys_context() -> dict:
     """Template context for the Keys tab."""
     return dict(keys=_auth_backend().list_access_keys())
+
+
+def _billing_context() -> dict:
+    """Template context for the Billing placeholder tab — the current access
+    mode plus the per-tier daily allowances read from config."""
+    return dict(
+        access_mode=os.environ.get("AIME_ACCESS_MODE", "keys").strip().lower(),
+        tiers=_config.USAGE_TIERS,
+        bank_days=_config.USAGE_BANK_DAYS,
+    )
 
 
 def _system_context() -> dict:
@@ -5086,7 +5173,7 @@ def _tab(args) -> str:
     t = args.get("tab")
     return t if t in ("overview", "cache", "activity", "tools", "agents",
                       "trends", "users", "conversations", "routing", "accounts",
-                      "keys", "system", "security") else "users"
+                      "keys", "billing", "system", "security") else "users"
 
 
 def _render_fragment(ctx, tab) -> str:
@@ -5101,6 +5188,7 @@ def _render_fragment(ctx, tab) -> str:
         "routing": _FRAGMENT_ROUTING,
         "accounts": _FRAGMENT_ACCOUNTS,
         "keys": _FRAGMENT_KEYS,
+        "billing": _FRAGMENT_BILLING,
         "system": _FRAGMENT_SYSTEM,
         "security": _FRAGMENT_SECURITY,
         "overview": _FRAGMENT_OVERVIEW,
@@ -5168,6 +5256,10 @@ def index():
         ctx["flash_keys"] = flash_keys
         auto = 0
         page_ctx = empty_page_ctx
+    elif tab == "billing":
+        ctx = _billing_context()
+        auto = 0
+        page_ctx = empty_page_ctx
     elif tab == "system":
         ctx = _system_context()
         auto = 0
@@ -5217,7 +5309,7 @@ def index():
     qs = {t: urlencode({**keep, "tab": t})
           for t in ("overview", "cache", "activity", "tools", "agents", "trends",
                     "users", "conversations", "routing", "accounts", "keys",
-                    "system", "security")}
+                    "billing", "system", "security")}
 
     return render_template_string(
         _PAGE, fragment=fragment, tab=tab, auto=auto,
@@ -5229,7 +5321,7 @@ def index():
         qs_trends=qs["trends"], qs_users=qs["users"],
         qs_conversations=qs["conversations"],
         qs_routing=qs["routing"],
-        qs_accounts=qs["accounts"], qs_keys=qs["keys"],
+        qs_accounts=qs["accounts"], qs_keys=qs["keys"], qs_billing=qs["billing"],
         qs_system=qs["system"], qs_security=qs["security"], **page_ctx,
     )
 
@@ -5280,7 +5372,7 @@ def user_drilldown(username):
     qs = {t: urlencode({**keep_tz, "tab": t})
           for t in ("overview", "cache", "activity", "tools", "agents", "trends",
                     "users", "conversations", "routing", "accounts", "keys",
-                    "system", "security")}
+                    "billing", "system", "security")}
     return render_template_string(
         _PAGE, fragment=fragment, tab="user", auto=0,
         auto_label="second",
@@ -5291,7 +5383,7 @@ def user_drilldown(username):
         qs_trends=qs["trends"], qs_users=qs["users"],
         qs_conversations=qs["conversations"],
         qs_routing=qs["routing"],
-        qs_accounts=qs["accounts"], qs_keys=qs["keys"],
+        qs_accounts=qs["accounts"], qs_keys=qs["keys"], qs_billing=qs["billing"],
         qs_system=qs["system"], qs_security=qs["security"], **empty_page_ctx,
     )
 
@@ -5358,7 +5450,7 @@ def session_drilldown(session_id):
     qs = {t: urlencode({**keep_tz, "tab": t})
           for t in ("overview", "cache", "activity", "tools", "agents", "trends",
                     "users", "conversations", "routing", "accounts", "keys",
-                    "system", "security")}
+                    "billing", "system", "security")}
     return render_template_string(
         _PAGE, fragment=fragment, tab="session", auto=0,
         auto_label="second",
@@ -5369,7 +5461,7 @@ def session_drilldown(session_id):
         qs_trends=qs["trends"], qs_users=qs["users"],
         qs_conversations=qs["conversations"],
         qs_routing=qs["routing"],
-        qs_accounts=qs["accounts"], qs_keys=qs["keys"],
+        qs_accounts=qs["accounts"], qs_keys=qs["keys"], qs_billing=qs["billing"],
         qs_system=qs["system"], qs_security=qs["security"], **empty_page_ctx,
     )
 
@@ -5387,6 +5479,21 @@ def account_access():
     if _auth_backend().set_api_access_by_username(username, grant):
         verb = "Granted" if grant else "Revoked"
         _flash("ok", f"{verb} send access for {username!r}.")
+    else:
+        _flash("bad", f"No such user: {username!r}.")
+    return redirect(url_for("index", tab="accounts"))
+
+
+@app.route("/accounts/set-tier", methods=["POST"])
+@admin_post
+def account_set_tier():
+    username = (request.form.get("username") or "").strip()
+    tier = (request.form.get("tier") or "").strip().lower()
+    if tier not in _config.USAGE_TIERS:
+        _flash("bad", f"Unknown tier: {tier!r}.")
+    elif _auth_backend().set_tier_by_username(username, tier):
+        _flash("ok", f"Set {username!r} to the {tier!r} tier "
+                     f"(${_config.USAGE_TIERS[tier]:.2f}/day).")
     else:
         _flash("bad", f"No such user: {username!r}.")
     return redirect(url_for("index", tab="accounts"))

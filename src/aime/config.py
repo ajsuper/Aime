@@ -138,6 +138,67 @@ CREATE_GRAPHICS_SCHEMA = "../resources/tools/api_create_graphics_schema.json"
 GET_GRAPHIC_SCHEMA = "../resources/tools/api_get_graphic_schema.json"
 
 
+# --- Usage limits / tiers (see aime.quota, docs/usage-limits.md) -------------
+# Per-user daily cost allowance, in USD, keyed by tier. A user's balance is a
+# token bucket: it refills at the tier's daily rate and banks up to
+# USAGE_BANK_DAYS days' worth, so a quiet day's allowance carries forward to a
+# busy one (and a fully-rested user starts with a multi-day buffer). The cost of
+# every API call is debited from the balance (see aime.pricing). Enforcement is
+# *armed by AIME_ACCESS_MODE*, not a separate flag — disarmed in "open" mode,
+# armed in "keys"/"billing" (mirrors the /send api_access gate). The terminal
+# action at an empty balance is deliberately deferred: today the system only
+# notifies; see aime.quota.enforcement_decision for the single seam to change.
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+# Daily USD allowance per tier. Defaults are set with headroom above each tier's
+# observed average daily cost so a normal day never trips the cap. Overridable
+# per tier so prices/plans can move without a code change.
+USAGE_TIERS = {
+    "light": _env_float("AIME_TIER_LIGHT", 0.75),
+    "power": _env_float("AIME_TIER_POWER", 1.50),
+}
+
+# How many days' allowance a balance may bank up to (the token-bucket ceiling).
+# 7 => a light user can hold $5.25, a power user $10.50.
+USAGE_BANK_DAYS = _env_int("AIME_USAGE_BANK_DAYS", 7)
+
+# Warn the user when their balance drops below this fraction of a single day's
+# allowance (the "running low" notice). Purely a notification threshold today.
+USAGE_NOTIFY_LOW_FRACTION = _env_float("AIME_USAGE_NOTIFY_LOW_FRACTION", 0.25)
+
+# Tier stamped on a new account at signup. Admins (and, later, the billing
+# system) move users between tiers; this is just the starting point.
+USAGE_DEFAULT_TIER = os.environ.get("AIME_USAGE_DEFAULT_TIER", "light")
+
+
+def tier_daily_cap(tier: str | None) -> float:
+    """Daily USD allowance for a tier name, falling back to the default tier's
+    cap for an unknown/None tier (so a malformed value never zeroes a user out)."""
+    if tier and tier in USAGE_TIERS:
+        return USAGE_TIERS[tier]
+    return USAGE_TIERS.get(USAGE_DEFAULT_TIER, next(iter(USAGE_TIERS.values())))
+
+
 def load_system_prompt(path: str = SYSTEM_PROMPT_PATH) -> str:
     with open(path) as f:
         return f.read()

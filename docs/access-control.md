@@ -58,8 +58,21 @@ an `open` period is permanently grandfathered. The *only* row that can hold
   people, and it is the default so a misconfigured deployment fails closed.
 - **`open`** — `/send` is not gated; new accounts are stamped `api_access=1`.
   This is local / personal / fully-trusted use, and must be chosen explicitly.
-- **`billing`** (future) — a billing system will own `api_access`. The
-  invite-key path simply goes dormant; `api_access` is unchanged.
+- **`billing`** — behaves like `keys` for the send gate (the future billing
+  system will own `api_access`; the invite-key path goes dormant) and, like
+  `keys`, **arms usage limits** (see [usage-limits.md](usage-limits.md)), where a
+  user's *tier* is their subscription plan. The Stripe integration itself is
+  deferred — a webhook will set `api_access` + `tier` together; until then tiers
+  are assigned by an admin.
+
+## Usage limits
+
+Independently of the send gate, `keys` and `billing` modes **arm per-user usage
+limits**: a banked daily cost allowance (token bucket) per tier, metered against
+real Anthropic cost. `open` mode disarms them (trusted local use). This is the
+budget that protects your spend; it is fully documented in
+[usage-limits.md](usage-limits.md). The two layers are orthogonal — `api_access`
+is *whether* a user may send; the usage budget is *how much* they may spend.
 
 ## Invite keys
 
@@ -80,6 +93,7 @@ Managed with `scripts/access_keys.py`:
 | `list`                             | List users (with their flag) and all keys.           |
 | `grant <username>`                 | Directly set `api_access=1` — admin override.        |
 | `revoke <username>`                | Directly set `api_access=0` — the over-limit switch. |
+| `tier <username> <light\|power>`   | Set the user's usage-limit tier (daily cost allowance). |
 | `revoke-key <key>`                 | Kill an unredeemed key.                              |
 | `revoke-all`                       | Zero `api_access` for everyone — billing cutover.    |
 
@@ -200,9 +214,11 @@ without shell access. It is enabled with `AIME_USAGE_DASHBOARD=1` and served on
 port 5050. Four tabs:
 
 - **Overview** / **Cache Efficacy** — usage statistics from `usage.jsonl`.
-- **Accounts** — list / grant / revoke send access, soft-delete, restore, and
-  purge expired accounts.
+- **Accounts** — list / grant / revoke send access, set each user's usage **tier**
+  (with a live **Usage** column), soft-delete, restore, and purge expired accounts.
 - **Keys** — mint and revoke invite keys.
+- **Billing** — placeholder documenting the tiers and the Stripe drop-in point
+  (see [usage-limits.md](usage-limits.md)).
 
 It wraps the **same** `auth.py` / `accounts.py` functions the CLIs use — no
 access logic is duplicated in the frontend.

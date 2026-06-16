@@ -2842,9 +2842,9 @@
           </div>
           <div class="settings-section" id="account-access-section">
             <h3>Account usage</h3>
-            <div class="settings-row">
-              <span class="label">Used this period</span>
-              <span class="value" id="account-usage-pct">0%</span>
+            <div class="settings-row" id="account-usage-row" style="display:none">
+              <span class="label">Aime remaining</span>
+              <span class="value" id="account-usage-pct">—</span>
             </div>
             <p class="desc" id="account-access-desc" style="display:none">—</p>
             <div class="settings-row" id="account-redeem-row" style="display:none">
@@ -4543,6 +4543,19 @@ es.onmessage = (ev) => {
       if (verbosity === "verbose") {
         appendNotice("· turn → " + (e.text || "sonnet"), "info");
       }
+      break;
+    case "usage_notice":
+      // The usage budget crossed a threshold this turn (running low / spent).
+      // Calm, non-blocking nudge — the turn already completed. Refresh the
+      // account meter so the modal reflects the new balance.
+      if (e.text === "over") {
+        appendNotice("You've used up today's Aime — it refills a little every "
+          + "hour, so check back soon.", "warning");
+      } else {
+        appendNotice("You're running low on today's Aime. It keeps refilling "
+          + "as the day goes on.", "info");
+      }
+      refreshMe();
       break;
     case "tool_call":
       // First activity of the turn may be a tool call rather than text; the
@@ -8838,6 +8851,33 @@ function applyAccessState() {
   redeemRow.style.display = "";
 }
 
+// Render the daily-allowance meter in the Account modal from /me's `usage`.
+// The user never sees dollars: a banked balance shows as "≈ N days of Aime
+// banked"; below a day it reads as a percentage of today's allowance. Hidden
+// entirely when usage limits are disarmed (open mode). See aime.quota.
+const usageRow = document.getElementById("account-usage-row");
+const usagePctEl = document.getElementById("account-usage-pct");
+function applyUsageMeter(armed, usage) {
+  if (!usageRow || !usagePctEl) return;
+  if (!armed || !usage) {
+    usageRow.style.display = "none";
+    return;
+  }
+  usageRow.style.display = "";
+  let text, color = "var(--text)";
+  if (usage.over) {
+    text = "Out for now — refills hourly";
+    color = "var(--error)";
+  } else if (usage.days_banked >= 1) {
+    text = "≈ " + usage.days_banked.toFixed(1) + " days banked";
+  } else {
+    text = Math.round(usage.pct_of_day) + "% of today left";
+    if (usage.decision === "notify_low") color = "var(--error)";
+  }
+  usagePctEl.textContent = text;
+  usagePctEl.style.color = color;
+}
+
 async function refreshMe() {
   try {
     const r = await fetch("/me", {credentials: "same-origin"});
@@ -8849,6 +8889,7 @@ async function refreshMe() {
     if (contactInput) contactInput.value = data.messaging_contact || "";
     __accessMode = data.access_mode || "open";
     __apiAccess = !!data.api_access;
+    applyUsageMeter(data.usage_limits_armed, data.usage);
     // Used by the edit-lock UI to tell "me" from "someone else" and to build
     // the canonical owner:topic key for my own shared topics.
     window.__userId = data.id;

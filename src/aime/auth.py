@@ -122,6 +122,11 @@ class UserRecord:
     # future UI can greet the user by name.
     first_name: str | None = None
     last_name: str | None = None
+    # Usage-limit plan: which daily cost allowance applies to this account (see
+    # aime.quota, config.USAGE_TIERS). Only consulted when usage limits are
+    # armed (AIME_ACCESS_MODE in keys/billing). Defaults to the base tier; an
+    # admin (and, later, the billing system) moves users between tiers.
+    tier: str = "light"
 
     @property
     def display_name(self) -> str:
@@ -215,6 +220,7 @@ class AuthBackend(Protocol):
     def create(
         self, username: str, password: str, api_access: bool = True,
         *, first_name: str | None = None, last_name: str | None = None,
+        tier: str = "light",
     ) -> tuple[UserRecord, bytes]: ...
     # Update the display-only first/last name on an existing account. The
     # username is never touched here — it's the immutable identity.
@@ -248,6 +254,8 @@ class AuthBackend(Protocol):
     # A future admin dashboard would call exactly these, behind an admin-only
     # route guard (see docs/access-control.md, "Future: admin dashboard").
     def set_api_access(self, user_id: int, allowed: bool) -> bool: ...
+    # Usage-limit tier (see aime.quota). Admin override today; billing hook later.
+    def set_tier(self, user_id: int, tier: str) -> bool: ...
     def redeem_key(self, user_id: int, key: str) -> bool: ...
     def generate_access_key(self, note: str = "") -> str: ...
     def list_access_keys(self) -> list[AccessKeyRecord]: ...
@@ -504,6 +512,20 @@ class LocalAuthBackend:
                     )
             # END display-name MIGRATION
 
+            # tier MIGRATION — usage-limit plan (see aime.quota,
+            # docs/usage-limits.md). Determines the user's daily cost allowance.
+            # DEFAULT 'light' grandfathers every existing account onto the base
+            # tier; new accounts set it explicitly in create() from
+            # config.USAGE_DEFAULT_TIER. Tiers only bite when usage limits are
+            # armed (AIME_ACCESS_MODE in keys/billing); in "open" mode the column
+            # is inert. Dropping the feature is just dropping this column + its
+            # setters.
+            if "tier" not in existing_cols:
+                self._conn.execute(
+                    "ALTER TABLE users ADD COLUMN tier TEXT NOT NULL DEFAULT 'light'"
+                )
+            # END tier MIGRATION
+
             # Pending email-verification rows. Used for three flows:
             #   purpose='signup'    — username/password are being held until
             #                         the 6-digit code mailed to `email` is
@@ -563,17 +585,22 @@ class LocalAuthBackend:
     def create(
         self, username: str, password: str, api_access: bool = True,
         *, first_name: str | None = None, last_name: str | None = None,
+        tier: str = "light",
     ) -> tuple[UserRecord, bytes]:
         """Create a new account. `api_access` is the value stamped into the
         new row: callers pass True for AIME_ACCESS_MODE=open and False for
         =keys (see web_app.py). It is plain persistent state from here on.
 
         `first_name`/`last_name` are optional display-only fields (see
-        UserRecord); they're normalized to NULL when blank."""
+        UserRecord); they're normalized to NULL when blank.
+
+        `tier` is the usage-limit plan stamped on the new row (see
+        config.USAGE_DEFAULT_TIER); it only bites when usage limits are armed."""
         self._validate_username(username)
         self._validate_password(password, username=username)
         first_name = self._validate_name(first_name)
         last_name = self._validate_name(last_name)
+        tier = self._validate_tier(tier)
         pw_hash = self._hasher.hash(password)
 
         # Generate this user's per-account data key and wrap it under a KEK
@@ -591,10 +618,10 @@ class LocalAuthBackend:
                 cur = self._conn.execute(
                     "INSERT INTO users "
                     "(username, password_hash, salt_dek, wrapped_dek_v2, "
-                    "enc_version, api_access, first_name, last_name) "
-                    f"VALUES (?, ?, ?, ?, {_ENC_VERSION_CURRENT}, ?, ?, ?)",
+                    "enc_version, api_access, first_name, last_name, tier) "
+                    f"VALUES (?, ?, ?, ?, {_ENC_VERSION_CURRENT}, ?, ?, ?, ?)",
                     (username, pw_hash, salt_dek, wrapped,
-                     1 if api_access else 0, first_name, last_name),
+                     1 if api_access else 0, first_name, last_name, tier),
                 )
                 self._conn.commit()
             except sqlite3.IntegrityError as e:
@@ -602,7 +629,7 @@ class LocalAuthBackend:
             return (
                 UserRecord(
                     id=cur.lastrowid, username=username, api_access=api_access,
-                    first_name=first_name, last_name=last_name,
+                    first_name=first_name, last_name=last_name, tier=tier,
                 ),
                 dek,
             )
@@ -770,7 +797,7 @@ class LocalAuthBackend:
         with self._lock:
             row = self._conn.execute(
                 "SELECT id, username, api_access, email, messaging_contact, "
-                "first_name, last_name, tz, date_format, time_format "
+                "first_name, last_name, tz, date_format, time_format, tier "
                 "FROM users WHERE id = ? AND deleted_at IS NULL",
                 (user_id,),
             ).fetchone()
@@ -780,7 +807,7 @@ class LocalAuthBackend:
             id=row[0], username=row[1],
             api_access=bool(row[2]), email=row[3], messaging_contact=row[4],
             first_name=row[5], last_name=row[6], tz=row[7],
-            date_format=row[8], time_format=row[9],
+            date_format=row[8], time_format=row[9], tier=row[10] or "light",
         )
 
     def lookup_by_username(self, username: str) -> UserRecord | None:
@@ -793,7 +820,7 @@ class LocalAuthBackend:
         with self._lock:
             row = self._conn.execute(
                 "SELECT id, username, api_access, email, messaging_contact, "
-                "first_name, last_name, tz, date_format, time_format "
+                "first_name, last_name, tz, date_format, time_format, tier "
                 "FROM users WHERE username = ? AND deleted_at IS NULL",
                 (username,),
             ).fetchone()
@@ -803,7 +830,7 @@ class LocalAuthBackend:
             id=row[0], username=row[1],
             api_access=bool(row[2]), email=row[3], messaging_contact=row[4],
             first_name=row[5], last_name=row[6], tz=row[7],
-            date_format=row[8], time_format=row[9],
+            date_format=row[8], time_format=row[9], tier=row[10] or "light",
         )
 
     def set_messaging_contact(self, user_id: int, contact: str | None) -> bool:
@@ -995,6 +1022,41 @@ class LocalAuthBackend:
             self._conn.commit()
         return cur.rowcount > 0
 
+    @staticmethod
+    def _validate_tier(tier: str | None) -> str:
+        """Normalize a tier name against the configured tiers. An unknown or
+        blank value falls back to the default tier rather than raising — a
+        malformed tier must never wedge account creation or an admin update."""
+        from . import config
+        name = (tier or "").strip().lower()
+        if name in config.USAGE_TIERS:
+            return name
+        return config.USAGE_DEFAULT_TIER
+
+    def set_tier(self, user_id: int, tier: str) -> bool:
+        """Set a user's usage-limit tier (see aime.quota). Admin override today;
+        the billing system's hook later. Unknown tiers normalize to the default.
+        Returns False if no such user."""
+        tier = self._validate_tier(tier)
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE users SET tier = ? WHERE id = ?",
+                (tier, user_id),
+            )
+            self._conn.commit()
+        return cur.rowcount > 0
+
+    def set_tier_by_username(self, username: str, tier: str) -> bool:
+        """Username-keyed variant for admin tooling (CLI / dashboard)."""
+        tier = self._validate_tier(tier)
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE users SET tier = ? WHERE username = ? AND deleted_at IS NULL",
+                (tier, username),
+            )
+            self._conn.commit()
+        return cur.rowcount > 0
+
     def revoke_all_access(self) -> int:
         """Set api_access = 0 for every user. Intended for the billing
         cutover (zero the slate, then let billing re-grant on payment).
@@ -1091,15 +1153,16 @@ class LocalAuthBackend:
         ]
 
     def list_users(self) -> list[UserRecord]:
-        """Every active account with its current api_access. Soft-deleted
+        """Every active account with its current api_access and tier. Soft-deleted
         accounts are excluded — see list_deleted_users(). For admin listings."""
         with self._lock:
             rows = self._conn.execute(
-                "SELECT id, username, api_access FROM users "
+                "SELECT id, username, api_access, tier FROM users "
                 "WHERE deleted_at IS NULL ORDER BY id"
             ).fetchall()
         return [
-            UserRecord(id=r[0], username=r[1], api_access=bool(r[2]))
+            UserRecord(id=r[0], username=r[1], api_access=bool(r[2]),
+                       tier=r[3] or "light")
             for r in rows
         ]
 

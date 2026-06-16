@@ -1,0 +1,112 @@
+# Usage limits
+
+How Aime caps each user's cost. This is the always-on budget that protects the
+Anthropic spend — distinct from the opt-in usage *log* (`aime.usage`, for
+reporting). It covers the token-bucket model, the two tiers, what is enforced
+today (and what is deliberately deferred), how it's armed, and the admin
+controls.
+
+## The model: a banked daily allowance (token bucket)
+
+Each user has a **balance** in USD and a tier-defined **daily allowance**. The
+balance is a token bucket:
+
+- It **refills continuously** at the tier's daily rate — there is no midnight
+  reset cliff, capacity just trickles back at `allowance/day`.
+- It **banks up to `USAGE_BANK_DAYS` (default 7) days'** worth. A quiet day's
+  unused allowance carries forward to a busy one, up to that ceiling.
+- Every API call's **real cost** is debited (priced by `aime.pricing`, the same
+  model the usage report and dashboard use). Title/compaction/router/web-search
+  calls all count — they are real spend.
+- A fresh user starts **full** (at the ceiling).
+
+This fixes the weakness of a hard daily cap: it neither wastes your quiet days
+nor clips your busy ones, while still **guaranteeing a daily refill** (so you can
+always use Aime each day) and bounding exposure (the ceiling stops anyone
+hoarding a month and dumping it at once).
+
+The user never sees dollars. The account meter shows the balance as a percentage
+of *one day's* allowance (100% = a full day; reads higher when banked) and a
+plain "≈ N days banked".
+
+## Tiers
+
+Two tiers, each a daily USD allowance (configurable):
+
+| Tier  | Daily allowance | Max banked (7 days) |
+|-------|-----------------|---------------------|
+| light | `$0.75` (`AIME_TIER_LIGHT`) | `$5.25` |
+| power | `$1.50` (`AIME_TIER_POWER`) | `$10.50` |
+
+Defaults sit ~1.4–1.5× above each tier's observed average daily cost, so a
+normal day never trips the cap; only blow-out days draw the bank down. A new
+account is stamped `AIME_USAGE_DEFAULT_TIER` (`light`). An admin moves users
+between tiers; later, the billing system will.
+
+## What is enforced — and what is deferred
+
+Today the budget is **metered and surfaced, but not blocked.** When a turn's
+debit crosses a threshold the user gets a calm, transient banner:
+
+- **running low** — balance below `AIME_USAGE_NOTIFY_LOW_FRACTION` (0.25) of a
+  day's allowance.
+- **out** — balance spent (≤ 0).
+
+No turn is refused. The terminal **action** at an empty balance (hard block?
+force cheap Haiku? nothing?) is intentionally left open. It lives behind a single
+seam, `aime.quota.enforcement_decision`, which classifies a balance as `ALLOW` /
+`NOTIFY_LOW` / `OVER`. To turn `OVER` into a hard stop, flip the clearly-marked
+"future hard-block seam" in `web_app.py`'s `/send` (the budget status is already
+in hand there) — no metering changes needed.
+
+## Arming: driven by `AIME_ACCESS_MODE`
+
+Usage limits are **not** a separate flag. They arm exactly like the `/send`
+`api_access` gate (see [access-control.md](access-control.md)):
+
+| Mode      | Usage limits | Notes |
+|-----------|--------------|-------|
+| `open`    | **off**      | Trusted local/personal use — nothing is metered; no meter is attached, `quota.sql` is never written. |
+| `keys`    | **on**       | The free-tester cohort. Tiers are how their cost is bounded. |
+| `billing` | **on**       | A tier *is* the subscription plan. The (deferred) Stripe webhook sets `api_access` + `tier` together. |
+
+## Config (environment)
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `AIME_TIER_LIGHT` | `0.75` | Light daily allowance (USD). |
+| `AIME_TIER_POWER` | `1.50` | Power daily allowance (USD). |
+| `AIME_USAGE_BANK_DAYS` | `7` | Days of allowance the balance may bank (ceiling). |
+| `AIME_USAGE_NOTIFY_LOW_FRACTION` | `0.25` | Fraction of a day below which "running low" fires. |
+| `AIME_USAGE_DEFAULT_TIER` | `light` | Tier stamped on a new account. |
+
+## Admin controls
+
+- **Web dashboard** (`src/frontends/usage_dashboard.py`, password-gated):
+  - **Accounts** tab — a **Tier** dropdown per user (instant change) and a
+    **Usage** column showing each account's remaining allowance.
+  - **Billing** tab — placeholder documenting the current tiers and the Stripe
+    drop-in point.
+- **CLI** — `scripts/access_keys.py tier <username> <light|power>`, at parity
+  with the dashboard.
+
+## Implementation map
+
+- `src/aime/pricing.py` — the cost model (prices, `api_cost`, `record_from_usage`,
+  `cost_from_usage`). Single source of truth for the report, dashboard, and the
+  live debit. `scripts/usage_report.py` re-exports it.
+- `src/aime/quota.py` — `QuotaStore` (sqlite `quota.sql`), `QuotaMeter` (per-user
+  handle), the token-bucket math, and `enforcement_decision` (the seam).
+- `src/aime/auth.py` — the `tier` column, `UserRecord.tier`, `set_tier` /
+  `set_tier_by_username`.
+- `src/aime/config.py` — tier caps, bank days, thresholds, `tier_daily_cap`.
+- `src/provider_backend.py` — debits in `_record_usage`; emits `usage_notice`.
+- `src/aime/web_search_agent.py` — debits the offloaded search's cost.
+- `src/aime/controller.py` — passes `usage_notice` through to frontends.
+- `src/frontends/web_app.py` — `_usage_limits_armed()`, builds the per-user
+  `QuotaMeter`, signup tier stamp, `/me` usage snapshot, the `/send` hard-block
+  seam.
+- `resources/style/web_chat.html` — the account meter and the `usage_notice`
+  banner.
+- `src/frontends/usage_dashboard.py` — the Accounts tier/usage columns and the
+  Billing tab.

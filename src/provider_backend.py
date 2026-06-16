@@ -163,6 +163,10 @@ EventKind = Literal[
     # label ("haiku" or "sonnet"); the controller surfaces this only when
     # verbose mode is on.
     "turn_routing",
+    # The user's usage budget crossed a notification threshold this turn
+    # (running low, or spent). Carried in `text` as the state ("notify_low" /
+    # "over") with the budget snapshot in `tool_result`. See aime.quota.
+    "usage_notice",
 ]
 
 
@@ -315,6 +319,7 @@ class AnthropicMessagesBackend:
         terminal_tool_schema: "str | dict | None" = None,
         persist_enabled: bool = True,
         usage_source: str = "interactive",
+        quota=None,
     ):
         self._client = Anthropic(max_retries=3)
         self._system_prompt = system_prompt
@@ -340,6 +345,15 @@ class AnthropicMessagesBackend:
         # dashboard separate a user's autonomous-agent cost from their
         # live-chat cost. Non-identifying, so unconditionally recorded.
         self._usage_source = usage_source or "interactive"
+        # Optional per-user usage budget (aime.quota.QuotaMeter). When attached,
+        # every API call's real cost is debited here (in _record_usage) and a
+        # usage_notice is emitted from _run_turn when the budget crosses a
+        # threshold. None when usage limits are disarmed (AIME_ACCESS_MODE=open).
+        self._quota = quota
+        # Last threshold state we notified the user about, so a "running low" /
+        # "over" banner fires on the *transition* rather than on every turn.
+        self._last_usage_decision = None
+        self._usage_notice_pending: dict | None = None
         # Per-user state: where this user's encrypted conversation files live
         # and the data key that decrypts them. Both are required for any IO.
         self._conversations_dir = conversations_dir
@@ -1389,6 +1403,18 @@ class AnthropicMessagesBackend:
             # response. The next turn pays full prefix cost only if compaction
             # hasn't landed yet; once it does, subsequent turns benefit.
             self._spawn_compaction()
+            # If this turn's debit crossed a budget threshold, surface the
+            # notice now (before turn_end) so the UI can show a gentle banner.
+            # Stashed by _record_usage, which can't yield. Notify only — no turn
+            # is blocked (the enforcement action is deferred; see aime.quota).
+            notice = self._usage_notice_pending
+            self._usage_notice_pending = None
+            if notice is not None:
+                yield BackendEvent(
+                    kind="usage_notice",
+                    text=notice["state"],
+                    tool_result=notice["status"],
+                )
             yield BackendEvent(kind="turn_end", stop_reason=stop_reason or "end_turn")
         elif flushed:
             # All tool_results are in and appended as one user message —
@@ -1851,6 +1877,30 @@ class AnthropicMessagesBackend:
             )
         except Exception:
             pass
+        # Debit this call's real cost from the user's budget (independent of the
+        # opt-in usage log above). Fully guarded — a quota failure must never
+        # break a turn, so it fails open (the turn proceeds). Captures every
+        # purpose (turn/title/compaction/route) since they all flow through here.
+        if self._quota is not None:
+            try:
+                from aime import quota as _quota
+                from aime import pricing as _pricing
+                cost = _pricing.cost_from_usage(model, usage)
+                decision = self._quota.debit(cost)
+                # Surface a banner only on a *transition* into a notify state, so
+                # the user isn't nagged every turn. Stashed for _run_turn to emit
+                # (this method can't yield). Background-purpose calls (title/
+                # compaction) still debit but never set a pending UI notice.
+                if (decision in (_quota.Decision.NOTIFY_LOW, _quota.Decision.OVER)
+                        and decision != self._last_usage_decision
+                        and purpose == "turn"):
+                    self._usage_notice_pending = {
+                        "state": decision.value,
+                        "status": self._quota.status(),
+                    }
+                self._last_usage_decision = decision
+            except Exception:
+                pass
 
 
 class SessionsBackend:

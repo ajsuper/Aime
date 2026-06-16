@@ -67,6 +67,7 @@ class WebSearchAgent:
         tool_version: str,
         usage_label: str | None = None,
         record_api: Callable | None = None,
+        quota_debit: Callable | None = None,
         usage_source: str = "interactive",
         # A single request may now bundle many items (the caller is told to
         # batch — "tuition for 10 colleges" in one call), so the search budget
@@ -90,6 +91,10 @@ class WebSearchAgent:
         # Injected so this module doesn't import aime.usage directly (keeps it
         # testable and avoids an import cycle), mirroring ModelRouter.
         self._record_api = record_api
+        # Injected budget-debit callback (cost_usd -> None). The offloaded Haiku
+        # search is real spend attributed to the same user, so it draws down the
+        # same bucket as the conversational turn. None when limits are disarmed.
+        self._quota_debit = quota_debit
         self._max_loops = max_loops
         self._max_tokens = max_tokens
         self._client = Anthropic(max_retries=2)
@@ -202,21 +207,29 @@ class WebSearchAgent:
         return "".join(text_chunks)
 
     def _record(self, resp, session_id: str | None, started: datetime.datetime) -> None:
-        if self._record_api is None:
-            return
-        try:
-            self._record_api(
-                self._usage_label,
-                self._model,
-                getattr(resp, "usage", None),
-                purpose="web_search",
-                session_id=session_id,
-                stop_reason=getattr(resp, "stop_reason", None),
-                duration_ms=(datetime.datetime.now() - started).total_seconds() * 1000.0,
-                # No routed_decision: this is its own purpose, not a routed user
-                # turn, so it stays out of the routing tab's turn/misclass counts.
-                # The web-search savings view re-prices it on its own.
-                source=self._usage_source,
-            )
-        except Exception:
-            pass
+        usage = getattr(resp, "usage", None)
+        if self._record_api is not None:
+            try:
+                self._record_api(
+                    self._usage_label,
+                    self._model,
+                    usage,
+                    purpose="web_search",
+                    session_id=session_id,
+                    stop_reason=getattr(resp, "stop_reason", None),
+                    duration_ms=(datetime.datetime.now() - started).total_seconds() * 1000.0,
+                    # No routed_decision: this is its own purpose, not a routed user
+                    # turn, so it stays out of the routing tab's turn/misclass counts.
+                    # The web-search savings view re-prices it on its own.
+                    source=self._usage_source,
+                )
+            except Exception:
+                pass
+        # Draw this search's real cost (Haiku tokens + flat per-search fee) from
+        # the user's budget. Guarded — a debit failure must never break a search.
+        if self._quota_debit is not None:
+            try:
+                from aime import pricing as _pricing
+                self._quota_debit(_pricing.cost_from_usage(self._model, usage))
+            except Exception:
+                pass
