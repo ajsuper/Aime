@@ -2841,14 +2841,22 @@ def send():
     if not text and not images:
         return jsonify({"ok": False, "error": "empty"}), 400
     ctx = _context_for(g.user_id)
-    # FUTURE hard-block seam: when usage limits are armed and the user's budget
-    # is spent, this is where a turn would be refused (and turned into a calm
-    # "you're out for today" response). The enforcement *action* is deliberately
-    # deferred — today the budget only notifies (see aime.quota and the
-    # usage_notice event), so we never block here. To enable a hard stop, gate on
-    #   _usage_limits_armed() and ctx.quota_meter and
-    #   ctx.quota_meter.status()["over"]
-    # and return a 402/403 the frontend renders gently.
+    # Hard budget stop. When usage limits are armed and the user's daily Aime is
+    # spent, refuse the turn instead of letting it spend more — this is the
+    # enforcement action the metering was built around. The budget refills
+    # continuously (see aime.quota), so access comes back on its own as the
+    # allowance trickles in over the next day; we tell the user it'll be back
+    # tomorrow. We answer 402 (distinct from the api_access gate's 403) so the
+    # frontend locks the composer with a calm, *temporary* "back tomorrow"
+    # message rather than the permanent invite-key prompt.
+    if _usage_limits_armed() and ctx.quota_meter is not None \
+            and ctx.quota_meter.status().get("over"):
+        return jsonify({
+            "ok": False,
+            "error": "usage_exhausted",
+            "message": "You've used up today's Aime. Your access will be back "
+                       "tomorrow.",
+        }), 402
     # The browser sends its IANA timezone (e.g. "America/New_York") with each
     # message so per-turn timestamps the model sees track the user's local
     # time. Refreshed every send — self-corrects if the user travels.

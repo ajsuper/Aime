@@ -4549,8 +4549,11 @@ es.onmessage = (ev) => {
       // Calm, non-blocking nudge — the turn already completed. Refresh the
       // account meter so the modal reflects the new balance.
       if (e.text === "over") {
-        appendNotice("You've used up today's Aime — it refills a little every "
-          + "hour, so check back soon.", "warning");
+        // That turn spent the last of today's budget. Sending is now locked
+        // until the allowance refills — refreshMe() flips __usageOver and
+        // applyAccessState() disables the composer with the matching message.
+        appendNotice("You've used up today's Aime. Your access will be back "
+          + "tomorrow.", "warning");
       } else {
         appendNotice("You're running low on today's Aime. It keeps refilling "
           + "as the day goes on.", "info");
@@ -4833,6 +4836,18 @@ async function sendText(text, images) {
     clearOptimisticUserMessage();
     modelBusy = false;
     appendNotice("failed to send message: " + e, "error");
+    return;
+  }
+  // Budget spent: the daily Aime is used up. Distinct from a permanent access
+  // revocation (403) — the composer locks with a calm "back tomorrow" message
+  // and unlocks on its own once the allowance refills. refreshMe() pulls the
+  // over-budget state so the lock also survives a page reload.
+  if (r.status === 402) {
+    clearOptimisticUserMessage();
+    modelBusy = false;
+    appendNotice("You've used up today's Aime. Your access will be back "
+      + "tomorrow.", "warning");
+    refreshMe();
     return;
   }
   // Defense in depth: if access was revoked since the page loaded, the
@@ -8811,6 +8826,10 @@ const nameMsg = document.getElementById("account-name-msg");
 // first /me resolves; the server-side /send gate is the real guard.
 let __accessMode = "open";
 let __apiAccess = true;
+// True when usage limits are armed and the daily budget is spent. Locks the
+// composer like a missing api_access does, but temporarily — it clears on its
+// own once the allowance refills (see aime.quota). Synced from /me's `usage`.
+let __usageOver = false;
 
 const accessSection = document.getElementById("account-access-section");
 const accessDesc = document.getElementById("account-access-desc");
@@ -8826,13 +8845,18 @@ const contactMsg = document.getElementById("account-contact-msg");
 // locked only in "keys" mode for a user without api_access — login and all
 // data browsing stay available regardless.
 function applyAccessState() {
-  const locked = (__accessMode === "keys" && !__apiAccess);
+  const keyLocked = (__accessMode === "keys" && !__apiAccess);
+  // Two reasons the composer can be locked: no invite key (permanent, needs a
+  // key) or the daily budget is spent (temporary, lifts as it refills). They
+  // get different placeholders so the user knows which one applies.
+  const locked = keyLocked || __usageOver;
   const input = document.getElementById("i");
   const sendBtn = document.querySelector(".send-btn");
   if (input) {
     input.disabled = locked;
-    if (locked) input.placeholder = "Add invite key in Account settings, or ask admin to unlock access";
-    else if (input.placeholder.startsWith("Add invite key")) input.placeholder = "Message Aime…";
+    if (keyLocked) input.placeholder = "Add invite key in Account settings, or ask admin to unlock access";
+    else if (__usageOver) input.placeholder = "You've used up today's Aime — your access will be back tomorrow";
+    else if (input.placeholder.startsWith("Add invite key") || input.placeholder.startsWith("You've used up")) input.placeholder = "Message Aime…";
   }
   if (sendBtn) sendBtn.disabled = locked;
 
@@ -8866,7 +8890,7 @@ function applyUsageMeter(armed, usage) {
   usageRow.style.display = "";
   let text, color = "var(--text)";
   if (usage.over) {
-    text = "0% — refills hourly";
+    text = "0% — back tomorrow";
     color = "var(--error)";
   } else {
     // Lead with the battery-style fullness %, with the banked days as context.
@@ -8891,6 +8915,7 @@ async function refreshMe() {
     if (contactInput) contactInput.value = data.messaging_contact || "";
     __accessMode = data.access_mode || "open";
     __apiAccess = !!data.api_access;
+    __usageOver = !!(data.usage_limits_armed && data.usage && data.usage.over);
     applyUsageMeter(data.usage_limits_armed, data.usage);
     // Used by the edit-lock UI to tell "me" from "someone else" and to build
     // the canonical owner:topic key for my own shared topics.

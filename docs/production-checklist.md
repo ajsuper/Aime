@@ -89,9 +89,11 @@ cost. See [usage-limits.md](usage-limits.md). Before going public:
 - Pick tier caps (`AIME_TIER_LIGHT` / `AIME_TIER_POWER`) and the bank ceiling
   (`AIME_USAGE_BANK_DAYS`) for your budget — the defaults are tuned to the
   current cohort's averages.
-- Decide the **enforcement action** at an empty balance. Today the budget only
-  *notifies*; the hard-block seam in `web_app.py`'s `/send` is left off so a
-  blocked turn never surprises users. Turn it on deliberately.
+- The **enforcement action** at an empty balance is now a hard block: `/send`
+  refuses the turn (HTTP 402) with a calm "you've used up today's Aime — your
+  access will be back tomorrow" message and the composer locks until the budget
+  refills. (Previously notify-only.) The classification seam is
+  `aime.quota.enforcement_decision`; see [usage-limits.md](usage-limits.md).
 - `open` mode disarms limits entirely — never use it internet-facing.
 
 ## 9. Conscious tradeoffs to revisit

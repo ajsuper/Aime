@@ -17,11 +17,12 @@ The model is a **token bucket** (see ``docs/usage-limits.md``):
     balance may go negative — that is "over budget".
   * A fresh user starts **full** (at the ceiling).
 
-What happens when the balance runs out is **deliberately not decided here**: the
-single seam is :func:`enforcement_decision`, which today only distinguishes
-"allow", "running low", and "over". Callers currently *notify* on the latter two
-and block on neither. Turning ``OVER`` into a hard block (or a forced-cheap
-downgrade) later is a change at the call sites, not in this math.
+What happens when the balance runs out is decided by the caller, not here: the
+single seam is :func:`enforcement_decision`, which distinguishes "allow",
+"running low", and "over". On ``NOTIFY_LOW`` callers surface a gentle nudge; on
+``OVER`` the ``/send`` route now **hard-blocks** the turn (answering 402) until
+the balance refills, while completed turns still emit the notice. The
+classification math stays caller-agnostic.
 
 Enforcement is armed by ``AIME_ACCESS_MODE`` (``keys``/``billing``), mirroring
 the ``/send`` ``api_access`` gate; in ``open`` mode no meter is attached and this
@@ -52,7 +53,7 @@ class Decision(enum.Enum):
 
     ALLOW = "allow"          # comfortably within budget
     NOTIFY_LOW = "notify_low"  # under the low-water mark; surface a gentle nudge
-    OVER = "over"            # balance exhausted (<= 0); notify only, for now
+    OVER = "over"            # balance exhausted (<= 0); /send hard-blocks the turn
 
 
 def enforcement_decision(

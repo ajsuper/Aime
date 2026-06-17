@@ -45,21 +45,22 @@ normal day never trips the cap; only blow-out days draw the bank down. A new
 account is stamped `AIME_USAGE_DEFAULT_TIER` (`light`). An admin moves users
 between tiers; later, the billing system will.
 
-## What is enforced — and what is deferred
+## What is enforced
 
-Today the budget is **metered and surfaced, but not blocked.** When a turn's
-debit crosses a threshold the user gets a calm, transient banner:
+When a turn's debit crosses a threshold the user gets a calm, transient banner:
 
 - **running low** — balance below `AIME_USAGE_NOTIFY_LOW_FRACTION` (0.25) of a
-  day's allowance.
-- **out** — balance spent (≤ 0).
+  day's allowance. Notify only; the turn proceeds.
+- **out** — balance spent (≤ 0). Sending is **blocked.**
 
-No turn is refused. The terminal **action** at an empty balance (hard block?
-force cheap Haiku? nothing?) is intentionally left open. It lives behind a single
-seam, `aime.quota.enforcement_decision`, which classifies a balance as `ALLOW` /
-`NOTIFY_LOW` / `OVER`. To turn `OVER` into a hard stop, flip the clearly-marked
-"future hard-block seam" in `web_app.py`'s `/send` (the budget status is already
-in hand there) — no metering changes needed.
+At an empty balance the budget is now a **hard stop**: `/send` refuses the turn
+(HTTP `402`) with a calm "you've used up today's Aime — your access will be back
+tomorrow" message, and the frontend locks the composer. Because the balance
+refills continuously (no midnight reset), access returns on its own as the
+allowance trickles back over the next day — the composer re-enables the moment
+`/me` reports the budget is no longer over. The classification lives behind a
+single seam, `aime.quota.enforcement_decision` (`ALLOW` / `NOTIFY_LOW` /
+`OVER`); the `/send` route blocks on `OVER` and notifies on `NOTIFY_LOW`.
 
 ## Arming: driven by `AIME_ACCESS_MODE`
 
@@ -112,9 +113,9 @@ Usage limits are **not** a separate flag. They arm exactly like the `/send`
 - `src/aime/web_search_agent.py` — debits the offloaded search's cost.
 - `src/aime/controller.py` — passes `usage_notice` through to frontends.
 - `src/frontends/web_app.py` — `_usage_limits_armed()`, builds the per-user
-  `QuotaMeter`, signup tier stamp, `/me` usage snapshot, the `/send` hard-block
-  seam.
-- `resources/style/web_chat.html` — the account meter and the `usage_notice`
-  banner.
+  `QuotaMeter`, signup tier stamp, `/me` usage snapshot, the `/send` hard block
+  (402 when over).
+- `resources/style/web_chat.html` — the account meter, the `usage_notice`
+  banner, and the over-budget composer lock (`__usageOver`, the 402 handler).
 - `src/frontends/usage_dashboard.py` — the Accounts tier/usage columns and the
   Billing tab.
