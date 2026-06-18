@@ -109,6 +109,17 @@ intervention.
 (`AIME_HTTPS=0`), or use `AIME_HTTPS=1` when the app terminates TLS itself
 (which implies secure cookies). They are off only for plain-HTTP dev.
 
+### CSRF
+
+There is no CSRF token. Cross-site request forgery is mitigated by
+`SameSite=Strict` on the session cookie — a request originating from
+another site never carries the cookie, so a forged state-changing POST
+arrives unauthenticated. The state-changing API also speaks JSON via
+`fetch`, which adds a same-origin preflight for any non-simple request.
+This is sufficient for the current threat model, but it is a **single
+layer**: if you ever loosen `SameSite` (e.g. to `Lax` for a cross-site
+embed or OAuth return), add explicit CSRF tokens at the same time.
+
 ---
 
 ## At-rest encryption
@@ -227,6 +238,42 @@ can be deleted once you have decided all installs have upgraded.
 
 ---
 
+## Email verification and account recovery
+
+Gated entirely behind **`DO_EMAIL_VERIFICATION`** (default `0`). When off,
+none of the routes below are reachable — they redirect to `/login`, and
+the system behaves as password-only with no self-service reset. When on,
+it requires working SMTP (see `email_send.py` / `SMTP_*` env in
+[`production-checklist.md`](./production-checklist.md)). All flows share
+one `email_verifications` table and a single short-lived emailed code.
+
+| Flow | Routes | Backend |
+|---|---|---|
+| **Signup verification** | `/signup/verify*` | `start_/complete_signup_verification` — a new account is unusable until its email code is entered. |
+| **Login second factor** | `/login/verify*` | `start_/complete_login_verification` — after a correct password, a one-time code is mailed and the session is withheld until it's entered. |
+| **Add email** | `/add-email*` | `start_/complete_add_email_verification` — stamps an email onto an account that predates verification. |
+| **Forgot password** | `/forgot`, `/forgot/verify*` | `start_/complete_password_reset` — emailed code authorizes a new password. |
+| **Account recovery** | `/account/recover` | `restore` — un-deletes a soft-deleted account on next login; re-stamps `api_access` so a recovered account can't skip the access gate. |
+
+Security properties that matter:
+
+- **Enumeration-safe.** `/signup` and `/forgot` advance to the same next
+  page and send the same response whether or not an account matched, so a
+  prober cannot tell a real address from a miss. (Note this is the
+  *opposite* posture from known-gap #6 below, which is about `/signup`'s
+  "username already taken" message — the email flows are the hardened
+  ones.)
+- **Per-IP throttled.** Reset requests are rate-limited per source IP so
+  the form can't be used to bomb a victim's inbox; over the limit it
+  silently skips sending but still advances, preserving enumeration safety.
+- **Fails closed.** If mail is down during a required login second factor,
+  the login is **refused** (HTTP 502) rather than bypassing the factor.
+- **Trusted device.** A "remember this device" cookie token
+  (`is_trusted_device`) lets a known browser skip the emailed code; it is
+  the only thing that shortcuts the second factor.
+
+---
+
 ## Known gaps and compromises
 
 The following are conscious tradeoffs in the current implementation. They
@@ -280,11 +327,17 @@ no in-memory key cache to evict; the DEK is re-derived on demand. The
 hardening path is to move `machine_secret` off the local disk — see
 "Future hardening" below.
 
-### 5. Login is single-factor
+### 5. Second factor is email-only and opt-in
 
-There is no second factor (TOTP, WebAuthn, etc.). The `AuthBackend`
-protocol in `auth.py` is the intended seam for adding one without
-disturbing the rest of the system.
+When `DO_EMAIL_VERIFICATION=1` (see [Email verification and account
+recovery](#email-verification-and-account-recovery)), login carries an
+**emailed one-time code** as a second factor, with an optional
+"remember this device" trusted-device token that skips the code on a
+known browser. There is no app-based second factor (TOTP, WebAuthn);
+email possession is the only supported factor. When
+`DO_EMAIL_VERIFICATION` is off (the default), login is single-factor
+(password only). The `AuthBackend` protocol in `auth.py` is the seam for
+adding a stronger factor without disturbing the rest of the system.
 
 ### 6. `/signup` discloses whether a username exists
 

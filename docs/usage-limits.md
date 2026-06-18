@@ -62,6 +62,25 @@ allowance trickles back over the next day — the composer re-enables the moment
 single seam, `aime.quota.enforcement_decision` (`ALLOW` / `NOTIFY_LOW` /
 `OVER`); the `/send` route blocks on `OVER` and notifies on `NOTIFY_LOW`.
 
+**The block is one turn behind (by design).** `/send` checks the budget
+*before* the turn runs, but the cost is debited *during* it (each API call, in
+`_record_usage`). So a user with any positive balance — even 1% — passes the
+check and runs one more full turn, which is then debited in full and may push
+the balance well negative. They are only refused on the *next* send. This means
+the budget bounds **steady-state** spend, not the cost of a single turn: a long
+context with many tool calls (or a web-search subagent) can overshoot the
+remaining balance by one expensive turn. That is acceptable for the free-tester
+cohort the limits target; a real per-turn ceiling would require a pre-turn cost
+*estimate* gate, which is deliberately not built. The continuous refill absorbs
+the overshoot — a turn that drives the balance to `−$0.40` simply delays the
+return of access by that much allowance.
+
+The debit itself **fails open**: any error in pricing or the quota store lets
+the turn proceed uncharged (a cost-control bug must never break a turn). Because
+a *persistent* failure would silently disable enforcement for everyone, the
+debit path logs at `warning` (`provider_backend` logger) when it fails — that
+log line is the signal that the ledger is broken.
+
 ## Arming: driven by `AIME_ACCESS_MODE`
 
 Usage limits are **not** a separate flag. They arm exactly like the `/send`

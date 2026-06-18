@@ -4204,6 +4204,19 @@ def _pdf_export_css() -> str:
         "@page { size: A4; margin: 1.3cm; }",
         "body { max-width: none !important; margin: 0 !important; "
         "padding: 0 !important; }",
+        # Keep tables inside the page. `table-layout: fixed` + full width makes
+        # columns share the available width instead of growing to fit content
+        # (which is what pushed wide tables off the right edge); breaking long
+        # words/URLs inside cells stops a single unbreakable token from forcing
+        # an overflow.
+        "table { width: 100%; border-collapse: collapse; table-layout: fixed; }",
+        "th, td { border: 1px solid #d0d0d0; padding: 4px 7px; "
+        "vertical-align: top; text-align: left; "
+        "overflow-wrap: break-word; word-break: break-word; }",
+        # Long code lines and embedded graphics shouldn't overflow either.
+        "pre, code { white-space: pre-wrap; overflow-wrap: break-word; "
+        "word-break: break-word; }",
+        "img { max-width: 100%; height: auto; }",
     ]
     return "<style>\n" + "\n".join(rules) + "\n</style>"
 
@@ -4216,6 +4229,48 @@ def _inject_head_css(html: str, style: str) -> str:
     if idx == -1:
         return style + html
     return html[:idx] + style + html[idx:]
+
+
+# Inline ![alt](data:image/<type>;base64,<data>) images, as posted by the client
+# when it rasterizes [graphic-…] tags for an image-capable export.
+_DATA_URI_IMG_RE = re.compile(
+    r"!\[([^\]]*)\]\(\s*data:image/([a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=\s]+?)\s*\)"
+)
+
+# data: image subtype -> file extension where they differ.
+_IMG_SUBTYPE_EXT = {"jpeg": "jpg", "svg+xml": "svg"}
+
+
+def _materialize_data_uri_images(markdown: str, dest_dir: str) -> str:
+    """Rewrite inline base64 ``data:`` image URIs to real files in `dest_dir`,
+    returning markdown that points at those files by relative name.
+
+    WeasyPrint (our PDF path) renders ``data:`` URIs natively, but pandoc only
+    embeds images it can read from disk — older bundled pandoc builds silently
+    drop ``data:`` URIs, which is why graphics used to survive only in PDF
+    exports. Handing pandoc real files (with ``--resource-path=dest_dir``) makes
+    graphics travel into docx/odt/epub/rtf on any pandoc version. Returns the
+    markdown unchanged when it has no such images."""
+    idx = 0
+
+    def repl(m: "re.Match[str]") -> str:
+        nonlocal idx
+        alt, subtype, b64 = m.group(1), m.group(2).lower(), m.group(3)
+        try:
+            raw = base64.b64decode("".join(b64.split()), validate=False)
+        except Exception:
+            return m.group(0)  # leave a malformed URI untouched
+        ext = _IMG_SUBTYPE_EXT.get(subtype, subtype)
+        name = f"img{idx}.{ext}"
+        idx += 1
+        try:
+            with open(os.path.join(dest_dir, name), "wb") as fh:
+                fh.write(raw)
+        except OSError:
+            return m.group(0)
+        return f"![{alt}]({name})"
+
+    return _DATA_URI_IMG_RE.sub(repl, markdown)
 
 
 @app.route("/topics/<topic_id>/export", methods=["GET", "POST"])
@@ -4283,23 +4338,26 @@ def topic_export(topic_id: str):
                 # Tighten pandoc's wide default margins (the page stays white).
                 html = _inject_head_css(html, _pdf_export_css())
                 data = _WeasyHTML(string=html).write_pdf()
-            elif target in ("docx", "odt", "epub"):
-                with tempfile.NamedTemporaryFile(
-                    suffix=f".{ext}", delete=False
-                ) as tf:
-                    tmp_path = tf.name
-                try:
+            elif target in ("docx", "odt", "epub", "rtf"):
+                # Binary/rich formats that embed images. Render in a temp dir so
+                # pandoc can read the graphics we materialize from the posted
+                # data: URIs (see _materialize_data_uri_images). `--columns=999`
+                # stops pandoc from deciding a wide table is "too wide" and
+                # baking in a fixed layout with narrow fixed column widths —
+                # the cause of cell text wrapping one character per line in
+                # Word. Without it the table autofits to its content.
+                with tempfile.TemporaryDirectory() as work:
+                    doc_md = _materialize_data_uri_images(markdown, work)
+                    tmp_path = os.path.join(work, f"out.{ext}")
                     _pypandoc.convert_text(
-                        markdown, target, format="md", outputfile=tmp_path,
+                        doc_md, target, format="md", outputfile=tmp_path,
+                        extra_args=["--resource-path", work, "--columns=999"],
                     )
                     with open(tmp_path, "rb") as f:
                         data = f.read()
-                finally:
-                    try:
-                        os.unlink(tmp_path)
-                    except OSError:
-                        pass
             else:
+                # Text formats (html, plain). HTML keeps inline data: URIs (they
+                # render natively); plain text ignores images.
                 text = _pypandoc.convert_text(markdown, target, format="md")
                 data = text.encode("utf-8")
         except OSError as exc:

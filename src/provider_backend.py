@@ -5,6 +5,7 @@ only ever talks to an `AgentBackend`; concrete implementations live below.
 """
 
 import json
+import logging
 import os
 import hashlib
 import threading
@@ -15,6 +16,8 @@ from typing import Iterator, Literal, Protocol, runtime_checkable
 
 from anthropic import Anthropic, BadRequestError
 from cryptography.exceptions import InvalidTag
+
+logger = logging.getLogger(__name__)
 
 # `aime.encryption` is imported lazily at the bottom of this file. Importing
 # the `aime` package eagerly here would deadlock: aime/__init__.py imports
@@ -1876,7 +1879,10 @@ class AnthropicMessagesBackend:
                 source=self._usage_source,
             )
         except Exception:
-            pass
+            # Usage logging is opt-in and best-effort; it must never break a
+            # turn. Log at debug so a persistent failure is discoverable without
+            # spamming a deployment that simply has the log disabled.
+            logger.debug("usage log record failed", exc_info=True)
         # Debit this call's real cost from the user's budget (independent of the
         # opt-in usage log above). Fully guarded — a quota failure must never
         # break a turn, so it fails open (the turn proceeds). Captures every
@@ -1900,7 +1906,12 @@ class AnthropicMessagesBackend:
                     }
                 self._last_usage_decision = decision
             except Exception:
-                pass
+                # The budget debit fails open: a quota bug must never break a
+                # turn. But a *persistent* failure here silently stops charging
+                # everyone (enforcement quietly disabled), so log at warning —
+                # this is the signal that the cost-control ledger is broken.
+                logger.warning("quota debit failed; turn not charged",
+                               exc_info=True)
 
 
 class SessionsBackend:
