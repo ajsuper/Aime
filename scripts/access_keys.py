@@ -21,6 +21,9 @@ Examples:
     ./scripts/access_keys.py grant alice
     ./scripts/access_keys.py revoke alice
 
+    # Set a user's usage-limit tier (daily cost allowance; see docs/usage-limits.md)
+    ./scripts/access_keys.py tier alice power
+
     # Kill an unredeemed key; zero everyone for a billing cutover
     ./scripts/access_keys.py revoke-key <key>
     ./scripts/access_keys.py revoke-all
@@ -112,6 +115,20 @@ def cmd_revoke(args: argparse.Namespace) -> int:
     return 1
 
 
+def cmd_tier(args: argparse.Namespace) -> int:
+    tier = args.tier.strip().lower()
+    if tier not in aime_config.USAGE_TIERS:
+        valid = ", ".join(aime_config.USAGE_TIERS)
+        print(f"Unknown tier {tier!r}. Choose one of: {valid}", file=sys.stderr)
+        return 1
+    if _backend().set_tier_by_username(args.username, tier):
+        cap = aime_config.USAGE_TIERS[tier]
+        print(f"Set {args.username!r} to the {tier!r} tier (${cap:.2f}/day).")
+        return 0
+    print(f"No such user: {args.username!r}", file=sys.stderr)
+    return 1
+
+
 def cmd_revoke_key(args: argparse.Namespace) -> int:
     if _backend().revoke_access_key(args.key):
         print("Key revoked; it can no longer be redeemed.")
@@ -157,6 +174,11 @@ def main() -> int:
     p_revoke = sub.add_parser("revoke", help="revoke a user's send access")
     p_revoke.add_argument("username")
     p_revoke.set_defaults(func=cmd_revoke)
+
+    p_tier = sub.add_parser("tier", help="set a user's usage-limit tier")
+    p_tier.add_argument("username")
+    p_tier.add_argument("tier", help="tier name (e.g. light, power)")
+    p_tier.set_defaults(func=cmd_tier)
 
     p_rk = sub.add_parser("revoke-key", help="kill an unredeemed invite key")
     p_rk.add_argument("key")

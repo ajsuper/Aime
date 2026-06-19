@@ -64,6 +64,9 @@ CoreEventKind = Literal[
     "error",                    # unrecoverable controller/backend error
     "turn_routing",             # router picked a model for the next turn
                                 # (emitted only when verbose mode is on)
+    "usage_notice",             # the user's usage budget crossed a threshold;
+                                # carries state ("notify_low"/"over") in `text`
+                                # and the budget snapshot in `payload`
     "agent_result",             # headless background agent called SubmitResult;
                                 # carries the structured result in `payload`
     "graphic",                  # CreateGraphics: a chart/diagram/SVG to render
@@ -610,6 +613,16 @@ class ConversationController:
             # backend/frontend toggle pair that disagree.
             label = (event.text or "").strip() or "sonnet"
             self._emit(CoreEvent(kind="turn_routing", text=label))
+        elif kind == "usage_notice":
+            # Forward the budget threshold crossing to frontends. The web
+            # frontend renders a calm banner; the budget snapshot rides in
+            # `payload` (event.tool_result on the BackendEvent). Notify-only —
+            # the turn already completed; nothing is blocked here.
+            self._emit(CoreEvent(
+                kind="usage_notice",
+                text=(event.text or "").strip(),
+                payload=event.tool_result if isinstance(event.tool_result, dict) else None,
+            ))
         elif kind == "turn_end":
             self._emit(CoreEvent(
                 kind="turn_end",

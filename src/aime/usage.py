@@ -152,26 +152,11 @@ def record_api(
     if not _enabled():
         return
 
-    def _int(val) -> int:
-        try:
-            return int(val) if val is not None else 0
-        except (TypeError, ValueError):
-            return 0
-
-    # Per-TTL cache-write breakdown lives in the nested `cache_creation`
-    # object. Older API responses may omit it; fall back to attributing the
-    # lumped `cache_creation_input_tokens` total to the 5-minute bucket (its
-    # cheaper rate — never over-bills the user if the breakdown is missing).
-    cache_creation = _attr(usage, "cache_creation")
-    cc_5m = _int(_attr(cache_creation, "ephemeral_5m_input_tokens"))
-    cc_1h = _int(_attr(cache_creation, "ephemeral_1h_input_tokens"))
-    cc_total = _int(_attr(usage, "cache_creation_input_tokens"))
-    if cache_creation is None and cc_total:
-        cc_5m = cc_total
-
-    # Server-side web_search request count — billed flat, not by token.
-    server_tool_use = _attr(usage, "server_tool_use")
-    web_search_requests = _int(_attr(server_tool_use, "web_search_requests"))
+    # Token/cache/web-search extraction is shared with the live cost-control
+    # debit (aime.quota) via aime.pricing, so the usage log and the budget can
+    # never price the same call differently.
+    from aime import pricing as _pricing
+    tokens = _pricing.record_from_usage(model, usage)
 
     rec = _base_record("api", user)
     rec.update({
@@ -188,14 +173,14 @@ def record_api(
         "session_id": session_id if (session_id and _link_users()) else None,
         "stop_reason": stop_reason or None,
         "duration_ms": round(float(duration_ms), 1) if duration_ms is not None else None,
-        "input_tokens": _int(_attr(usage, "input_tokens")),
-        "output_tokens": _int(_attr(usage, "output_tokens")),
-        "cache_read_tokens": _int(_attr(usage, "cache_read_input_tokens")),
+        "input_tokens": tokens["input_tokens"],
+        "output_tokens": tokens["output_tokens"],
+        "cache_read_tokens": tokens["cache_read_tokens"],
         # Total kept for convenience; the two TTL splits are what get priced.
-        "cache_creation_tokens": cc_total,
-        "cache_creation_5m_tokens": cc_5m,
-        "cache_creation_1h_tokens": cc_1h,
-        "web_search_requests": web_search_requests,
+        "cache_creation_tokens": tokens["cache_creation_tokens"],
+        "cache_creation_5m_tokens": tokens["cache_creation_5m_tokens"],
+        "cache_creation_1h_tokens": tokens["cache_creation_1h_tokens"],
+        "web_search_requests": tokens["web_search_requests"],
         "routed_decision": routed_decision or None,
         # Who drove this call: a live chat ("interactive") or a background
         # agent run ("agent"). Non-identifying, so always stamped.

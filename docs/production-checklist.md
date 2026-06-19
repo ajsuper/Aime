@@ -55,6 +55,20 @@ each user's hash will be upgraded automatically. Make sure
 `requirements.txt` allows that movement: bump `argon2-cffi` versions when
 you bump other deps so the upgrades actually happen.
 
+### Dependency security cadence
+
+`requirements.txt` is **fully pinned** (`==`) for reproducible builds, which
+means *no* security patch reaches you without a deliberate bump. Establish a
+recurring review (e.g. `pip list --outdated`, Dependabot, or `pip-audit`) and
+prioritise the libraries that parse untrusted input:
+
+- **`pillow` / `pillow-heif`** — decode user-uploaded images; a recurring CVE
+  surface. Treat their advisories as high priority.
+- **`cryptography`** — the at-rest encryption and TLS primitives.
+- **`flask` / `requests` / `waitress`** — the request path and all outbound
+  HTTP (messaging, web search).
+- **`argon2-cffi`** — also drives the rehash-on-login upgrade above.
+
 ## 5. Backup strategy
 
 Everything that matters lives under `$AIME_DATABASE_DIR`
@@ -76,11 +90,45 @@ abnormal `/login` 401/429 rates or `/signup` 429s.
 
 ## 7. Account recovery
 
-There is no "forgot password" flow. If you go public you'll want one —
-build it before launch, not after a user gets locked out. The pluggable
-`AuthBackend` interface is the right seam to add reset tokens to.
+A self-service **forgot-password** flow exists (`/forgot` → emailed code →
+new password) along with **email login verification** and **soft-delete
+account recovery** — but all of it is gated behind `DO_EMAIL_VERIFICATION=1`
+and needs working SMTP (see §10). With the flag **off** (the default) there
+is *no* reset path, so a locked-out user is stuck. Before going public:
 
-## 8. Conscious tradeoffs to revisit
+- Set `DO_EMAIL_VERIFICATION=1` and configure SMTP so the reset flow is
+  actually reachable.
+- Verify the flow end-to-end (request a code, reset, log in) on the real
+  mail transport — a misconfigured `SMTP_*` silently disables every email
+  flow, including the login second factor, which then **fails closed**
+  (logins refused with HTTP 502) rather than letting users in.
+
+See [security.md → Email verification and account recovery](security.md#email-verification-and-account-recovery)
+for the full surface.
+
+## 8. Usage limits and cost control
+
+In `keys` / `billing` access mode, per-user **usage limits** are armed: a banked
+daily cost allowance (token bucket) per tier, metered against real Anthropic
+cost. See [usage-limits.md](usage-limits.md). Before going public:
+
+- Pick tier caps (`AIME_TIER_LIGHT` / `AIME_TIER_POWER`) and the bank ceiling
+  (`AIME_USAGE_BANK_DAYS`) for your budget — the defaults are tuned to the
+  current cohort's averages.
+- The **enforcement action** at an empty balance is now a hard block: `/send`
+  refuses the turn (HTTP 402) with a calm "you've used up today's Aime — your
+  access will be back tomorrow" message and the composer locks until the budget
+  refills. (Previously notify-only.) The classification seam is
+  `aime.quota.enforcement_decision`; see [usage-limits.md](usage-limits.md).
+  Note the block is **one turn behind**: the check is pre-turn but the debit is
+  in-turn, so a user can overshoot their remaining balance by a single expensive
+  turn before the next send is refused. The budget bounds steady-state spend,
+  not one turn's cost — fine for the free-tester cohort, but size tier caps with
+  that headroom in mind. The debit fails open and logs at `warning` on failure;
+  watch that log line — it means cost control is silently off.
+- `open` mode disarms limits entirely — never use it internet-facing.
+
+## 9. Conscious tradeoffs to revisit
 
 These are acceptable for personal scale; reconsider before going public:
 
@@ -93,6 +141,26 @@ These are acceptable for personal scale; reconsider before going public:
 - **TLS is the operator's job.** Flask never serves TLS itself.
 - **Topic markdown sanitization is client-side** (DOMPurify). A JS-disabled
   client would see raw markdown — fine, the app needs JS anyway.
+
+## 10. Email (SMTP) configuration
+
+Required if you turn on `DO_EMAIL_VERIFICATION=1` (§7): signup verification,
+the login second factor, add-email, and password reset all send mail through
+`email_send.py`. Configure the SMTP account in the environment:
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `SMTP_HOST` | `smtp.gmail.com` | Submission server hostname. |
+| `SMTP_PORT` | `587` | Submission port (STARTTLS). |
+| `SMTP_USERNAME` | `EMAIL_ADDRESS` | Login username. |
+| `SMTP_PASSWORD` | `EMAIL_PASSWORD` | Login password / app password. |
+| `SMTP_FROM` | `SMTP_USERNAME` | From address. |
+
+The legacy `EMAIL_ADDRESS` / `EMAIL_PASSWORD` pair still works on its own.
+**Verify mail actually sends before launch:** a misconfigured account
+silently disables every email flow, and because the login second factor
+fails *closed*, that turns into users being refused at login (HTTP 502),
+not a soft degradation.
 
 ## Quick verification before launch
 

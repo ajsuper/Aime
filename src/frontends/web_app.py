@@ -92,6 +92,8 @@ from aime.graphics_store import (
 from aime import graphics as _graphics
 from aime import email_send as _email_send
 from aime import topic_shares as _topic_shares
+from aime import quota as _quota
+from aime import feedback as _feedback
 from aime.tool_formatting import TOOL_NAME_MAP
 
 from . import stt as _stt
@@ -129,6 +131,17 @@ _auth_backend = _auth.LocalAuthBackend(
 # at the root next to auth.sql, not in any one user's silo.
 _share_store = _topic_shares.ShareStore(
     os.path.join(aime_config.DATABASE_DIR, "topic_shares.sql")
+)
+# Per-user usage budget (aime.quota). Cross-user, root-level beside auth.sql.
+# Only touched when usage limits are armed (see _usage_limits_armed); in "open"
+# mode no meter is attached so this file is never written.
+_quota_store = _quota.QuotaStore(
+    os.path.join(aime_config.DATABASE_DIR, "quota.sql")
+)
+# User feedback / error-report tickets (aime.feedback). Cross-user, root-level
+# beside auth.sql; read by the admin dashboard's Feedback tab.
+_feedback_store = _feedback.FeedbackStore(
+    os.path.join(aime_config.DATABASE_DIR, "feedback.sql")
 )
 
 
@@ -640,6 +653,19 @@ class UserContext:
         # contact. Kept separate so the controller can distinguish "not set up on
         # the server" from "no contact connected" (see _deliver_message).
         messenger = _aime_messaging.get_messenger()
+
+        # Per-user usage budget. Only built when limits are armed (keys/billing);
+        # in "open" mode it stays None and nothing is metered. The cap resolver
+        # re-reads the user's tier on every debit so an admin tier change takes
+        # effect live, without restarting the session.
+        quota_meter = None
+        if _usage_limits_armed():
+            def _resolve_daily_cap(uid=user_id):
+                rec = _auth_backend.lookup(uid)
+                return aime_config.tier_daily_cap(rec.tier if rec else None)
+            quota_meter = _quota.QuotaMeter(_quota_store, username, _resolve_daily_cap)
+        self.quota_meter = quota_meter
+
         router = ModelRouter(
             haiku_model=aime_config.HAIKU_MODEL,
             sonnet_model=aime_config.SONNET_MODEL,
@@ -653,6 +679,7 @@ class UserContext:
             tool_version=aime_config.WEB_SEARCH_TOOL_VERSION,
             usage_label=username,
             record_api=_aime_usage.record_api,
+            quota_debit=(quota_meter.debit if quota_meter is not None else None),
         ) if aime_config.WEB_SEARCH_ENABLED else None
         backend = AnthropicMessagesBackend(
             system_prompt=aime_config.load_system_prompt(),
@@ -674,6 +701,7 @@ class UserContext:
                 aime_config.WEB_SEARCH_SCHEMA if aime_config.WEB_SEARCH_ENABLED else None
             ),
             terminal_tool_schema=aime_config.ONBOARDING_TOOL_SCHEMA,
+            quota=quota_meter,
         )
         backend.new_session()
 
@@ -844,6 +872,10 @@ class UserContext:
                 "assistant_html_partial", "turn_end", "ready",
                 "remote_edit", "agent_run_update", "share_update",
                 "topic_lock",
+                # Transient budget nudge — replaying it on reconnect would
+                # re-pop a stale "running low" banner. The live /me meter is the
+                # durable surface for budget state.
+                "usage_notice",
             ):
                 self._history.append(payload)
         with self._subscribers_lock:
@@ -1144,11 +1176,64 @@ _ALLOW_SIGNUP = bool(int(os.environ.get("AIME_ALLOW_SIGNUP", "0")))
 
 # Access mode — see docs/access-control.md. "keys" (the default) gates /send
 # behind each user's api_access flag; new accounts start with no send access
-# and must redeem an invite key. "open" disarms the gate entirely. An
-# unrecognised value is treated as "keys" so a typo fails closed.
+# and must redeem an invite key. "open" disarms the gate entirely. "billing"
+# behaves like "keys" for the send gate (api_access is set by the — deferred —
+# billing system) and likewise arms usage limits. An unrecognised value is
+# treated as "keys" so a typo fails closed.
 _ACCESS_MODE = os.environ.get("AIME_ACCESS_MODE", "keys").strip().lower()
-if _ACCESS_MODE not in ("keys", "open"):
+if _ACCESS_MODE not in ("keys", "open", "billing"):
     _ACCESS_MODE = "keys"
+
+
+def _send_gate_armed() -> bool:
+    """True when /send is gated behind each user's api_access flag. Armed in
+    "keys" and "billing"; disarmed in "open" (trusted local use)."""
+    return _ACCESS_MODE in ("keys", "billing")
+
+
+def _usage_limits_armed() -> bool:
+    """True when the per-user usage budget (aime.quota) is metered and notified.
+    Mirrors the send gate: armed in "keys"/"billing", off in "open". The single
+    switch that turns the whole usage-limit system on or off."""
+    return _ACCESS_MODE in ("keys", "billing")
+
+
+def _user_over_budget(user_id: int) -> bool:
+    """True when usage limits are armed and this user's daily budget is spent.
+
+    The on-demand counterpart to the /send 402 gate: it guards the paths where a
+    user asks for *new work right now* — the ad-hoc agent launcher, the saved-
+    agent Run button, and "run schedule now". Without it those would be a hole
+    around the chat block (an out-of-budget user could just spin up a one-off
+    agent to keep working). Reads the quota store straight off the user's tier —
+    no UserContext needed. Disarmed (open) mode is never over.
+
+    The *autonomous* scheduler loop deliberately does NOT consult this: a
+    recurring agent the user already set up keeps firing even when their chat
+    budget is spent — that is automation delivering, not new on-demand work, so
+    blocking it would punish usage rather than limit it (see docs/usage-limits.md).
+    The durable paid/unpaid line is api_access, which gates every path regardless."""
+    if not _usage_limits_armed():
+        return False
+    rec = _auth_backend.lookup(user_id)
+    if rec is None:
+        return False
+    cap = aime_config.tier_daily_cap(rec.tier)
+    ceiling = cap * aime_config.USAGE_BANK_DAYS
+    return _quota_store.read(rec.username, cap, ceiling) <= 0
+
+
+def _usage_exhausted_response():
+    """The shared 402 body for a budget-blocked on-demand action (chat or an
+    on-demand agent run), so the message stays identical across paths. The
+    frontend keys off the 402 status; the budget refills on its own."""
+    return jsonify({
+        "ok": False,
+        "error": "usage_exhausted",
+        "message": "You've used up today's Aime. Your access will be back "
+                   "tomorrow.",
+    }), 402
+
 
 # Toggle for the email 2FA flow. Off by default so a fresh install behaves
 # like it did before the feature shipped — handy for dev, demos, and anyone
@@ -1323,11 +1408,11 @@ def login_required(view):
 def api_access_required(view):
     """Gate a route behind the user's send access. Applies *under*
     login_required (which populates g.api_access). In "open" access mode the
-    gate is disarmed and this is a pass-through; in "keys" mode a user without
-    api_access gets a 403 telling them to redeem an invite key."""
+    gate is disarmed and this is a pass-through; in "keys"/"billing" mode a user
+    without api_access gets a 403 telling them to redeem an invite key."""
     @wraps(view)
     def wrapper(*args, **kwargs):
-        if _ACCESS_MODE == "keys" and not g.get("api_access", False):
+        if _send_gate_armed() and not g.get("api_access", False):
             return jsonify({
                 "ok": False,
                 "error": "no_access",
@@ -2018,6 +2103,7 @@ def signup_submit():
             user, _dek = _auth_backend.create(
                 username, password, api_access=(_ACCESS_MODE == "open"),
                 first_name=first_name, last_name=last_name,
+                tier=aime_config.USAGE_DEFAULT_TIER,
             )
         except _auth.UsernameTaken:
             return _signup_err("That username is already taken.", status=409)
@@ -2129,6 +2215,13 @@ def signup_verify_submit():
             ),
             mimetype="text/html", status=409,
         )
+
+    # Stamp the default usage tier on the freshly-verified account. The
+    # email-verification create path goes through the pending row (which doesn't
+    # carry a tier), so the column defaults to 'light'; re-stamp here so a
+    # non-default AIME_USAGE_DEFAULT_TIER is honored on this path too.
+    if aime_config.USAGE_DEFAULT_TIER != "light":
+        _auth_backend.set_tier(user.id, aime_config.USAGE_DEFAULT_TIER)
 
     # Promote: clear the pending state, log the new account in.
     session.clear()
@@ -2247,6 +2340,16 @@ def me():
     # access_mode + api_access let the frontend show the invite-key field in
     # profile settings and disable the composer when sending is gated.
     user = _auth_backend.lookup(g.user_id)
+    # Usage budget snapshot for the account meter. Computed straight off the
+    # store (no per-session meter needed) so /me stays cheap. None when limits
+    # are disarmed (open mode) — the frontend then hides the meter entirely.
+    usage = None
+    tier = user.tier if user else None
+    if _usage_limits_armed():
+        cap = aime_config.tier_daily_cap(tier)
+        ceiling = cap * aime_config.USAGE_BANK_DAYS
+        balance = _quota_store.read(g.username, cap, ceiling)
+        usage = _quota.make_status(balance, cap, ceiling)
     return jsonify({
         "id": g.user_id,
         "username": g.username,
@@ -2256,6 +2359,9 @@ def me():
         "last_name": user.last_name if user else None,
         "access_mode": _ACCESS_MODE,
         "api_access": g.api_access,
+        "tier": tier,
+        "usage_limits_armed": _usage_limits_armed(),
+        "usage": usage,
     })
 
 
@@ -2298,6 +2404,31 @@ def messaging_contact():
         from aime import messaging as _aime_messaging
         ctx.controller.set_messaging_target(_aime_messaging.get_messenger(), contact)
     return jsonify({"ok": True, "messaging_contact": contact})
+
+
+@app.route("/feedback", methods=["POST"])
+@login_required
+def feedback_submit():
+    """File a feedback or error-report ticket from the chat UI. ``kind`` is
+    'feedback' (the Send-feedback button) or 'error' (the "report this error?"
+    prompt); ``message`` is the user's words and ``detail`` carries the raw error
+    text / page context for error reports. Tickets surface on the admin
+    dashboard's Feedback tab."""
+    data = request.get_json(silent=True) or {}
+    kind = (data.get("kind") or "feedback").strip().lower()
+    message = (data.get("message") or "").strip()
+    detail = (data.get("detail") or "").strip() or None
+    if not message:
+        return jsonify({"ok": False, "error": "invalid",
+                        "message": "Please include a message."}), 400
+    try:
+        ticket_id = _feedback_store.submit(
+            user_id=g.user_id, username=g.username,
+            kind=kind, message=message, detail=detail,
+        )
+    except ValueError as e:
+        return jsonify({"ok": False, "error": "invalid", "message": str(e)}), 400
+    return jsonify({"ok": True, "ticket_id": ticket_id})
 
 
 @app.route("/redeem", methods=["POST"])
@@ -2779,6 +2910,17 @@ def send():
     if not text and not images:
         return jsonify({"ok": False, "error": "empty"}), 400
     ctx = _context_for(g.user_id)
+    # Hard budget stop. When usage limits are armed and the user's daily Aime is
+    # spent, refuse the turn instead of letting it spend more — this is the
+    # enforcement action the metering was built around. The budget refills
+    # continuously (see aime.quota), so access comes back on its own as the
+    # allowance trickles in over the next day; we tell the user it'll be back
+    # tomorrow. We answer 402 (distinct from the api_access gate's 403) so the
+    # frontend locks the composer with a calm, *temporary* "back tomorrow"
+    # message rather than the permanent invite-key prompt.
+    if _usage_limits_armed() and ctx.quota_meter is not None \
+            and ctx.quota_meter.status().get("over"):
+        return _usage_exhausted_response()
     # The browser sends its IANA timezone (e.g. "America/New_York") with each
     # message so per-turn timestamps the model sees track the user's local
     # time. Refreshed every send — self-corrects if the user travels.
@@ -2932,11 +3074,16 @@ def _schedule_store(user_id: int) -> ScheduleStore:
 
 
 def _scheduler_run_agent(agent_id: str, user_id: int, tz: str | None) -> None:
-    """Scheduler action: run a saved agent now, exactly as its Run button does.
+    """Scheduler action: run a saved agent on its cadence (the autonomous path).
 
-    Honors the same api-access gate as ``/agents/<id>/run`` — a scheduled run
-    spends tokens, so an account without send access must not fire one. A
-    deleted agent is a quiet no-op (the user can remove the dangling schedule)."""
+    Honors the api-access gate — a run spends tokens, so an account without send
+    access (e.g. unpaid in billing mode) never fires one. But it deliberately
+    does NOT consult the daily budget: this is automation the user already set
+    up delivering on schedule, not new on-demand work, so a spent chat budget
+    must not silently kill their recurring briefing (the manual Run paths gate
+    on the budget; see _user_over_budget and docs/usage-limits.md). The run
+    still debits the budget, so its cost is bounded over time. A deleted agent
+    is a quiet no-op (the user can remove the dangling schedule)."""
     rec = _auth_backend.lookup(user_id)
     if rec is None or not rec.api_access:
         return
@@ -3104,6 +3251,12 @@ def _launch_agent_run(
                 messaging_contact=messaging_contact,
                 api_url=aime_config.API_URL,
                 agent_id=agent_id,
+                # Debit this run's real cost against the user's budget (None when
+                # limits are disarmed). The run is never *blocked* by the budget —
+                # on-demand runs are gated up front in the route, recurring ones
+                # are deliberately exempt — but its spend still draws down the
+                # bucket so an agent can't be a free, uncapped channel.
+                quota=ctx.quota_meter,
             )
         except Exception:
             # The runner already converts its own failures into a persisted
@@ -3165,6 +3318,12 @@ def agents_run():
     allow_web = bool(data.get("allow_web_search", False))
     tz = data.get("tz")
     client_tz = tz if isinstance(tz, str) and tz else None
+
+    # On-demand work: an ad-hoc run spends tokens the user is asking for right
+    # now, so the daily budget blocks it exactly like /send. (Recurring agents
+    # fired by the scheduler are exempt — see _user_over_budget.)
+    if _user_over_budget(g.user_id):
+        return _usage_exhausted_response()
 
     # Unique, registry-safe name for this one-off agent. The timestamp keeps
     # runs listed in creation order; the random suffix avoids collisions.
@@ -3302,6 +3461,11 @@ def agents_run_saved(agent_id: str):
     record = _agent_def_store(g.user_id).load(agent_id)
     if record is None:
         return jsonify({"ok": False, "error": "agent not found"}), 404
+    # Pressing Run is on-demand work, so the daily budget blocks it like /send.
+    # The same agent fired by the scheduler on its cadence is exempt (see
+    # _user_over_budget / _scheduler_run_agent).
+    if _user_over_budget(g.user_id):
+        return _usage_exhausted_response()
     data = request.get_json(silent=True) or {}
     tz = data.get("tz")
     client_tz = tz if isinstance(tz, str) and tz else None
@@ -3411,6 +3575,12 @@ def schedules_run_now(schedule_id: str):
     record = _schedule_store(g.user_id).load(schedule_id)
     if record is None:
         return jsonify({"ok": False, "error": "schedule not found"}), 404
+    # "Run now" is a manual, on-demand trigger, so an agent action it fires is
+    # budget-blocked like /send. Message reminders cost no tokens, so they're
+    # left alone. The autonomous cadence (the scheduler loop) stays exempt.
+    if record.get("action", {}).get("kind") == "run_agent" \
+            and _user_over_budget(g.user_id):
+        return _usage_exhausted_response()
     data = request.get_json(silent=True) or {}
     tz = data.get("tz")
     client_tz = tz if isinstance(tz, str) and tz else record.get("tz")
@@ -4126,6 +4296,19 @@ def _pdf_export_css() -> str:
         "@page { size: A4; margin: 1.3cm; }",
         "body { max-width: none !important; margin: 0 !important; "
         "padding: 0 !important; }",
+        # Keep tables inside the page. `table-layout: fixed` + full width makes
+        # columns share the available width instead of growing to fit content
+        # (which is what pushed wide tables off the right edge); breaking long
+        # words/URLs inside cells stops a single unbreakable token from forcing
+        # an overflow.
+        "table { width: 100%; border-collapse: collapse; table-layout: fixed; }",
+        "th, td { border: 1px solid #d0d0d0; padding: 4px 7px; "
+        "vertical-align: top; text-align: left; "
+        "overflow-wrap: break-word; word-break: break-word; }",
+        # Long code lines and embedded graphics shouldn't overflow either.
+        "pre, code { white-space: pre-wrap; overflow-wrap: break-word; "
+        "word-break: break-word; }",
+        "img { max-width: 100%; height: auto; }",
     ]
     return "<style>\n" + "\n".join(rules) + "\n</style>"
 
@@ -4138,6 +4321,48 @@ def _inject_head_css(html: str, style: str) -> str:
     if idx == -1:
         return style + html
     return html[:idx] + style + html[idx:]
+
+
+# Inline ![alt](data:image/<type>;base64,<data>) images, as posted by the client
+# when it rasterizes [graphic-…] tags for an image-capable export.
+_DATA_URI_IMG_RE = re.compile(
+    r"!\[([^\]]*)\]\(\s*data:image/([a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=\s]+?)\s*\)"
+)
+
+# data: image subtype -> file extension where they differ.
+_IMG_SUBTYPE_EXT = {"jpeg": "jpg", "svg+xml": "svg"}
+
+
+def _materialize_data_uri_images(markdown: str, dest_dir: str) -> str:
+    """Rewrite inline base64 ``data:`` image URIs to real files in `dest_dir`,
+    returning markdown that points at those files by relative name.
+
+    WeasyPrint (our PDF path) renders ``data:`` URIs natively, but pandoc only
+    embeds images it can read from disk — older bundled pandoc builds silently
+    drop ``data:`` URIs, which is why graphics used to survive only in PDF
+    exports. Handing pandoc real files (with ``--resource-path=dest_dir``) makes
+    graphics travel into docx/odt/epub/rtf on any pandoc version. Returns the
+    markdown unchanged when it has no such images."""
+    idx = 0
+
+    def repl(m: "re.Match[str]") -> str:
+        nonlocal idx
+        alt, subtype, b64 = m.group(1), m.group(2).lower(), m.group(3)
+        try:
+            raw = base64.b64decode("".join(b64.split()), validate=False)
+        except Exception:
+            return m.group(0)  # leave a malformed URI untouched
+        ext = _IMG_SUBTYPE_EXT.get(subtype, subtype)
+        name = f"img{idx}.{ext}"
+        idx += 1
+        try:
+            with open(os.path.join(dest_dir, name), "wb") as fh:
+                fh.write(raw)
+        except OSError:
+            return m.group(0)
+        return f"![{alt}]({name})"
+
+    return _DATA_URI_IMG_RE.sub(repl, markdown)
 
 
 @app.route("/topics/<topic_id>/export", methods=["GET", "POST"])
@@ -4205,23 +4430,26 @@ def topic_export(topic_id: str):
                 # Tighten pandoc's wide default margins (the page stays white).
                 html = _inject_head_css(html, _pdf_export_css())
                 data = _WeasyHTML(string=html).write_pdf()
-            elif target in ("docx", "odt", "epub"):
-                with tempfile.NamedTemporaryFile(
-                    suffix=f".{ext}", delete=False
-                ) as tf:
-                    tmp_path = tf.name
-                try:
+            elif target in ("docx", "odt", "epub", "rtf"):
+                # Binary/rich formats that embed images. Render in a temp dir so
+                # pandoc can read the graphics we materialize from the posted
+                # data: URIs (see _materialize_data_uri_images). `--columns=999`
+                # stops pandoc from deciding a wide table is "too wide" and
+                # baking in a fixed layout with narrow fixed column widths —
+                # the cause of cell text wrapping one character per line in
+                # Word. Without it the table autofits to its content.
+                with tempfile.TemporaryDirectory() as work:
+                    doc_md = _materialize_data_uri_images(markdown, work)
+                    tmp_path = os.path.join(work, f"out.{ext}")
                     _pypandoc.convert_text(
-                        markdown, target, format="md", outputfile=tmp_path,
+                        doc_md, target, format="md", outputfile=tmp_path,
+                        extra_args=["--resource-path", work, "--columns=999"],
                     )
                     with open(tmp_path, "rb") as f:
                         data = f.read()
-                finally:
-                    try:
-                        os.unlink(tmp_path)
-                    except OSError:
-                        pass
             else:
+                # Text formats (html, plain). HTML keeps inline data: URIs (they
+                # render natively); plain text ignores images.
                 text = _pypandoc.convert_text(markdown, target, format="md")
                 data = text.encode("utf-8")
         except OSError as exc:

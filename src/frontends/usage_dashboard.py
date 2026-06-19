@@ -61,6 +61,8 @@ import usage_report as _report  # noqa: E402
 from aime import config as _config  # noqa: E402
 from aime import auth as _auth  # noqa: E402
 from aime import accounts as _accounts  # noqa: E402
+from aime import quota as _quota  # noqa: E402
+from aime import feedback as _feedback  # noqa: E402
 
 app = Flask(__name__)
 
@@ -176,6 +178,34 @@ def _auth_backend() -> _auth.LocalAuthBackend:
             os.path.join(_config.DATABASE_DIR, "auth.sql")
         )
     return _auth_backend_singleton
+
+
+# Lazily-built usage-budget store (aime.quota), opened only when the Accounts
+# tab renders the per-user usage column or a tier is changed.
+_quota_store_singleton: _quota.QuotaStore | None = None
+
+
+def _quota_store() -> _quota.QuotaStore:
+    global _quota_store_singleton
+    if _quota_store_singleton is None:
+        _quota_store_singleton = _quota.QuotaStore(
+            os.path.join(_config.DATABASE_DIR, "quota.sql")
+        )
+    return _quota_store_singleton
+
+
+# Lazily-built feedback-ticket store (aime.feedback), opened only when the
+# Feedback tab renders or a ticket is triaged.
+_feedback_store_singleton: _feedback.FeedbackStore | None = None
+
+
+def _feedback_store() -> _feedback.FeedbackStore:
+    global _feedback_store_singleton
+    if _feedback_store_singleton is None:
+        _feedback_store_singleton = _feedback.FeedbackStore(
+            os.path.join(_config.DATABASE_DIR, "feedback.sql")
+        )
+    return _feedback_store_singleton
 
 
 def _log_path() -> str:
@@ -2285,6 +2315,46 @@ _FRAGMENT_OVERVIEW = """<div class="meta">
       {% endfor %}
     </tbody>
   </table>
+
+  <h2 title="How well each usage tier fits its users: how much of the daily allowance they consume, and how many exceed it, how often. Drives tier sizing — see docs/usage-limits.md.">Tiers</h2>
+  {% if anonymized %}
+  <p class="note">User linkage is off (AIME_USAGE_LINK_USERS=0), so spend can't be attributed to a user or tier. Turn it on to populate this section.</p>
+  {% endif %}
+  {% if not tier_rows %}
+  <p class="empty">No tier data in this window.</p>
+  {% else %}
+  <table>
+    <thead>
+      <tr>
+        <th title="Usage-limit tier. '(unknown)' is spend from accounts not currently on a known tier (e.g. since-deleted).">Tier</th>
+        <th title="Daily cost allowance for this tier.">Daily cap</th>
+        <th title="Accounts currently on this tier.">Users</th>
+        <th title="Users on this tier with any spend in the window.">Active</th>
+        <th title="Average cost per active user-day.">Avg $/day</th>
+        <th title="Average daily spend as a percent of the tier's daily allowance. Over 100% means the typical active day exceeds the cap — the tier may be undersized.">Avg utilization</th>
+        <th title="Distinct users who exceeded the daily allowance on at least one day in the window.">Users over</th>
+        <th title="Active user-days that exceeded the daily allowance, out of all active user-days (and the rate). Note the bucket banks several days, so a day over the cap is not necessarily a blocked day.">Days over</th>
+        <th title="Most expensive single user-day on this tier.">Peak day</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for t in tier_rows %}
+      <tr>
+        <td>{{ t.tier }}</td>
+        <td>{% if t.cap %}${{ "%.2f"|format(t.cap) }}{% else %}—{% endif %}</td>
+        <td>{{ t.n_users }}</td>
+        <td>{{ t.n_active }}</td>
+        <td class="cost">${{ "%.4f"|format(t.avg_daily) }}</td>
+        <td class="{{ 'bad' if t.avg_util_pct > 100 else ('good' if t.avg_util_pct else '') }}">{{ t.avg_util_pct|round|int }}%</td>
+        <td class="{{ 'bad' if t.users_over else '' }}">{{ t.users_over }}</td>
+        <td>{% if t.user_days %}{{ t.over_days }} / {{ t.user_days }} ({{ t.over_rate_pct|round|int }}%){% else %}—{% endif %}</td>
+        <td class="cost">${{ "%.2f"|format(t.max_day) }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p class="note">"Over" compares each user's daily spend to their tier's daily allowance. Tier reflects each account's current tier; mid-window changes aren't back-applied.</p>
+  {% endif %}
   {% endif %}"""
 
 
@@ -3589,6 +3659,109 @@ _FRAGMENT_SECURITY = """
   {% endif %}"""
 
 
+# Feedback / error-report ticket queue. A basic ticket system over the
+# aime.feedback store: filter by status, read the message (and any captured
+# error trace), move a ticket through open → in progress → resolved, and jot a
+# triage note. State-changing actions are CSRF-guarded admin POSTs.
+_FRAGMENT_FEEDBACK = """
+  <h2 title="Feedback and error reports submitted from the chat UI. Triage them here.">Feedback &amp; error reports</h2>
+
+  <div class="userfilter" style="margin-bottom: 1rem;">
+    <a class="chipbtn {{ 'active' if not status_filter else '' }}" href="/?{{ qs_all }}">All <span class="note">{{ counts.total }}</span></a>
+    <a class="chipbtn {{ 'active' if status_filter == 'open' else '' }}" href="/?{{ qs_open }}">Open <span class="note">{{ counts.open }}</span></a>
+    <a class="chipbtn {{ 'active' if status_filter == 'in_progress' else '' }}" href="/?{{ qs_in_progress }}">In progress <span class="note">{{ counts.in_progress }}</span></a>
+    <a class="chipbtn {{ 'active' if status_filter == 'resolved' else '' }}" href="/?{{ qs_resolved }}">Resolved <span class="note">{{ counts.resolved }}</span></a>
+  </div>
+
+  {% if not tickets %}
+    <p class="empty">No {{ status_filter.replace('_', ' ') if status_filter else '' }} tickets.</p>
+  {% else %}
+  <table>
+    <thead>
+      <tr>
+        <th title="Ticket id.">ID</th>
+        <th title="Whether this came from the Send-feedback button or an error report.">Kind</th>
+        <th title="Account that submitted it.">User</th>
+        <th title="The message, plus any captured error trace.">Message</th>
+        <th title="When it was submitted (UTC).">Submitted</th>
+        <th title="Triage state.">Status</th>
+        <th title="Move the ticket through its lifecycle and jot a note.">Triage</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for t in tickets %}
+      <tr>
+        <td>#{{ t.id }}</td>
+        <td><span class="pill pill-{{ t.kind }}">{{ t.kind }}</span></td>
+        <td>{{ t.username or '(unknown)' }}</td>
+        <td>
+          <p class="ticket-msg">{{ t.message }}</p>
+          {% if t.detail %}
+          <details class="ticket-detail">
+            <summary>{{ 'Error trace' if t.kind == 'error' else 'Details' }}</summary>
+            <pre>{{ t.detail }}</pre>
+          </details>
+          {% endif %}
+        </td>
+        <td title="{{ t.created_at }} UTC">{{ t.created_at }}</td>
+        <td><span class="pill pill-{{ t.status }}">{{ t.status.replace('_', ' ') }}</span></td>
+        <td class="actions">
+          <form method="post" action="feedback/status" class="inline-action">
+            <input type="hidden" name="csrf" value="{{ csrf }}">
+            <input type="hidden" name="id" value="{{ t.id }}">
+            <input type="hidden" name="status_filter" value="{{ status_filter }}">
+            <select name="status" onchange="this.form.submit()" title="Set the ticket status.">
+              {% for s in statuses %}
+              <option value="{{ s }}" {{ 'selected' if t.status == s else '' }}>{{ s.replace('_', ' ') }}</option>
+              {% endfor %}
+            </select>
+            <noscript><button type="submit">Set</button></noscript>
+          </form>
+          <form method="post" action="feedback/note" class="ticket-note">
+            <input type="hidden" name="csrf" value="{{ csrf }}">
+            <input type="hidden" name="id" value="{{ t.id }}">
+            <input type="hidden" name="status_filter" value="{{ status_filter }}">
+            <textarea name="note" rows="1" placeholder="Triage note…">{{ t.admin_note or '' }}</textarea>
+            <button type="submit">Save note</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}"""
+
+
+# Billing placeholder. The drop-in point for a future Stripe integration: a
+# webhook will set api_access + tier together (see docs/access-control.md and
+# docs/usage-limits.md). Until then this tab documents the current state — tiers
+# are assigned by an admin on the Accounts tab; access mode and tier caps are
+# read from the environment.
+_FRAGMENT_BILLING = """
+  <h2>Billing</h2>
+  <p class="empty" style="text-align:left;max-width:60ch">
+    Billing is not wired up yet. Usage limits and tiers run independently of
+    payment: the access mode is <code>{{ access_mode }}</code>, and the per-day
+    cost allowance per tier is:
+  </p>
+  <table>
+    <thead><tr><th>Tier</th><th>Daily allowance</th><th>Max banked ({{ bank_days }} days)</th></tr></thead>
+    <tbody>
+      {% for t, cap in tiers.items() %}
+      <tr><td>{{ t }}</td><td>${{ '%.2f'|format(cap) }}/day</td><td>${{ '%.2f'|format(cap * bank_days) }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p class="note" style="max-width:60ch">
+    To connect Stripe later: have the subscription webhook call
+    <code>set_tier</code> + <code>set_api_access</code> on a user, and run the
+    app with <code>AIME_ACCESS_MODE=billing</code>. No metering or enforcement
+    code changes — tiers and the usage budget already work today. Assign tiers
+    manually from the <strong>Accounts</strong> tab in the meantime.
+  </p>
+"""
+
+
 # Accounts admin. A web equivalent of scripts/access_keys.py (grant/revoke,
 # revoke-all) + scripts/manage_users.py (delete/restore/purge). Every form
 # carries the session CSRF token.
@@ -3603,6 +3776,8 @@ _FRAGMENT_ACCOUNTS = """
         <th title="Internal account id.">ID</th>
         <th title="Account username.">Username</th>
         <th title="The api_access flag: whether this user may send messages through the paid model backend.">Send access</th>
+        <th title="Usage-limit plan. Sets the daily cost allowance; change it to move the user between tiers.">Tier</th>
+        <th title="Remaining budget as a percent of the full bank (the 7-day ceiling), with days banked in parentheses.">Usage</th>
         <th title="Grant/revoke send access, or soft-delete the account.">Actions</th>
       </tr>
     </thead>
@@ -3612,6 +3787,21 @@ _FRAGMENT_ACCOUNTS = """
         <td>#{{ u.id }}</td>
         <td>{{ u.username }}</td>
         <td class="{{ 'good' if u.api_access else 'bad' }}">{{ 'yes' if u.api_access else 'no' }}</td>
+        <td>
+          <form method="post" action="accounts/set-tier" class="inline-action">
+            <input type="hidden" name="csrf" value="{{ csrf }}">
+            <input type="hidden" name="username" value="{{ u.username }}">
+            <select name="tier" onchange="this.form.submit()">
+              {% for t in tiers %}
+              <option value="{{ t }}" {{ 'selected' if u.tier == t else '' }}>{{ t }}</option>
+              {% endfor %}
+            </select>
+            <noscript><button type="submit">Set</button></noscript>
+          </form>
+        </td>
+        <td class="{{ 'bad' if usage[u.username].over else '' }}" title="Daily cap ${{ '%.2f'|format(usage[u.username].daily_cap) }}; balance ${{ '%.2f'|format(usage[u.username].balance) }}; {{ '%.1f'|format(usage[u.username].days_banked) }} days banked">
+          {% if usage[u.username].over %}0% (out){% else %}{{ usage[u.username].pct_full|round|int }}%{% if usage[u.username].days_banked >= 1 %} ({{ '%.1f'|format(usage[u.username].days_banked) }}d){% endif %}{% endif %}
+        </td>
         <td class="actions">
           <form method="post" action="accounts/access">
             <input type="hidden" name="csrf" value="{{ csrf }}">
@@ -3803,6 +3993,29 @@ _PAGE = """<!doctype html>
     .badge-casual   { background: #c8860a22; border-color: #c8860a88; color: #c8860a; }
     .badge-one-off  { background: #8a4fd022; border-color: #8a4fd088; color: #8a4fd0; }
     .badge-none     { background: #8882; }
+
+    /* Unresolved-ticket count next to the Feedback tab. */
+    .tab-badge { display: inline-block; min-width: 1.1rem; padding: 0 .35rem;
+      font-size: .7rem; line-height: 1.25rem; text-align: center;
+      border-radius: 999px; background: #d2333322; border: 1px solid #d2333388;
+      color: #d23; font-weight: 700; vertical-align: middle; }
+    /* Ticket kind / status pills on the Feedback tab. */
+    .pill { display: inline-block; padding: .05rem .5rem; font-size: .72rem;
+      border-radius: 999px; border: 1px solid #8884; color: #888; font-weight: 600; }
+    .pill-error    { background: #d2333322; border-color: #d2333388; color: #d23; }
+    .pill-feedback { background: #2f6fd022; border-color: #2f6fd088; color: #2f6fd0; }
+    .pill-open        { background: #c8860a22; border-color: #c8860a88; color: #c8860a; }
+    .pill-in_progress { background: #2f6fd022; border-color: #2f6fd088; color: #2f6fd0; }
+    .pill-resolved    { background: #2e9e4f22; border-color: #2e9e4f88; color: #2e9e4f; }
+    .ticket-msg { white-space: pre-wrap; word-break: break-word; margin: 0; }
+    .ticket-detail { margin: .4rem 0 0; }
+    .ticket-detail summary { cursor: pointer; color: #888; font-size: .82rem; }
+    .ticket-detail pre { white-space: pre-wrap; word-break: break-word;
+      background: #8881; border: 1px solid #8883; border-radius: 6px;
+      padding: .5rem .6rem; margin: .4rem 0 0; max-height: 220px; overflow: auto;
+      font-size: .78rem; }
+    .ticket-note textarea { width: 100%; box-sizing: border-box; min-height: 2.2rem;
+      font: inherit; font-size: .82rem; }
 
     /* Used by the session-detail timeline to soften the tool-record rows. */
     tr.dim td { color: #888; }
@@ -4056,10 +4269,14 @@ _PAGE = """<!doctype html>
       title="List, grant/revoke, soft-delete, restore and purge accounts.">Accounts</a>
     <a href="/?{{ qs_keys }}" class="{{ 'active' if tab == 'keys' else '' }}"
       title="Mint and revoke invite keys.">Keys</a>
+    <a href="/?{{ qs_billing }}" class="{{ 'active' if tab == 'billing' else '' }}"
+      title="Subscription billing — placeholder for the future Stripe integration.">Billing</a>
     <a href="/?{{ qs_system }}" class="{{ 'active' if tab == 'system' else '' }}"
       title="Operator health — account/key counts, storage per user, log size.">System</a>
     <a href="/?{{ qs_security }}" class="{{ 'active' if tab == 'security' else '' }}"
       title="Audit log of failed logins, lockouts, and signup throttles.">Security</a>
+    <a href="/?{{ qs_feedback }}" class="{{ 'active' if tab == 'feedback' else '' }}"
+      title="User-submitted feedback and error reports — a basic ticket queue.">Feedback{% if feedback_open %} <span class="tab-badge">{{ feedback_open }}</span>{% endif %}</a>
   </nav>
 
   {% for f in flashes %}
@@ -4327,6 +4544,93 @@ def _refresh_seconds(args) -> int:
     return val if val in _REFRESH_CHOICES else _REFRESH_DEFAULT
 
 
+def _aggregate_tiers(records, user_tiers):
+    """Tier-fit analytics from the windowed api records, joined with each user's
+    current tier (``user_tiers``: username -> tier).
+
+    Answers the tier-system questions: how much of each tier's daily allowance
+    its users actually consume, how many exceed it, and how often. The
+    comparison is against the **daily cap** (not the banked bucket): for tier
+    *sizing*, "on what fraction of active days does a user blow past the daily
+    allowance?" is the useful signal. (A day over the cap isn't necessarily a
+    blocked day — the bucket banks several days — but a high over-rate says the
+    tier is undersized for that cohort.)
+
+    Users in the log but not in ``user_tiers`` (e.g. since-deleted) bucket under
+    "(unknown)". Tier is the user's *current* tier; mid-window changes are not
+    back-applied.
+    """
+    # Cost per (user, day).
+    ud: dict = {}
+    for rec in records:
+        if rec.get("kind") != "api":
+            continue
+        user = rec.get("user") or "(anonymous)"
+        day = str(rec.get("ts", ""))[:10]
+        if not day:
+            continue
+        ud[(user, day)] = ud.get((user, day), 0.0) + _report._api_cost(rec)
+
+    tiers: dict = {}
+    for (user, day), cost in ud.items():
+        tier = user_tiers.get(user, "(unknown)")
+        cap = _config.tier_daily_cap(tier) if tier in _config.USAGE_TIERS else 0.0
+        t = tiers.setdefault(tier, {
+            "users": set(), "user_days": 0, "total_cost": 0.0,
+            "over_days": 0, "users_over": set(), "util_sum": 0.0, "max_day": 0.0,
+            "cap": cap,
+        })
+        t["users"].add(user)
+        t["user_days"] += 1
+        t["total_cost"] += cost
+        t["max_day"] = max(t["max_day"], cost)
+        if cap > 0:
+            t["util_sum"] += cost / cap
+            if cost > cap:
+                t["over_days"] += 1
+                t["users_over"].add(user)
+
+    # Tier populations (so the user count reflects everyone on a tier, not just
+    # those active in the window).
+    population: dict = {}
+    for user, tier in user_tiers.items():
+        population.setdefault(tier, set()).add(user)
+
+    rows = []
+    seen = set()
+    for tier, t in tiers.items():
+        seen.add(tier)
+        ud_n = t["user_days"]
+        rows.append({
+            "tier": tier,
+            "cap": t["cap"],
+            "n_users": len(population.get(tier, set())) or len(t["users"]),
+            "n_active": len(t["users"]),
+            "avg_daily": (t["total_cost"] / ud_n) if ud_n else 0.0,
+            "avg_util_pct": (100.0 * t["util_sum"] / ud_n) if ud_n else 0.0,
+            "users_over": len(t["users_over"]),
+            "over_days": t["over_days"],
+            "user_days": ud_n,
+            "over_rate_pct": (100.0 * t["over_days"] / ud_n) if ud_n else 0.0,
+            "max_day": t["max_day"],
+        })
+    # Tiers with population but no activity in the window still get a row.
+    for tier, members in population.items():
+        if tier in seen:
+            continue
+        rows.append({
+            "tier": tier, "cap": _config.tier_daily_cap(tier),
+            "n_users": len(members), "n_active": 0, "avg_daily": 0.0,
+            "avg_util_pct": 0.0, "users_over": 0, "over_days": 0,
+            "user_days": 0, "over_rate_pct": 0.0, "max_day": 0.0,
+        })
+    # Configured tier order first (light, power, ...), unknown/extras last.
+    order = list(_config.USAGE_TIERS.keys())
+    rows.sort(key=lambda r: (order.index(r["tier"]) if r["tier"] in order
+                             else len(order), r["tier"]))
+    return rows
+
+
 def _compute(args):
     """Build the template context for the current filter query args."""
     path = _log_path()
@@ -4393,6 +4697,17 @@ def _compute(args):
         return True
 
     records = [r for r in all_records if _keep(r)]
+
+    # Tier-fit analytics: each active user's current tier (from auth) joined
+    # against their per-day spend. Best-effort — a missing auth backend just
+    # yields an empty mapping (every user buckets under "(unknown)").
+    user_tiers: dict = {}
+    try:
+        for u in _auth_backend().list_users():
+            user_tiers[u.username] = u.tier
+    except Exception:
+        pass
+    tier_rows = _aggregate_tiers(records, user_tiers)
 
     # --- Overview aggregations ---
     users = _report.aggregate(records)
@@ -4710,6 +5025,7 @@ def _compute(args):
         curr=curr_p,
         prev=prev_p,
         prev_window=overview_prev_window,
+        tier_rows=tier_rows,
         # conversations
         sessions=sessions,
         session_count=len(sessions),
@@ -4807,8 +5123,21 @@ def _accounts_context() -> dict:
     soft-deleted ones annotated with their purge countdown."""
     backend = _auth_backend()
     pending = _accounts.list_pending(backend, grace_days=_GRACE_DAYS)
+    active = backend.list_users()
+    # Per-user usage-budget snapshot (read-only; never writes the store) so the
+    # admin sees each account's remaining daily allowance alongside its tier.
+    store = _quota_store()
+    usage = {}
+    for u in active:
+        cap = _config.tier_daily_cap(u.tier)
+        ceiling = cap * _config.USAGE_BANK_DAYS
+        usage[u.username] = _quota.make_status(
+            store.read(u.username, cap, ceiling), cap, ceiling
+        )
     return dict(
-        active_users=backend.list_users(),
+        active_users=active,
+        usage=usage,
+        tiers=list(_config.USAGE_TIERS.keys()),
         pending=pending,
         expired_count=sum(1 for p in pending if p.expired),
         grace_days=_GRACE_DAYS,
@@ -4818,6 +5147,16 @@ def _accounts_context() -> dict:
 def _keys_context() -> dict:
     """Template context for the Keys tab."""
     return dict(keys=_auth_backend().list_access_keys())
+
+
+def _billing_context() -> dict:
+    """Template context for the Billing placeholder tab — the current access
+    mode plus the per-tier daily allowances read from config."""
+    return dict(
+        access_mode=os.environ.get("AIME_ACCESS_MODE", "keys").strip().lower(),
+        tiers=_config.USAGE_TIERS,
+        bank_days=_config.USAGE_BANK_DAYS,
+    )
 
 
 def _system_context() -> dict:
@@ -5086,7 +5425,8 @@ def _tab(args) -> str:
     t = args.get("tab")
     return t if t in ("overview", "cache", "activity", "tools", "agents",
                       "trends", "users", "conversations", "routing", "accounts",
-                      "keys", "system", "security") else "users"
+                      "keys", "billing", "system", "security",
+                      "feedback") else "users"
 
 
 def _render_fragment(ctx, tab) -> str:
@@ -5101,8 +5441,10 @@ def _render_fragment(ctx, tab) -> str:
         "routing": _FRAGMENT_ROUTING,
         "accounts": _FRAGMENT_ACCOUNTS,
         "keys": _FRAGMENT_KEYS,
+        "billing": _FRAGMENT_BILLING,
         "system": _FRAGMENT_SYSTEM,
         "security": _FRAGMENT_SECURITY,
+        "feedback": _FRAGMENT_FEEDBACK,
         "overview": _FRAGMENT_OVERVIEW,
     }.get(tab, _FRAGMENT_USERS)
     return render_template_string(template, **ctx)
@@ -5168,6 +5510,10 @@ def index():
         ctx["flash_keys"] = flash_keys
         auto = 0
         page_ctx = empty_page_ctx
+    elif tab == "billing":
+        ctx = _billing_context()
+        auto = 0
+        page_ctx = empty_page_ctx
     elif tab == "system":
         ctx = _system_context()
         auto = 0
@@ -5179,6 +5525,11 @@ def index():
         ctx = _security_context(request.args.get("tz", ""))
         auto = 0
         page_ctx = {**empty_page_ctx, "tz_label": ctx["tz_label"]}
+    elif tab == "feedback":
+        ctx = _feedback_context(request.args)
+        ctx["csrf"] = csrf
+        auto = 0
+        page_ctx = empty_page_ctx
     else:
         ctx = _compute(request.args)
         auto = _refresh_seconds(request.args)
@@ -5217,21 +5568,49 @@ def index():
     qs = {t: urlencode({**keep, "tab": t})
           for t in ("overview", "cache", "activity", "tools", "agents", "trends",
                     "users", "conversations", "routing", "accounts", "keys",
-                    "system", "security")}
+                    "billing", "system", "security", "feedback")}
+
+    # Unresolved-ticket count for the nav badge — shown on every tab. Guarded so
+    # a feedback-store hiccup never takes down the whole dashboard.
+    try:
+        feedback_open = _feedback_store().counts()["unresolved"]
+    except Exception:
+        feedback_open = 0
 
     return render_template_string(
         _PAGE, fragment=fragment, tab=tab, auto=auto,
         auto_label=_AUTO_LABELS.get(auto, "second"),
-        csrf=csrf, flashes=flashes,
+        csrf=csrf, flashes=flashes, feedback_open=feedback_open,
         qs_overview=qs["overview"], qs_cache=qs["cache"],
         qs_activity=qs["activity"], qs_tools=qs["tools"],
         qs_agents=qs["agents"],
         qs_trends=qs["trends"], qs_users=qs["users"],
         qs_conversations=qs["conversations"],
         qs_routing=qs["routing"],
-        qs_accounts=qs["accounts"], qs_keys=qs["keys"],
-        qs_system=qs["system"], qs_security=qs["security"], **page_ctx,
+        qs_accounts=qs["accounts"], qs_keys=qs["keys"], qs_billing=qs["billing"],
+        qs_system=qs["system"], qs_security=qs["security"],
+        qs_feedback=qs["feedback"], **page_ctx,
     )
+
+
+def _feedback_context(args) -> dict:
+    """Tickets for the Feedback tab, optionally filtered by status, plus the
+    per-status counts for the summary chips."""
+    store = _feedback_store()
+    status = args.get("status", "")
+    if status not in _feedback.STATUSES:
+        status = ""
+    tickets = store.list(status or None)
+    return {
+        "tickets": tickets,
+        "counts": store.counts(),
+        "status_filter": status,
+        "statuses": _feedback.STATUSES,
+        "qs_all": urlencode({"tab": "feedback"}),
+        "qs_open": urlencode({"tab": "feedback", "status": "open"}),
+        "qs_in_progress": urlencode({"tab": "feedback", "status": "in_progress"}),
+        "qs_resolved": urlencode({"tab": "feedback", "status": "resolved"}),
+    }
 
 
 @app.route("/fragment")
@@ -5280,7 +5659,7 @@ def user_drilldown(username):
     qs = {t: urlencode({**keep_tz, "tab": t})
           for t in ("overview", "cache", "activity", "tools", "agents", "trends",
                     "users", "conversations", "routing", "accounts", "keys",
-                    "system", "security")}
+                    "billing", "system", "security")}
     return render_template_string(
         _PAGE, fragment=fragment, tab="user", auto=0,
         auto_label="second",
@@ -5291,7 +5670,7 @@ def user_drilldown(username):
         qs_trends=qs["trends"], qs_users=qs["users"],
         qs_conversations=qs["conversations"],
         qs_routing=qs["routing"],
-        qs_accounts=qs["accounts"], qs_keys=qs["keys"],
+        qs_accounts=qs["accounts"], qs_keys=qs["keys"], qs_billing=qs["billing"],
         qs_system=qs["system"], qs_security=qs["security"], **empty_page_ctx,
     )
 
@@ -5358,7 +5737,7 @@ def session_drilldown(session_id):
     qs = {t: urlencode({**keep_tz, "tab": t})
           for t in ("overview", "cache", "activity", "tools", "agents", "trends",
                     "users", "conversations", "routing", "accounts", "keys",
-                    "system", "security")}
+                    "billing", "system", "security")}
     return render_template_string(
         _PAGE, fragment=fragment, tab="session", auto=0,
         auto_label="second",
@@ -5369,7 +5748,7 @@ def session_drilldown(session_id):
         qs_trends=qs["trends"], qs_users=qs["users"],
         qs_conversations=qs["conversations"],
         qs_routing=qs["routing"],
-        qs_accounts=qs["accounts"], qs_keys=qs["keys"],
+        qs_accounts=qs["accounts"], qs_keys=qs["keys"], qs_billing=qs["billing"],
         qs_system=qs["system"], qs_security=qs["security"], **empty_page_ctx,
     )
 
@@ -5387,6 +5766,21 @@ def account_access():
     if _auth_backend().set_api_access_by_username(username, grant):
         verb = "Granted" if grant else "Revoked"
         _flash("ok", f"{verb} send access for {username!r}.")
+    else:
+        _flash("bad", f"No such user: {username!r}.")
+    return redirect(url_for("index", tab="accounts"))
+
+
+@app.route("/accounts/set-tier", methods=["POST"])
+@admin_post
+def account_set_tier():
+    username = (request.form.get("username") or "").strip()
+    tier = (request.form.get("tier") or "").strip().lower()
+    if tier not in _config.USAGE_TIERS:
+        _flash("bad", f"Unknown tier: {tier!r}.")
+    elif _auth_backend().set_tier_by_username(username, tier):
+        _flash("ok", f"Set {username!r} to the {tier!r} tier "
+                     f"(${_config.USAGE_TIERS[tier]:.2f}/day).")
     else:
         _flash("bad", f"No such user: {username!r}.")
     return redirect(url_for("index", tab="accounts"))
@@ -5469,6 +5863,54 @@ def keys_revoke():
     else:
         _flash("bad", "Key not found or already redeemed.")
     return redirect(url_for("index", tab="keys"))
+
+
+# ---------------------------------------------------------------------------
+# Routes — feedback ticket triage
+# ---------------------------------------------------------------------------
+
+
+def _feedback_redirect():
+    """Back to the Feedback tab, preserving the active status filter."""
+    status_filter = (request.form.get("status_filter") or "").strip()
+    args = {"tab": "feedback"}
+    if status_filter in _feedback.STATUSES:
+        args["status"] = status_filter
+    return redirect(url_for("index", **args))
+
+
+@app.route("/feedback/status", methods=["POST"])
+@admin_post
+def feedback_status():
+    try:
+        ticket_id = int(request.form.get("id", ""))
+    except (TypeError, ValueError):
+        _flash("bad", "Bad ticket id.")
+        return _feedback_redirect()
+    status = (request.form.get("status") or "").strip()
+    if _feedback_store().set_status(ticket_id, status):
+        _flash("ok", f"Ticket #{ticket_id} moved to "
+                     f"{status.replace('_', ' ')!r}.")
+    else:
+        _flash("bad", f"Couldn't update ticket #{ticket_id} "
+                      f"(unknown status or missing ticket).")
+    return _feedback_redirect()
+
+
+@app.route("/feedback/note", methods=["POST"])
+@admin_post
+def feedback_note():
+    try:
+        ticket_id = int(request.form.get("id", ""))
+    except (TypeError, ValueError):
+        _flash("bad", "Bad ticket id.")
+        return _feedback_redirect()
+    note = request.form.get("note") or ""
+    if _feedback_store().set_note(ticket_id, note):
+        _flash("ok", f"Saved note on ticket #{ticket_id}.")
+    else:
+        _flash("bad", f"No such ticket: #{ticket_id}.")
+    return _feedback_redirect()
 
 
 def main() -> None:

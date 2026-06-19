@@ -29,33 +29,24 @@ import argparse
 import datetime
 
 
-# Anthropic base list prices in USD per million tokens — base input and
-# output only. Edit to match current pricing. Unknown models fall back to
-# "default". Cache rates are NOT listed separately: they are fixed multiples
-# of the base input price, applied in _api_cost():
-#
-#   cache read           = 0.10x base input
-#   cache write, 5m TTL  = 1.25x base input
-#   cache write, 1h TTL  = 2.00x base input
-#
-# Recording cache writes split by TTL (see aime/usage.py) is what lets this
-# script bill the 1h writes at 2x and the 5m writes at 1.25x exactly, rather
-# than guessing an average off a lumped total.
-CACHE_READ_MULT = 0.10
-CACHE_WRITE_5M_MULT = 1.25
-CACHE_WRITE_1H_MULT = 2.00
-
-# Server-side web_search is billed as a flat per-request charge, independent
-# of token usage: $10 per 1,000 requests. Recorded as `web_search_requests`
-# on each api record by aime.usage.
-WEB_SEARCH_COST_PER_REQUEST = 10.00 / 1000.0
-
-PRICES = {
-    "default":                  {"in": 3.00, "out": 15.00},
-    "claude-sonnet-4-6":        {"in": 3.00, "out": 15.00},
-    "claude-haiku-4-5":         {"in": 1.00, "out":  5.00},
-    "claude-haiku-4-5-20251001":{"in": 1.00, "out":  5.00},
-}
+# The cost model lives in the core package (aime.pricing) so the live
+# cost-control path can price a turn without importing from scripts/. Re-export
+# its constants and functions here (under the historical names) so this CLI and
+# the admin dashboard — which reference usage_report._api_cost etc. — are
+# unchanged. Edit prices in src/aime/pricing.py.
+_SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
+if _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
+from aime.pricing import (  # noqa: E402
+    CACHE_READ_MULT,
+    CACHE_WRITE_5M_MULT,
+    CACHE_WRITE_1H_MULT,
+    WEB_SEARCH_COST_PER_REQUEST,
+    PRICES,
+    price_for as _price_for,
+    cache_write_tokens as _cache_write_tokens,
+    api_cost as _api_cost,
+)
 
 
 def _default_log_path() -> str:
@@ -78,49 +69,6 @@ def _parse_bound(text: str, *, end: bool) -> datetime.datetime:
         return datetime.datetime.fromisoformat(text)
     except ValueError:
         sys.exit(f"error: could not parse date/time: {text!r}")
-
-
-def _price_for(model: str) -> dict:
-    """Look up base prices for a model.
-
-    The API stamps records with a *dated* model id (e.g.
-    "claude-sonnet-4-6-20260101"), which won't match a bare PRICES key. Try an
-    exact hit first, then the longest PRICES key that is a prefix of the model
-    id, and only then fall back to "default"."""
-    if model in PRICES:
-        return PRICES[model]
-    candidates = [k for k in PRICES if k != "default" and model.startswith(k)]
-    if candidates:
-        return PRICES[max(candidates, key=len)]
-    return PRICES["default"]
-
-
-def _cache_write_tokens(rec: dict) -> tuple[int, int]:
-    """Return (5m, 1h) cache-write token counts for a record.
-
-    New records carry the per-TTL split directly. Records written before the
-    split was added only have the lumped `cache_creation_tokens` — attribute
-    those to the 5-minute bucket (the cheaper rate, so an old record can never
-    be over-billed)."""
-    cc_5m = rec.get("cache_creation_5m_tokens")
-    cc_1h = rec.get("cache_creation_1h_tokens")
-    if cc_5m is None and cc_1h is None:
-        return rec.get("cache_creation_tokens", 0), 0
-    return cc_5m or 0, cc_1h or 0
-
-
-def _api_cost(rec: dict) -> float:
-    p = _price_for(rec.get("model", ""))
-    cc_5m, cc_1h = _cache_write_tokens(rec)
-    token_cost = (
-        rec.get("input_tokens", 0)        * p["in"]
-        + rec.get("output_tokens", 0)     * p["out"]
-        + rec.get("cache_read_tokens", 0) * p["in"] * CACHE_READ_MULT
-        + cc_5m                           * p["in"] * CACHE_WRITE_5M_MULT
-        + cc_1h                           * p["in"] * CACHE_WRITE_1H_MULT
-    ) / 1_000_000.0
-    # Web search is billed flat per request, on top of token cost.
-    return token_cost + rec.get("web_search_requests", 0) * WEB_SEARCH_COST_PER_REQUEST
 
 
 def load_records(path, since, until, user_filter):
