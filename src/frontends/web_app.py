@@ -93,6 +93,7 @@ from aime import graphics as _graphics
 from aime import email_send as _email_send
 from aime import topic_shares as _topic_shares
 from aime import quota as _quota
+from aime import feedback as _feedback
 from aime.tool_formatting import TOOL_NAME_MAP
 
 from . import stt as _stt
@@ -136,6 +137,11 @@ _share_store = _topic_shares.ShareStore(
 # mode no meter is attached so this file is never written.
 _quota_store = _quota.QuotaStore(
     os.path.join(aime_config.DATABASE_DIR, "quota.sql")
+)
+# User feedback / error-report tickets (aime.feedback). Cross-user, root-level
+# beside auth.sql; read by the admin dashboard's Feedback tab.
+_feedback_store = _feedback.FeedbackStore(
+    os.path.join(aime_config.DATABASE_DIR, "feedback.sql")
 )
 
 
@@ -1190,6 +1196,44 @@ def _usage_limits_armed() -> bool:
     Mirrors the send gate: armed in "keys"/"billing", off in "open". The single
     switch that turns the whole usage-limit system on or off."""
     return _ACCESS_MODE in ("keys", "billing")
+
+
+def _user_over_budget(user_id: int) -> bool:
+    """True when usage limits are armed and this user's daily budget is spent.
+
+    The on-demand counterpart to the /send 402 gate: it guards the paths where a
+    user asks for *new work right now* — the ad-hoc agent launcher, the saved-
+    agent Run button, and "run schedule now". Without it those would be a hole
+    around the chat block (an out-of-budget user could just spin up a one-off
+    agent to keep working). Reads the quota store straight off the user's tier —
+    no UserContext needed. Disarmed (open) mode is never over.
+
+    The *autonomous* scheduler loop deliberately does NOT consult this: a
+    recurring agent the user already set up keeps firing even when their chat
+    budget is spent — that is automation delivering, not new on-demand work, so
+    blocking it would punish usage rather than limit it (see docs/usage-limits.md).
+    The durable paid/unpaid line is api_access, which gates every path regardless."""
+    if not _usage_limits_armed():
+        return False
+    rec = _auth_backend.lookup(user_id)
+    if rec is None:
+        return False
+    cap = aime_config.tier_daily_cap(rec.tier)
+    ceiling = cap * aime_config.USAGE_BANK_DAYS
+    return _quota_store.read(rec.username, cap, ceiling) <= 0
+
+
+def _usage_exhausted_response():
+    """The shared 402 body for a budget-blocked on-demand action (chat or an
+    on-demand agent run), so the message stays identical across paths. The
+    frontend keys off the 402 status; the budget refills on its own."""
+    return jsonify({
+        "ok": False,
+        "error": "usage_exhausted",
+        "message": "You've used up today's Aime. Your access will be back "
+                   "tomorrow.",
+    }), 402
+
 
 # Toggle for the email 2FA flow. Off by default so a fresh install behaves
 # like it did before the feature shipped — handy for dev, demos, and anyone
@@ -2362,6 +2406,31 @@ def messaging_contact():
     return jsonify({"ok": True, "messaging_contact": contact})
 
 
+@app.route("/feedback", methods=["POST"])
+@login_required
+def feedback_submit():
+    """File a feedback or error-report ticket from the chat UI. ``kind`` is
+    'feedback' (the Send-feedback button) or 'error' (the "report this error?"
+    prompt); ``message`` is the user's words and ``detail`` carries the raw error
+    text / page context for error reports. Tickets surface on the admin
+    dashboard's Feedback tab."""
+    data = request.get_json(silent=True) or {}
+    kind = (data.get("kind") or "feedback").strip().lower()
+    message = (data.get("message") or "").strip()
+    detail = (data.get("detail") or "").strip() or None
+    if not message:
+        return jsonify({"ok": False, "error": "invalid",
+                        "message": "Please include a message."}), 400
+    try:
+        ticket_id = _feedback_store.submit(
+            user_id=g.user_id, username=g.username,
+            kind=kind, message=message, detail=detail,
+        )
+    except ValueError as e:
+        return jsonify({"ok": False, "error": "invalid", "message": str(e)}), 400
+    return jsonify({"ok": True, "ticket_id": ticket_id})
+
+
 @app.route("/redeem", methods=["POST"])
 @login_required
 def redeem():
@@ -2851,12 +2920,7 @@ def send():
     # message rather than the permanent invite-key prompt.
     if _usage_limits_armed() and ctx.quota_meter is not None \
             and ctx.quota_meter.status().get("over"):
-        return jsonify({
-            "ok": False,
-            "error": "usage_exhausted",
-            "message": "You've used up today's Aime. Your access will be back "
-                       "tomorrow.",
-        }), 402
+        return _usage_exhausted_response()
     # The browser sends its IANA timezone (e.g. "America/New_York") with each
     # message so per-turn timestamps the model sees track the user's local
     # time. Refreshed every send — self-corrects if the user travels.
@@ -3010,11 +3074,16 @@ def _schedule_store(user_id: int) -> ScheduleStore:
 
 
 def _scheduler_run_agent(agent_id: str, user_id: int, tz: str | None) -> None:
-    """Scheduler action: run a saved agent now, exactly as its Run button does.
+    """Scheduler action: run a saved agent on its cadence (the autonomous path).
 
-    Honors the same api-access gate as ``/agents/<id>/run`` — a scheduled run
-    spends tokens, so an account without send access must not fire one. A
-    deleted agent is a quiet no-op (the user can remove the dangling schedule)."""
+    Honors the api-access gate — a run spends tokens, so an account without send
+    access (e.g. unpaid in billing mode) never fires one. But it deliberately
+    does NOT consult the daily budget: this is automation the user already set
+    up delivering on schedule, not new on-demand work, so a spent chat budget
+    must not silently kill their recurring briefing (the manual Run paths gate
+    on the budget; see _user_over_budget and docs/usage-limits.md). The run
+    still debits the budget, so its cost is bounded over time. A deleted agent
+    is a quiet no-op (the user can remove the dangling schedule)."""
     rec = _auth_backend.lookup(user_id)
     if rec is None or not rec.api_access:
         return
@@ -3182,6 +3251,12 @@ def _launch_agent_run(
                 messaging_contact=messaging_contact,
                 api_url=aime_config.API_URL,
                 agent_id=agent_id,
+                # Debit this run's real cost against the user's budget (None when
+                # limits are disarmed). The run is never *blocked* by the budget —
+                # on-demand runs are gated up front in the route, recurring ones
+                # are deliberately exempt — but its spend still draws down the
+                # bucket so an agent can't be a free, uncapped channel.
+                quota=ctx.quota_meter,
             )
         except Exception:
             # The runner already converts its own failures into a persisted
@@ -3243,6 +3318,12 @@ def agents_run():
     allow_web = bool(data.get("allow_web_search", False))
     tz = data.get("tz")
     client_tz = tz if isinstance(tz, str) and tz else None
+
+    # On-demand work: an ad-hoc run spends tokens the user is asking for right
+    # now, so the daily budget blocks it exactly like /send. (Recurring agents
+    # fired by the scheduler are exempt — see _user_over_budget.)
+    if _user_over_budget(g.user_id):
+        return _usage_exhausted_response()
 
     # Unique, registry-safe name for this one-off agent. The timestamp keeps
     # runs listed in creation order; the random suffix avoids collisions.
@@ -3380,6 +3461,11 @@ def agents_run_saved(agent_id: str):
     record = _agent_def_store(g.user_id).load(agent_id)
     if record is None:
         return jsonify({"ok": False, "error": "agent not found"}), 404
+    # Pressing Run is on-demand work, so the daily budget blocks it like /send.
+    # The same agent fired by the scheduler on its cadence is exempt (see
+    # _user_over_budget / _scheduler_run_agent).
+    if _user_over_budget(g.user_id):
+        return _usage_exhausted_response()
     data = request.get_json(silent=True) or {}
     tz = data.get("tz")
     client_tz = tz if isinstance(tz, str) and tz else None
@@ -3489,6 +3575,12 @@ def schedules_run_now(schedule_id: str):
     record = _schedule_store(g.user_id).load(schedule_id)
     if record is None:
         return jsonify({"ok": False, "error": "schedule not found"}), 404
+    # "Run now" is a manual, on-demand trigger, so an agent action it fires is
+    # budget-blocked like /send. Message reminders cost no tokens, so they're
+    # left alone. The autonomous cadence (the scheduler loop) stays exempt.
+    if record.get("action", {}).get("kind") == "run_agent" \
+            and _user_over_budget(g.user_id):
+        return _usage_exhausted_response()
     data = request.get_json(silent=True) or {}
     tz = data.get("tz")
     client_tz = tz if isinstance(tz, str) and tz else record.get("tz")

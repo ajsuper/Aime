@@ -81,6 +81,37 @@ a *persistent* failure would silently disable enforcement for everyone, the
 debit path logs at `warning` (`provider_backend` logger) when it fails — that
 log line is the signal that the ledger is broken.
 
+## Background agents: limit, don't punish
+
+Background agents (the headless-worker framework) draw the **same** budget as
+chat — every agent turn and any offloaded web-search is debited from the user's
+bucket (the runner takes the user's `QuotaMeter`; see
+[background-agents](../src/aime/agents/runner.py)). So an agent can never be a
+free, uncapped channel around the budget.
+
+But the **block** is applied by *how the run was started*, not by what it costs.
+The distinction is **new on-demand work** vs **automation the user already set
+up**:
+
+- **On-demand runs are blocked when over budget**, exactly like `/send` (same
+  402): the ad-hoc agent launcher (`/agents/run`), the saved-agent **Run**
+  button (`/agents/<id>/run`), and **run schedule now**
+  (`/schedules/<id>/run`). Without this, an out-of-budget user could just spin
+  up a one-off agent to keep working — a hole around the chat block. The seam is
+  `web_app._user_over_budget`.
+- **Recurring runs fired by the scheduler loop are *not* blocked.** A daily
+  "tell me about my day" briefing the user scheduled keeps arriving even on a
+  day they spent their chat budget. Blocking it would punish usage rather than
+  limit it. The cost is still debited (so it draws the bucket down and is
+  bounded over time), but the run proceeds. The autonomous path
+  (`web_app._scheduler_run_agent`) deliberately skips the budget check.
+
+The durable paid/unpaid line is **`api_access`**, not the daily budget: *every*
+agent path (scheduled and on-demand) is gated on it, so when the (deferred)
+billing webhook revokes access for a user who stops paying, both their recurring
+and on-demand agents stop. The budget is a daily soft limit; `api_access` is the
+hard switch.
+
 ## Arming: driven by `AIME_ACCESS_MODE`
 
 Usage limits are **not** a separate flag. They arm exactly like the `/send`
@@ -129,11 +160,17 @@ Usage limits are **not** a separate flag. They arm exactly like the `/send`
   `set_tier_by_username`.
 - `src/aime/config.py` — tier caps, bank days, thresholds, `tier_daily_cap`.
 - `src/provider_backend.py` — debits in `_record_usage`; emits `usage_notice`.
-- `src/aime/web_search_agent.py` — debits the offloaded search's cost.
+- `src/aime/web_search_agent.py` — debits the offloaded search's cost (chat and
+  agent runs both inject `quota_debit`).
+- `src/aime/agents/runner.py` — takes the owning user's `QuotaMeter` (`quota=`)
+  and threads it into the run's backend + web-search agent, so agent spend
+  debits the same bucket. Never blocks here — see "Background agents" above.
 - `src/aime/controller.py` — passes `usage_notice` through to frontends.
 - `src/frontends/web_app.py` — `_usage_limits_armed()`, builds the per-user
   `QuotaMeter`, signup tier stamp, `/me` usage snapshot, the `/send` hard block
-  (402 when over).
+  (402 when over). `_user_over_budget()` is the on-demand agent-run gate (the
+  `/agents/run`, `/agents/<id>/run`, `/schedules/<id>/run` routes); the
+  autonomous `_scheduler_run_agent` skips it (recurring runs aren't blocked).
 - `resources/style/web_chat.html` — the account meter, the `usage_notice`
   banner, and the over-budget composer lock (`__usageOver`, the 402 handler).
 - `src/frontends/usage_dashboard.py` — the Accounts tier/usage columns and the

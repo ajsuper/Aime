@@ -62,6 +62,7 @@ from aime import config as _config  # noqa: E402
 from aime import auth as _auth  # noqa: E402
 from aime import accounts as _accounts  # noqa: E402
 from aime import quota as _quota  # noqa: E402
+from aime import feedback as _feedback  # noqa: E402
 
 app = Flask(__name__)
 
@@ -191,6 +192,20 @@ def _quota_store() -> _quota.QuotaStore:
             os.path.join(_config.DATABASE_DIR, "quota.sql")
         )
     return _quota_store_singleton
+
+
+# Lazily-built feedback-ticket store (aime.feedback), opened only when the
+# Feedback tab renders or a ticket is triaged.
+_feedback_store_singleton: _feedback.FeedbackStore | None = None
+
+
+def _feedback_store() -> _feedback.FeedbackStore:
+    global _feedback_store_singleton
+    if _feedback_store_singleton is None:
+        _feedback_store_singleton = _feedback.FeedbackStore(
+            os.path.join(_config.DATABASE_DIR, "feedback.sql")
+        )
+    return _feedback_store_singleton
 
 
 def _log_path() -> str:
@@ -3644,6 +3659,79 @@ _FRAGMENT_SECURITY = """
   {% endif %}"""
 
 
+# Feedback / error-report ticket queue. A basic ticket system over the
+# aime.feedback store: filter by status, read the message (and any captured
+# error trace), move a ticket through open → in progress → resolved, and jot a
+# triage note. State-changing actions are CSRF-guarded admin POSTs.
+_FRAGMENT_FEEDBACK = """
+  <h2 title="Feedback and error reports submitted from the chat UI. Triage them here.">Feedback &amp; error reports</h2>
+
+  <div class="userfilter" style="margin-bottom: 1rem;">
+    <a class="chipbtn {{ 'active' if not status_filter else '' }}" href="/?{{ qs_all }}">All <span class="note">{{ counts.total }}</span></a>
+    <a class="chipbtn {{ 'active' if status_filter == 'open' else '' }}" href="/?{{ qs_open }}">Open <span class="note">{{ counts.open }}</span></a>
+    <a class="chipbtn {{ 'active' if status_filter == 'in_progress' else '' }}" href="/?{{ qs_in_progress }}">In progress <span class="note">{{ counts.in_progress }}</span></a>
+    <a class="chipbtn {{ 'active' if status_filter == 'resolved' else '' }}" href="/?{{ qs_resolved }}">Resolved <span class="note">{{ counts.resolved }}</span></a>
+  </div>
+
+  {% if not tickets %}
+    <p class="empty">No {{ status_filter.replace('_', ' ') if status_filter else '' }} tickets.</p>
+  {% else %}
+  <table>
+    <thead>
+      <tr>
+        <th title="Ticket id.">ID</th>
+        <th title="Whether this came from the Send-feedback button or an error report.">Kind</th>
+        <th title="Account that submitted it.">User</th>
+        <th title="The message, plus any captured error trace.">Message</th>
+        <th title="When it was submitted (UTC).">Submitted</th>
+        <th title="Triage state.">Status</th>
+        <th title="Move the ticket through its lifecycle and jot a note.">Triage</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for t in tickets %}
+      <tr>
+        <td>#{{ t.id }}</td>
+        <td><span class="pill pill-{{ t.kind }}">{{ t.kind }}</span></td>
+        <td>{{ t.username or '(unknown)' }}</td>
+        <td>
+          <p class="ticket-msg">{{ t.message }}</p>
+          {% if t.detail %}
+          <details class="ticket-detail">
+            <summary>{{ 'Error trace' if t.kind == 'error' else 'Details' }}</summary>
+            <pre>{{ t.detail }}</pre>
+          </details>
+          {% endif %}
+        </td>
+        <td title="{{ t.created_at }} UTC">{{ t.created_at }}</td>
+        <td><span class="pill pill-{{ t.status }}">{{ t.status.replace('_', ' ') }}</span></td>
+        <td class="actions">
+          <form method="post" action="feedback/status" class="inline-action">
+            <input type="hidden" name="csrf" value="{{ csrf }}">
+            <input type="hidden" name="id" value="{{ t.id }}">
+            <input type="hidden" name="status_filter" value="{{ status_filter }}">
+            <select name="status" onchange="this.form.submit()" title="Set the ticket status.">
+              {% for s in statuses %}
+              <option value="{{ s }}" {{ 'selected' if t.status == s else '' }}>{{ s.replace('_', ' ') }}</option>
+              {% endfor %}
+            </select>
+            <noscript><button type="submit">Set</button></noscript>
+          </form>
+          <form method="post" action="feedback/note" class="ticket-note">
+            <input type="hidden" name="csrf" value="{{ csrf }}">
+            <input type="hidden" name="id" value="{{ t.id }}">
+            <input type="hidden" name="status_filter" value="{{ status_filter }}">
+            <textarea name="note" rows="1" placeholder="Triage note…">{{ t.admin_note or '' }}</textarea>
+            <button type="submit">Save note</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}"""
+
+
 # Billing placeholder. The drop-in point for a future Stripe integration: a
 # webhook will set api_access + tier together (see docs/access-control.md and
 # docs/usage-limits.md). Until then this tab documents the current state — tiers
@@ -3906,6 +3994,29 @@ _PAGE = """<!doctype html>
     .badge-one-off  { background: #8a4fd022; border-color: #8a4fd088; color: #8a4fd0; }
     .badge-none     { background: #8882; }
 
+    /* Unresolved-ticket count next to the Feedback tab. */
+    .tab-badge { display: inline-block; min-width: 1.1rem; padding: 0 .35rem;
+      font-size: .7rem; line-height: 1.25rem; text-align: center;
+      border-radius: 999px; background: #d2333322; border: 1px solid #d2333388;
+      color: #d23; font-weight: 700; vertical-align: middle; }
+    /* Ticket kind / status pills on the Feedback tab. */
+    .pill { display: inline-block; padding: .05rem .5rem; font-size: .72rem;
+      border-radius: 999px; border: 1px solid #8884; color: #888; font-weight: 600; }
+    .pill-error    { background: #d2333322; border-color: #d2333388; color: #d23; }
+    .pill-feedback { background: #2f6fd022; border-color: #2f6fd088; color: #2f6fd0; }
+    .pill-open        { background: #c8860a22; border-color: #c8860a88; color: #c8860a; }
+    .pill-in_progress { background: #2f6fd022; border-color: #2f6fd088; color: #2f6fd0; }
+    .pill-resolved    { background: #2e9e4f22; border-color: #2e9e4f88; color: #2e9e4f; }
+    .ticket-msg { white-space: pre-wrap; word-break: break-word; margin: 0; }
+    .ticket-detail { margin: .4rem 0 0; }
+    .ticket-detail summary { cursor: pointer; color: #888; font-size: .82rem; }
+    .ticket-detail pre { white-space: pre-wrap; word-break: break-word;
+      background: #8881; border: 1px solid #8883; border-radius: 6px;
+      padding: .5rem .6rem; margin: .4rem 0 0; max-height: 220px; overflow: auto;
+      font-size: .78rem; }
+    .ticket-note textarea { width: 100%; box-sizing: border-box; min-height: 2.2rem;
+      font: inherit; font-size: .82rem; }
+
     /* Used by the session-detail timeline to soften the tool-record rows. */
     tr.dim td { color: #888; }
     .dim { color: #888; }
@@ -4164,6 +4275,8 @@ _PAGE = """<!doctype html>
       title="Operator health — account/key counts, storage per user, log size.">System</a>
     <a href="/?{{ qs_security }}" class="{{ 'active' if tab == 'security' else '' }}"
       title="Audit log of failed logins, lockouts, and signup throttles.">Security</a>
+    <a href="/?{{ qs_feedback }}" class="{{ 'active' if tab == 'feedback' else '' }}"
+      title="User-submitted feedback and error reports — a basic ticket queue.">Feedback{% if feedback_open %} <span class="tab-badge">{{ feedback_open }}</span>{% endif %}</a>
   </nav>
 
   {% for f in flashes %}
@@ -5312,7 +5425,8 @@ def _tab(args) -> str:
     t = args.get("tab")
     return t if t in ("overview", "cache", "activity", "tools", "agents",
                       "trends", "users", "conversations", "routing", "accounts",
-                      "keys", "billing", "system", "security") else "users"
+                      "keys", "billing", "system", "security",
+                      "feedback") else "users"
 
 
 def _render_fragment(ctx, tab) -> str:
@@ -5330,6 +5444,7 @@ def _render_fragment(ctx, tab) -> str:
         "billing": _FRAGMENT_BILLING,
         "system": _FRAGMENT_SYSTEM,
         "security": _FRAGMENT_SECURITY,
+        "feedback": _FRAGMENT_FEEDBACK,
         "overview": _FRAGMENT_OVERVIEW,
     }.get(tab, _FRAGMENT_USERS)
     return render_template_string(template, **ctx)
@@ -5410,6 +5525,11 @@ def index():
         ctx = _security_context(request.args.get("tz", ""))
         auto = 0
         page_ctx = {**empty_page_ctx, "tz_label": ctx["tz_label"]}
+    elif tab == "feedback":
+        ctx = _feedback_context(request.args)
+        ctx["csrf"] = csrf
+        auto = 0
+        page_ctx = empty_page_ctx
     else:
         ctx = _compute(request.args)
         auto = _refresh_seconds(request.args)
@@ -5448,12 +5568,19 @@ def index():
     qs = {t: urlencode({**keep, "tab": t})
           for t in ("overview", "cache", "activity", "tools", "agents", "trends",
                     "users", "conversations", "routing", "accounts", "keys",
-                    "billing", "system", "security")}
+                    "billing", "system", "security", "feedback")}
+
+    # Unresolved-ticket count for the nav badge — shown on every tab. Guarded so
+    # a feedback-store hiccup never takes down the whole dashboard.
+    try:
+        feedback_open = _feedback_store().counts()["unresolved"]
+    except Exception:
+        feedback_open = 0
 
     return render_template_string(
         _PAGE, fragment=fragment, tab=tab, auto=auto,
         auto_label=_AUTO_LABELS.get(auto, "second"),
-        csrf=csrf, flashes=flashes,
+        csrf=csrf, flashes=flashes, feedback_open=feedback_open,
         qs_overview=qs["overview"], qs_cache=qs["cache"],
         qs_activity=qs["activity"], qs_tools=qs["tools"],
         qs_agents=qs["agents"],
@@ -5461,8 +5588,29 @@ def index():
         qs_conversations=qs["conversations"],
         qs_routing=qs["routing"],
         qs_accounts=qs["accounts"], qs_keys=qs["keys"], qs_billing=qs["billing"],
-        qs_system=qs["system"], qs_security=qs["security"], **page_ctx,
+        qs_system=qs["system"], qs_security=qs["security"],
+        qs_feedback=qs["feedback"], **page_ctx,
     )
+
+
+def _feedback_context(args) -> dict:
+    """Tickets for the Feedback tab, optionally filtered by status, plus the
+    per-status counts for the summary chips."""
+    store = _feedback_store()
+    status = args.get("status", "")
+    if status not in _feedback.STATUSES:
+        status = ""
+    tickets = store.list(status or None)
+    return {
+        "tickets": tickets,
+        "counts": store.counts(),
+        "status_filter": status,
+        "statuses": _feedback.STATUSES,
+        "qs_all": urlencode({"tab": "feedback"}),
+        "qs_open": urlencode({"tab": "feedback", "status": "open"}),
+        "qs_in_progress": urlencode({"tab": "feedback", "status": "in_progress"}),
+        "qs_resolved": urlencode({"tab": "feedback", "status": "resolved"}),
+    }
 
 
 @app.route("/fragment")
@@ -5715,6 +5863,54 @@ def keys_revoke():
     else:
         _flash("bad", "Key not found or already redeemed.")
     return redirect(url_for("index", tab="keys"))
+
+
+# ---------------------------------------------------------------------------
+# Routes — feedback ticket triage
+# ---------------------------------------------------------------------------
+
+
+def _feedback_redirect():
+    """Back to the Feedback tab, preserving the active status filter."""
+    status_filter = (request.form.get("status_filter") or "").strip()
+    args = {"tab": "feedback"}
+    if status_filter in _feedback.STATUSES:
+        args["status"] = status_filter
+    return redirect(url_for("index", **args))
+
+
+@app.route("/feedback/status", methods=["POST"])
+@admin_post
+def feedback_status():
+    try:
+        ticket_id = int(request.form.get("id", ""))
+    except (TypeError, ValueError):
+        _flash("bad", "Bad ticket id.")
+        return _feedback_redirect()
+    status = (request.form.get("status") or "").strip()
+    if _feedback_store().set_status(ticket_id, status):
+        _flash("ok", f"Ticket #{ticket_id} moved to "
+                     f"{status.replace('_', ' ')!r}.")
+    else:
+        _flash("bad", f"Couldn't update ticket #{ticket_id} "
+                      f"(unknown status or missing ticket).")
+    return _feedback_redirect()
+
+
+@app.route("/feedback/note", methods=["POST"])
+@admin_post
+def feedback_note():
+    try:
+        ticket_id = int(request.form.get("id", ""))
+    except (TypeError, ValueError):
+        _flash("bad", "Bad ticket id.")
+        return _feedback_redirect()
+    note = request.form.get("note") or ""
+    if _feedback_store().set_note(ticket_id, note):
+        _flash("ok", f"Saved note on ticket #{ticket_id}.")
+    else:
+        _flash("bad", f"No such ticket: #{ticket_id}.")
+    return _feedback_redirect()
 
 
 def main() -> None:

@@ -690,6 +690,35 @@
     .new-chat-pill:hover { color: var(--text); border-color: var(--accent);
                            background: var(--bg-elev); }
     .new-chat-pill svg { width: 16px; height: 16px; }
+    /* Send-feedback: a deliberately quiet icon button beside the new-chat pill.
+       No border at rest so it recedes; it warms up only on hover. */
+    .feedback-btn { display: inline-flex; align-items: center; justify-content: center;
+                    background: transparent; color: var(--muted);
+                    border: 1px solid transparent; border-radius: var(--r-sm);
+                    padding: 0.4rem; cursor: pointer; font: inherit; flex-shrink: 0;
+                    transition: color 0.15s, border-color 0.15s, background 0.15s; }
+    .feedback-btn:hover { color: var(--text); border-color: var(--border);
+                          background: var(--bg-elev); }
+    .feedback-btn svg { width: 17px; height: 17px; }
+    /* Feedback modal internals. */
+    .feedback-intro { color: var(--muted); font-size: 0.88rem; margin: 0;
+                      line-height: 1.4; }
+    #feedback-message { width: 100%; resize: vertical; min-height: 90px;
+                        background: var(--bg-input); color: var(--text);
+                        border: 1px solid var(--border); border-radius: 8px;
+                        padding: 0.6rem 0.7rem; font: inherit; font-size: 0.9rem;
+                        box-sizing: border-box;
+                        transition: border-color 0.15s, box-shadow 0.15s; }
+    #feedback-message:focus { outline: none; border-color: var(--accent);
+                        box-shadow: 0 0 0 2px color-mix(in srgb,
+                          var(--accent) 25%, transparent); }
+    #feedback-error-detail { font-size: 0.82rem; color: var(--muted); }
+    #feedback-error-detail summary { cursor: pointer; }
+    #feedback-error-detail pre { margin: 0.5rem 0 0; padding: 0.55rem 0.65rem;
+                        background: var(--bg-input); border: 1px solid var(--border);
+                        border-radius: 6px; max-height: 160px; overflow: auto;
+                        white-space: pre-wrap; word-break: break-word;
+                        font-size: 0.78rem; color: var(--text); }
     .input-wrap { flex: 1 1 320px; min-width: 0; position: relative;
                   display: flex; gap: 0.5rem; align-items: center;
                   background: var(--bg-input); border: 1px solid var(--border);
@@ -804,6 +833,34 @@
                    transition: opacity 0.18s ease, transform 0.18s ease;
                    max-width: 90vw; text-align: center; }
     #voice-toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+    /* Error-report prompt — a small card pinned bottom-right that asks whether
+       to file a report. Persists until acted on, so it isn't a fading toast. */
+    #error-report-pop { position: fixed; right: 24px; bottom: 96px;
+                        background: var(--bg-elev); color: var(--text);
+                        border: 1px solid var(--border); border-radius: 12px;
+                        padding: 0.85rem 1rem; max-width: 320px; z-index: 1000;
+                        box-shadow: 0 10px 30px rgba(0,0,0,0.4);
+                        opacity: 0; transform: translateY(10px);
+                        pointer-events: none;
+                        transition: opacity 0.2s ease, transform 0.2s ease; }
+    #error-report-pop.show { opacity: 1; transform: translateY(0);
+                             pointer-events: auto; }
+    #error-report-pop[hidden] { display: none; }
+    #error-report-pop .erp-text { font-size: 0.88rem; line-height: 1.4;
+                                  margin-bottom: 0.7rem; }
+    #error-report-pop .erp-actions { display: flex; gap: 0.5rem;
+                                     justify-content: flex-end; }
+    #error-report-pop button { border-radius: 7px; padding: 0.4rem 0.85rem;
+                               cursor: pointer; font: inherit; font-size: 0.84rem;
+                               transition: background 0.15s, border-color 0.15s; }
+    #error-report-pop .erp-ghost { background: transparent; color: var(--muted);
+                                   border: 1px solid var(--border); }
+    #error-report-pop .erp-ghost:hover { color: var(--text);
+                                         border-color: var(--accent); }
+    #error-report-pop .erp-primary { background: var(--accent);
+                                     border: 1px solid var(--accent); color: white; }
+    #error-report-pop .erp-primary:hover { background: var(--accent-hover);
+                                           border-color: var(--accent-hover); }
     #voice-toast .title { display: block; font-weight: 600;
                           color: var(--accent); margin-bottom: 0.15rem; }
     #voice-toast kbd { background: var(--bg); border: 1px solid var(--border);
@@ -2516,12 +2573,70 @@
             </svg>
             <span>New conversation</span>
           </button>
+          <button type="button" class="feedback-btn tip-anchor" id="feedback-btn"
+                  data-tip="Send feedback" aria-label="Send feedback">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                 stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+            </svg>
+          </button>
         </div>
       </form>
     </div>
   </div>
   <div id="drop-overlay">Drop files to attach</div>
   <div id="voice-toast" role="status" aria-live="polite"></div>
+
+  <!-- Feedback modal. Opened by the Send-feedback button, and also reused as
+       the "report this error?" flow: when an error report is in progress the
+       captured error text is carried in a hidden field and the heading shifts
+       to "Report an error". -->
+  <div id="feedback-backdrop" class="modal-backdrop" role="dialog"
+       aria-modal="true" aria-labelledby="feedback-title" hidden>
+    <div class="modal-card">
+      <div class="modal-head">
+        <span class="title" id="feedback-title">Send feedback</span>
+        <button class="modal-close" id="feedback-close" title="Close"
+                aria-label="Close">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="18" y1="6" x2="6" y2="18"/>
+            <line x1="6" y1="6" x2="18" y2="18"/>
+          </svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <p class="feedback-intro" id="feedback-intro">
+          Found a bug or have an idea? Tell us — it goes straight to the team.
+        </p>
+        <details id="feedback-error-detail" hidden>
+          <summary>Error details that will be included</summary>
+          <pre id="feedback-error-text"></pre>
+        </details>
+        <textarea id="feedback-message" rows="5"
+                  placeholder="What's on your mind?"
+                  aria-label="Feedback message"></textarea>
+        <p class="ev-modal-error" id="feedback-error" hidden></p>
+      </div>
+      <div class="modal-foot">
+        <span class="spacer"></span>
+        <button type="button" id="feedback-cancel">Cancel</button>
+        <button type="button" class="primary" id="feedback-send">Send</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Error-report prompt. A quiet popup that slides up when Aime hits an
+       error, offering to file an error report. "Report" opens the feedback
+       modal pre-loaded with the captured error text; the popup persists until
+       the user acts on it (it needs a decision, so it doesn't auto-dismiss). -->
+  <div id="error-report-pop" role="alertdialog" aria-live="polite" hidden>
+    <div class="erp-text">Aime ran into an error. Would you like to report it?</div>
+    <div class="erp-actions">
+      <button type="button" id="erp-dismiss" class="erp-ghost">Not now</button>
+      <button type="button" id="erp-report" class="erp-primary">Report</button>
+    </div>
+  </div>
 
   <!-- Event detail / edit modal. Opened by clicking an event block or
        all-day pill in any calendar view. Stores the active event id in
@@ -4691,8 +4806,10 @@ es.onmessage = (ev) => {
       if (e.severity === "error" && verbosity !== "verbose") {
         console.error("Aime notice:", e.text);
         appendNotice("Aime encountered an issue", "error");
+        offerErrorReport(e.text);
       } else {
         appendNotice(e.text, e.severity);
+        if (e.severity === "error") offerErrorReport(e.text);
       }
       break;
     case "session_restart":
@@ -4723,6 +4840,7 @@ es.onmessage = (ev) => {
         console.error("Aime error:", e.text);
         appendNotice("Aime encountered an issue", "error");
       }
+      offerErrorReport(e.text);
       break;
   }
 };
@@ -4775,6 +4893,134 @@ form.addEventListener("submit", async (ev) => {
 
 document.getElementById("new-chat-btn").addEventListener("click", () => {
   sendText("/reset", []);
+});
+
+// --- Feedback & error reporting -------------------------------------------
+// One modal serves both the deliberate "Send feedback" button and the
+// "report this error?" prompt. `feedbackKind` tracks which; in "error" mode the
+// captured error text rides along as `detail` so the team gets the real trace.
+const feedbackBackdrop = document.getElementById("feedback-backdrop");
+const feedbackTitle = document.getElementById("feedback-title");
+const feedbackIntro = document.getElementById("feedback-intro");
+const feedbackMessage = document.getElementById("feedback-message");
+const feedbackErrorEl = document.getElementById("feedback-error");
+const feedbackErrorDetail = document.getElementById("feedback-error-detail");
+const feedbackErrorText = document.getElementById("feedback-error-text");
+const feedbackSendBtn = document.getElementById("feedback-send");
+let feedbackKind = "feedback";
+let feedbackDetail = null;
+
+function openFeedback(kind, detail) {
+  feedbackKind = kind === "error" ? "error" : "feedback";
+  feedbackDetail = detail || null;
+  feedbackErrorEl.hidden = true;
+  feedbackMessage.value = "";
+  feedbackSendBtn.disabled = false;
+  feedbackSendBtn.textContent = "Send";
+  if (feedbackKind === "error") {
+    feedbackTitle.textContent = "Report an error";
+    feedbackIntro.textContent =
+      "Tell us what you were doing when this happened — it helps us fix it. (Optional.)";
+    feedbackMessage.placeholder = "What were you doing? (optional)";
+    if (feedbackDetail) {
+      feedbackErrorText.textContent = feedbackDetail;
+      feedbackErrorDetail.hidden = false;
+      feedbackErrorDetail.open = false;
+    } else {
+      feedbackErrorDetail.hidden = true;
+    }
+  } else {
+    feedbackTitle.textContent = "Send feedback";
+    feedbackIntro.textContent =
+      "Found a bug or have an idea? Tell us — it goes straight to the team.";
+    feedbackMessage.placeholder = "What's on your mind?";
+    feedbackErrorDetail.hidden = true;
+  }
+  feedbackBackdrop.hidden = false;
+  setTimeout(() => feedbackMessage.focus(), 30);
+}
+
+function closeFeedback() {
+  feedbackBackdrop.hidden = true;
+}
+
+async function submitFeedback() {
+  const message = feedbackMessage.value.trim();
+  // A deliberate feedback note needs words; an error report can go with just
+  // the captured trace, so an empty message is allowed there.
+  if (!message && feedbackKind !== "error") {
+    feedbackErrorEl.textContent = "Please write a message first.";
+    feedbackErrorEl.hidden = false;
+    return;
+  }
+  const payload = {
+    kind: feedbackKind,
+    message: message ||
+      (feedbackKind === "error" ? "(no description provided)" : ""),
+    detail: feedbackDetail || "",
+  };
+  feedbackSendBtn.disabled = true;
+  feedbackSendBtn.textContent = "Sending…";
+  try {
+    const r = await fetch("/feedback", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(payload),
+    });
+    const data = await r.json().catch(() => ({ok: false}));
+    if (!r.ok || !data.ok) throw new Error(data.message || data.error || "failed");
+    closeFeedback();
+    appendNotice(feedbackKind === "error"
+      ? "Thanks — your error report was sent. We'll look into it."
+      : "Thanks for the feedback!", "info");
+  } catch (_) {
+    feedbackErrorEl.textContent = "Couldn't send that just now — please try again.";
+    feedbackErrorEl.hidden = false;
+    feedbackSendBtn.disabled = false;
+    feedbackSendBtn.textContent = "Send";
+  }
+}
+
+document.getElementById("feedback-btn")
+  .addEventListener("click", () => openFeedback("feedback", null));
+document.getElementById("feedback-close").addEventListener("click", closeFeedback);
+document.getElementById("feedback-cancel").addEventListener("click", closeFeedback);
+feedbackSendBtn.addEventListener("click", submitFeedback);
+feedbackBackdrop.addEventListener("click", (e) => {
+  if (e.target === feedbackBackdrop) closeFeedback();
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !feedbackBackdrop.hidden) closeFeedback();
+});
+// Cmd/Ctrl+Enter sends straight from the textarea.
+feedbackMessage.addEventListener("keydown", (e) => {
+  if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+    e.preventDefault();
+    submitFeedback();
+  }
+});
+
+// The "report this error?" popup. Shown when Aime surfaces an error; remembers
+// the raw error text so a later Report click attaches it. Repeated errors just
+// refresh the same popup rather than stacking copies.
+const errorReportPop = document.getElementById("error-report-pop");
+let lastErrorDetail = null;
+let errorPopTimer = null;
+function offerErrorReport(detail) {
+  lastErrorDetail = detail || null;
+  clearTimeout(errorPopTimer);
+  errorReportPop.hidden = false;
+  requestAnimationFrame(() => errorReportPop.classList.add("show"));
+}
+function hideErrorReport() {
+  errorReportPop.classList.remove("show");
+  clearTimeout(errorPopTimer);
+  errorPopTimer = setTimeout(() => { errorReportPop.hidden = true; }, 220);
+}
+document.getElementById("erp-dismiss").addEventListener("click", hideErrorReport);
+document.getElementById("erp-report").addEventListener("click", () => {
+  hideErrorReport();
+  openFeedback("error", lastErrorDetail);
 });
 
 // The browser's IANA timezone (e.g. "America/New_York"), resolved fresh on

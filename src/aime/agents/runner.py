@@ -76,6 +76,7 @@ class BackgroundAgentRunner:
         messaging_contact: str | None = None,
         api_url: str = config.API_URL,
         agent_id: str | None = None,
+        quota=None,
     ) -> AgentResult:
         """Execute ``spec`` against ``user_id``'s database and return the result.
 
@@ -88,6 +89,13 @@ class BackgroundAgentRunner:
         user via the SendMessage tool or SubmitResult's ``message_to_user``
         field. The caller supplies it (the runner has no auth access of its own),
         which keeps contact resolution out of this layer.
+
+        ``quota`` is the owning user's :class:`aime.quota.QuotaMeter` (or None
+        when usage limits are disarmed). When present this run's real cost is
+        debited from the user's budget, the same as an interactive turn — a run
+        is never *blocked* here (on-demand runs are gated before launch; recurring
+        ones are exempt by design), but its spend is accounted so an agent can't
+        be a free channel around the budget. See docs/usage-limits.md.
         """
         run_id = new_run_id(spec.name)
         started_at = _utc_now_iso()
@@ -95,7 +103,7 @@ class BackgroundAgentRunner:
         backend, controller, collector = self._build(
             spec, user_id=user_id, dek=dek, runs_dir=runs_dir,
             usage_label=usage_label, api_url=api_url, client_tz=client_tz,
-            messaging_contact=messaging_contact,
+            messaging_contact=messaging_contact, quota=quota,
         )
 
         status = ""
@@ -139,7 +147,7 @@ class BackgroundAgentRunner:
 
     def _build(
         self, spec, *, user_id, dek, runs_dir, usage_label, api_url, client_tz,
-        messaging_contact=None,
+        messaging_contact=None, quota=None,
     ):
         web_search_agent = None
         web_search_schema = None
@@ -149,6 +157,9 @@ class BackgroundAgentRunner:
                 tool_version=config.WEB_SEARCH_TOOL_VERSION,
                 usage_label=usage_label,
                 record_api=_usage.record_api,
+                # The offloaded search is real spend for the same user, so it
+                # draws down the same budget as the run's own turns.
+                quota_debit=(quota.debit if quota is not None else None),
                 # Attribute this run's offloaded searches to agent usage, so
                 # they land under the Agents tab rather than interactive
                 # web_search. Cost is keyed to the owning user (usage_label).
@@ -174,6 +185,10 @@ class BackgroundAgentRunner:
             # usage dashboard can separate a user's agent cost from their
             # interactive cost. The owning user comes from usage_label.
             usage_source="agent",
+            # Debit each turn's real cost from the user's budget (None disarms
+            # it). The run is never blocked on the budget here — see the run()
+            # docstring — but its spend is accounted.
+            quota=quota,
         )
         backend.new_session()
 

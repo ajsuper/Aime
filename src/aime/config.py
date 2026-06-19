@@ -145,9 +145,10 @@ GET_GRAPHIC_SCHEMA = "../resources/tools/api_get_graphic_schema.json"
 # busy one (and a fully-rested user starts with a multi-day buffer). The cost of
 # every API call is debited from the balance (see aime.pricing). Enforcement is
 # *armed by AIME_ACCESS_MODE*, not a separate flag — disarmed in "open" mode,
-# armed in "keys"/"billing" (mirrors the /send api_access gate). The terminal
-# action at an empty balance is deliberately deferred: today the system only
-# notifies; see aime.quota.enforcement_decision for the single seam to change.
+# armed in "keys"/"billing" (mirrors the /send api_access gate). At an empty
+# balance /send hard-blocks the turn (402) until the allowance refills; below a
+# day's allowance it notifies. The classification lives behind one seam,
+# aime.quota.enforcement_decision.
 
 
 def _env_float(name: str, default: float) -> float:

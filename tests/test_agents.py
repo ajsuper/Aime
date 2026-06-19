@@ -231,3 +231,85 @@ def test_agent_result_ok_only_when_completed():
     assert AgentResult(status="completed", summary_text="s").ok is True
     for bad in ("max_turns", "no_result", "error"):
         assert AgentResult(status=bad, summary_text="s").ok is False
+
+
+# --------------------------------------------------------------------------- #
+# Budget wiring — a run debits the owning user's budget, but is never blocked
+# here. The route layer gates on-demand runs; recurring runs are exempt by
+# design (see web_app._user_over_budget / docs/usage-limits.md). What this layer
+# must guarantee is only that the QuotaMeter reaches the spend paths.
+# --------------------------------------------------------------------------- #
+def _patch_runner_collaborators(monkeypatch, captured):
+    """Replace the heavy collaborators _build constructs with kwarg-capturing
+    fakes, so a test can assert the quota wiring without standing up a real
+    backend/controller (no model client, no schema files)."""
+    from aime.agents import runner as runner_mod
+
+    class FakeBackend:
+        def __init__(self, **kw):
+            captured["backend"] = kw
+
+        def new_session(self):
+            pass
+
+    class FakeWebSearch:
+        def __init__(self, **kw):
+            captured["web_search"] = kw
+
+    class FakeGateway:
+        def __init__(self, **kw):
+            pass
+
+    class FakeController:
+        def __init__(self, **kw):
+            pass
+
+        def set_client_timezone(self, tz):
+            pass
+
+        def subscribe(self, sub):
+            pass
+
+    monkeypatch.setattr(runner_mod, "AnthropicMessagesBackend", FakeBackend)
+    monkeypatch.setattr(runner_mod, "WebSearchAgent", FakeWebSearch)
+    monkeypatch.setattr(runner_mod, "ToolGateway", FakeGateway)
+    monkeypatch.setattr(runner_mod, "ConversationController", FakeController)
+    monkeypatch.setattr(runner_mod._messaging, "get_messenger", lambda: None)
+    monkeypatch.setattr(config, "load_agent_base_prompt", lambda: "")
+    monkeypatch.setattr(config, "WEB_SEARCH_ENABLED", True)
+    monkeypatch.setattr(
+        BackgroundAgentRunner, "_schema_files_for", staticmethod(lambda spec: [])
+    )
+    monkeypatch.setattr(AgentSpec, "submit_result_raw_schema", lambda self: None)
+
+
+def _build_with_quota(monkeypatch, quota):
+    captured: dict = {}
+    _patch_runner_collaborators(monkeypatch, captured)
+    BackgroundAgentRunner()._build(
+        _spec(tool_allowlist=None),  # None allowlist => web search allowed
+        user_id=1, dek=b"k", runs_dir="/tmp", usage_label="alice",
+        api_url="http://x", client_tz=None, messaging_contact=None, quota=quota,
+    )
+    return captured
+
+
+def test_runner_threads_quota_into_backend_and_web_search(monkeypatch):
+    class FakeMeter:
+        def debit(self, cost):
+            return None
+
+    meter = FakeMeter()
+    captured = _build_with_quota(monkeypatch, meter)
+    # The backend gets the meter itself (it debits each turn in _record_usage).
+    assert captured["backend"]["quota"] is meter
+    # The offloaded web search gets the meter's debit callback (it bills the
+    # flat per-search fee + Haiku tokens against the same bucket).
+    assert captured["web_search"]["quota_debit"] == meter.debit
+
+
+def test_runner_quota_none_disarms_both_spend_paths(monkeypatch):
+    captured = _build_with_quota(monkeypatch, None)
+    # Disarmed (open mode): nothing is metered on either path.
+    assert captured["backend"]["quota"] is None
+    assert captured["web_search"]["quota_debit"] is None

@@ -1408,8 +1408,9 @@ class AnthropicMessagesBackend:
             self._spawn_compaction()
             # If this turn's debit crossed a budget threshold, surface the
             # notice now (before turn_end) so the UI can show a gentle banner.
-            # Stashed by _record_usage, which can't yield. Notify only — no turn
-            # is blocked (the enforcement action is deferred; see aime.quota).
+            # Stashed by _record_usage, which can't yield. This notice doesn't
+            # block — the turn already ran; the hard block lives one send ahead
+            # in /send (the pre-turn 402 gate). See aime.quota.
             notice = self._usage_notice_pending
             self._usage_notice_pending = None
             if notice is not None:
