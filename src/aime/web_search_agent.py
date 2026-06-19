@@ -30,9 +30,26 @@ relay, never an exception — a search failure must not break the turn.
 """
 
 import datetime
+from dataclasses import dataclass, field
 from typing import Callable
 
 from anthropic import Anthropic
+
+
+@dataclass
+class WebSearchResult:
+    """What one ``WebSearch`` delegation produced.
+
+    ``digest`` is the text the conversational model reads (summary + an
+    embedded Sources list). ``sources`` is the *same* citation data as
+    structured ``(title, url)`` pairs, so the frontend can surface a source
+    bubble deterministically instead of hoping the model echoes the list back
+    in its reply. Empty ``sources`` means the search found nothing to cite (or
+    failed) — there's simply no bubble to show.
+    """
+
+    digest: str
+    sources: list[tuple[str, str]] = field(default_factory=list)
 
 
 _SYSTEM = (
@@ -99,19 +116,19 @@ class WebSearchAgent:
         self._max_tokens = max_tokens
         self._client = Anthropic(max_retries=2)
 
-    def search(self, request: str, *, session_id: str | None = None) -> str:
-        """Run the request and return ``summary + Sources``.
+    def search(self, request: str, *, session_id: str | None = None) -> WebSearchResult:
+        """Run the request and return a :class:`WebSearchResult`.
 
-        Always returns a string — on any failure, a short factual line the
-        caller can relay rather than an exception.
+        Always returns a result (never raises) — on any failure, ``digest`` is a
+        short factual line the caller can relay and ``sources`` is empty.
         """
         request = (request or "").strip()
         if not request:
-            return "No search request was provided."
+            return WebSearchResult("No search request was provided.")
         try:
             return self._run(request, session_id=session_id)
         except Exception as exc:  # never let a search failure break the turn
-            return (
+            return WebSearchResult(
                 "The web search could not be completed right now "
                 f"({type(exc).__name__}). Tell the user the lookup failed and, "
                 "if you can, answer from what you already know."
@@ -119,7 +136,7 @@ class WebSearchAgent:
 
     # --- internals ---
 
-    def _run(self, request: str, *, session_id: str | None) -> str:
+    def _run(self, request: str, *, session_id: str | None) -> WebSearchResult:
         messages: list[dict] = [{"role": "user", "content": request}]
         text_parts: list[str] = []
         sources: list[tuple[str, str]] = []   # (title, url), order-preserving
@@ -157,11 +174,13 @@ class WebSearchAgent:
 
         # Prefer the sources Haiku actually cited; fall back to the raw result
         # list only if it cited nothing (so we still surface where it looked).
+        # The same list is both embedded in the digest (for the model) and
+        # returned structured (for the UI's source bubble).
         chosen = sources or result_fallback[:8]
         if chosen:
             lines = "\n".join(f"- {title} — {url}" for title, url in chosen)
-            return f"{summary}\n\nSources:\n{lines}"
-        return summary
+            return WebSearchResult(f"{summary}\n\nSources:\n{lines}", chosen)
+        return WebSearchResult(summary, [])
 
     @staticmethod
     def _harvest(

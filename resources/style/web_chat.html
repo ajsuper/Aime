@@ -1567,6 +1567,9 @@
     .topic-content input[type=checkbox] { cursor: pointer; margin-right: 0.4rem;
                                           accent-color: var(--accent); vertical-align: -2px; }
     .topic-content input[type=checkbox]:disabled { cursor: not-allowed; }
+    /* A table cell holding only a checkbox (e.g. a "Done?" column) centers it. */
+    .topic-content table td:has(> input[type=checkbox]:only-child),
+    .topic-content table th:has(> input[type=checkbox]:only-child) { text-align: center; }
 
     /* Tab bar is gone — left rail controls which pane is open. */
     #tabbar { display: none; }
@@ -1757,6 +1760,12 @@
     .ev-summary-rendered li.task-list-item input[type="checkbox"] {
         margin: 0 0.45em 0 0; vertical-align: -1px; cursor: pointer;
         accent-color: var(--cta); }
+    /* Checkboxes promoted from `[ ]`/`[x]` inside table cells. */
+    .ev-summary-rendered table input[type="checkbox"] {
+        vertical-align: -1px; cursor: pointer; accent-color: var(--cta); }
+    .ev-summary-rendered table td:has(> input[type=checkbox]:only-child),
+    .ev-summary-rendered table th:has(> input[type=checkbox]:only-child) {
+        text-align: center; }
     .ev-modal-error { color: var(--warning, #e29a4a); font-size: 0.8rem;
                       margin: 0; }
     /* Lifecycle metadata in the event modal: a row of clickable status pills,
@@ -2082,6 +2091,28 @@
     .msg.user .att-chip .thumb svg { color: white; }
     .msg .att-chip .fname { overflow: hidden; text-overflow: ellipsis;
                             white-space: nowrap; }
+
+    /* Web-search source bubble: a calm row of citation chips that sits just
+       under the model's reply. Built in renderSourceBubble. */
+    .msg.sources { display: flex; flex-wrap: wrap; align-items: center;
+                   gap: 0.4rem; margin: 0.15rem 0 0.5rem; padding: 0;
+                   font-size: 0.78rem; }
+    .sources-label { color: var(--muted); font-size: 0.72rem;
+                     text-transform: uppercase; letter-spacing: 0.04em;
+                     margin-right: 0.1rem; }
+    .source-chip { display: inline-flex; align-items: center; gap: 0.4rem;
+                   max-width: 280px; padding: 0.28rem 0.65rem;
+                   background: var(--bg-input, rgba(127,127,127,0.08));
+                   border: 1px solid var(--border); border-radius: 999px;
+                   color: var(--text); text-decoration: none; line-height: 1.3;
+                   transition: border-color 0.15s ease, background 0.15s ease; }
+    .source-chip:hover { border-color: var(--accent);
+                         background: color-mix(in srgb, var(--accent) 10%, transparent); }
+    .source-fav { width: 14px; height: 14px; border-radius: 3px; flex-shrink: 0;
+                  object-fit: cover; }
+    .source-host { color: var(--accent); font-weight: 600; flex-shrink: 0; }
+    .source-title { color: var(--muted); overflow: hidden;
+                    text-overflow: ellipsis; white-space: nowrap; }
 
     /* "Sending…" indicator shown under an optimistic user message while the
        /send POST is in flight (large uploads / slow connections). Removed
@@ -2414,7 +2445,7 @@
       <!-- Topics pane -->
       <div class="pane" data-pane="topics">
         <div class="topics-search">
-          <input type="text" id="topic-search" placeholder="Search title or summary…"
+          <input type="text" id="topic-search" placeholder="Search title, summary, or #id…"
                  autocomplete="off" spellcheck="false">
           <span class="count" id="topic-count"></span>
         </div>
@@ -3493,6 +3524,12 @@ document.addEventListener("keyup", (e) => {
 
 let currentAssistant = null;
 let pendingHtmlTarget = null;
+// Web-search citations for the in-flight turn. `turnSources` accumulates and
+// dedupes {title, url} across every WebSearch in the turn; `turnSourceBubble`
+// is the single `.msg.sources` element rendering them under the reply (null
+// until something cites). Both reset at each turn boundary. See renderSourceBubble.
+let turnSources = [];
+let turnSourceBubble = null;
 // True while the assistant is responding to a turn. Used to gate form
 // submission: if the user sends a message while busy, it's held back as
 // a draft (#queued-bar) instead of being POSTed to /send.
@@ -3646,6 +3683,101 @@ function appendNotice(text, severity) {
   logInner.appendChild(div);
   scrollToBottom();
   return div;
+}
+
+// --- Web-search source bubble ---------------------------------------------
+// Sources arrive (as `web_sources` events) when a WebSearch finishes, which is
+// always *before* the model's follow-up answer. We accumulate them and let the
+// answer's render anchor the bubble directly beneath that reply — see the
+// assistant_text / assistant_html cases and flushPendingSourceBubble.
+
+// Bare hostname for a chip label, e.g. "https://en.wikipedia.org/x" → "wikipedia.org".
+function sourceHost(url) {
+  try { return new URL(url).hostname.replace(/^www\./, ""); }
+  catch { return String(url || ""); }
+}
+
+// Favicon URL for a source chip via DuckDuckGo's icon proxy. Keyed on the full
+// hostname (keeps subdomains like maps.google.com distinct). Returns "" for a
+// URL we can't parse, so the caller just skips the icon.
+function faviconUrl(url) {
+  try {
+    return "https://icons.duckduckgo.com/ip3/"
+      + encodeURIComponent(new URL(url).hostname) + ".ico";
+  } catch { return ""; }
+}
+
+// Merge new {title, url} sources into the current turn's list, deduped by URL
+// and order-preserving (first cite wins its slot).
+function mergeTurnSources(list) {
+  (list || []).forEach(s => {
+    if (!s || !s.url) return;
+    if (turnSources.some(x => x.url === s.url)) return;
+    turnSources.push({url: s.url, title: s.title || s.url});
+  });
+}
+
+// Build / refresh the single source bubble for the turn and place it. When
+// `anchor` is an element the bubble is moved to sit right after it (under the
+// reply); otherwise it's left where it is (in-place refresh) or appended to the
+// log if it isn't mounted yet. No-op when nothing has been cited.
+function renderSourceBubble(anchor) {
+  if (!turnSources.length) return;
+  if (!turnSourceBubble) {
+    turnSourceBubble = document.createElement("div");
+    turnSourceBubble.className = "msg sources";
+  }
+  turnSourceBubble.innerHTML = "";
+  const label = document.createElement("span");
+  label.className = "sources-label";
+  label.textContent = turnSources.length === 1 ? "Source" : "Sources";
+  turnSourceBubble.appendChild(label);
+  turnSources.forEach(s => {
+    const a = document.createElement("a");
+    a.className = "source-chip";
+    a.href = s.url;
+    a.target = "_blank";
+    a.rel = "noopener noreferrer";
+    a.title = s.title ? s.title + " — " + s.url : s.url;
+    // Favicon from DuckDuckGo's icon proxy (privacy-respecting; no Google
+    // beacon). If it fails to load — offline, no icon, blocked — it removes
+    // itself so the chip degrades cleanly to host + title.
+    const favUrl = faviconUrl(s.url);
+    if (favUrl) {
+      const fav = document.createElement("img");
+      fav.className = "source-fav";
+      fav.src = favUrl;
+      fav.alt = "";
+      fav.loading = "lazy";
+      fav.addEventListener("error", () => fav.remove());
+      a.appendChild(fav);
+    }
+    const host = document.createElement("span");
+    host.className = "source-host";
+    host.textContent = sourceHost(s.url);
+    const ttl = document.createElement("span");
+    ttl.className = "source-title";
+    ttl.textContent = s.title || sourceHost(s.url);
+    a.appendChild(host);
+    a.appendChild(ttl);
+    turnSourceBubble.appendChild(a);
+  });
+  if (anchor && anchor.parentNode) {
+    anchor.parentNode.insertBefore(turnSourceBubble, anchor.nextSibling);
+  } else if (!turnSourceBubble.parentNode) {
+    logInner.appendChild(turnSourceBubble);
+  }
+  scrollToBottom();
+}
+
+// Safety net for a turn that cited sources but produced no answer text to
+// anchor the bubble under (a bare search, or replayed history with no live
+// turn_end): attach it after the last assistant bubble, or the log. No-op if
+// the bubble was already anchored by the reply render.
+function flushPendingSourceBubble() {
+  if (!turnSources.length || turnSourceBubble) return;
+  const bubbles = logInner.querySelectorAll(".msg.aime");
+  renderSourceBubble(bubbles.length ? bubbles[bubbles.length - 1] : null);
 }
 
 // --- Inline graphics (CreateGraphics) -------------------------------------
@@ -4530,6 +4662,8 @@ function clearTranscriptView() {
   currentAssistant = null;
   pendingHtmlTarget = null;
   pendingSendBubble = null;
+  turnSources = [];
+  turnSourceBubble = null;
   if (typewriter.rafId != null) cancelAnimationFrame(typewriter.rafId);
   typewriter.bubble = null;
   typewriter.rafId = null;
@@ -4555,6 +4689,11 @@ es.onmessage = (ev) => {
   const e = JSON.parse(ev.data);
   switch (e.kind) {
     case "user_message_shown": {
+      // A new turn begins — close out any sources still pending from the last
+      // turn (rare: a search with no follow-up text), then reset for this turn.
+      flushPendingSourceBubble();
+      turnSources = [];
+      turnSourceBubble = null;
       currentAssistant = null;
       pendingHtmlTarget = null;
       // The server has echoed the message back — drop the local "Sending…"
@@ -4597,13 +4736,17 @@ es.onmessage = (ev) => {
       // sending while the model is busy and renders the queued draft
       // itself in #queued-bar. Ignore.
       break;
-    case "assistant_text":
+    case "assistant_text": {
       clearThinking();
-      ensureAssistant()._content.appendChild(document.createTextNode(e.text));
+      const bubble = ensureAssistant();
+      bubble._content.appendChild(document.createTextNode(e.text));
       pendingHtmlTarget = currentAssistant;
       currentAssistant = null;
+      // Anchor any web-search sources for this turn under the reply.
+      if (turnSources.length) renderSourceBubble(bubble);
       scrollToBottom();
       break;
+    }
     case "assistant_text_delta":
       // Don't append raw text — the typewriter is driven by the formatted
       // HTML companion (assistant_html_partial) that follows each delta.
@@ -4636,6 +4779,8 @@ es.onmessage = (ev) => {
         target._content.innerHTML = e.text;
         resolveGraphicTags(target._content);
       }
+      // Anchor any web-search sources for this turn directly under the reply.
+      if (turnSources.length) renderSourceBubble(target);
       pendingHtmlTarget = null;
       currentAssistant = null;
       scrollToBottom();
@@ -4698,6 +4843,14 @@ es.onmessage = (ev) => {
       clearWorkingIndicator();
       renderGraphic(e.payload || {});
       break;
+    case "web_sources":
+      // WebSearch cited sources. Accumulate them; the bubble is anchored under
+      // the model's reply when its text renders (assistant_text/_html). If the
+      // bubble is already showing (a second search this turn), refresh it in
+      // place so the new sources appear immediately.
+      mergeTurnSources(e.payload && e.payload.sources);
+      if (turnSourceBubble) renderSourceBubble(null);
+      break;
     case "tool_result":
       if (verbosity === "verbose") {
         // Collapsed dropdown: one-line result summary + an arrow to expand the
@@ -4745,6 +4898,9 @@ es.onmessage = (ev) => {
       clearThinking();
       if (verbosity === "minimal") freezeWorkingIndicator();
       else clearWorkingIndicator();
+      // If the turn cited sources but never produced text to anchor them under,
+      // attach the bubble now so a bare search still shows where it looked.
+      flushPendingSourceBubble();
       // Catches title-refresh, which runs in a background Haiku thread on
       // turn end and isn't tied to any tool call — scheduleActivePaneRefresh
       // alone wouldn't see it.
@@ -6678,6 +6834,8 @@ function renderEventSummary(md) {
   } else {
     evFSummaryRendered.textContent = text;
   }
+  // Render `[ ]`/`[x]` task markers inside table cells as checkboxes too.
+  enableTableTaskCheckboxes(evFSummaryRendered);
   // Marked renders task-list items with a disabled checkbox by default.
   // Enable them and index each so toggles can flip the right markdown marker.
   const boxes = evFSummaryRendered.querySelectorAll('input[type="checkbox"]');
@@ -8043,8 +8201,12 @@ function renderTopicList() {
         const summary = (t.summary || t.description || "").toLowerCase();
         const category = (t.category || "").toLowerCase();
         const folder = (t.folder || "").toLowerCase();
+        // The topic handle shown in each item's meta row — "<id>" for own
+        // topics, "<owner>:<id>" for shared — so a user can jump to a topic by
+        // typing its number. Mirrors the `tid` derivation in buildTopicItem.
+        const id = String(t.id ?? t.topic_id ?? t.name ?? t.title ?? "").toLowerCase();
         return title.includes(q) || summary.includes(q)
-            || category.includes(q) || folder.includes(q);
+            || category.includes(q) || folder.includes(q) || id.includes(q);
       })
     : allTopics.slice();
 
@@ -8349,6 +8511,8 @@ function renderTopicMarkdown(md) {
     topicBodyEl.innerHTML = "";
     topicBodyEl.appendChild(pre);
   }
+  // Render `[ ]`/`[x]` task markers inside table cells as checkboxes too.
+  enableTableTaskCheckboxes(topicBodyEl);
   // Marked renders task-list items with a disabled checkbox by default.
   // Enable them and index each so we know which markdown marker to flip.
   const boxes = topicBodyEl.querySelectorAll('input[type="checkbox"]');
@@ -8651,18 +8815,48 @@ shareBackdrop.addEventListener("click", (e) => {
   if (e.target === shareBackdrop) closeShareModal();
 });
 
-// Regex matches a markdown task-list marker at the start of a list item:
-//   "- [ ]", "* [x]", "+ [X]", with optional leading indent and ordered-list
-// variants like "1. [ ]". Group 1 is the leading prefix (list bullet + space),
-// group 2 is the state char inside the brackets.
-const TASK_RE = /(^|\n)([ \t]*(?:[-*+]|\d+\.)\s+)\[( |x|X)\]/g;
+// Regex matches a markdown task marker, in source order, in either place we
+// render a clickable checkbox:
+//   • a list item — "- [ ]", "* [x]", "+ [X]", with optional indent and
+//     ordered-list variants like "1. [ ]" (alternative 1: groups 1–3);
+//   • the start of a GFM table cell — "| [ ] |" (alternative 2: groups 4–5),
+//     matching the leading-marker rule enableTableTaskCheckboxes() uses so the
+//     Nth rendered checkbox lines up with the Nth marker matched here.
+const TASK_RE = /(^|\n)([ \t]*(?:[-*+]|\d+\.)\s+)\[( |x|X)\]|(\|[ \t]*)\[( |x|X)\]/g;
 
 function flipNthTask(md, n, checked) {
   let i = 0;
-  return md.replace(TASK_RE, (whole, lead, bullet, state) => {
+  return md.replace(TASK_RE, (whole, lead, bullet, lState, cellLead, cState) => {
     if (i++ !== n) return whole;
     const newState = checked ? "x" : " ";
-    return lead + bullet + "[" + newState + "]";
+    // The list-item branch sets `bullet`; the table-cell branch sets `cellLead`.
+    return bullet !== undefined
+      ? lead + bullet + "[" + newState + "]"
+      : cellLead + "[" + newState + "]";
+  });
+}
+
+// Marked only converts `- [ ]` list items into checkboxes; a `[ ]`/`[x]` that
+// begins a table cell is left as literal text. Convert those leading cell
+// markers into real checkbox inputs so to-do tables render — and, paired with
+// the table-cell branch of TASK_RE, toggle and persist — like task lists. Cells
+// are walked in document (== source) order so the inputs interleave with the
+// list checkboxes in the exact order flipNthTask expects. Must run after the
+// HTML is in the DOM but before checkboxes are indexed.
+function enableTableTaskCheckboxes(container) {
+  container.querySelectorAll("table td, table th").forEach(cell => {
+    const first = cell.firstChild;
+    if (!first || first.nodeType !== Node.TEXT_NODE) return;
+    const m = /^(\s*)\[( |x|X)\](\s?)/.exec(first.nodeValue);
+    if (!m) return;
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.checked = m[2] !== " ";
+    // Strip the marker (and one trailing space) so any cell label text remains.
+    first.nodeValue = first.nodeValue.slice(m[0].length);
+    cell.insertBefore(box, first);
+    // Drop a now-empty text node so a checkbox-only cell can center via CSS.
+    if (!first.nodeValue.trim()) cell.removeChild(first);
   });
 }
 

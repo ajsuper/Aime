@@ -1095,7 +1095,8 @@ _CSP = (
     "default-src 'self'; "
     "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
     "style-src 'self' 'unsafe-inline'; "
-    "img-src 'self' data: blob:; "
+    # icons.duckduckgo.com serves the favicons on web-search source chips.
+    "img-src 'self' data: blob: https://icons.duckduckgo.com; "
     "media-src 'self' blob:; "
     "connect-src 'self'; "
     "font-src 'self' data:; "
