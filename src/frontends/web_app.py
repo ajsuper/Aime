@@ -3011,11 +3011,20 @@ def stream():
                     # died silently (phone sleep, closed tab, network drop,
                     # proxy idle timeout) is never noticed because we only
                     # learn the socket is dead when a yield tries to write to
-                    # it. Emitting a keepalive comment on idle forces that
-                    # write: if the peer is gone it raises here, the `finally`
-                    # runs, and the waitress thread is reclaimed instead of
-                    # leaking. (16 threads leak over ~a day → queue backs up.)
-                    yield ": keepalive\n\n"
+                    # it. Emitting a heartbeat on idle forces that write: if the
+                    # peer is gone it raises here, the `finally` runs, and the
+                    # waitress thread is reclaimed instead of leaking. (16
+                    # threads leak over ~a day → queue backs up.)
+                    #
+                    # Sent as a real `data:` event rather than an SSE comment
+                    # (`: …`) so the *client* can see it too: EventSource never
+                    # surfaces comment lines to JS, but the browser's own
+                    # auto-reconnect doesn't detect a half-open (zombie)
+                    # connection. The client watches the gap between heartbeats
+                    # to notice a dead stream and force a reconnect, which
+                    # rebuilds its transcript from authoritative history. The
+                    # client ignores this `ping` kind.
+                    yield f"data: {json.dumps({'kind': 'ping'})}\n\n"
                     continue
                 yield f"data: {json.dumps(payload)}\n\n"
         finally:

@@ -1944,9 +1944,36 @@
     .settings-tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
     .settings-tab { display: none; }
     .settings-tab.active { display: flex; flex-direction: column; gap: 1.25rem; }
-    /* Simple UI mode — strip advanced-only controls from the chrome. The
-       toggle lives in Settings > General; see `aime.uiMode` in the script. */
-    body.ui-simple .advanced-only { display: none !important; }
+    /* Display-detail gating. A single resolver (`applyDetail` in the script)
+       toggles these body classes from the Simple/Full/Custom preset or the
+       per-axis custom toggles; the chrome reads them purely via CSS. */
+    body:not(.show-ids)        .detail-id    { display: none !important; }
+    body:not(.show-export-all) .export-extra { display: none !important; }
+    body:not(.show-dev)        .dev-only     { display: none !important; }
+
+    /* Display-detail control: a Simple/Full/Custom segment group plus the
+       per-axis rows it presets. Rows lock (greyed, non-interactive) unless
+       Custom is selected. */
+    .seg-group { display: inline-flex; background: var(--bg-input);
+                 border: 1px solid var(--border); border-radius: 8px;
+                 padding: 2px; gap: 2px; }
+    .seg-btn { background: transparent; border: 0; color: var(--muted);
+               font: inherit; font-size: 0.85rem; padding: 0.35rem 0.85rem;
+               border-radius: 6px; cursor: pointer;
+               transition: background 0.15s, color 0.15s; }
+    .seg-btn:hover { color: var(--text); }
+    .seg-btn.active { background: var(--accent); color: #fff; }
+    .detail-controls { display: flex; flex-direction: column; gap: 0;
+                       margin-top: 0.5rem; transition: opacity 0.15s; }
+    .detail-controls.locked { opacity: 0.5; pointer-events: none; }
+
+    /* Danger zone — the one red-bordered card collecting destructive actions. */
+    .settings-section.danger-zone { border-color: var(--error); }
+    .settings-section.danger-zone h3 { color: var(--error); }
+
+    /* Muted wordmark line pinned at the foot of the settings body. */
+    .settings-footer { text-align: center; color: var(--muted);
+                       font-size: 0.8rem; margin: 0.5rem 0 0; opacity: 0.7; }
     .dev-warn { color: var(--warning); font-size: 0.8rem; margin: 0 0 0.5rem;
                 padding: 0.55rem 0.75rem; border: 1px solid var(--warning);
                 border-radius: 8px; background: rgba(255, 170, 70, 0.06); }
@@ -2484,7 +2511,7 @@
           <div id="topic-divider" title="Drag to resize"></div>
           <div class="topic-content scroll" id="topic-content">
             <div class="topic-toolbar" id="topic-toolbar">
-              <button id="topic-edit-btn" class="advanced-only" title="Edit topic">Edit</button>
+              <button id="topic-edit-btn" title="Edit topic">Edit</button>
               <span id="topic-lock-note" hidden></span>
               <button id="topic-share-btn" title="Share topic" aria-label="Share topic">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
@@ -2512,11 +2539,11 @@
                      role="menu" hidden>
                   <button role="menuitem" data-format="pdf">PDF</button>
                   <button role="menuitem" data-format="docx">Word (.docx)</button>
-                  <button role="menuitem" data-format="odt" class="advanced-only">OpenDocument (.odt)</button>
-                  <button role="menuitem" data-format="html" class="advanced-only">HTML</button>
-                  <button role="menuitem" data-format="md" class="advanced-only">Markdown</button>
-                  <button role="menuitem" data-format="epub" class="advanced-only">EPUB</button>
-                  <button role="menuitem" data-format="rtf" class="advanced-only">Rich Text (.rtf)</button>
+                  <button role="menuitem" data-format="odt" class="export-extra">OpenDocument (.odt)</button>
+                  <button role="menuitem" data-format="html" class="export-extra">HTML</button>
+                  <button role="menuitem" data-format="md" class="export-extra">Markdown</button>
+                  <button role="menuitem" data-format="epub" class="export-extra">EPUB</button>
+                  <button role="menuitem" data-format="rtf" class="export-extra">Rich Text (.rtf)</button>
                   <button role="menuitem" data-format="txt">Plain text</button>
                 </div>
               </div>
@@ -2895,21 +2922,54 @@
                 aria-selected="true">General</button>
         <button class="settings-tab-btn" data-tab="account" role="tab"
                 aria-selected="false">Account</button>
-        <button class="settings-tab-btn advanced-only" data-tab="developer" role="tab"
+        <button class="settings-tab-btn dev-only" data-tab="developer" role="tab"
                 aria-selected="false">Developer</button>
       </div>
       <div class="settings-body">
         <div class="settings-tab active" data-tab="user" role="tabpanel">
           <div class="settings-section">
-            <h3>Mode</h3>
-            <p class="desc">Simple hides advanced controls so the interface
-              stays calm. Advanced reveals every option.</p>
+            <h3>Display detail</h3>
+            <p class="desc">How much Aime shows you. <b>Simple</b> keeps things
+              calm; <b>Full</b> surfaces everything; <b>Custom</b> lets you pick
+              each option below.</p>
             <div class="settings-row">
-              <span class="label">Interface</span>
-              <select id="ui-mode-select">
-                <option value="simple">Simple</option>
-                <option value="advanced">Advanced</option>
-              </select>
+              <span class="label">Mode</span>
+              <div class="seg-group" id="detail-seg" role="tablist">
+                <button class="seg-btn" data-mode="simple" type="button">Simple</button>
+                <button class="seg-btn" data-mode="full" type="button">Full</button>
+                <button class="seg-btn" data-mode="custom" type="button">Custom</button>
+              </div>
+            </div>
+            <div class="detail-controls" id="detail-controls">
+              <div class="settings-row">
+                <span class="label">Tool activity</span>
+                <select id="detail-tool-select">
+                  <option value="minimal">Minimal — just "working"</option>
+                  <option value="standard">Standard — a line per step</option>
+                  <option value="verbose">Verbose — names + full detail</option>
+                </select>
+              </div>
+              <div class="settings-row">
+                <span class="label">Show topic &amp; graphic IDs</span>
+                <select id="detail-ids-select">
+                  <option value="off">Hidden</option>
+                  <option value="on">Shown</option>
+                </select>
+              </div>
+              <div class="settings-row">
+                <span class="label">Export formats</span>
+                <select id="detail-export-select">
+                  <option value="off">Essential (PDF, Word, Text)</option>
+                  <option value="on">All formats</option>
+                </select>
+              </div>
+              <div class="settings-row">
+                <span class="label">Show developer info</span>
+                <select id="detail-dev-select">
+                  <option value="off">Hidden</option>
+                  <option value="on">Shown</option>
+                </select>
+              </div>
             </div>
           </div>
           <div class="settings-section">
@@ -2929,20 +2989,8 @@
                 <option value="parchment">Parchment (light)</option>
               </select>
             </div>
-            <div class="settings-row advanced-only">
-              <span class="label">Information detail</span>
-              <select id="verbosity-select">
-                <option value="minimal">Minimal</option>
-                <option value="standard">Standard</option>
-                <option value="verbose">Verbose</option>
-              </select>
-            </div>
-            <p class="desc advanced-only">Minimal hides tool activity behind a status line.
-              Standard shows a line per step. Verbose shows tool names and
-              full error text, with a dropdown arrow on each tool step to
-              expand its complete input and result.</p>
           </div>
-          <div class="settings-section advanced-only">
+          <div class="settings-section">
             <h3>Date & time</h3>
             <p class="desc">How dates and times are displayed. Doesn't change
               how Aime stores them internally.</p>
@@ -2967,18 +3015,6 @@
                 <option value="24">24-hour (e.g. 15:45)</option>
               </select>
             </div>
-          </div>
-          <div class="settings-section">
-            <h3>Session</h3>
-            <div class="settings-row">
-              <span class="label" style="color: var(--error)">Log out</span>
-              <button class="btn-danger" id="account-logout-btn">Log out</button>
-            </div>
-          </div>
-          <div class="settings-section">
-            <h3>About</h3>
-            <p class="wordmark">Aime</p>
-            <p class="desc">Your personal assistant.</p>
           </div>
         </div>
         <div class="settings-tab" data-tab="account" role="tabpanel">
@@ -3039,7 +3075,7 @@
             </div>
             <p class="desc" id="account-redeem-msg" style="display:none;margin-top:0.4rem"></p>
           </div>
-          <div class="settings-section advanced-only">
+          <div class="settings-section">
             <h3>Messaging</h3>
             <p class="desc">Let Aime text you outside the chat — reminders, or
               results from background tasks. Paste your Telegram chat ID (message
@@ -3059,10 +3095,9 @@
             </div>
             <p class="desc" id="account-contact-msg" style="display:none;margin-top:0.4rem"></p>
           </div>
-          <div class="settings-section advanced-only">
-            <h3>Data</h3>
-            <p class="desc">Download your full data set as a zip, restore one,
-              or delete saved conversations.</p>
+          <div class="settings-section">
+            <h3>Your data</h3>
+            <p class="desc">Download your full data set as a zip, or restore one.</p>
             <div class="settings-row">
               <span class="label">Export my data</span>
               <button class="btn-neutral" id="account-export-btn"
@@ -3072,7 +3107,7 @@
                 Download .zip
               </button>
             </div>
-            <div class="settings-row advanced-only">
+            <div class="settings-row">
               <span class="label">Import data</span>
               <button class="btn-neutral" id="account-import-btn"
                       style="background:var(--bg-input);color:var(--text);
@@ -3085,16 +3120,23 @@
                    accept=".zip,application/zip" style="display:none">
             <p class="desc" id="account-import-msg"
                style="display:none;margin-top:0.4rem"></p>
+          </div>
+          <div class="settings-section">
+            <h3>Session</h3>
+            <div class="settings-row">
+              <span class="label">Log out</span>
+              <button class="btn-danger" id="account-logout-btn">Log out</button>
+            </div>
+          </div>
+          <div class="settings-section danger-zone">
+            <h3>Danger zone</h3>
+            <p class="desc">Deleting conversations is permanent. Deleting your
+              account deactivates it (recoverable by signing in again) and
+              permanently removes it after 30 days.</p>
             <div class="settings-row">
               <span class="label" style="color: var(--error)">Delete all conversations</span>
               <button class="btn-danger" id="account-delete-all-btn">Delete all</button>
             </div>
-          </div>
-          <div class="settings-section advanced-only">
-            <h3>Delete account</h3>
-            <p class="desc">Deactivates your account — it will appear to no
-              longer exist. You can recover it by signing in again. After 30
-              days it is permanently deleted.</p>
             <div class="settings-row">
               <span class="label" style="color: var(--error)">Delete my account</span>
               <button class="btn-danger" id="account-delete-btn">Delete account</button>
@@ -3121,6 +3163,7 @@
             <p class="desc" id="stt-model-hint" style="margin-top:0.4rem"></p>
           </div>
         </div>
+        <p class="settings-footer">Aime · your personal assistant</p>
       </div>
     </div>
   </div>
@@ -4336,10 +4379,12 @@ function renderGraphic(payload) {
   idBar.className = "graphic-id";
   if (display) {
     const idText = document.createElement("span");
-    idText.className = "graphic-id-text";
+    idText.className = "graphic-id-text detail-id";
     idText.textContent = "ID: " + display;
     idBar.appendChild(idText);
-    idBar.appendChild(makeCopyButton(display, "Copy graphic ID"));
+    const copyBtn = makeCopyButton(display, "Copy graphic ID");
+    copyBtn.classList.add("detail-id");
+    idBar.appendChild(copyBtn);
   }
   inner.appendChild(idBar);
   card.appendChild(inner);
@@ -4437,10 +4482,12 @@ function makeGraphicMount(id) {
   const idBar = document.createElement("div");
   idBar.className = "graphic-id";
   const idText = document.createElement("span");
-  idText.className = "graphic-id-text";
+  idText.className = "graphic-id-text detail-id";
   idText.textContent = "ID: " + display;
   idBar.appendChild(idText);
-  idBar.appendChild(makeCopyButton(display, "Copy graphic ID"));
+  const copyBtn = makeCopyButton(display, "Copy graphic ID");
+  copyBtn.classList.add("detail-id");
+  idBar.appendChild(copyBtn);
   card.appendChild(idBar);
   fetchGraphicAsset(id)
     .then((g) => {
@@ -4735,24 +4782,86 @@ function clearTranscriptView() {
   typewriter.rafId = null;
 }
 
-const es = new EventSource("/stream");
-
-// The browser's EventSource silently auto-reconnects after the connection
-// drops (phone/laptop sleep, Wi-Fi↔cellular handoff, a proxy idle timeout).
-// On every (re)connect the server replays the full history snapshot, so a
-// naive reconnect would append a second copy of the whole conversation — and,
-// with liveMode still true, re-run the typewriter over all of it. Guard both:
-// reset liveMode so the snapshot renders instantly until `history_done`, and on
-// a *reconnect* wipe the transcript first so the snapshot rebuilds it in place
-// instead of duplicating it.
+// The browser's EventSource silently auto-reconnects after a *clean* drop
+// (phone/laptop sleep, Wi-Fi↔cellular handoff, a proxy idle timeout). On every
+// (re)connect the server replays the full history snapshot, so a naive
+// reconnect would append a second copy of the whole conversation — and, with
+// liveMode still true, re-run the typewriter over all of it. Guard both: reset
+// liveMode so the snapshot renders instantly until `history_done`, and on a
+// *reconnect* wipe the transcript first so the snapshot rebuilds it in place
+// instead of duplicating it. Rebuilding from the authoritative snapshot is also
+// what corrects a transcript that has drifted from the server (e.g. a
+// conversation switch whose `session_restart` was missed on a zombie stream).
+let es = null;
 let streamConnectedOnce = false;
-es.onopen = () => {
+// Timestamp of the last byte heard from the stream (any event, including the
+// server's `ping` heartbeat). The watchdog below uses it to spot a half-open
+// connection that the browser hasn't noticed and force a fresh reconnect.
+let lastStreamMsgAt = 0;
+let streamWatchdog = null;
+let reconnectNotice = null;
+
+function onStreamOpen() {
   liveMode = false;
   if (streamConnectedOnce) clearTranscriptView();
   streamConnectedOnce = true;
-};
-es.onmessage = (ev) => {
+  lastStreamMsgAt = Date.now();
+  // Recovered — drop any "reconnecting" banner.
+  if (reconnectNotice) { reconnectNotice.remove(); reconnectNotice = null; }
+}
+
+function onStreamError() {
+  // Fires when the connection drops or fails to open. The browser will try to
+  // auto-reconnect on its own; we just surface a calm, deduped banner so a long
+  // outage isn't silent. A truly dead (half-open) socket that never errors is
+  // handled by the watchdog instead. State is reconciled authoritatively by the
+  // snapshot replay + history_done once a connection is re-established.
+  if (!reconnectNotice) {
+    reconnectNotice = appendNotice("Connection lost — reconnecting…", "warning");
+  }
+}
+
+// Tear down and reopen the stream. Used by the watchdog / visibility handler to
+// recover a zombie connection the browser hasn't given up on. Closing stops the
+// browser's own reconnect for the old EventSource, so we own the new one.
+function connectStream() {
+  if (es) { try { es.close(); } catch (_) {} }
+  es = new EventSource("/stream");
+  es.onopen = onStreamOpen;
+  es.onmessage = onStreamMessage;
+  es.onerror = onStreamError;
+  lastStreamMsgAt = Date.now();
+}
+
+// Liveness watchdog. The server emits a `ping` at least every ~20s, so a gap
+// well past that means the stream is dead even if the browser still thinks it's
+// open (common after sleep/wake or behind a proxy that half-closes). Force a
+// reconnect, which rebuilds the transcript from the server's current history —
+// the same path that fixes a stale transcript after a missed conversation
+// switch.
+const STREAM_STALE_MS = 50000;
+function startStreamWatchdog() {
+  if (streamWatchdog != null) clearInterval(streamWatchdog);
+  streamWatchdog = setInterval(() => {
+    if (document.hidden) return;  // throttled tabs don't get timely heartbeats
+    if (Date.now() - lastStreamMsgAt > STREAM_STALE_MS) connectStream();
+  }, 10000);
+}
+
+// Coming back to a backgrounded tab is the classic moment for a silently-dead
+// stream: reconnect promptly if we haven't heard from it recently, so the user
+// doesn't stare at a stale transcript while the backend has moved on.
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && Date.now() - lastStreamMsgAt > STREAM_STALE_MS) {
+    connectStream();
+  }
+});
+
+function onStreamMessage(ev) {
+  lastStreamMsgAt = Date.now();
   const e = JSON.parse(ev.data);
+  // Heartbeat — purely a liveness signal (timestamp already bumped above).
+  if (e.kind === "ping") return;
   switch (e.kind) {
     case "user_message_shown": {
       // A new turn begins — close out any sources still pending from the last
@@ -4763,8 +4872,11 @@ es.onmessage = (ev) => {
       currentAssistant = null;
       pendingHtmlTarget = null;
       // The server has echoed the message back — drop the local "Sending…"
-      // placeholder so the authoritative bubble replaces it.
-      if (!e.from_replay) clearOptimisticUserMessage();
+      // placeholder so the authoritative bubble replaces it. Cleared on replay
+      // too: if the live event was missed (stream attached after /send
+      // broadcast) the message only arrives as replay, and a stray placeholder
+      // must still be reconciled away rather than left stuck.
+      clearOptimisticUserMessage();
       const {text: cleanedText, files} = extractAttachedFiles(e.text);
       const attachments = (e.attachments || []).concat(files);
       const msg = appendMessage("user", "you", cleanedText);
@@ -5056,6 +5168,16 @@ es.onmessage = (ev) => {
       console.debug("Aime: backend session terminated");
       break;
     case "error":
+      // An error can end a turn without a `turn_end` (e.g. the backend submit
+      // throwing in dispatch_input emits `error` and nothing else). turn_end is
+      // the only thing that clears modelBusy / the indicators, so without this
+      // the composer would wedge into "queue everything" mode and the spinner
+      // would hang until reload. Reconcile the turn state here too.
+      clearThinking();
+      clearWorkingIndicator();
+      clearOptimisticUserMessage();
+      modelBusy = false;
+      if (queuedDraft) flushQueuedDraft();
       if (verbosity === "verbose") {
         appendNotice("error: " + e.text, "error");
       } else {
@@ -5065,7 +5187,10 @@ es.onmessage = (ev) => {
       offerErrorReport(e.text);
       break;
   }
-};
+}
+
+connectStream();
+startStreamWatchdog();
 
 form.addEventListener("submit", async (ev) => {
   ev.preventDefault();
@@ -5313,8 +5438,8 @@ async function sendText(text, images) {
   if (r.status === 402) {
     clearOptimisticUserMessage();
     modelBusy = false;
-    appendNotice("You've used up today's Aime. Your access will be back "
-      + "tomorrow.", "warning");
+    appendNotice("Your Aime is empty for now. It recharges on its own — "
+      + "you'll be able to chat again soon.", "warning");
     refreshMe();
     return;
   }
@@ -5325,7 +5450,17 @@ async function sendText(text, images) {
     applyAccessState();
     clearOptimisticUserMessage();
     modelBusy = false;
+    return;
   }
+  // Success. The live `user_message_shown` normally already swapped the
+  // optimistic bubble for the authoritative one (it's emitted synchronously
+  // during this request). But on the very first message the stream can attach
+  // *after* that broadcast, so the live event is missed and only arrives later
+  // as replay (from_replay=true) — which by design doesn't clear the
+  // placeholder. Clearing it here on the 200 guarantees the "Sending…" bubble
+  // never sticks; the authoritative bubble still renders from the live or
+  // replayed event.
+  if (r.ok) clearOptimisticUserMessage();
 }
 
 // --- Queued draft (above the prompt) ------------------------------------
@@ -8234,7 +8369,7 @@ function buildTopicItem(t) {
     meta.appendChild(c);
   }
   const idTag = document.createElement("span");
-  idTag.className = "topic-id";
+  idTag.className = "topic-id detail-id";
   const idText = document.createElement("span");
   idText.className = "topic-id-text";
   idText.textContent = "ID: " + tid;
@@ -9069,55 +9204,155 @@ themeSelect.addEventListener("change", () => {
   localStorage.setItem(THEME_KEY, themeSelect.value);
 });
 
-// -- Information detail (verbosity) -------------------------------------
-// Controls how much tool/error chatter the transcript shows. Read by the
-// SSE event handler above. `minimal` keeps the UI calm by default.
+// -- Display detail (Simple / Full / Custom) ----------------------------
+// One control governs how much Aime surfaces. Simple and Full are presets;
+// Custom unlocks the per-axis pickers. A single resolver (`applyDetail`)
+// computes the effective values and pushes them to the DOM:
+//   - `verbosity` (read by the SSE handler above) <- tool-activity detail
+//   - body.show-ids / .show-export-all / .show-dev <- CSS gating
+// Real features are never gated by this — only ID badges, the export-format
+// count, tool/working chatter, and the Developer tab.
 
-const VERBOSITY_KEY = "aime.verbosity";
-const DEFAULT_VERBOSITY = "minimal";
-const verbositySelect = document.getElementById("verbosity-select");
+const DETAIL_MODE_KEY   = "aime.detailMode";
+const DETAIL_TOOL_KEY   = "aime.detail.tool";
+const DETAIL_IDS_KEY    = "aime.detail.ids";
+const DETAIL_EXPORT_KEY = "aime.detail.export";
+const DETAIL_DEV_KEY    = "aime.detail.dev";
 
-let verbosity = localStorage.getItem(VERBOSITY_KEY) || DEFAULT_VERBOSITY;
-verbositySelect.value = verbosity;
+// Named points in the (tool, ids, export, dev) space. Custom reads the stored
+// per-axis values instead of a preset.
+const DETAIL_PRESETS = {
+  simple: { tool: "minimal", ids: false, export: false, dev: false },
+  full:   { tool: "verbose", ids: true,  export: true,  dev: true  },
+};
 
-verbositySelect.addEventListener("change", () => {
-  verbosity = verbositySelect.value;
-  localStorage.setItem(VERBOSITY_KEY, verbosity);
-  // Background-agent runs are a Verbose-only addition to the Conversations
-  // menu, so re-render it when the tier changes while it's open.
-  if (activePaneName === "chats") loadChats(true);
-});
+// Verbosity global the SSE handler reads; kept in sync by applyDetail().
+let verbosity = "minimal";
 
-// -- UI mode (Simple / Advanced) ----------------------------------------
-// Purely cosmetic: toggles `body.ui-simple`, which hides every element
-// tagged `.advanced-only`. No backend behaviour changes.
+const detailSeg          = document.getElementById("detail-seg");
+const detailControls     = document.getElementById("detail-controls");
+const detailToolSelect   = document.getElementById("detail-tool-select");
+const detailIdsSelect    = document.getElementById("detail-ids-select");
+const detailExportSelect = document.getElementById("detail-export-select");
+const detailDevSelect    = document.getElementById("detail-dev-select");
 
-const UI_MODE_KEY = "aime.uiMode";
-const DEFAULT_UI_MODE = "simple";
-const uiModeSelect = document.getElementById("ui-mode-select");
+// One-time migration from the old split settings (uiMode + verbosity).
+(function migrateDetailSettings() {
+  if (localStorage.getItem(DETAIL_MODE_KEY)) return;
+  const oldMode = localStorage.getItem("aime.uiMode");
+  const oldVerb = localStorage.getItem("aime.verbosity");
+  if (oldMode == null && oldVerb == null) return;
+  if (oldMode === "advanced") {
+    localStorage.setItem(DETAIL_MODE_KEY, "full");
+  } else if (oldVerb && oldVerb !== "minimal") {
+    // Simple chrome but raised verbosity is a custom mix.
+    localStorage.setItem(DETAIL_MODE_KEY, "custom");
+    localStorage.setItem(DETAIL_TOOL_KEY, oldVerb);
+    localStorage.setItem(DETAIL_IDS_KEY, "off");
+    localStorage.setItem(DETAIL_EXPORT_KEY, "off");
+    localStorage.setItem(DETAIL_DEV_KEY, "off");
+  } else {
+    localStorage.setItem(DETAIL_MODE_KEY, "simple");
+  }
+  localStorage.removeItem("aime.uiMode");
+  localStorage.removeItem("aime.verbosity");
+})();
 
-function applyUiMode(mode) {
-  const simple = mode !== "advanced";
-  document.body.classList.toggle("ui-simple", simple);
-  // If the Developer tab was active and we just hid it, fall back to General.
-  if (simple) {
+let detailMode = localStorage.getItem(DETAIL_MODE_KEY) || "simple";
+
+// Effective per-axis values: the preset's, unless Custom — where the stored
+// per-axis prefs win (falling back to the Simple preset).
+function effectiveDetail() {
+  if (detailMode !== "custom") {
+    return DETAIL_PRESETS[detailMode] || DETAIL_PRESETS.simple;
+  }
+  const base = DETAIL_PRESETS.simple;
+  const flag = (k, d) => (localStorage.getItem(k) || (d ? "on" : "off")) === "on";
+  return {
+    tool: localStorage.getItem(DETAIL_TOOL_KEY) || base.tool,
+    ids: flag(DETAIL_IDS_KEY, base.ids),
+    export: flag(DETAIL_EXPORT_KEY, base.export),
+    dev: flag(DETAIL_DEV_KEY, base.dev),
+  };
+}
+
+let _detailReady = false;
+
+// Reflect the resolved settings into the DOM, the verbosity global, and the
+// (possibly locked) custom controls.
+function applyDetail() {
+  const eff = effectiveDetail();
+  const prevVerbosity = verbosity;
+  verbosity = eff.tool;
+  document.body.classList.toggle("show-ids", eff.ids);
+  document.body.classList.toggle("show-export-all", eff.export);
+  document.body.classList.toggle("show-dev", eff.dev);
+
+  // Mirror values into the pickers so Simple/Full visibly document themselves,
+  // and lock them unless Custom is selected.
+  detailToolSelect.value   = eff.tool;
+  detailIdsSelect.value    = eff.ids ? "on" : "off";
+  detailExportSelect.value = eff.export ? "on" : "off";
+  detailDevSelect.value    = eff.dev ? "on" : "off";
+  const locked = detailMode !== "custom";
+  detailControls.classList.toggle("locked", locked);
+  detailToolSelect.disabled = detailIdsSelect.disabled =
+    detailExportSelect.disabled = detailDevSelect.disabled = locked;
+  detailSeg.querySelectorAll(".seg-btn").forEach(b => {
+    b.classList.toggle("active", b.dataset.mode === detailMode);
+  });
+
+  // Never leave the modal parked on a now-hidden Developer tab.
+  if (!eff.dev) {
     const devBtn = document.querySelector('.settings-tab-btn[data-tab="developer"]');
     if (devBtn && devBtn.classList.contains("active")) {
       const userBtn = document.querySelector('.settings-tab-btn[data-tab="user"]');
       if (userBtn) userBtn.click();
     }
   }
+
+  // Agent runs are a verbose-only addition to the Conversations menu, so
+  // re-render it when verbosity actually changes while it's open.
+  if (_detailReady && verbosity !== prevVerbosity &&
+      typeof activePaneName !== "undefined" && activePaneName === "chats") {
+    loadChats(true);
+  }
 }
 
-let uiMode = localStorage.getItem(UI_MODE_KEY) || DEFAULT_UI_MODE;
-uiModeSelect.value = uiMode;
-applyUiMode(uiMode);
-
-uiModeSelect.addEventListener("change", () => {
-  uiMode = uiModeSelect.value;
-  localStorage.setItem(UI_MODE_KEY, uiMode);
-  applyUiMode(uiMode);
+detailSeg.querySelectorAll(".seg-btn").forEach(btn => {
+  btn.addEventListener("click", () => {
+    const next = btn.dataset.mode;
+    // Entering Custom seeds the per-axis prefs from whatever preset was
+    // showing, so it continues rather than resets.
+    if (next === "custom" && detailMode !== "custom") {
+      const eff = effectiveDetail();
+      localStorage.setItem(DETAIL_TOOL_KEY, eff.tool);
+      localStorage.setItem(DETAIL_IDS_KEY, eff.ids ? "on" : "off");
+      localStorage.setItem(DETAIL_EXPORT_KEY, eff.export ? "on" : "off");
+      localStorage.setItem(DETAIL_DEV_KEY, eff.dev ? "on" : "off");
+    }
+    detailMode = next;
+    localStorage.setItem(DETAIL_MODE_KEY, detailMode);
+    applyDetail();
+  });
 });
+
+// Custom pickers persist their own keys (only consulted while in Custom).
+detailToolSelect.addEventListener("change", () => {
+  localStorage.setItem(DETAIL_TOOL_KEY, detailToolSelect.value); applyDetail();
+});
+detailIdsSelect.addEventListener("change", () => {
+  localStorage.setItem(DETAIL_IDS_KEY, detailIdsSelect.value); applyDetail();
+});
+detailExportSelect.addEventListener("change", () => {
+  localStorage.setItem(DETAIL_EXPORT_KEY, detailExportSelect.value); applyDetail();
+});
+detailDevSelect.addEventListener("change", () => {
+  localStorage.setItem(DETAIL_DEV_KEY, detailDevSelect.value); applyDetail();
+});
+
+applyDetail();
+_detailReady = true;
 
 // -- Date & time format -------------------------------------------------
 // Display-only preference. Internal storage (DD/MM/YYYY from the backend,
