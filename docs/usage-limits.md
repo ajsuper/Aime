@@ -25,11 +25,20 @@ nor clips your busy ones, while still **guaranteeing a daily refill** (so you ca
 always use Aime each day) and bounding exposure (the ceiling stops anyone
 hoarding a month and dumping it at once).
 
-The user never sees dollars. The account meter leads with a **battery-style
-percentage** — `pct_full`, the balance as a fraction of the full bank (the 7-day
-ceiling), always 0–100% — with the banked days in parentheses (e.g. "68%
-(≈ 4.8 days)"). The snapshot also carries `pct_of_day` (balance ÷ one day's
-allowance, which reads above 100% when banked) for callers that want it.
+The user never sees dollars. The account meter is framed as a **battery** —
+the mechanic (a continuously-refilling, banking allowance) isn't self-evident
+from a bare number, and an earlier "68% (≈ 4.8 days)" reading just prompted
+"what are 7 days? is that a lifetime cap? why does it drop faster than real
+time?". So the meter shows: a fill bar driven by `pct_full` (balance ÷ the
+full bank, always 0–100%); a "**N% full**" headline; a concrete **recharge
+ETA** ("full again in about 2 days" — computed client-side from
+`balance`/`daily_cap`/`ceiling`, shown only as a duration, never dollars); and
+a one-line "works like a battery" explainer. State-specific copy: *running low*
+drops the ETA for calm reassurance, *empty* shows "chat again in about X" (the
+short climb back above zero, `-balance/daily_cap`), *full* reads "Fully
+charged". The snapshot also carries `days_banked` and `pct_of_day` (balance ÷
+one day's allowance, which reads above 100% when banked) for callers that want
+them, though the UI no longer surfaces a raw "days" figure.
 
 ## Tiers
 

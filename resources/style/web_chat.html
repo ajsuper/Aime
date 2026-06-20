@@ -1979,6 +1979,20 @@
                     gap: 1rem; padding: 0.55rem 0; }
     .settings-row .label { font-size: 0.9rem; }
     .settings-row .value { color: var(--muted); font-size: 0.85rem; }
+    /* Usage battery meter (Account modal): a fill bar over a centered "% full"
+       headline, recharge-ETA sub-line, and the battery-metaphor explainer. */
+    .usage-meter { height: 12px; border-radius: 999px; overflow: hidden;
+                   background: var(--bg-input); border: 1px solid var(--border);
+                   margin: 0.1rem 0 0.6rem; }
+    .usage-meter-fill { height: 100%; width: 0; border-radius: 999px;
+                        background: var(--accent);
+                        transition: width 0.4s ease, background 0.2s ease; }
+    .usage-pct { display: block; text-align: center; line-height: 1.1;
+                 font-family: var(--font-display); font-size: 1.3rem;
+                 font-weight: 600; }
+    .usage-sub { display: block; text-align: center; margin-top: 0.2rem;
+                 font-size: 0.85rem; color: var(--muted); }
+    .usage-explainer { margin-top: 0.55rem !important; }
     .settings-row select { background: var(--bg-input); color: var(--text);
                            border: 1px solid var(--border); border-radius: 8px;
                            padding: 0.4rem 0.6rem; font: inherit; font-size: 0.85rem;
@@ -2113,6 +2127,20 @@
     .source-host { color: var(--accent); font-weight: 600; flex-shrink: 0; }
     .source-title { color: var(--muted); overflow: hidden;
                     text-overflow: ellipsis; white-space: nowrap; }
+    /* Overflow toggle: same pill shape, collapses/expands the extra sources.
+       `.faded` (collapsed state) dims it so it reads as "there's more behind
+       this", with a ▾ that flips to ▴ when expanded. */
+    .source-more { display: inline-flex; align-items: center; gap: 0.3rem;
+                   padding: 0.28rem 0.65rem; border-radius: 999px;
+                   border: 1px solid var(--border); cursor: pointer;
+                   background: var(--bg-input, rgba(127,127,127,0.08));
+                   color: var(--muted); font: inherit; line-height: 1.3;
+                   transition: border-color 0.15s ease, background 0.15s ease,
+                               opacity 0.15s ease; }
+    .source-more:hover { border-color: var(--accent); color: var(--text);
+                         opacity: 1; }
+    .source-more.faded { opacity: 0.6; }
+    .source-more-arrow { font-size: 0.7em; color: var(--accent); }
 
     /* "Sending…" indicator shown under an optimistic user message while the
        /send POST is in flight (large uploads / slow connections). Removed
@@ -2988,9 +3016,13 @@
           </div>
           <div class="settings-section" id="account-access-section">
             <h3>Account usage</h3>
-            <div class="settings-row" id="account-usage-row" style="display:none">
-              <span class="label">Aime remaining</span>
-              <span class="value" id="account-usage-pct">—</span>
+            <div id="account-usage-block" style="display:none">
+              <div class="usage-meter" aria-hidden="true">
+                <div class="usage-meter-fill" id="account-usage-fill"></div>
+              </div>
+              <span class="usage-pct" id="account-usage-pct">—</span>
+              <span class="usage-sub" id="account-usage-sub"></span>
+              <p class="desc usage-explainer" id="account-usage-explainer"></p>
             </div>
             <p class="desc" id="account-access-desc" style="display:none">—</p>
             <div class="settings-row" id="account-redeem-row" style="display:none">
@@ -3717,51 +3749,85 @@ function mergeTurnSources(list) {
   });
 }
 
+// How many source chips show before the rest collapse behind a "+N more" pill.
+const SOURCE_CHIP_CAP = 5;
+
+// Build one source chip (favicon + host + title) linking out to the source.
+function buildSourceChip(s) {
+  const a = document.createElement("a");
+  a.className = "source-chip";
+  a.href = s.url;
+  a.target = "_blank";
+  a.rel = "noopener noreferrer";
+  a.title = s.title ? s.title + " — " + s.url : s.url;
+  // Favicon from DuckDuckGo's icon proxy (privacy-respecting; no Google
+  // beacon). If it fails to load — offline, no icon, blocked — it removes
+  // itself so the chip degrades cleanly to host + title.
+  const favUrl = faviconUrl(s.url);
+  if (favUrl) {
+    const fav = document.createElement("img");
+    fav.className = "source-fav";
+    fav.src = favUrl;
+    fav.alt = "";
+    fav.loading = "lazy";
+    fav.addEventListener("error", () => fav.remove());
+    a.appendChild(fav);
+  }
+  const host = document.createElement("span");
+  host.className = "source-host";
+  host.textContent = sourceHost(s.url);
+  const ttl = document.createElement("span");
+  ttl.className = "source-title";
+  ttl.textContent = s.title || sourceHost(s.url);
+  a.appendChild(host);
+  a.appendChild(ttl);
+  return a;
+}
+
 // Build / refresh the single source bubble for the turn and place it. When
 // `anchor` is an element the bubble is moved to sit right after it (under the
 // reply); otherwise it's left where it is (in-place refresh) or appended to the
 // log if it isn't mounted yet. No-op when nothing has been cited.
+//
+// Past SOURCE_CHIP_CAP sources the overflow collapses behind a faded "+N more"
+// pill so a search with many hits doesn't flood the transcript; clicking it
+// expands the rest in place. The expanded flag lives on the element so it
+// survives the in-place refreshes that fire as more sources stream in.
 function renderSourceBubble(anchor) {
   if (!turnSources.length) return;
   if (!turnSourceBubble) {
     turnSourceBubble = document.createElement("div");
     turnSourceBubble.className = "msg sources";
+    turnSourceBubble._expanded = false;
   }
   turnSourceBubble.innerHTML = "";
   const label = document.createElement("span");
   label.className = "sources-label";
   label.textContent = turnSources.length === 1 ? "Source" : "Sources";
   turnSourceBubble.appendChild(label);
-  turnSources.forEach(s => {
-    const a = document.createElement("a");
-    a.className = "source-chip";
-    a.href = s.url;
-    a.target = "_blank";
-    a.rel = "noopener noreferrer";
-    a.title = s.title ? s.title + " — " + s.url : s.url;
-    // Favicon from DuckDuckGo's icon proxy (privacy-respecting; no Google
-    // beacon). If it fails to load — offline, no icon, blocked — it removes
-    // itself so the chip degrades cleanly to host + title.
-    const favUrl = faviconUrl(s.url);
-    if (favUrl) {
-      const fav = document.createElement("img");
-      fav.className = "source-fav";
-      fav.src = favUrl;
-      fav.alt = "";
-      fav.loading = "lazy";
-      fav.addEventListener("error", () => fav.remove());
-      a.appendChild(fav);
-    }
-    const host = document.createElement("span");
-    host.className = "source-host";
-    host.textContent = sourceHost(s.url);
-    const ttl = document.createElement("span");
-    ttl.className = "source-title";
-    ttl.textContent = s.title || sourceHost(s.url);
-    a.appendChild(host);
-    a.appendChild(ttl);
-    turnSourceBubble.appendChild(a);
-  });
+
+  const overflow = turnSources.length - SOURCE_CHIP_CAP;
+  const collapsed = overflow > 0 && !turnSourceBubble._expanded;
+  const shown = collapsed ? SOURCE_CHIP_CAP : turnSources.length;
+  for (let i = 0; i < shown; i++) {
+    turnSourceBubble.appendChild(buildSourceChip(turnSources[i]));
+  }
+  if (overflow > 0) {
+    const more = document.createElement("button");
+    more.type = "button";
+    more.className = "source-more" + (collapsed ? " faded" : "");
+    more.textContent = collapsed ? "+" + overflow + " more" : "Show less";
+    const arrow = document.createElement("span");
+    arrow.className = "source-more-arrow";
+    arrow.textContent = collapsed ? "▾" : "▴";
+    more.appendChild(arrow);
+    more.addEventListener("click", () => {
+      turnSourceBubble._expanded = !turnSourceBubble._expanded;
+      renderSourceBubble(null);  // refresh in place, keep position
+    });
+    turnSourceBubble.appendChild(more);
+  }
+
   if (anchor && anchor.parentNode) {
     anchor.parentNode.insertBefore(turnSourceBubble, anchor.nextSibling);
   } else if (!turnSourceBubble.parentNode) {
@@ -4812,10 +4878,10 @@ es.onmessage = (ev) => {
         // That turn spent the last of today's budget. Sending is now locked
         // until the allowance refills — refreshMe() flips __usageOver and
         // applyAccessState() disables the composer with the matching message.
-        appendNotice("You've used up today's Aime. Your access will be back "
-          + "tomorrow.", "warning");
+        appendNotice("Your Aime is empty for now. It recharges on its own — "
+          + "you'll be able to chat again soon.", "warning");
       } else {
-        appendNotice("You're running low on today's Aime. It keeps refilling "
+        appendNotice("Your Aime is running low. It keeps recharging "
           + "as the day goes on.", "info");
       }
       refreshMe();
@@ -9295,8 +9361,8 @@ function applyAccessState() {
   if (input) {
     input.disabled = locked;
     if (keyLocked) input.placeholder = "Add invite key in Account settings, or ask admin to unlock access";
-    else if (__usageOver) input.placeholder = "You've used up today's Aime — your access will be back tomorrow";
-    else if (input.placeholder.startsWith("Add invite key") || input.placeholder.startsWith("You've used up")) input.placeholder = "Message Aime…";
+    else if (__usageOver) input.placeholder = "Out of Aime for now — it recharges on its own, so check back soon";
+    else if (input.placeholder.startsWith("Add invite key") || input.placeholder.startsWith("Out of Aime")) input.placeholder = "Message Aime…";
   }
   if (sendBtn) sendBtn.disabled = locked;
 
@@ -9315,33 +9381,74 @@ function applyAccessState() {
   redeemRow.style.display = "";
 }
 
-// Render the daily-allowance meter in the Account modal from /me's `usage`.
-// The user never sees dollars: a banked balance shows as "≈ N days of Aime
-// banked"; below a day it reads as a percentage of today's allowance. Hidden
-// entirely when usage limits are disarmed (open mode). See aime.quota.
-const usageRow = document.getElementById("account-usage-row");
+// A refill duration in hours rendered as a calm, approximate phrase. Used for
+// the recharge ETA so the user gets a concrete "when" without seeing dollars.
+function humanizeRecharge(hours) {
+  if (hours <= 0) return "moments";
+  if (hours < 1) return "under an hour";
+  if (hours < 1.5) return "about an hour";
+  if (hours < 23.5) return "about " + Math.round(hours) + " hours";
+  const days = hours / 24;
+  if (days < 1.5) return "about a day";
+  return "about " + Math.round(days) + " days";
+}
+
+// Render the usage meter in the Account modal from /me's `usage`. The mechanic
+// (a continuously-refilling, banking allowance) isn't self-evident, so we frame
+// it as a battery: a fill bar for how charged it is, a "% full" headline, a
+// concrete recharge ETA, and a one-line "works like a battery" explainer. The
+// user never sees dollars — the ETA is computed from the balance/rate but shown
+// only as a duration. Hidden when limits are disarmed (open mode). See aime.quota.
+const usageBlock = document.getElementById("account-usage-block");
 const usagePctEl = document.getElementById("account-usage-pct");
+const usageSubEl = document.getElementById("account-usage-sub");
+const usageFillEl = document.getElementById("account-usage-fill");
+const usageExplainerEl = document.getElementById("account-usage-explainer");
 function applyUsageMeter(armed, usage) {
-  if (!usageRow || !usagePctEl) return;
+  if (!usageBlock) return;
   if (!armed || !usage) {
-    usageRow.style.display = "none";
+    usageBlock.style.display = "none";
     return;
   }
-  usageRow.style.display = "";
-  let text, color = "var(--text)";
+  usageBlock.style.display = "";
+
+  const pct = Math.max(0, Math.min(100, Math.round(usage.pct_full)));
+  const cap = usage.daily_cap || 0;          // one day's allowance
+  const bal = usage.balance || 0;            // current charge (may be negative)
+  const ceiling = usage.ceiling || 0;        // full bank
+  // The bank refills continuously at `cap` per day toward `ceiling`. Time to
+  // 100% can be a day or two (the bank is several days deep but fills ~1 day a
+  // day); time back to usable from empty is just the climb back above zero.
+  const hoursToFull = cap > 0 ? Math.max(0, (ceiling - bal) / cap * 24) : 0;
+  const hoursToUsable = cap > 0 ? Math.max(0, -bal / cap * 24) : 0;
+
+  const low = usage.over || usage.decision === "notify_low";
+  let pctText, sub;
   if (usage.over) {
-    text = "0% — back tomorrow";
-    color = "var(--error)";
+    pctText = "Empty";
+    sub = "Out for now — you'll be able to chat again in "
+        + humanizeRecharge(hoursToUsable) + ".";
+  } else if (usage.decision === "notify_low") {
+    pctText = pct + "% full";
+    sub = "Running low — it keeps recharging as the day goes on.";
+  } else if (pct >= 99) {
+    pctText = pct + "% full";
+    sub = "Fully charged.";
   } else {
-    // Lead with the battery-style fullness %, with the banked days as context.
-    text = Math.round(usage.pct_full) + "%";
-    if (usage.days_banked >= 1) {
-      text += " (≈ " + usage.days_banked.toFixed(1) + " days)";
-    }
-    if (usage.decision === "notify_low") color = "var(--error)";
+    pctText = pct + "% full";
+    sub = "Recharges as you go — full again in " + humanizeRecharge(hoursToFull) + ".";
   }
-  usagePctEl.textContent = text;
-  usagePctEl.style.color = color;
+
+  usageFillEl.style.width = pct + "%";
+  usageFillEl.style.background = low ? "var(--error)" : "var(--accent)";
+  usagePctEl.textContent = pctText;
+  usagePctEl.style.color = low ? "var(--error)" : "var(--text)";
+  usageSubEl.textContent = sub;
+  usageSubEl.style.color = low ? "var(--error)" : "var(--muted)";
+
+  usageExplainerEl.textContent =
+    "Works like a battery: it recharges through the day and drains as you chat. "
+    + "If it ever runs empty, it fills back up on its own.";
 }
 
 async function refreshMe() {
