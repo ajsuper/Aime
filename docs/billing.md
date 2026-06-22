@@ -5,10 +5,11 @@ payment layer on top of the two columns Aime already gates on — `api_access`
 (the send gate) and `tier` (the daily cost allowance). It is **off** in
 `open`/`keys` mode; nothing here runs and no Stripe calls are made.
 
-We never touch card data. Every card field is hosted by Stripe (hosted Checkout
-+ Customer Portal). A signed **webhook** is the *only* authority that grants
-access — the Checkout success redirect grants nothing — so a spoofed return URL
-can't unlock an account.
+We never touch card data. Every card field is rendered by Stripe — the inline
+**Payment Element** (mounted in Aime's own Billing tab) for subscribing, and the
+hosted **Customer Portal** for managing/cancelling. A signed **webhook** is the
+*only* authority that grants access (creating a subscription or confirming a
+card grants nothing on its own), so a spoofed return can't unlock an account.
 
 ## The model
 
@@ -20,12 +21,12 @@ can't unlock an account.
 - **Card at signup, then a 30-day free trial.** A new billing-mode account is
   created with `api_access=0` (no send access), exactly like a `keys`-mode
   account before it redeems a key. The user opens the **Billing** tab, starts a
-  trial, and enters a card in Stripe Checkout (card required up front even
-  though the trial is free). The webhook sees `trialing` and flips
-  `api_access=1`. After 30 days Stripe auto-charges; on success the subscription
-  goes `active` and access continues. On cancellation or a failed payment the
-  subscription goes `canceled`/`past_due`/`unpaid`, and the webhook flips
-  `api_access=0`.
+  trial, and enters a card in the inline Payment Element (card required up front
+  even though the trial is free — see *Subscribing* below for why this is a
+  two-step flow). The webhook sees `trialing` and flips `api_access=1`. After 30
+  days Stripe auto-charges; on success the subscription goes `active` and access
+  continues. On cancellation or a failed payment the subscription goes
+  `canceled`/`past_due`/`unpaid`, and the webhook flips `api_access=0`.
 - **The webhook reads the tier off the *actual* subscription Price** (server
   side), never off anything the client said — so a user can't select a tier
   they didn't pay for.
@@ -34,14 +35,31 @@ can't unlock an account.
 
 ```
 signup (billing mode)            account created, api_access=0
-   └─ Billing tab "Start trial" ─► POST /billing/checkout ─► Stripe Checkout (hosted, card, trial 30d)
+   └─ Billing tab "Start trial" ─► POST /billing/subscribe ──► SetupIntent (client secret)
+                                          │
+              inline Payment Element confirms the card (stripe.confirmSetup)
+                                          │
+        POST /billing/subscribe/confirm ─► create subscription on saved card (trial 30d)
                                                                    │
-   Stripe ── customer.subscription.* / checkout.session.completed ─┤
+   Stripe ──────── customer.subscription.* ────────────────────────┤
                                                                    ▼
                                           POST /billing/webhook (signature-verified)
                                                    └─ reconcile: status→api_access, price→tier
    Manage / cancel / update card ─► POST /billing/portal ─► Stripe Customer Portal (hosted)
 ```
+
+The subscribe flow is **two steps on purpose.** A free-trial subscription
+created directly would enter `trialing` the instant it exists — i.e. *before*
+the card is confirmed — granting access (and consuming the customer's one trial)
+even if they abandoned the card form. So step 1 (`/billing/subscribe`) only
+creates a **SetupIntent** to collect+save the card (no subscription yet, no
+access, no trial spent); step 2 (`/billing/subscribe/confirm`) creates the
+subscription on that saved card *after* it's confirmed, so it goes `trialing`
+with a payment method already attached. The one-trial / no-double-subscription
+guards run in step 2 (the request that actually creates the subscription). For a
+returning customer who already used their trial, the first invoice is charged
+immediately off-session (`error_if_incomplete`, so a decline surfaces as an
+error instead of a stuck `incomplete` subscription).
 
 Status → access mapping (`aime.billing.reconcile_subscription`):
 
@@ -66,8 +84,11 @@ only safety net against a permanently-lost grant/revoke.
 
 ## Subscribing: one subscription, one trial
 
-`POST /billing/checkout` guards two things before creating a Checkout session
-(one Stripe round-trip, `billing.subscription_state`):
+`POST /billing/subscribe/confirm` — the step that actually creates the
+subscription — guards two things (one Stripe round-trip,
+`billing.subscription_state`). `/billing/subscribe` (step 1) also pre-checks the
+double-subscription guard so the card form isn't even shown to an already-paying
+user, but step 2 is the authoritative gate:
 
 - **No double subscription.** If the customer already has a live subscription
   (`trialing`/`active`/`past_due`/`unpaid`/`paused`) the route returns `409` and
@@ -75,10 +96,14 @@ only safety net against a permanently-lost grant/revoke.
   a second, double-billing subscription behind the UI's back.
 - **One trial per customer.** The 30-day trial is granted only if *none* of the
   customer's subscriptions has ever carried a trial. A user who starts a trial,
-  cancels, and checks out again is charged immediately (no second trial). This
+  cancels, and subscribes again is charged immediately (no second trial). This
   blocks trial farming **on the same account**; the cross-account vector (a new
   email + a new card) can only be seen by Stripe — close it with a **Radar rule**
   (below), which the card-at-signup requirement makes possible.
+
+The chosen tier is carried on the SetupIntent metadata and read back server-side
+in step 2 — never taken from the step-2 request body — so it can't be swapped
+after the card is entered.
 
 ## Operator setup
 
@@ -87,6 +112,9 @@ only safety net against a permanently-lost grant/revoke.
 2. **Set the environment** (see `.env.example`):
    - `AIME_ACCESS_MODE=billing`
    - `AIME_STRIPE_SECRET_KEY` (`sk_test_…` / `sk_live_…`)
+   - `AIME_STRIPE_PUBLISHABLE_KEY` (`pk_test_…` / `pk_live_…`) — shipped to the
+     browser for the inline Payment Element. Must be from the **same account and
+     mode** as the secret key.
    - `AIME_STRIPE_WEBHOOK_SECRET` (`whsec_…`, from step 3)
    - `AIME_STRIPE_PRICE_LIGHT`, `AIME_STRIPE_PRICE_POWER`
    - `AIME_STRIPE_TRIAL_DAYS` (default 30)
@@ -95,14 +123,14 @@ only safety net against a permanently-lost grant/revoke.
      **Required** — the app refuses to start in billing mode without it, so the
      Stripe return URLs can't be forged from a spoofed `Host` header.
 
-   The app **refuses to start** in billing mode unless the secret key, webhook
-   secret, and a Price for each tier are all set — otherwise the send gate would
-   be armed with no way for anyone to gain access.
+   The app **refuses to start** in billing mode unless the secret key,
+   publishable key, webhook secret, and a Price for each tier are all set —
+   otherwise the send gate would be armed with no way for anyone to gain access.
 3. **Register the webhook endpoint** in Stripe at
    `https://<your-host>/billing/webhook`, subscribed to
-   `customer.subscription.created`, `customer.subscription.updated`,
-   `customer.subscription.deleted`, and `checkout.session.completed`. Copy its
-   signing secret into `AIME_STRIPE_WEBHOOK_SECRET`. (For local testing use
+   `customer.subscription.created`, `customer.subscription.updated`, and
+   `customer.subscription.deleted`. Copy its signing secret into
+   `AIME_STRIPE_WEBHOOK_SECRET`. (For local testing use
    `stripe listen --forward-to localhost:5000/billing/webhook`, which prints a
    `whsec_`.)
 4. **Configure the Customer Portal** in the Stripe Dashboard. In **live** mode
@@ -110,8 +138,9 @@ only safety net against a permanently-lost grant/revoke.
    `billingPortal.sessions.create` works; test mode has a default. Enable
    **plan switching** between the two Prices (so users can upgrade/downgrade —
    the webhook reconciles the new Price → tier). Set the branding (logo, colors)
-   there too — Checkout and the Portal both inherit it, which is how the hosted
-   pages are themed to match Aime.
+   there too — the hosted Portal inherits it. (The inline Payment Element is
+   themed separately, from Aime's own CSS variables via Stripe's Appearance
+   API — see the Billing tab JS in `web_chat.html`.)
 5. **Limit free trials (anti-abuse).** Aime already blocks a *second* trial on
    the same Stripe customer, but a determined user can make a new account with a
    new email + card. Only Stripe can see the card, so close that vector with a
@@ -205,11 +234,15 @@ of record. Plan/payment changes happen in Stripe or the user's own portal.
 2. `stripe listen --forward-to localhost:5000/billing/webhook` (copy the
    `whsec_` into the env and restart).
 3. Sign up → the composer is locked → open **Billing** → pick a plan → **Start
-   30-day free trial** → Stripe Checkout → card `4242 4242 4242 4242`.
-4. Confirm: the webhook fires `checkout.session.completed` +
+   30-day free trial** → the inline card panel appears → card
+   `4242 4242 4242 4242` → **Start free trial**.
+4. Confirm: the card is saved via the SetupIntent, `/billing/subscribe/confirm`
+   creates the subscription, and the webhook fires
    `customer.subscription.created (trialing)`; `/me` shows
    `billing.status=trialing`; `api_access` flips true; the composer unlocks; the
-   tier matches the chosen Price.
+   tier matches the chosen Price. (To exercise the 3-D Secure redirect path, use
+   test card `4000 0027 6000 3184` — Stripe redirects to the return URL and the
+   page finishes the subscription on the way back.)
 5. In the Portal, cancel → `customer.subscription.deleted` → the composer
    re-locks; the dashboard shows `canceled`.
 6. A failed renewal (Stripe retries → `past_due`/`unpaid`) fires
@@ -227,14 +260,17 @@ of record. Plan/payment changes happen in Stripe or the user's own portal.
   `set_stripe_customer`, `set_subscription`, and the `comp_access` flag +
   `set_comp_access` (sets comp + `api_access` together).
 - `src/frontends/web_app.py` — `_billing_armed()`, the fail-closed startup
-  check, the `/billing/{checkout,portal,summary,return,webhook}` routes (checkout
-  enforces one-subscription / one-trial; the webhook 500s on unexpected errors so
-  Stripe retries), the `/me` billing block, cancel-on-delete, and the
-  recovery resume+reconcile.
-- `src/aime/billing.py` helpers — `subscription_state` (checkout guards),
-  `cancel_subscriptions` / `resume_subscriptions` (account delete/recover).
-- `resources/style/web_chat.html` — the Billing settings tab and the
-  billing-mode composer-lock copy.
+  check, the `/billing/{subscribe,subscribe/confirm,portal,summary,webhook}`
+  routes (`subscribe/confirm` enforces one-subscription / one-trial; the webhook
+  500s on unexpected errors so Stripe retries), the `/me` billing block,
+  cancel-on-delete, and the recovery resume+reconcile.
+- `src/aime/billing.py` helpers — `create_setup_intent` /
+  `saved_payment_method` / `create_subscription` (the two-step inline subscribe),
+  `subscription_state` (the subscribe guards), `cancel_subscriptions` /
+  `resume_subscriptions` (account delete/recover).
+- `resources/style/web_chat.html` — the Billing settings tab (incl. the inline
+  Payment Element + its Appearance theming) and the billing-mode composer-lock
+  copy.
 - `src/frontends/usage_dashboard.py` — the read-only Billing tab, and the
   Accounts-tab **Grant/Remove full access** (comp) control + `/accounts/comp`
   route (billing mode).

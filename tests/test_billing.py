@@ -26,6 +26,7 @@ _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _BILLING_ENV = {
     "AIME_ACCESS_MODE": "billing",
     "AIME_STRIPE_SECRET_KEY": "sk_test_dummy",
+    "AIME_STRIPE_PUBLISHABLE_KEY": "pk_test_dummy",
     "AIME_STRIPE_WEBHOOK_SECRET": "whsec_dummy",
     "AIME_STRIPE_PRICE_LIGHT": "price_light",
     "AIME_STRIPE_PRICE_POWER": "price_power",
@@ -80,9 +81,13 @@ def test_unknown_price_and_tier_are_none(prices):
 
 def test_stripe_configured(monkeypatch, prices):
     monkeypatch.setattr(config, "STRIPE_SECRET_KEY", "sk")
+    monkeypatch.setattr(config, "STRIPE_PUBLISHABLE_KEY", "pk")
     monkeypatch.setattr(config, "STRIPE_WEBHOOK_SECRET", "wh")
     monkeypatch.setattr(config, "PUBLIC_BASE_URL", "https://aime.test")
     assert config.stripe_configured() is True
+    monkeypatch.setattr(config, "STRIPE_PUBLISHABLE_KEY", "")
+    assert config.stripe_configured() is False  # publishable key required for Stripe.js
+    monkeypatch.setattr(config, "STRIPE_PUBLISHABLE_KEY", "pk")
     monkeypatch.setattr(config, "PUBLIC_BASE_URL", "")
     assert config.stripe_configured() is False  # base url required for safe URLs
     monkeypatch.setattr(config, "PUBLIC_BASE_URL", "https://aime.test")
@@ -504,7 +509,9 @@ def test_webhook_500_on_handler_error():
     assert "OK" in proc.stdout
 
 
-def test_checkout_blocks_second_subscription():
+def test_subscribe_blocks_second_subscription():
+    """Step 1 (/billing/subscribe) refuses to start a card flow when the
+    customer already has a live subscription."""
     proc = _run_snippet(
         _BILLING_ENV,
         "import frontends.web_app as w\n"
@@ -512,7 +519,7 @@ def test_checkout_blocks_second_subscription():
         "c.post('/signup', data={'username':'owner','password':'Sufficiently-long-pw-1','password2':'Sufficiently-long-pw-1'})\n"
         "w._billing.ensure_customer = lambda ab, u: 'cus_1'\n"
         "w._billing.subscription_state = lambda cid: {'has_active': True, 'used_trial': True}\n"
-        "r = c.post('/billing/checkout', json={'tier':'power'})\n"
+        "r = c.post('/billing/subscribe', json={'tier':'power'})\n"
         "assert r.status_code == 409, r.status_code\n"
         "assert r.get_json()['code'] == 'already_subscribed'\n"
         "print('OK')\n",
@@ -521,22 +528,72 @@ def test_checkout_blocks_second_subscription():
     assert "OK" in proc.stdout
 
 
-def test_checkout_trial_gate():
-    """A first-time customer gets the trial; one who already used it does not."""
+def test_subscribe_returns_client_secret():
+    """Step 1 hands back the SetupIntent client secret + publishable key for the
+    inline Payment Element."""
     proc = _run_snippet(
         _BILLING_ENV,
         "import frontends.web_app as w\n"
         "c = w.app.test_client()\n"
         "c.post('/signup', data={'username':'owner','password':'Sufficiently-long-pw-1','password2':'Sufficiently-long-pw-1'})\n"
         "w._billing.ensure_customer = lambda ab, u: 'cus_1'\n"
-        "seen = {}\n"
-        "w._billing.create_checkout_session = lambda **k: (seen.update(k) or 'https://stripe.test/x')\n"
         "w._billing.subscription_state = lambda cid: {'has_active': False, 'used_trial': False}\n"
-        "assert c.post('/billing/checkout', json={'tier':'power'}).status_code == 200\n"
+        "w._billing.create_setup_intent = lambda **k: {'client_secret': 'seti_secret', 'setup_intent_id': 'seti_1'}\n"
+        "r = c.post('/billing/subscribe', json={'tier':'power'})\n"
+        "assert r.status_code == 200, r.status_code\n"
+        "j = r.get_json()\n"
+        "assert j['client_secret'] == 'seti_secret', j\n"
+        "assert j['publishable_key'] == 'pk_test_dummy', j\n"
+        "print('OK')\n",
+    )
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "OK" in proc.stdout
+
+
+def test_subscribe_confirm_trial_gate():
+    """Step 2 (/billing/subscribe/confirm) reads the tier off the SetupIntent,
+    grants the trial to a first-time customer and withholds it from one who
+    already used it. The card-confirmation guard lives in saved_payment_method."""
+    proc = _run_snippet(
+        _BILLING_ENV,
+        "import frontends.web_app as w\n"
+        "c = w.app.test_client()\n"
+        "c.post('/signup', data={'username':'owner','password':'Sufficiently-long-pw-1','password2':'Sufficiently-long-pw-1'})\n"
+        "w._auth_backend.set_stripe_customer(1, 'cus_1')\n"
+        "w._billing.saved_payment_method = lambda sid, cid: ('pm_1', 'power')\n"
+        "seen = {}\n"
+        "w._billing.create_subscription = lambda **k: (seen.update(k) or 'sub_1')\n"
+        "w._billing.subscription_state = lambda cid: {'has_active': False, 'used_trial': False}\n"
+        "r = c.post('/billing/subscribe/confirm', json={'setup_intent_id':'seti_1'})\n"
+        "assert r.status_code == 200, (r.status_code, r.get_json())\n"
         "assert seen['trial_days'] == w.aime_config.STRIPE_TRIAL_DAYS, seen\n"
+        "assert seen['payment_method_id'] == 'pm_1', seen\n"
+        "assert seen['tier'] == 'power', seen\n"
         "w._billing.subscription_state = lambda cid: {'has_active': False, 'used_trial': True}\n"
-        "assert c.post('/billing/checkout', json={'tier':'power'}).status_code == 200\n"
+        "assert c.post('/billing/subscribe/confirm', json={'setup_intent_id':'seti_1'}).status_code == 200\n"
         "assert seen['trial_days'] == 0, seen\n"
+        "print('OK')\n",
+    )
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "OK" in proc.stdout
+
+
+def test_subscribe_confirm_rejects_unconfirmed_card():
+    """If the SetupIntent isn't confirmed/ours, no subscription is created."""
+    proc = _run_snippet(
+        _BILLING_ENV,
+        "import frontends.web_app as w\n"
+        "c = w.app.test_client()\n"
+        "c.post('/signup', data={'username':'owner','password':'Sufficiently-long-pw-1','password2':'Sufficiently-long-pw-1'})\n"
+        "w._auth_backend.set_stripe_customer(1, 'cus_1')\n"
+        "def boom(sid, cid):\n"
+        "    raise ValueError('card has not been confirmed yet')\n"
+        "w._billing.saved_payment_method = boom\n"
+        "made = []\n"
+        "w._billing.create_subscription = lambda **k: made.append(k)\n"
+        "r = c.post('/billing/subscribe/confirm', json={'setup_intent_id':'seti_1'})\n"
+        "assert r.status_code == 400, r.status_code\n"
+        "assert made == [], made\n"
         "print('OK')\n",
     )
     assert proc.returncode == 0, proc.stderr + proc.stdout

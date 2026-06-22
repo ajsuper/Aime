@@ -622,6 +622,19 @@ def _render_markup_to_html(markup: str, final: bool = False) -> str:
     return html.strip("\n")
 
 
+def _drain_queue(q: "queue.Queue") -> None:
+    """Discard everything currently buffered in a client's SSE queue. Used when
+    a client has fallen so far behind that its queue overflowed: the backlog is
+    stale relative to the server's history, so we drop it wholesale and let the
+    client resync from a fresh snapshot rather than crawl through megabytes of
+    obsolete streaming partials."""
+    while True:
+        try:
+            q.get_nowait()
+        except queue.Empty:
+            return
+
+
 class UserContext:
     """Everything keyed to a single logged-in user: their controller, agent
     backend session, gateway, SSE subscribers, replay history, and streaming
@@ -885,7 +898,24 @@ class UserContext:
             try:
                 q.put_nowait(payload)
             except queue.Full:
-                pass
+                # This client's consumer has fallen far enough behind that its
+                # queue is full — typically a slow or janky browser applying
+                # backpressure mid-response. Silently dropping the event would
+                # desync that client *permanently*: the connection stays alive
+                # (the ping heartbeat keeps flowing), so neither the browser's
+                # EventSource nor the client-side liveness watchdog ever notices,
+                # and the user is stuck staring at a half-arrived reply until
+                # they manually reload. Instead, drop the now-stale backlog and
+                # hand the client a single `resync` marker — it reconnects and
+                # rebuilds the transcript from authoritative history. Goes
+                # straight to this one queue (not via history), so it can't
+                # replay onto other clients. Self-healing where the old code
+                # needed a manual refresh.
+                _drain_queue(q)
+                try:
+                    q.put_nowait({"kind": "resync"})
+                except queue.Full:
+                    pass
 
     def notify_remote_edit(self, source: str) -> None:
         """Tell every connected session of this user to re-fetch their
@@ -1091,16 +1121,20 @@ def _wants_trusted_device() -> bool:
 
 # Content Security Policy. Inline styles are required (Rich produces inline
 # style="..." on every span), and we load marked + DOMPurify from jsdelivr.
-# Everything else is locked to same-origin.
+# In billing mode we also load Stripe.js (js.stripe.com) for the inline Payment
+# Element, which talks to api.stripe.com and renders its card fields + any 3-D
+# Secure step inside iframes from js.stripe.com / hooks.stripe.com. Everything
+# else is locked to same-origin.
 _CSP = (
     "default-src 'self'; "
-    "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+    "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://js.stripe.com; "
     "style-src 'self' 'unsafe-inline'; "
     # icons.duckduckgo.com serves the favicons on web-search source chips.
     "img-src 'self' data: blob: https://icons.duckduckgo.com; "
     "media-src 'self' blob:; "
-    "connect-src 'self'; "
+    "connect-src 'self' https://api.stripe.com; "
     "font-src 'self' data:; "
+    "frame-src https://js.stripe.com https://hooks.stripe.com; "
     "frame-ancestors 'none'; "
     "base-uri 'self'; "
     "form-action 'self'"
@@ -1194,7 +1228,8 @@ if _ACCESS_MODE not in ("keys", "open", "billing"):
 if _ACCESS_MODE == "billing" and not _billing.billing_enabled():
     raise RuntimeError(
         "AIME_ACCESS_MODE=billing requires Stripe to be configured: set "
-        "AIME_STRIPE_SECRET_KEY, AIME_STRIPE_WEBHOOK_SECRET, a price per tier "
+        "AIME_STRIPE_SECRET_KEY, AIME_STRIPE_PUBLISHABLE_KEY, "
+        "AIME_STRIPE_WEBHOOK_SECRET, a price per tier "
         "(AIME_STRIPE_PRICE_LIGHT / AIME_STRIPE_PRICE_POWER), and "
         "AIME_PUBLIC_BASE_URL (absolute, for safe Stripe return URLs). See "
         "docs/billing.md. Refusing to start so users aren't locked out."
@@ -2519,12 +2554,14 @@ def _billing_base_url() -> str:
     return aime_config.PUBLIC_BASE_URL or request.url_root.rstrip("/")
 
 
-@app.route("/billing/checkout", methods=["POST"])
+@app.route("/billing/subscribe", methods=["POST"])
 @login_required
-def billing_checkout():
-    """Create a subscription Checkout Session for the chosen tier and return its
-    hosted URL. The client navigates to it (window.location); access is granted
-    later by the webhook, not by the success redirect."""
+def billing_subscribe():
+    """Step 1 of the inline subscribe flow: create a SetupIntent so the browser
+    can collect a card with the Payment Element. No subscription exists yet —
+    access is granted only later by the webhook, after the card is confirmed and
+    /billing/subscribe/confirm creates the subscription. Returns the client
+    secret + publishable key the Payment Element needs."""
     if not _billing_armed():
         abort(404)
     data = request.get_json(silent=True) or {}
@@ -2536,11 +2573,59 @@ def billing_checkout():
         abort(404)
     try:
         customer_id = _billing.ensure_customer(_auth_backend, user)
-        # Guard against a second subscription (the UI hides the button once
-        # subscribed, but a direct POST would otherwise double-bill), and only
-        # grant the free trial to a customer who hasn't already used one
-        # (blocks cancel-and-restart trial farming on the same account). One
-        # Stripe round-trip answers both.
+        # Block a second subscription up front (the UI hides the button once
+        # subscribed, but a direct POST would otherwise double-bill).
+        if _billing.subscription_state(customer_id)["has_active"]:
+            return jsonify({"ok": False, "code": "already_subscribed",
+                            "message": "You already have an active subscription. "
+                                       "Use “Manage billing” to change "
+                                       "your plan."}), 409
+        intent = _billing.create_setup_intent(customer_id=customer_id, tier=tier)
+    except Exception:
+        app.logger.warning("billing: setup-intent create failed for user %s",
+                            g.user_id, exc_info=True)
+        return jsonify({"ok": False,
+                        "message": "We couldn't start checkout just now. "
+                                   "Please try again in a moment."}), 502
+    return jsonify({"ok": True,
+                    "client_secret": intent["client_secret"],
+                    "publishable_key": aime_config.STRIPE_PUBLISHABLE_KEY})
+
+
+@app.route("/billing/subscribe/confirm", methods=["POST"])
+@login_required
+def billing_subscribe_confirm():
+    """Step 2 of the inline subscribe flow: the browser has confirmed the
+    SetupIntent (card saved), so create the subscription on that card. The tier
+    is read off the SetupIntent metadata (server-side, never the client), and
+    the one-trial / no-double-subscription guards run here too — this is the
+    request that actually creates the subscription, so it's the real gate, not
+    step 1. Access still comes from the webhook that follows."""
+    if not _billing_armed():
+        abort(404)
+    data = request.get_json(silent=True) or {}
+    setup_intent_id = (data.get("setup_intent_id") or "").strip()
+    if not setup_intent_id:
+        return jsonify({"ok": False, "message": "Missing payment confirmation."}), 400
+    user = _auth_backend.lookup(g.user_id)
+    if user is None or not user.stripe_customer_id:
+        abort(404)
+    customer_id = user.stripe_customer_id
+    try:
+        payment_method_id, tier = _billing.saved_payment_method(
+            setup_intent_id, customer_id)
+    except ValueError:
+        # The card isn't confirmed / isn't ours — never create a subscription.
+        return jsonify({"ok": False,
+                        "message": "We couldn't confirm your card. "
+                                   "Please try again."}), 400
+    if tier not in aime_config.USAGE_TIERS:
+        return jsonify({"ok": False, "message": "Pick a plan to continue."}), 400
+    try:
+        # Re-check the guards now that we're about to create the real
+        # subscription: block a second one, and grant the free trial only to a
+        # customer who hasn't used one (blocks cancel-and-restart trial farming
+        # on the same account).
         state = _billing.subscription_state(customer_id)
         if state["has_active"]:
             return jsonify({"ok": False, "code": "already_subscribed",
@@ -2548,20 +2633,17 @@ def billing_checkout():
                                        "Use “Manage billing” to change "
                                        "your plan."}), 409
         trial_days = 0 if state["used_trial"] else aime_config.STRIPE_TRIAL_DAYS
-        base = _billing_base_url()
-        url = _billing.create_checkout_session(
+        _billing.create_subscription(
             user_id=user.id, customer_id=customer_id, tier=tier,
-            success_url=base + "/billing/return",
-            cancel_url=base + "/",
-            trial_days=trial_days,
+            payment_method_id=payment_method_id, trial_days=trial_days,
         )
     except Exception:
-        app.logger.warning("billing: checkout create failed for user %s",
+        app.logger.warning("billing: subscription create failed for user %s",
                             g.user_id, exc_info=True)
         return jsonify({"ok": False,
-                        "message": "We couldn't start checkout just now. "
-                                   "Please try again in a moment."}), 502
-    return jsonify({"ok": True, "url": url})
+                        "message": "We saved your card but couldn't start your "
+                                   "plan. Please try again in a moment."}), 502
+    return jsonify({"ok": True})
 
 
 @app.route("/billing/portal", methods=["POST"])
@@ -2612,17 +2694,6 @@ def billing_summary():
     return jsonify(summary)
 
 
-@app.route("/billing/return", methods=["GET"])
-@login_required
-def billing_return():
-    """Landing page after Checkout. Access is granted by the webhook (usually
-    within a second), so this just sends the user back to the app, which polls
-    /me and unlocks the composer once the webhook lands."""
-    if not _billing_armed():
-        abort(404)
-    return redirect("/")
-
-
 @app.route("/billing/webhook", methods=["POST"])
 def billing_webhook():
     """Stripe webhook — the SOLE authority that grants/revokes api_access.
@@ -2660,14 +2731,6 @@ def billing_webhook():
             # Terminal — a retrieve would 404, so the embedded object is the
             # authoritative final state.
             _billing.reconcile_subscription(_auth_backend, obj)
-        elif etype == "checkout.session.completed":
-            # Bind customer→user early and reconcile if a subscription exists.
-            # The subscription.* events also fire and are the main path; this
-            # just tightens the window. Best-effort.
-            sub_id = obj.get("subscription")
-            if sub_id:
-                sub = _billing.retrieve_subscription(sub_id)
-                _billing.reconcile_subscription(_auth_backend, sub)
     except Exception:
         # Unexpected — let Stripe retry (idempotent reconcile makes that safe).
         app.logger.warning("billing: webhook %s handling failed", etype,

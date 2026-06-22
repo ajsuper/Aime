@@ -6,6 +6,10 @@
   <title>Aime</title>
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
+  <!-- Stripe.js for the inline Payment Element in the Billing tab (billing mode
+       only; harmless to load otherwise — nothing references it until a card is
+       collected). -->
+  <script src="https://js.stripe.com/v3/"></script>
   <!-- Typography: Fraunces (characterful display, for the wordmark & headings)
        paired with Hanken Grotesk (a warm, highly legible body face). -->
   <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -3207,6 +3211,34 @@
                   Start 30-day free trial
                 </button>
               </div>
+              <!-- Inline card panel: revealed when "Start trial" is clicked. The
+                   Stripe Payment Element mounts into #billing-payment-element;
+                   the surrounding card uses Aime's own variables so it matches
+                   the rest of settings. -->
+              <div id="billing-card-panel" style="display:none;margin-top:0.9rem;
+                   border:1px solid var(--border);border-radius:12px;
+                   padding:1rem;background:var(--bg-input)">
+                <p class="desc" style="margin:0 0 0.75rem">
+                  Enter your card to start your free trial. You won't be charged
+                  until the trial ends, and you can cancel anytime. Your card is
+                  handled securely by Stripe — Aime never sees it.</p>
+                <div id="billing-payment-element"></div>
+                <div style="display:flex;gap:0.5rem;margin-top:0.9rem;align-items:center">
+                  <button class="btn-primary" id="billing-pay-btn"
+                          style="background:var(--accent);color:#fff;border:0;border-radius:8px;
+                                 padding:0.45rem 1rem;cursor:pointer;font-size:0.85rem">
+                    Start free trial
+                  </button>
+                  <button class="btn-secondary" id="billing-pay-cancel"
+                          style="background:transparent;color:var(--muted);
+                                 border:1px solid var(--border);border-radius:8px;
+                                 padding:0.45rem 0.9rem;cursor:pointer;font-size:0.85rem">
+                    Cancel
+                  </button>
+                  <span class="desc" id="billing-pay-status"
+                        style="display:none"></span>
+                </div>
+              </div>
             </div>
             <p class="desc" id="billing-loading">Loading your billing details…</p>
             <p class="desc" id="billing-msg"
@@ -5044,6 +5076,15 @@ function onStreamMessage(ev) {
       // Replayed history has no turn_end, so a "Working…" line added while
       // replaying tool calls would otherwise linger — drop it here.
       clearWorkingIndicator();
+      break;
+    case "resync":
+      // The server's per-client send buffer overflowed (this browser fell too
+      // far behind mid-stream), so its event backlog was dropped to avoid a
+      // silent permanent desync. Reconnect: connectStream() tears down the live
+      // stream and reopens it, which clears the transcript and rebuilds it from
+      // the server's authoritative history snapshot — the same recovery path the
+      // liveness watchdog uses, just triggered by the server instead of a gap.
+      connectStream();
       break;
     case "turn_routing":
       // Per-turn model-routing decision. Only surfaced in Verbose so the
@@ -9837,9 +9878,11 @@ keyInput.addEventListener("keydown", (e) => {
 // -- Billing tab (AIME_ACCESS_MODE=billing only) -----------------------------
 // The headline state comes from the cheap /me billing block; when the tab is
 // opened we fetch GET /billing/summary once for the live detail (plan, renewal
-// date, cancel-pending). "Start trial" / "Manage billing" POST to their route
-// and navigate to Stripe's hosted page via window.location (an HTML form would
-// be blocked by the CSP form-action 'self'). See aime.billing + docs/billing.md.
+// date, cancel-pending). "Start trial" collects the card INLINE via the Stripe
+// Payment Element (see the inline-subscribe block below); only "Manage billing"
+// still leaves for a Stripe-hosted page (the Customer Portal), navigated via
+// window.location since an HTML form post is blocked by CSP form-action 'self'.
+// See aime.billing + docs/billing.md.
 const billingCompBlock   = document.getElementById("billing-comp-block");
 const billingIntroEl     = document.getElementById("billing-intro");
 const billingStatusBlock = document.getElementById("billing-status-block");
@@ -9856,6 +9899,11 @@ const billingStatusNote  = document.getElementById("billing-status-note");
 const billingPortalBtn   = document.getElementById("billing-portal-btn");
 const billingStartBtn    = document.getElementById("billing-start-btn");
 const billingPlanSelect  = document.getElementById("billing-plan-select");
+const billingCardPanel   = document.getElementById("billing-card-panel");
+const billingPayBtn      = document.getElementById("billing-pay-btn");
+const billingPayCancel   = document.getElementById("billing-pay-cancel");
+const billingPayStatus   = document.getElementById("billing-pay-status");
+const billingPayElement  = document.getElementById("billing-payment-element");
 
 const BILLING_STATUS_LABEL = {
   trialing: "Free trial", active: "Active", past_due: "Payment due",
@@ -9963,8 +10011,170 @@ async function goToStripe(path, body, btn) {
   if (btn) btn.disabled = false;
 }
 
-billingStartBtn.addEventListener("click", () =>
-  goToStripe("/billing/checkout", {tier: billingPlanSelect.value}, billingStartBtn));
+// -- Inline subscribe (Stripe Payment Element) -------------------------------
+// Two steps, mirroring the backend: POST /billing/subscribe creates a
+// SetupIntent (collect the card, no subscription yet); the user confirms the
+// card inline; then POST /billing/subscribe/confirm creates the subscription on
+// that saved card. Access is granted by the webhook that follows, so on success
+// we just poll /me and reload the summary. See aime.billing + docs/billing.md.
+let __stripe = null;       // Stripe.js instance (created once we have a pk_)
+let __billingElements = null;  // Elements group bound to the current SetupIntent
+let __billingSetupId = null;   // id of the SetupIntent being confirmed
+
+// Theme the Stripe-hosted card fields to match Aime by reading our own CSS
+// custom properties — the inputs then sit seamlessly inside the settings card.
+function billingAppearance() {
+  const css = getComputedStyle(document.documentElement);
+  const v = (n, fallback) => (css.getPropertyValue(n).trim() || fallback);
+  return {
+    theme: "night",
+    variables: {
+      colorPrimary:    v("--accent", "#7c5cff"),
+      colorBackground: v("--bg-input", "#1c1c22"),
+      colorText:       v("--text", "#f0f0f5"),
+      colorDanger:     v("--error", "#ff6b6b"),
+      borderRadius:    "8px",
+    },
+  };
+}
+
+function setBillingPayStatus(msg, isError) {
+  if (!msg) { billingPayStatus.style.display = "none"; return; }
+  billingPayStatus.textContent = msg;
+  billingPayStatus.style.color = isError ? "var(--error)" : "var(--muted)";
+  billingPayStatus.style.display = "";
+}
+
+function closeBillingCardPanel() {
+  billingCardPanel.style.display = "none";
+  setBillingPayStatus("", false);
+  if (__billingElements) { try { __billingElements.getElement("payment")?.unmount(); } catch {} }
+  __billingElements = null;
+  __billingSetupId = null;
+  billingStartBtn.disabled = false;
+  billingPayBtn.disabled = false;
+}
+
+// Step 1: ask the server for a SetupIntent, then mount the Payment Element.
+async function startInlineSubscribe() {
+  billingMsg.style.display = "none";
+  if (!window.Stripe) {
+    billingMsg.textContent = "Payment form failed to load — please refresh.";
+    billingMsg.style.color = "var(--error)";
+    billingMsg.style.display = "";
+    return;
+  }
+  billingStartBtn.disabled = true;
+  try {
+    const r = await fetch("/billing/subscribe", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      credentials: "same-origin",
+      body: JSON.stringify({tier: billingPlanSelect.value}),
+    });
+    const data = await r.json();
+    if (!data.ok) {
+      // A subscription already exists — refresh into the status view.
+      if (data.code === "already_subscribed") { loadBillingSummary(true); return; }
+      billingMsg.textContent = data.message || "Something went wrong. Try again.";
+      billingMsg.style.color = "var(--error)";
+      billingMsg.style.display = "";
+      billingStartBtn.disabled = false;
+      return;
+    }
+    __stripe = __stripe || Stripe(data.publishable_key);
+    __billingElements = __stripe.elements({
+      clientSecret: data.client_secret,
+      appearance: billingAppearance(),
+    });
+    __billingElements.create("payment").mount(billingPayElement);
+    billingCardPanel.style.display = "";
+    setBillingPayStatus("", false);
+  } catch {
+    billingMsg.textContent = "Network error — try again.";
+    billingMsg.style.color = "var(--error)";
+    billingMsg.style.display = "";
+    billingStartBtn.disabled = false;
+  }
+}
+
+// Step 2: confirm the card, then have the server create the subscription.
+async function confirmInlineSubscribe() {
+  if (!__stripe || !__billingElements) return;
+  billingPayBtn.disabled = true;
+  setBillingPayStatus("Confirming your card…", false);
+  const submit = await __billingElements.submit();
+  if (submit.error) {
+    setBillingPayStatus(submit.error.message || "Please check your card details.", true);
+    billingPayBtn.disabled = false;
+    return;
+  }
+  // redirect:"if_required" keeps the user inline for cards that don't need 3-D
+  // Secure; cards that do are sent to return_url and finished by
+  // resumeBillingRedirect() on the way back.
+  const result = await __stripe.confirmSetup({
+    elements: __billingElements,
+    confirmParams: { return_url: window.location.origin + "/?billing_return=1" },
+    redirect: "if_required",
+  });
+  if (result.error) {
+    setBillingPayStatus(result.error.message || "We couldn't confirm your card.", true);
+    billingPayBtn.disabled = false;
+    return;
+  }
+  await finalizeSubscribe(result.setupIntent.id);
+}
+
+// Tell the server the card is confirmed so it can create the subscription, then
+// reflect the new access. Shared by the inline and redirect-return paths.
+async function finalizeSubscribe(setupIntentId) {
+  setBillingPayStatus("Starting your plan…", false);
+  try {
+    const r = await fetch("/billing/subscribe/confirm", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      credentials: "same-origin",
+      body: JSON.stringify({setup_intent_id: setupIntentId}),
+    });
+    const data = await r.json();
+    if (!data.ok) {
+      setBillingPayStatus(data.message || "Something went wrong. Try again.", true);
+      billingPayBtn.disabled = false;
+      return;
+    }
+  } catch {
+    setBillingPayStatus("Network error — please try again.", true);
+    billingPayBtn.disabled = false;
+    return;
+  }
+  // Access is granted by the webhook; refresh the headline state and the tab.
+  closeBillingCardPanel();
+  if (typeof refreshMe === "function") { try { await refreshMe(); } catch {} }
+  loadBillingSummary(true);
+}
+
+// If we came back from a 3-D Secure redirect, Stripe appended the SetupIntent to
+// the URL. Finish the subscription we never got to create before leaving.
+async function resumeBillingRedirect() {
+  const p = new URLSearchParams(window.location.search);
+  if (!p.get("billing_return")) return;
+  const setupId = p.get("setup_intent");
+  const status = p.get("redirect_status");
+  // Clean the query so a refresh doesn't re-run this.
+  history.replaceState(null, "", window.location.pathname);
+  if (setupId && status === "succeeded") {
+    try {
+      openSettings();
+      document.querySelector('.settings-tab-btn[data-tab="billing"]')?.click();
+    } catch {}
+    await finalizeSubscribe(setupId);
+  }
+}
+resumeBillingRedirect();
+
+billingStartBtn.addEventListener("click", startInlineSubscribe);
+billingPayBtn.addEventListener("click", confirmInlineSubscribe);
+billingPayCancel.addEventListener("click", closeBillingCardPanel);
 billingPortalBtn.addEventListener("click", () =>
   goToStripe("/billing/portal", {}, billingPortalBtn));
 

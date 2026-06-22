@@ -138,35 +138,100 @@ def ensure_customer(auth_backend, user) -> str:
     return customer.id
 
 
-def create_checkout_session(
+# --- Inline subscribe (Stripe Payment Element) -----------------------------
+#
+# The subscribe flow is two steps so the "card up front" rule survives the move
+# off hosted Checkout. A *free-trial* subscription created directly would start
+# in ``trialing`` the instant it's created — i.e. BEFORE the card is confirmed —
+# which would both grant access and burn the customer's one trial even if they
+# abandoned the card form. So instead:
+#
+#   1. ``create_setup_intent`` — collect + save the card inline (no subscription
+#      yet, so no access and no trial consumed if abandoned).
+#   2. ``create_subscription`` — only after the SetupIntent succeeds, create the
+#      subscription server-side with that saved card as its default. Now it goes
+#      ``trialing`` *with* a payment method attached, exactly like the old
+#      Checkout flow's ``payment_method_collection='always'``.
+#
+# The web route runs its double-subscription / one-trial guards between the two.
+
+def create_setup_intent(*, customer_id: str, tier: str) -> dict:
+    """Create a SetupIntent to collect + save a card inline (Payment Element),
+    with no subscription yet. Returns ``{client_secret, setup_intent_id}``. The
+    chosen tier rides along in metadata so the confirm step can read it back
+    without trusting the client."""
+    init_stripe()
+    intent = stripe.SetupIntent.create(
+        customer=customer_id,
+        usage="off_session",
+        automatic_payment_methods={"enabled": True},
+        metadata={"aime_tier": tier},
+    )
+    return {
+        "client_secret": _get(intent, "client_secret"),
+        "setup_intent_id": _get(intent, "id"),
+    }
+
+
+def saved_payment_method(setup_intent_id: str, customer_id: str) -> tuple[str, str]:
+    """Resolve a *succeeded* SetupIntent into its (payment_method_id, tier),
+    verifying it belongs to ``customer_id``. Raises ``ValueError`` if the intent
+    isn't ours, hasn't succeeded, or carries no payment method — the confirm
+    route turns that into a 400 rather than creating a subscription on an
+    unconfirmed card."""
+    init_stripe()
+    intent = stripe.SetupIntent.retrieve(setup_intent_id)
+    si_customer = _get(intent, "customer")
+    if isinstance(si_customer, dict):
+        si_customer = _get(si_customer, "id")
+    if si_customer != customer_id:
+        raise ValueError("setup intent does not belong to this customer")
+    if _get(intent, "status") != "succeeded":
+        raise ValueError("card has not been confirmed yet")
+    pm = _get(intent, "payment_method")
+    if isinstance(pm, dict):
+        pm = _get(pm, "id")
+    if not pm:
+        raise ValueError("setup intent has no payment method")
+    tier = _get(_get(intent, "metadata") or {}, "aime_tier") or ""
+    return pm, tier
+
+
+def create_subscription(
     *, user_id: int, customer_id: str, tier: str,
-    success_url: str, cancel_url: str, trial_days: int = 0,
+    payment_method_id: str, trial_days: int = 0,
 ) -> str:
-    """Create a subscription Checkout Session for ``tier`` and return its hosted
-    URL. Card is collected up front (``payment_method_collection='always'``).
-    ``trial_days`` > 0 grants a free trial; pass 0 for a returning customer who
-    already used their trial (they're charged immediately — the anti-abuse gate
-    lives in the caller). The user id is stamped on both the session
-    (client_reference_id) and the subscription (metadata) as the webhook's
-    fallback identity."""
+    """Create the subscription on a card already confirmed via SetupIntent, and
+    return its id. The card is the subscription's ``default_payment_method`` (so
+    the post-trial / next-cycle charge needs no further prompt). With a trial,
+    ``missing_payment_method='cancel'`` is belt-and-suspenders — we always
+    attach a card, but it guarantees a card-less trial could never silently
+    convert. With no trial (a returning customer who already used theirs) the
+    first invoice is charged immediately off-session; ``error_if_incomplete``
+    makes a declined/auth-required card raise here instead of leaving a stuck
+    ``incomplete`` subscription. Access is still granted only by the webhook."""
     init_stripe()
     price_id = config.stripe_price_for_tier(tier)
     if not price_id:
         raise ValueError(f"no Stripe price configured for tier {tier!r}")
-    sub_data: dict = {"metadata": {"aime_user_id": str(user_id)}}
+    params: dict = {
+        "customer": customer_id,
+        "items": [{"price": price_id}],
+        "default_payment_method": payment_method_id,
+        "metadata": {"aime_user_id": str(user_id)},
+        "off_session": True,
+    }
     if trial_days and trial_days > 0:
-        sub_data["trial_period_days"] = trial_days
-    session = stripe.checkout.Session.create(
-        mode="subscription",
-        customer=customer_id,
-        line_items=[{"price": price_id, "quantity": 1}],
-        subscription_data=sub_data,
-        payment_method_collection="always",
-        client_reference_id=str(user_id),
-        success_url=success_url,
-        cancel_url=cancel_url,
-    )
-    return session.url
+        params["trial_period_days"] = trial_days
+        params["trial_settings"] = {
+            "end_behavior": {"missing_payment_method": "cancel"},
+        }
+    else:
+        # Charge the first invoice now; surface a decline as an error rather
+        # than a half-created subscription.
+        params["payment_behavior"] = "error_if_incomplete"
+    sub = stripe.Subscription.create(**params)
+    return _get(sub, "id")
 
 
 def create_portal_session(*, customer_id: str, return_url: str) -> str:
@@ -194,10 +259,11 @@ def _list_subscriptions(customer_id: str, limit: int = 100) -> list:
 
 
 def subscription_state(customer_id: str) -> dict:
-    """One Stripe round-trip answering the two questions Checkout needs:
-    ``has_active`` (is the customer already subscribed — block a second
+    """One Stripe round-trip answering the two questions the subscribe flow
+    needs: ``has_active`` (is the customer already subscribed — block a second
     subscription) and ``used_trial`` (has any of their subscriptions ever
-    carried a trial — don't grant another). Used by /billing/checkout."""
+    carried a trial — don't grant another). Used by /billing/subscribe and
+    /billing/subscribe/confirm."""
     subs = _list_subscriptions(customer_id)
     return {
         "has_active": any(_get(s, "status") in _LIVE_STATUSES for s in subs),
