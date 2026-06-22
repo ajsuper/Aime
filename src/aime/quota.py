@@ -253,6 +253,23 @@ class QuotaStore:
             self._conn.commit()
         return new_balance
 
+    def reset_full(self, username: str, ceiling: float) -> float:
+        """Set a user's balance to the full bank (the ceiling) and stamp the
+        update — an admin "refill to 100%". Upserts, so it also works for a user
+        with no row yet. Used by the dashboard's always-allow toggle, which
+        doubles as a per-user reset (see :mod:`frontends.usage_dashboard`)."""
+        now = _utcnow()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO usage_buckets (username, balance, last_update) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT(username) DO UPDATE SET balance = excluded.balance, "
+                "last_update = excluded.last_update",
+                (username, ceiling, now.isoformat(timespec="seconds")),
+            )
+            self._conn.commit()
+        return ceiling
+
 
 class QuotaMeter:
     """Per-user handle over a :class:`QuotaStore`, constructed per session like

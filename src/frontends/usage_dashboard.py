@@ -3846,6 +3846,12 @@ _FRAGMENT_ACCOUNTS = """
             <input type="hidden" name="grant" value="{{ '0' if u.api_access else '1' }}">
             <button type="submit">{{ 'Revoke access' if u.api_access else 'Grant access' }}</button>
           </form>
+          <form method="post" action="accounts/comp">
+            <input type="hidden" name="csrf" value="{{ csrf }}">
+            <input type="hidden" name="username" value="{{ u.username }}">
+            <input type="hidden" name="grant" value="{{ '0' if u.comp_access else '1' }}">
+            <button type="submit" title="Always-allow access: durable send access that an admin grants (it isn't auto-revoked). Granting also resets this user's usage to 100%, so this button doubles as a per-user refill. The daily budget still applies — re-grant to refill.">{{ 'Remove always-allow' if u.comp_access else 'Always-allow + reset' }}</button>
+          </form>
           {% endif %}
           <form method="post" action="accounts/delete"
             onsubmit="return confirm('Soft-delete {{ u.username }}? The account is disabled but its data is kept, and it can be restored within the {{ grace_days }}-day grace period.')">
@@ -5838,19 +5844,34 @@ def account_access():
 @app.route("/accounts/comp", methods=["POST"])
 @admin_post
 def account_comp():
-    """Grant or remove complimentary full access (billing mode). Sets
-    comp_access + api_access together so the user gains/loses send access and
-    the Stripe webhook stops reconciling them. See aime.billing + docs/billing.md."""
+    """Grant or remove complimentary "always-allow" access. Sets comp_access +
+    api_access together so the user gains/loses send access; in billing mode this
+    also makes the Stripe webhook stop reconciling them (see aime.billing +
+    docs/billing.md). Surfaced in *both* modes: billing as "full access", keys as
+    "always-allow + reset". On a grant it also refills the user's usage budget to
+    100% (QuotaStore.reset_full), so the toggle doubles as a per-user reset — the
+    daily budget still applies afterward, matching billing's comp (see
+    docs/usage-limits.md)."""
     username = (request.form.get("username") or "").strip()
     grant = request.form.get("grant") == "1"
+    billing = (os.environ.get("AIME_ACCESS_MODE", "keys").strip().lower()
+               == "billing")
     if _auth_backend().set_comp_access_by_username(username, grant):
         if grant:
-            _flash("ok", f"Granted complimentary full access to {username!r}. "
-                         f"They can use Aime without a subscription, and billing "
-                         f"won't revoke them.")
+            # Refill the bank to 100% as part of the same click. Look the user up
+            # for their tier (which sets the ceiling); a missing record just skips
+            # the refill rather than failing the access grant.
+            rec = _auth_backend().lookup_by_username(username)
+            if rec is not None:
+                cap = _config.tier_daily_cap(rec.tier)
+                _quota_store().reset_full(username, cap * _config.USAGE_BANK_DAYS)
+            extra = (" They can use Aime without a subscription, and billing "
+                     "won't revoke them.") if billing else ""
+            _flash("ok", f"Granted always-allow access to {username!r} and reset "
+                         f"their usage to 100%.{extra}")
         else:
-            _flash("ok", f"Removed complimentary access for {username!r}; send "
-                         f"access is now off (they can subscribe to regain it).")
+            _flash("ok", f"Removed always-allow access for {username!r}; send "
+                         f"access is now off.")
     else:
         _flash("bad", f"No such user: {username!r}.")
     return redirect(url_for("index", tab="accounts"))

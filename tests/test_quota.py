@@ -110,6 +110,21 @@ def test_debit_decrements_and_persists(store):
     assert bal2 < 0
 
 
+def test_reset_full_refills_to_ceiling(store):
+    """The admin 'always-allow + reset' refill: set the balance back to the full
+    bank from any state (including a fresh user with no row, and an over-budget
+    debtor)."""
+    cap, ceiling = 0.75, 0.75 * 7
+    # Fresh user with no row -> reset creates one at the ceiling.
+    assert store.reset_full("erin", ceiling) == pytest.approx(ceiling)
+    assert store.read("erin", cap, ceiling) == pytest.approx(ceiling)
+    # Drive an existing user negative, then reset clears the debt to full.
+    store.debit("frank", cap, ceiling, ceiling + 2.0)
+    assert store.read("frank", cap, ceiling) <= 0
+    assert store.reset_full("frank", ceiling) == pytest.approx(ceiling)
+    assert store.read("frank", cap, ceiling) == pytest.approx(ceiling)
+
+
 def test_meter_status_and_decision(store):
     meter = quota.QuotaMeter(store, "carol", lambda: 1.50)
     st = meter.status()

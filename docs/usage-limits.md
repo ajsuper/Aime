@@ -170,6 +170,15 @@ Usage limits are **not** a separate flag. They arm exactly like the `/send`
 - **Web dashboard** (`src/frontends/usage_dashboard.py`, password-gated):
   - **Accounts** tab — a **Tier** dropdown per user (instant change) and a
     **Usage** column showing each account's remaining allowance (% of full bank).
+    Each account also has an **always-allow access** control (the `comp_access`
+    toggle, `/accounts/comp`): durable send access an admin grants that isn't
+    auto-revoked — surfaced in *both* modes (billing labels it "full access",
+    keys "always-allow + reset"). **Granting it also refills that user's usage
+    bank to 100%** (`QuotaStore.reset_full`), so the button doubles as a per-user
+    reset. The daily budget still applies afterward (comp gates *send access*,
+    not the budget) — re-grant to refill again. In keys mode it sits alongside
+    the plain grant/revoke toggle; in billing mode it also tells the Stripe
+    webhook to leave the user alone (see [billing.md](billing.md)).
   - **Costs** tab — a **Tiers** section (tier-fit analytics): per tier, the user
     count, average daily spend, average **utilization** of the daily allowance,
     how many users went **over** it, and on what fraction of active user-days.
