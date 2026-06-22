@@ -1,11 +1,14 @@
 """Unit tests for the usage-budget token bucket (aime.quota) and the shared
 cost model (aime.pricing).
 
-Covers: continuous refill is linear in elapsed time; the balance clamps at the
-7-day ceiling; a debit decrements and may go negative; a fresh user starts full;
-the enforcement_decision thresholds; a live tier change flips the daily rate;
-the auth `tier` column defaults old rows to 'light'; and that aime.pricing prices
-a record identically to the legacy usage_report path.
+Covers: the daily grant adds one day's allowance per UTC midnight crossed and
+clamps at the 7-day ceiling; it wipes overshoot debt at the reset (floors at 0
+before granting); there is no intraday change; a backwards clock never removes
+balance; make_status carries seconds_to_reset; a debit decrements and may go
+negative; a fresh user starts full; the enforcement_decision thresholds; a live
+tier change flips the daily rate; the auth `tier` column defaults old rows to
+'light'; and that aime.pricing prices a record identically to the legacy
+usage_report path.
 """
 
 import datetime
@@ -20,21 +23,54 @@ from aime import config
 
 # --- pure token-bucket math -------------------------------------------------
 
-def test_refill_is_linear_and_clamps_at_ceiling():
+def test_grant_adds_one_day_per_boundary_and_clamps():
     now = datetime.datetime(2026, 6, 16, 12, 0, 0)
-    last = now - datetime.timedelta(days=2)
+    last = now - datetime.timedelta(days=2)  # two UTC midnights crossed
     cap, ceiling = 1.50, 1.50 * 7
-    # 2 days at $1.50/day = +$3.00 on top of a $1.00 balance.
-    assert quota._refill(1.00, last, cap, ceiling, now) == pytest.approx(4.00)
+    # 2 daily grants of $1.50 banked on top of a $1.00 balance.
+    assert quota._grant(1.00, last, cap, ceiling, now) == pytest.approx(4.00)
     # A long gap can never exceed the ceiling.
     old = now - datetime.timedelta(days=365)
-    assert quota._refill(0.0, old, cap, ceiling, now) == pytest.approx(ceiling)
+    assert quota._grant(0.0, old, cap, ceiling, now) == pytest.approx(ceiling)
 
 
-def test_refill_never_removes_balance_on_backwards_clock():
+def test_grant_wipes_overshoot_debt_at_reset():
+    """A balance driven negative by an overshooting turn is floored at 0 before
+    the day's allowance is added — so debt never carries past a reset. One day
+    crossed lands a debtor on exactly one day's allowance, not (debt + a day)."""
+    now = datetime.datetime(2026, 6, 16, 12, 0, 0)
+    cap, ceiling = 1.50, 1.50 * 7
+    one_day = now - datetime.timedelta(days=1)
+    assert quota._grant(-2.0, one_day, cap, ceiling, now) == pytest.approx(1.50)
+    # Multiple days: floor bites once, then whole days accrue from a clean base.
+    three_days = now - datetime.timedelta(days=3)
+    assert quota._grant(-2.0, three_days, cap, ceiling, now) == pytest.approx(4.50)
+
+
+def test_grant_has_no_intraday_trickle():
+    cap, ceiling = 1.50, 1.50 * 7
+    # Same calendar day, hours apart: no grant, balance unchanged (no trickle).
+    now = datetime.datetime(2026, 6, 16, 12, 0, 0)
+    earlier = datetime.datetime(2026, 6, 16, 2, 0, 0)
+    assert quota._grant(3.0, earlier, cap, ceiling, now) == pytest.approx(3.0)
+    # Crossing midnight grants a whole day even if only a couple hours elapsed.
+    before_midnight = datetime.datetime(2026, 6, 15, 23, 0, 0)
+    just_after = datetime.datetime(2026, 6, 16, 1, 0, 0)
+    assert quota._grant(3.0, before_midnight, cap, ceiling, just_after) \
+        == pytest.approx(4.50)
+
+
+def test_grant_never_removes_balance_on_backwards_clock():
     now = datetime.datetime(2026, 6, 16, 12, 0, 0)
     future = now + datetime.timedelta(days=1)  # last_update "after" now
-    assert quota._refill(5.0, future, 1.5, 10.5, now) == pytest.approx(5.0)
+    assert quota._grant(5.0, future, 1.5, 10.5, now) == pytest.approx(5.0)
+
+
+def test_make_status_carries_seconds_to_reset():
+    # 18:00 UTC -> next reset (00:00) is 6 hours away.
+    now = datetime.datetime(2026, 6, 16, 18, 0, 0)
+    st = quota.make_status(5.0, 1.50, 10.5, now=now)
+    assert st["seconds_to_reset"] == 6 * 3600
 
 
 def test_enforcement_decision_thresholds():
@@ -67,8 +103,8 @@ def test_fresh_user_reads_full(store):
 def test_debit_decrements_and_persists(store):
     cap, ceiling = 1.50, 1.50 * 7
     bal1 = store.debit("bob", cap, ceiling, 2.0)
-    # Started full at the ceiling; first debit subtracts (modulo a hair of
-    # refill from the elapsed microseconds).
+    # Started full at the ceiling; first debit subtracts exactly (a fresh user
+    # seeds at the ceiling and there is no intraday trickle to add).
     assert bal1 == pytest.approx(ceiling - 2.0, abs=1e-2)
     bal2 = store.debit("bob", cap, ceiling, ceiling)  # overspend
     assert bal2 < 0

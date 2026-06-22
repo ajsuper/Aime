@@ -1250,7 +1250,8 @@ def _user_over_budget(user_id: int) -> bool:
 def _usage_exhausted_response():
     """The shared 402 body for a budget-blocked on-demand action (chat or an
     on-demand agent run), so the message stays identical across paths. The
-    frontend keys off the 402 status; the budget refills on its own."""
+    frontend keys off the 402 status; the budget tops up again at the next daily
+    reset."""
     return jsonify({
         "ok": False,
         "error": "usage_exhausted",
@@ -3155,10 +3156,10 @@ def send():
     ctx = _context_for(g.user_id)
     # Hard budget stop. When usage limits are armed and the user's daily Aime is
     # spent, refuse the turn instead of letting it spend more — this is the
-    # enforcement action the metering was built around. The budget refills
-    # continuously (see aime.quota), so access comes back on its own as the
-    # allowance trickles in over the next day; we tell the user it'll be back
-    # tomorrow. We answer 402 (distinct from the api_access gate's 403) so the
+    # enforcement action the metering was built around. The budget tops up once a
+    # day (see aime.quota): access comes back on its own at the next daily reset,
+    # which also wipes any overshoot debt, so a heavy session never starves the
+    # next day. We answer 402 (distinct from the api_access gate's 403) so the
     # frontend locks the composer with a calm, *temporary* "back tomorrow"
     # message rather than the permanent invite-key prompt.
     if _usage_limits_armed() and ctx.quota_meter is not None \

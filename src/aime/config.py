@@ -140,14 +140,16 @@ GET_GRAPHIC_SCHEMA = "../resources/tools/api_get_graphic_schema.json"
 
 # --- Usage limits / tiers (see aime.quota, docs/usage-limits.md) -------------
 # Per-user daily cost allowance, in USD, keyed by tier. A user's balance is a
-# token bucket: it refills at the tier's daily rate and banks up to
-# USAGE_BANK_DAYS days' worth, so a quiet day's allowance carries forward to a
-# busy one (and a fully-rested user starts with a multi-day buffer). The cost of
-# every API call is debited from the balance (see aime.pricing). Enforcement is
-# *armed by AIME_ACCESS_MODE*, not a separate flag — disarmed in "open" mode,
-# armed in "keys"/"billing" (mirrors the /send api_access gate). At an empty
-# balance /send hard-blocks the turn (402) until the allowance refills; below a
-# day's allowance it notifies. The classification lives behind one seam,
+# daily-grant token bucket: it is topped up by one day's allowance at each daily
+# reset and banks up to USAGE_BANK_DAYS days' worth, so a quiet day's allowance
+# carries forward to a busy one (and a fully-rested user starts with a multi-day
+# buffer). The reset also floors the balance at 0 first, so a heavy day's
+# overshoot debt never starves the next day. The cost of every API call is
+# debited from the balance (see aime.pricing). Enforcement is *armed by
+# AIME_ACCESS_MODE*, not a separate flag — disarmed in "open" mode, armed in
+# "keys"/"billing" (mirrors the /send api_access gate). At an empty balance
+# /send hard-blocks the turn (402) until the next daily top-up; below a day's
+# allowance it notifies. The classification lives behind one seam,
 # aime.quota.enforcement_decision.
 
 
@@ -179,7 +181,7 @@ USAGE_TIERS = {
     "power": _env_float("AIME_TIER_POWER", 1.50),
 }
 
-# How many days' allowance a balance may bank up to (the token-bucket ceiling).
+# How many days' allowance a balance may bank up to (the daily-grant ceiling).
 # 7 => a light user can hold $5.25, a power user $10.50.
 USAGE_BANK_DAYS = _env_int("AIME_USAGE_BANK_DAYS", 7)
 

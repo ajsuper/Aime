@@ -5058,13 +5058,13 @@ function onStreamMessage(ev) {
       // account meter so the modal reflects the new balance.
       if (e.text === "over") {
         // That turn spent the last of today's budget. Sending is now locked
-        // until the allowance refills — refreshMe() flips __usageOver and
+        // until the next daily top-up — refreshMe() flips __usageOver and
         // applyAccessState() disables the composer with the matching message.
-        appendNotice("Your Aime is empty for now. It recharges on its own — "
-          + "you'll be able to chat again soon.", "warning");
+        appendNotice("Your Aime is empty for now. It tops up again with a fresh "
+          + "charge at the start of the next day — check back then.", "warning");
       } else {
-        appendNotice("Your Aime is running low. It keeps recharging "
-          + "as the day goes on.", "info");
+        appendNotice("Your Aime is running low. You'll get a fresh charge "
+          + "at your next daily top-up.", "info");
       }
       refreshMe();
       break;
@@ -5503,13 +5503,13 @@ async function sendText(text, images) {
   }
   // Budget spent: the daily Aime is used up. Distinct from a permanent access
   // revocation (403) — the composer locks with a calm "back tomorrow" message
-  // and unlocks on its own once the allowance refills. refreshMe() pulls the
+  // and unlocks on its own at the next daily top-up. refreshMe() pulls the
   // over-budget state so the lock also survives a page reload.
   if (r.status === 402) {
     clearOptimisticUserMessage();
     modelBusy = false;
-    appendNotice("Your Aime is empty for now. It recharges on its own — "
-      + "you'll be able to chat again soon.", "warning");
+    appendNotice("Your Aime is empty for now. It tops up again with a fresh "
+      + "charge at the start of the next day — check back then.", "warning");
     refreshMe();
     return;
   }
@@ -9641,7 +9641,7 @@ let __accessMode = "open";
 let __apiAccess = true;
 // True when usage limits are armed and the daily budget is spent. Locks the
 // composer like a missing api_access does, but temporarily — it clears on its
-// own once the allowance refills (see aime.quota). Synced from /me's `usage`.
+// own at the next daily top-up (see aime.quota). Synced from /me's `usage`.
 let __usageOver = false;
 // Cheap billing snapshot from /me ({status, trial_end, has_subscription}) or
 // null outside billing mode. Drives nothing on its own — the Billing tab loads
@@ -9668,7 +9668,7 @@ function applyAccessState() {
   const billingLocked = (__accessMode === "billing" && !__apiAccess);
   // Reasons the composer can be locked: no invite key / no subscription
   // (permanent until resolved) or the daily budget is spent (temporary, lifts
-  // as it refills). Each gets its own placeholder so the user knows which.
+  // at the next daily top-up). Each gets its own placeholder so the user knows which.
   const locked = keyLocked || billingLocked || __usageOver;
   const input = document.getElementById("i");
   const sendBtn = document.querySelector(".send-btn");
@@ -9676,7 +9676,7 @@ function applyAccessState() {
     input.disabled = locked;
     if (keyLocked) input.placeholder = "Add invite key in Account settings, or ask admin to unlock access";
     else if (billingLocked) input.placeholder = "Start your free trial in Billing settings to message Aime";
-    else if (__usageOver) input.placeholder = "Out of Aime for now — it recharges on its own, so check back soon";
+    else if (__usageOver) input.placeholder = "Out of Aime for now — it tops up with a fresh charge each day, so check back then";
     else if (input.placeholder.startsWith("Add invite key") || input.placeholder.startsWith("Start your free trial") || input.placeholder.startsWith("Out of Aime")) input.placeholder = "Message Aime…";
   }
   if (sendBtn) sendBtn.disabled = locked;
@@ -9709,11 +9709,11 @@ function humanizeRecharge(hours) {
 }
 
 // Render the usage meter in the Account modal from /me's `usage`. The mechanic
-// (a continuously-refilling, banking allowance) isn't self-evident, so we frame
-// it as a battery: a fill bar for how charged it is, a "% full" headline, a
-// concrete recharge ETA, and a one-line "works like a battery" explainer. The
-// user never sees dollars — the ETA is computed from the balance/rate but shown
-// only as a duration. Hidden when limits are disarmed (open mode). See aime.quota.
+// (a daily-topped-up, banking allowance) isn't self-evident, so we frame it as a
+// battery: a fill bar for how charged it is, a "% full" headline, a concrete
+// next-top-up ETA, and a one-line "works like a battery" explainer. The user
+// never sees dollars — the ETA is a duration (server-provided seconds_to_reset
+// for the empty case). Hidden when limits are disarmed (open mode). See aime.quota.
 const usageBlock = document.getElementById("account-usage-block");
 const usagePctEl = document.getElementById("account-usage-pct");
 const usageSubEl = document.getElementById("account-usage-sub");
@@ -9731,27 +9731,31 @@ function applyUsageMeter(armed, usage) {
   const cap = usage.daily_cap || 0;          // one day's allowance
   const bal = usage.balance || 0;            // current charge (may be negative)
   const ceiling = usage.ceiling || 0;        // full bank
-  // The bank refills continuously at `cap` per day toward `ceiling`. Time to
-  // 100% can be a day or two (the bank is several days deep but fills ~1 day a
-  // day); time back to usable from empty is just the climb back above zero.
-  const hoursToFull = cap > 0 ? Math.max(0, (ceiling - bal) / cap * 24) : 0;
-  const hoursToUsable = cap > 0 ? Math.max(0, -bal / cap * 24) : 0;
+  // The bank tops up once a day (no intraday trickle): a fresh day's allowance is
+  // granted at each reset and unused charge banks toward `ceiling`. Time back to
+  // usable from empty is just the wait until the next reset (server-provided);
+  // time to 100% is how many whole days of top-ups refill the bank — the first
+  // lands at the next reset, each later one ~24h after.
+  const hoursToReset = Math.max(0, (usage.seconds_to_reset || 0) / 3600);
+  const daysToFull = cap > 0
+      ? Math.ceil(Math.max(0, ceiling - Math.max(0, bal)) / cap) : 0;
+  const hoursToFull = daysToFull <= 0 ? 0 : hoursToReset + (daysToFull - 1) * 24;
 
   const low = usage.over || usage.decision === "notify_low";
   let pctText, sub;
   if (usage.over) {
     pctText = "Empty";
-    sub = "Out for now — you'll be able to chat again in "
-        + humanizeRecharge(hoursToUsable) + ".";
+    sub = "Out for now — a fresh charge lands at your next daily top-up, in "
+        + humanizeRecharge(hoursToReset) + ".";
   } else if (usage.decision === "notify_low") {
     pctText = pct + "% full";
-    sub = "Running low — it keeps recharging as the day goes on.";
+    sub = "Running low — you'll get a fresh charge at your next daily top-up.";
   } else if (pct >= 99) {
     pctText = pct + "% full";
     sub = "Fully charged.";
   } else {
     pctText = pct + "% full";
-    sub = "Recharges as you go — full again in " + humanizeRecharge(hoursToFull) + ".";
+    sub = "Tops up each day — full again in " + humanizeRecharge(hoursToFull) + ".";
   }
 
   usageFillEl.style.width = pct + "%";
@@ -9762,8 +9766,9 @@ function applyUsageMeter(armed, usage) {
   usageSubEl.style.color = low ? "var(--error)" : "var(--muted)";
 
   usageExplainerEl.textContent =
-    "Works like a battery: it recharges through the day and drains as you chat. "
-    + "If it ever runs empty, it fills back up on its own.";
+    "Works like a battery: you get a fresh charge each day, and any charge you "
+    + "don't use banks for your busy days. If it runs empty, you'll be topped "
+    + "up again at the start of the next day.";
 }
 
 async function refreshMe() {
