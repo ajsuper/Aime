@@ -15,4 +15,5 @@ pillow==12.2.0
 pillow-heif==1.3.0
 pypandoc-binary==1.13
 weasyprint==63.1
+stripe==15.2.1
 pytest==9.0.3

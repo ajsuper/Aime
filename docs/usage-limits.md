@@ -116,10 +116,10 @@ up**:
   (`web_app._scheduler_run_agent`) deliberately skips the budget check.
 
 The durable paid/unpaid line is **`api_access`**, not the daily budget: *every*
-agent path (scheduled and on-demand) is gated on it, so when the (deferred)
-billing webhook revokes access for a user who stops paying, both their recurring
-and on-demand agents stop. The budget is a daily soft limit; `api_access` is the
-hard switch.
+agent path (scheduled and on-demand) is gated on it, so when the billing webhook
+revokes access for a user who stops paying (see [billing.md](billing.md)), both
+their recurring and on-demand agents stop. The budget is a daily soft limit;
+`api_access` is the hard switch.
 
 ## Arming: driven by `AIME_ACCESS_MODE`
 
@@ -130,7 +130,7 @@ Usage limits are **not** a separate flag. They arm exactly like the `/send`
 |-----------|--------------|-------|
 | `open`    | **off**      | Trusted local/personal use — nothing is metered; no meter is attached, `quota.sql` is never written. |
 | `keys`    | **on**       | The free-tester cohort. Tiers are how their cost is bounded. |
-| `billing` | **on**       | A tier *is* the subscription plan. The (deferred) Stripe webhook sets `api_access` + `tier` together. |
+| `billing` | **on**       | A tier *is* the subscription plan. The Stripe webhook sets `api_access` + `tier` together (see [billing.md](billing.md)). |
 
 ## Config (environment)
 
@@ -153,8 +153,8 @@ Usage limits are **not** a separate flag. They arm exactly like the `/send`
     Utilization over 100% (or a high over-rate) flags a tier that's undersized
     for its cohort. Computed from `usage.jsonl` joined with each user's current
     tier; requires `AIME_USAGE_LINK_USERS=1`.
-  - **Billing** tab — placeholder documenting the current tiers and the Stripe
-    drop-in point.
+  - **Billing** tab — the tier allowances plus, in billing mode, each
+    subscriber's Stripe status (read-only). See [billing.md](billing.md).
 - **CLI** — `scripts/access_keys.py tier <username> <light|power>`, at parity
   with the dashboard.
 
@@ -184,3 +184,5 @@ Usage limits are **not** a separate flag. They arm exactly like the `/send`
   banner, and the over-budget composer lock (`__usageOver`, the 402 handler).
 - `src/frontends/usage_dashboard.py` — the Accounts tier/usage columns and the
   Billing tab.
+- `src/aime/billing.py` — the Stripe layer that, in billing mode, sets `tier` +
+  `api_access` from a subscription (see [billing.md](billing.md)).

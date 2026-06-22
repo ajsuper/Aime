@@ -1950,6 +1950,9 @@
     body:not(.show-ids)        .detail-id    { display: none !important; }
     body:not(.show-export-all) .export-extra { display: none !important; }
     body:not(.show-dev)        .dev-only     { display: none !important; }
+    /* The Billing tab only exists in billing mode (toggled by refreshMe from
+       /me's access_mode). Hidden everywhere else so keys/open never see it. */
+    body:not(.show-billing)    .billing-only { display: none !important; }
 
     /* Display-detail control: a Simple/Full/Custom segment group plus the
        per-axis rows it presets. Rows lock (greyed, non-interactive) unless
@@ -2922,6 +2925,8 @@
                 aria-selected="true">General</button>
         <button class="settings-tab-btn" data-tab="account" role="tab"
                 aria-selected="false">Account</button>
+        <button class="settings-tab-btn billing-only" data-tab="billing" role="tab"
+                aria-selected="false">Billing</button>
         <button class="settings-tab-btn dev-only" data-tab="developer" role="tab"
                 aria-selected="false">Developer</button>
       </div>
@@ -3141,6 +3146,71 @@
               <span class="label" style="color: var(--error)">Delete my account</span>
               <button class="btn-danger" id="account-delete-btn">Delete account</button>
             </div>
+          </div>
+        </div>
+        <div class="settings-tab billing-only" data-tab="billing" role="tabpanel">
+          <div class="settings-section">
+            <h3>Plan &amp; billing</h3>
+            <p class="desc" id="billing-intro">Aime runs on a simple monthly
+              plan with a 30-day free trial. Your card is handled securely by
+              Stripe — Aime never sees it.</p>
+            <!-- Complimentary access: an admin has comped this account; no
+                 subscription or card is needed. Shown instead of everything
+                 below when /me reports billing.comp. -->
+            <div id="billing-comp-block" style="display:none">
+              <p class="desc" style="color:var(--text)">✓ You have
+                <strong>complimentary full access</strong> — no subscription or
+                payment needed. Enjoy Aime!</p>
+            </div>
+            <!-- Current-state summary (filled from /billing/summary on open). -->
+            <div id="billing-status-block" style="display:none">
+              <div class="settings-row">
+                <span class="label">Status</span>
+                <span class="value" id="billing-status">—</span>
+              </div>
+              <div class="settings-row" id="billing-plan-row" style="display:none">
+                <span class="label">Plan</span>
+                <span class="value" id="billing-plan">—</span>
+              </div>
+              <div class="settings-row" id="billing-renews-row" style="display:none">
+                <span class="label" id="billing-renews-label">Renews</span>
+                <span class="value" id="billing-renews">—</span>
+              </div>
+              <p class="desc" id="billing-status-note"
+                 style="display:none;margin-top:0.4rem"></p>
+              <div class="settings-row" style="margin-top:0.6rem">
+                <span class="label">Manage your subscription</span>
+                <button class="btn-primary" id="billing-portal-btn"
+                        style="background:var(--accent);color:#fff;border:0;border-radius:8px;
+                               padding:0.4rem 0.9rem;cursor:pointer;font-size:0.85rem">
+                  Manage billing
+                </button>
+              </div>
+            </div>
+            <!-- No subscription yet: the plan picker + start-trial CTA. -->
+            <div id="billing-start-block" style="display:none">
+              <div class="settings-row">
+                <span class="label">Choose a plan</span>
+                <select id="billing-plan-select"
+                        style="background:var(--bg-input);color:var(--text);
+                               border:1px solid var(--border);border-radius:8px;
+                               padding:0.4rem 0.6rem;font-size:0.85rem">
+                  <option value="light">Light</option>
+                  <option value="power">Power</option>
+                </select>
+              </div>
+              <div class="settings-row" style="margin-top:0.6rem">
+                <span class="label">Start your free trial</span>
+                <button class="btn-primary" id="billing-start-btn"
+                        style="background:var(--accent);color:#fff;border:0;border-radius:8px;
+                               padding:0.4rem 0.9rem;cursor:pointer;font-size:0.85rem">
+                  Start 30-day free trial
+                </button>
+              </div>
+            </div>
+            <p class="desc" id="billing-loading">Loading your billing details…</p>
+            <p class="desc" id="billing-msg"
+               style="display:none;margin-top:0.4rem"></p>
           </div>
         </div>
         <div class="settings-tab" data-tab="developer" role="tabpanel">
@@ -9484,6 +9554,8 @@ document.querySelectorAll(".settings-tab-btn").forEach(btn => {
     document.querySelectorAll(".settings-tab").forEach(panel => {
       panel.classList.toggle("active", panel.dataset.tab === target);
     });
+    // Lazily load the live billing detail the first time the tab is opened.
+    if (target === "billing") loadBillingSummary(false);
   });
 });
 
@@ -9571,6 +9643,10 @@ let __apiAccess = true;
 // composer like a missing api_access does, but temporarily — it clears on its
 // own once the allowance refills (see aime.quota). Synced from /me's `usage`.
 let __usageOver = false;
+// Cheap billing snapshot from /me ({status, trial_end, has_subscription}) or
+// null outside billing mode. Drives nothing on its own — the Billing tab loads
+// live detail lazily — but kept for quick state checks. See aime.billing.
+let __billing = null;
 
 const accessSection = document.getElementById("account-access-section");
 const accessDesc = document.getElementById("account-access-desc");
@@ -9587,17 +9663,21 @@ const contactMsg = document.getElementById("account-contact-msg");
 // data browsing stay available regardless.
 function applyAccessState() {
   const keyLocked = (__accessMode === "keys" && !__apiAccess);
-  // Two reasons the composer can be locked: no invite key (permanent, needs a
-  // key) or the daily budget is spent (temporary, lifts as it refills). They
-  // get different placeholders so the user knows which one applies.
-  const locked = keyLocked || __usageOver;
+  // Billing mode locks the composer the same way until a subscription grants
+  // api_access, but the fix is "start your trial" rather than an invite key.
+  const billingLocked = (__accessMode === "billing" && !__apiAccess);
+  // Reasons the composer can be locked: no invite key / no subscription
+  // (permanent until resolved) or the daily budget is spent (temporary, lifts
+  // as it refills). Each gets its own placeholder so the user knows which.
+  const locked = keyLocked || billingLocked || __usageOver;
   const input = document.getElementById("i");
   const sendBtn = document.querySelector(".send-btn");
   if (input) {
     input.disabled = locked;
     if (keyLocked) input.placeholder = "Add invite key in Account settings, or ask admin to unlock access";
+    else if (billingLocked) input.placeholder = "Start your free trial in Billing settings to message Aime";
     else if (__usageOver) input.placeholder = "Out of Aime for now — it recharges on its own, so check back soon";
-    else if (input.placeholder.startsWith("Add invite key") || input.placeholder.startsWith("Out of Aime")) input.placeholder = "Message Aime…";
+    else if (input.placeholder.startsWith("Add invite key") || input.placeholder.startsWith("Start your free trial") || input.placeholder.startsWith("Out of Aime")) input.placeholder = "Message Aime…";
   }
   if (sendBtn) sendBtn.disabled = locked;
 
@@ -9699,6 +9779,11 @@ async function refreshMe() {
     __apiAccess = !!data.api_access;
     __usageOver = !!(data.usage_limits_armed && data.usage && data.usage.over);
     applyUsageMeter(data.usage_limits_armed, data.usage);
+    // Show the Billing tab only in billing mode (CSS gates .billing-only on
+    // this class). The cheap /me billing block drives the locked-composer copy;
+    // the tab itself loads its live detail lazily when opened.
+    __billing = data.billing || null;
+    document.body.classList.toggle("show-billing", __accessMode === "billing");
     // Used by the edit-lock UI to tell "me" from "someone else" and to build
     // the canonical owner:topic key for my own shared topics.
     window.__userId = data.id;
@@ -9743,6 +9828,140 @@ redeemBtn.addEventListener("click", async () => {
 keyInput.addEventListener("keydown", (e) => {
   if (e.key === "Enter") { e.preventDefault(); redeemBtn.click(); }
 });
+
+// -- Billing tab (AIME_ACCESS_MODE=billing only) -----------------------------
+// The headline state comes from the cheap /me billing block; when the tab is
+// opened we fetch GET /billing/summary once for the live detail (plan, renewal
+// date, cancel-pending). "Start trial" / "Manage billing" POST to their route
+// and navigate to Stripe's hosted page via window.location (an HTML form would
+// be blocked by the CSP form-action 'self'). See aime.billing + docs/billing.md.
+const billingCompBlock   = document.getElementById("billing-comp-block");
+const billingIntroEl     = document.getElementById("billing-intro");
+const billingStatusBlock = document.getElementById("billing-status-block");
+const billingStartBlock  = document.getElementById("billing-start-block");
+const billingLoading     = document.getElementById("billing-loading");
+const billingMsg         = document.getElementById("billing-msg");
+const billingStatusEl    = document.getElementById("billing-status");
+const billingPlanRow     = document.getElementById("billing-plan-row");
+const billingPlanEl      = document.getElementById("billing-plan");
+const billingRenewsRow   = document.getElementById("billing-renews-row");
+const billingRenewsLabel = document.getElementById("billing-renews-label");
+const billingRenewsEl    = document.getElementById("billing-renews");
+const billingStatusNote  = document.getElementById("billing-status-note");
+const billingPortalBtn   = document.getElementById("billing-portal-btn");
+const billingStartBtn    = document.getElementById("billing-start-btn");
+const billingPlanSelect  = document.getElementById("billing-plan-select");
+
+const BILLING_STATUS_LABEL = {
+  trialing: "Free trial", active: "Active", past_due: "Payment due",
+  unpaid: "Payment due", canceled: "Canceled", incomplete: "Setup incomplete",
+  incomplete_expired: "Setup expired", paused: "Paused",
+};
+
+function fmtBillingDate(unixSeconds) {
+  if (!unixSeconds) return "—";
+  try { return new Date(unixSeconds * 1000).toLocaleDateString(undefined,
+    {year: "numeric", month: "long", day: "numeric"}); }
+  catch { return "—"; }
+}
+
+function renderBillingSummary(s) {
+  billingLoading.style.display = "none";
+  const has = s && s.has_subscription;
+  billingStatusBlock.style.display = has ? "" : "none";
+  billingStartBlock.style.display  = has ? "none" : "";
+  if (!has) return;
+
+  billingStatusEl.textContent = BILLING_STATUS_LABEL[s.status] || s.status || "—";
+  const needsAttention = (s.status === "past_due" || s.status === "unpaid"
+    || s.status === "canceled" || s.status === "incomplete_expired");
+  billingStatusEl.style.color = needsAttention ? "var(--error)" : "var(--text)";
+
+  if (s.tier) {
+    billingPlanEl.textContent = s.tier.charAt(0).toUpperCase() + s.tier.slice(1);
+    billingPlanRow.style.display = "";
+  } else billingPlanRow.style.display = "none";
+
+  // One date line, framed by state: trial end while trialing, otherwise the
+  // renewal (or the end date when a cancel is pending).
+  let label = null, when = null;
+  if (s.status === "trialing" && s.trial_end) { label = "Free trial ends"; when = s.trial_end; }
+  else if (s.current_period_end) { label = s.cancel_at_period_end ? "Access ends" : "Renews"; when = s.current_period_end; }
+  if (when) {
+    billingRenewsLabel.textContent = label;
+    billingRenewsEl.textContent = fmtBillingDate(when);
+    billingRenewsRow.style.display = "";
+  } else billingRenewsRow.style.display = "none";
+
+  let note = "";
+  if (needsAttention) note = "Your subscription needs attention — open billing to update your payment details.";
+  else if (s.cancel_at_period_end) note = "Your plan is set to cancel — you can resume it from the billing portal.";
+  billingStatusNote.textContent = note;
+  billingStatusNote.style.display = note ? "" : "none";
+}
+
+let __billingLoaded = false;
+async function loadBillingSummary(force) {
+  // Comped accounts have no subscription to show — render the comp state and
+  // skip the Stripe round-trip entirely.
+  if (__billing && __billing.comp) {
+    billingCompBlock.style.display = "";
+    if (billingIntroEl) billingIntroEl.style.display = "none";
+    billingLoading.style.display = "none";
+    billingStatusBlock.style.display = "none";
+    billingStartBlock.style.display = "none";
+    billingMsg.style.display = "none";
+    return;
+  }
+  billingCompBlock.style.display = "none";
+  if (billingIntroEl) billingIntroEl.style.display = "";
+  if (__billingLoaded && !force) return;
+  billingMsg.style.display = "none";
+  billingLoading.style.display = "";
+  billingStatusBlock.style.display = "none";
+  billingStartBlock.style.display = "none";
+  try {
+    const r = await fetch("/billing/summary", {credentials: "same-origin"});
+    const data = await r.json();
+    renderBillingSummary(data);
+    __billingLoaded = true;
+  } catch {
+    billingLoading.style.display = "none";
+    billingMsg.textContent = "Couldn't load your billing details. Try again.";
+    billingMsg.style.color = "var(--error)";
+    billingMsg.style.display = "";
+  }
+}
+
+// Send the user to a Stripe-hosted page. POST returns {url}; we navigate the
+// top-level window to it (not a form post — see the CSP note above).
+async function goToStripe(path, body, btn) {
+  billingMsg.style.display = "none";
+  if (btn) btn.disabled = true;
+  try {
+    const r = await fetch(path, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      credentials: "same-origin",
+      body: JSON.stringify(body || {}),
+    });
+    const data = await r.json();
+    if (data.ok && data.url) { window.location.href = data.url; return; }
+    billingMsg.textContent = data.message || "Something went wrong. Try again.";
+    billingMsg.style.color = "var(--error)";
+    billingMsg.style.display = "";
+  } catch {
+    billingMsg.textContent = "Network error — try again.";
+    billingMsg.style.color = "var(--error)";
+    billingMsg.style.display = "";
+  }
+  if (btn) btn.disabled = false;
+}
+
+billingStartBtn.addEventListener("click", () =>
+  goToStripe("/billing/checkout", {tier: billingPlanSelect.value}, billingStartBtn));
+billingPortalBtn.addEventListener("click", () =>
+  goToStripe("/billing/portal", {}, billingPortalBtn));
 
 // Save (or clear, when blank) the account's outbound-messaging contact.
 contactBtn.addEventListener("click", async () => {
