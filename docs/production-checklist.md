@@ -117,8 +117,8 @@ cost. See [usage-limits.md](usage-limits.md). Before going public:
   current cohort's averages.
 - The **enforcement action** at an empty balance is now a hard block: `/send`
   refuses the turn (HTTP 402) with a calm "you've used up today's Aime — your
-  access will be back tomorrow" message and the composer locks until the budget
-  refills. (Previously notify-only.) The classification seam is
+  access will be back tomorrow" message and the composer locks until the next
+  daily top-up. (Previously notify-only.) The classification seam is
   `aime.quota.enforcement_decision`; see [usage-limits.md](usage-limits.md).
   Note the block is **one turn behind**: the check is pre-turn but the debit is
   in-turn, so a user can overshoot their remaining balance by a single expensive

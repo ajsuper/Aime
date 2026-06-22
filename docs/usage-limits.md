@@ -6,30 +6,56 @@ reporting). It covers the token-bucket model, the two tiers, what is enforced
 today (and what is deliberately deferred), how it's armed, and the admin
 controls.
 
-## The model: a banked daily allowance (token bucket)
+## The model: a banked daily allowance (daily-grant token bucket)
 
 Each user has a **balance** in USD and a tier-defined **daily allowance**. The
-balance is a token bucket:
+balance is a daily-grant token bucket — the rule, applied once per UTC day
+boundary crossed since the balance was last touched, is:
 
-- It **refills continuously** at the tier's daily rate — there is no midnight
-  reset cliff, capacity just trickles back at `allowance/day`.
+```
+balance = min(ceiling, max(balance, 0) + n × daily_allowance)
+```
+
+- It is **topped up once a day, not continuously**: at each daily reset it gains
+  one day's allowance — a fresh, usable lump — rather than trickling back per
+  second. Within a day your allowance is fixed and predictable.
 - It **banks up to `USAGE_BANK_DAYS` (default 7) days'** worth. A quiet day's
-  unused allowance carries forward to a busy one, up to that ceiling.
+  unused allowance carries forward to a busy one, up to that ceiling (the
+  `min(ceiling, …)` term).
+- The reset **wipes overshoot debt**: the balance is floored at 0 *before* the
+  day's allowance is added (the `max(balance, 0)` term). A heavy day that drove
+  the balance negative therefore never eats into the next day — you always start
+  a new day with at least one full day's allowance.
 - Every API call's **real cost** is debited (priced by `aime.pricing`, the same
   model the usage report and dashboard use). Title/compaction/router/web-search
   calls all count — they are real spend.
 - A fresh user starts **full** (at the ceiling).
 
-This fixes the weakness of a hard daily cap: it neither wastes your quiet days
-nor clips your busy ones, while still **guaranteeing a daily refill** (so you can
-always use Aime each day) and bounding exposure (the ceiling stops anyone
-hoarding a month and dumping it at once).
+This fixes two weaknesses at once. Against a hard daily cap, it neither wastes
+your quiet days nor clips your busy ones (the bank), and bounds exposure (the
+ceiling stops anyone hoarding a month and dumping it at once). Against the
+earlier *continuous* refill, the daily grant means a heavy night no longer
+starves the next morning to a useless per-second trickle: you wake to a fresh,
+spendable lump, and any overshoot debt from the night before is cleared — so the
+"you can always use Aime each day" guarantee actually holds (the floor makes it
+true even when a single turn overshot deep into the negative).
 
-The user never sees dollars. The account meter leads with a **battery-style
-percentage** — `pct_full`, the balance as a fraction of the full bank (the 7-day
-ceiling), always 0–100% — with the banked days in parentheses (e.g. "68%
-(≈ 4.8 days)"). The snapshot also carries `pct_of_day` (balance ÷ one day's
-allowance, which reads above 100% when banked) for callers that want it.
+The user never sees dollars. The account meter is framed as a **battery** —
+the mechanic (a daily-topped-up, banking allowance) isn't self-evident
+from a bare number, and an earlier "68% (≈ 4.8 days)" reading just prompted
+"what are 7 days? is that a lifetime cap? why does it drop faster than real
+time?". So the meter shows: a fill bar driven by `pct_full` (balance ÷ the
+full bank, always 0–100%); a "**N% full**" headline; a concrete **top-up
+ETA** ("full again in about 2 days" — computed client-side, where time-to-full
+counts whole daily top-ups from `balance`/`daily_cap`/`ceiling`, shown only as a
+duration, never dollars); and a one-line "works like a battery" explainer.
+State-specific copy: *running low* drops the ETA for calm reassurance, *empty*
+shows "a fresh charge lands at your next daily top-up, in about X" (the wait to
+the next reset, from the server-provided `seconds_to_reset` — **not** a
+continuous climb back above zero), *full* reads "Fully charged". The snapshot
+also carries `days_banked`, `pct_of_day` (balance ÷ one day's allowance, which
+reads above 100% when banked), and `seconds_to_reset` for callers that want
+them, though the UI no longer surfaces a raw "days" figure.
 
 ## Tiers
 
@@ -55,12 +81,13 @@ When a turn's debit crosses a threshold the user gets a calm, transient banner:
 
 At an empty balance the budget is now a **hard stop**: `/send` refuses the turn
 (HTTP `402`) with a calm "you've used up today's Aime — your access will be back
-tomorrow" message, and the frontend locks the composer. Because the balance
-refills continuously (no midnight reset), access returns on its own as the
-allowance trickles back over the next day — the composer re-enables the moment
-`/me` reports the budget is no longer over. The classification lives behind a
-single seam, `aime.quota.enforcement_decision` (`ALLOW` / `NOTIFY_LOW` /
-`OVER`); the `/send` route blocks on `OVER` and notifies on `NOTIFY_LOW`.
+tomorrow" message, and the frontend locks the composer. Access returns at the
+**next daily top-up** (the reset, which also wipes any overshoot debt) — the
+composer re-enables the moment `/me` reports the budget is no longer over, which
+the frontend learns by polling `/me` (the meter shows the precise wait via
+`seconds_to_reset`). The classification lives behind a single seam,
+`aime.quota.enforcement_decision` (`ALLOW` / `NOTIFY_LOW` / `OVER`); the `/send`
+route blocks on `OVER` and notifies on `NOTIFY_LOW`.
 
 **The block is one turn behind (by design).** `/send` checks the budget
 *before* the turn runs, but the cost is debited *during* it (each API call, in
@@ -71,9 +98,14 @@ the budget bounds **steady-state** spend, not the cost of a single turn: a long
 context with many tool calls (or a web-search subagent) can overshoot the
 remaining balance by one expensive turn. That is acceptable for the free-tester
 cohort the limits target; a real per-turn ceiling would require a pre-turn cost
-*estimate* gate, which is deliberately not built. The continuous refill absorbs
-the overshoot — a turn that drives the balance to `−$0.40` simply delays the
-return of access by that much allowance.
+*estimate* gate, which is deliberately not built. The **daily reset absorbs the
+overshoot**: because the next top-up floors the balance at 0 before granting the
+day's allowance, even a turn that drives the balance deep negative is cleared at
+the reset — the worst case is being blocked only until the next reset, never a
+multi-day debt repaid by a slow trickle (the failure the continuous-refill model
+had). Note the debit records the **real** cost (it is not clamped), so the budget
+analytics still see true spend; it is only the *carry-forward* that the floor
+caps.
 
 The debit itself **fails open**: any error in pricing or the quota store lets
 the turn proceed uncharged (a cost-control bug must never break a turn). Because
@@ -107,10 +139,10 @@ up**:
   (`web_app._scheduler_run_agent`) deliberately skips the budget check.
 
 The durable paid/unpaid line is **`api_access`**, not the daily budget: *every*
-agent path (scheduled and on-demand) is gated on it, so when the (deferred)
-billing webhook revokes access for a user who stops paying, both their recurring
-and on-demand agents stop. The budget is a daily soft limit; `api_access` is the
-hard switch.
+agent path (scheduled and on-demand) is gated on it, so when the billing webhook
+revokes access for a user who stops paying (see [billing.md](billing.md)), both
+their recurring and on-demand agents stop. The budget is a daily soft limit;
+`api_access` is the hard switch.
 
 ## Arming: driven by `AIME_ACCESS_MODE`
 
@@ -121,7 +153,7 @@ Usage limits are **not** a separate flag. They arm exactly like the `/send`
 |-----------|--------------|-------|
 | `open`    | **off**      | Trusted local/personal use — nothing is metered; no meter is attached, `quota.sql` is never written. |
 | `keys`    | **on**       | The free-tester cohort. Tiers are how their cost is bounded. |
-| `billing` | **on**       | A tier *is* the subscription plan. The (deferred) Stripe webhook sets `api_access` + `tier` together. |
+| `billing` | **on**       | A tier *is* the subscription plan. The Stripe webhook sets `api_access` + `tier` together (see [billing.md](billing.md)). |
 
 ## Config (environment)
 
@@ -144,8 +176,8 @@ Usage limits are **not** a separate flag. They arm exactly like the `/send`
     Utilization over 100% (or a high over-rate) flags a tier that's undersized
     for its cohort. Computed from `usage.jsonl` joined with each user's current
     tier; requires `AIME_USAGE_LINK_USERS=1`.
-  - **Billing** tab — placeholder documenting the current tiers and the Stripe
-    drop-in point.
+  - **Billing** tab — the tier allowances plus, in billing mode, each
+    subscriber's Stripe status (read-only). See [billing.md](billing.md).
 - **CLI** — `scripts/access_keys.py tier <username> <light|power>`, at parity
   with the dashboard.
 
@@ -155,7 +187,8 @@ Usage limits are **not** a separate flag. They arm exactly like the `/send`
   `cost_from_usage`). Single source of truth for the report, dashboard, and the
   live debit. `scripts/usage_report.py` re-exports it.
 - `src/aime/quota.py` — `QuotaStore` (sqlite `quota.sql`), `QuotaMeter` (per-user
-  handle), the token-bucket math, and `enforcement_decision` (the seam).
+  handle), the daily-grant math (`_grant`, the debt-wiping floor) and
+  `seconds_to_reset`, and `enforcement_decision` (the seam).
 - `src/aime/auth.py` — the `tier` column, `UserRecord.tier`, `set_tier` /
   `set_tier_by_username`.
 - `src/aime/config.py` — tier caps, bank days, thresholds, `tier_daily_cap`.
@@ -175,3 +208,5 @@ Usage limits are **not** a separate flag. They arm exactly like the `/send`
   banner, and the over-budget composer lock (`__usageOver`, the 402 handler).
 - `src/frontends/usage_dashboard.py` — the Accounts tier/usage columns and the
   Billing tab.
+- `src/aime/billing.py` — the Stripe layer that, in billing mode, sets `tier` +
+  `api_access` from a subscription (see [billing.md](billing.md)).

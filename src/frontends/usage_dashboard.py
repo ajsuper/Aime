@@ -3732,17 +3732,17 @@ _FRAGMENT_FEEDBACK = """
   {% endif %}"""
 
 
-# Billing placeholder. The drop-in point for a future Stripe integration: a
-# webhook will set api_access + tier together (see docs/access-control.md and
-# docs/usage-limits.md). Until then this tab documents the current state — tiers
-# are assigned by an admin on the Accounts tab; access mode and tier caps are
-# read from the environment.
+# Billing tab. In billing mode this shows each subscriber's Stripe status as the
+# webhook last recorded it (read-only — Stripe is the system of record; see
+# aime.billing, docs/billing.md). In keys/open mode it documents the tiers and
+# how to switch billing on. Tiers are still assigned by an admin on the Accounts
+# tab for keys-mode users; in billing mode the webhook owns tier + api_access.
 _FRAGMENT_BILLING = """
   <h2>Billing</h2>
   <p class="empty" style="text-align:left;max-width:60ch">
-    Billing is not wired up yet. Usage limits and tiers run independently of
-    payment: the access mode is <code>{{ access_mode }}</code>, and the per-day
-    cost allowance per tier is:
+    Access mode is <code>{{ access_mode }}</code>. A tier's daily <em>cost
+    allowance</em> (Aime's internal Anthropic-spend budget — not the customer
+    price) is:
   </p>
   <table>
     <thead><tr><th>Tier</th><th>Daily allowance</th><th>Max banked ({{ bank_days }} days)</th></tr></thead>
@@ -3752,13 +3752,42 @@ _FRAGMENT_BILLING = """
       {% endfor %}
     </tbody>
   </table>
+  {% if billing_mode %}
+  <h2 style="margin-top:1.5rem" title="Each user who has started a Stripe checkout, with the subscription status the webhook last recorded.">Subscribers</h2>
+  {% if not subscribers %}
+    <p class="empty">No subscribers yet.</p>
+  {% else %}
+  <table>
+    <thead><tr><th>ID</th><th>Username</th><th>Tier</th><th>Send access</th><th>Subscription</th><th>Stripe</th></tr></thead>
+    <tbody>
+      {% for u in subscribers %}
+      <tr>
+        <td>#{{ u.id }}</td>
+        <td>{{ u.username }}</td>
+        <td>{{ u.tier }}</td>
+        <td class="{{ 'good' if u.api_access else 'bad' }}">{{ 'yes' if u.api_access else 'no' }}</td>
+        <td>{{ u.subscription_status or '—' }}</td>
+        <td><a href="https://dashboard.stripe.com/customers/{{ u.stripe_customer_id }}" target="_blank" rel="noopener">open ↗</a></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
   <p class="note" style="max-width:60ch">
-    To connect Stripe later: have the subscription webhook call
-    <code>set_tier</code> + <code>set_api_access</code> on a user, and run the
-    app with <code>AIME_ACCESS_MODE=billing</code>. No metering or enforcement
-    code changes — tiers and the usage budget already work today. Assign tiers
-    manually from the <strong>Accounts</strong> tab in the meantime.
+    Status is what Stripe last sent via webhook; <strong>Send access</strong> is
+    the live <code>api_access</code> the webhook set from it. To change a plan or
+    payment, use Stripe (or the user's own billing portal) — this view is
+    read-only.
   </p>
+  {% endif %}
+  {% else %}
+  <p class="note" style="max-width:60ch">
+    To turn billing on: configure the <code>AIME_STRIPE_*</code> environment
+    variables and run with <code>AIME_ACCESS_MODE=billing</code> (see
+    docs/billing.md). The webhook then owns <code>api_access</code> + tier per
+    subscription. In <code>keys</code> mode, assign tiers manually from the
+    <strong>Accounts</strong> tab.
+  </p>
+  {% endif %}
 """
 
 
@@ -3786,7 +3815,7 @@ _FRAGMENT_ACCOUNTS = """
       <tr>
         <td>#{{ u.id }}</td>
         <td>{{ u.username }}</td>
-        <td class="{{ 'good' if u.api_access else 'bad' }}">{{ 'yes' if u.api_access else 'no' }}</td>
+        <td class="{{ 'good' if u.api_access else 'bad' }}">{{ 'yes' if u.api_access else 'no' }}{% if u.comp_access %} <span class="note" title="Complimentary full access — granted by an admin, not billed. Stripe won't revoke it.">comp</span>{% endif %}</td>
         <td>
           <form method="post" action="accounts/set-tier" class="inline-action">
             <input type="hidden" name="csrf" value="{{ csrf }}">
@@ -3803,12 +3832,21 @@ _FRAGMENT_ACCOUNTS = """
           {% if usage[u.username].over %}0% (out){% else %}{{ usage[u.username].pct_full|round|int }}%{% if usage[u.username].days_banked >= 1 %} ({{ '%.1f'|format(usage[u.username].days_banked) }}d){% endif %}{% endif %}
         </td>
         <td class="actions">
+          {% if billing_mode %}
+          <form method="post" action="accounts/comp">
+            <input type="hidden" name="csrf" value="{{ csrf }}">
+            <input type="hidden" name="username" value="{{ u.username }}">
+            <input type="hidden" name="grant" value="{{ '0' if u.comp_access else '1' }}">
+            <button type="submit" title="Complimentary full access: gives this user send access with no subscription, and stops Stripe from revoking them.">{{ 'Remove full access' if u.comp_access else 'Grant full access' }}</button>
+          </form>
+          {% else %}
           <form method="post" action="accounts/access">
             <input type="hidden" name="csrf" value="{{ csrf }}">
             <input type="hidden" name="username" value="{{ u.username }}">
             <input type="hidden" name="grant" value="{{ '0' if u.api_access else '1' }}">
             <button type="submit">{{ 'Revoke access' if u.api_access else 'Grant access' }}</button>
           </form>
+          {% endif %}
           <form method="post" action="accounts/delete"
             onsubmit="return confirm('Soft-delete {{ u.username }}? The account is disabled but its data is kept, and it can be restored within the {{ grace_days }}-day grace period.')">
             <input type="hidden" name="csrf" value="{{ csrf }}">
@@ -3820,6 +3858,17 @@ _FRAGMENT_ACCOUNTS = """
       {% endfor %}
     </tbody>
   </table>
+  {% if billing_mode %}
+  <p class="note" style="max-width:70ch">
+    Billing mode: <strong>Stripe owns send access</strong> for paying users (a
+    subscription grants it, a cancellation/failed payment revokes it).
+    <strong>Grant full access</strong> comps a user — send access with no
+    subscription, which the webhook won't touch. <strong>Tier</strong> follows
+    the subscription's plan for paying users (a manual change here is overwritten
+    by their next billing event); for comped or not-yet-subscribed users the tier
+    dropdown is authoritative.
+  </p>
+  {% endif %}
   <form method="post" action="accounts/revoke-all" class="inline-action"
     onsubmit="return confirm('Revoke send access for ALL users? This is the billing-cutover action.')">
     <input type="hidden" name="csrf" value="{{ csrf }}">
@@ -4270,7 +4319,7 @@ _PAGE = """<!doctype html>
     <a href="/?{{ qs_keys }}" class="{{ 'active' if tab == 'keys' else '' }}"
       title="Mint and revoke invite keys.">Keys</a>
     <a href="/?{{ qs_billing }}" class="{{ 'active' if tab == 'billing' else '' }}"
-      title="Subscription billing — placeholder for the future Stripe integration.">Billing</a>
+      title="Subscription billing — Stripe status per subscriber (read-only) and the tier allowances.">Billing</a>
     <a href="/?{{ qs_system }}" class="{{ 'active' if tab == 'system' else '' }}"
       title="Operator health — account/key counts, storage per user, log size.">System</a>
     <a href="/?{{ qs_security }}" class="{{ 'active' if tab == 'security' else '' }}"
@@ -5141,6 +5190,12 @@ def _accounts_context() -> dict:
         pending=pending,
         expired_count=sum(1 for p in pending if p.expired),
         grace_days=_GRACE_DAYS,
+        # In billing mode Stripe owns api_access for paying users, so the raw
+        # grant/revoke toggle is a footgun (the next webhook overrides it).
+        # Instead we expose a durable "full access" comp toggle. See the
+        # Accounts fragment + docs/billing.md.
+        billing_mode=(os.environ.get("AIME_ACCESS_MODE", "keys").strip().lower()
+                      == "billing"),
     )
 
 
@@ -5150,12 +5205,21 @@ def _keys_context() -> dict:
 
 
 def _billing_context() -> dict:
-    """Template context for the Billing placeholder tab — the current access
-    mode plus the per-tier daily allowances read from config."""
+    """Template context for the Billing tab — the access mode, per-tier
+    allowances, and (in billing mode) each user's Stripe subscription status as
+    last recorded by the webhook. Read-only: Stripe is the system of record."""
+    access_mode = os.environ.get("AIME_ACCESS_MODE", "keys").strip().lower()
+    subscribers = []
+    if access_mode == "billing":
+        subscribers = [
+            u for u in _auth_backend().list_users() if u.stripe_customer_id
+        ]
     return dict(
-        access_mode=os.environ.get("AIME_ACCESS_MODE", "keys").strip().lower(),
+        access_mode=access_mode,
+        billing_mode=(access_mode == "billing"),
         tiers=_config.USAGE_TIERS,
         bank_days=_config.USAGE_BANK_DAYS,
+        subscribers=subscribers,
     )
 
 
@@ -5766,6 +5830,27 @@ def account_access():
     if _auth_backend().set_api_access_by_username(username, grant):
         verb = "Granted" if grant else "Revoked"
         _flash("ok", f"{verb} send access for {username!r}.")
+    else:
+        _flash("bad", f"No such user: {username!r}.")
+    return redirect(url_for("index", tab="accounts"))
+
+
+@app.route("/accounts/comp", methods=["POST"])
+@admin_post
+def account_comp():
+    """Grant or remove complimentary full access (billing mode). Sets
+    comp_access + api_access together so the user gains/loses send access and
+    the Stripe webhook stops reconciling them. See aime.billing + docs/billing.md."""
+    username = (request.form.get("username") or "").strip()
+    grant = request.form.get("grant") == "1"
+    if _auth_backend().set_comp_access_by_username(username, grant):
+        if grant:
+            _flash("ok", f"Granted complimentary full access to {username!r}. "
+                         f"They can use Aime without a subscription, and billing "
+                         f"won't revoke them.")
+        else:
+            _flash("ok", f"Removed complimentary access for {username!r}; send "
+                         f"access is now off (they can subscribe to regain it).")
     else:
         _flash("bad", f"No such user: {username!r}.")
     return redirect(url_for("index", tab="accounts"))

@@ -6,22 +6,32 @@ This is deliberately separate from :mod:`aime.usage`. The usage log is an
 username when linkage is off. None of that is acceptable for enforcement, so the
 budget lives in its own always-on store.
 
-The model is a **token bucket** (see ``docs/usage-limits.md``):
+The model is a **daily-grant token bucket** (see ``docs/usage-limits.md``):
 
   * Each user has a ``balance`` in USD and a ``last_update`` timestamp.
-  * The balance refills **continuously** at the user's tier rate
-    (``config.USAGE_TIERS[tier]`` USD/day) — no midnight cliff — and is clamped
-    to a ceiling of ``USAGE_BANK_DAYS`` days' allowance. A quiet day's unused
-    allowance therefore carries forward to a busy one, up to the ceiling.
+  * The balance is topped up **once per day, not continuously**: at each UTC
+    midnight crossed since ``last_update`` it gains one day's allowance
+    (``config.USAGE_TIERS[tier]`` USD/day), carried forward up to a ceiling of
+    ``USAGE_BANK_DAYS`` days' allowance — so a quiet day's unused allowance banks
+    toward a busy one (the **bank**), up to the ceiling.
+  * The daily top-up also **wipes overshoot debt**: the balance is floored at 0
+    before the day's allowance is added (``min(ceiling, max(balance, 0) + n·cap)``
+    for ``n`` whole days crossed). A single expensive turn can still drive the
+    balance negative mid-day — the block is one turn behind (see
+    ``docs/usage-limits.md``) — but that debt never survives the next reset, so a
+    heavy night never starves the next morning. There is deliberately **no
+    intraday trickle**: within a day your allowance is fixed and predictable, and
+    a fresh, usable lump arrives at the reset rather than dripping back per-second.
   * Every API call's real cost (priced via :mod:`aime.pricing`) is debited. The
-    balance may go negative — that is "over budget".
+    balance may go negative within a day — that is "over budget".
   * A fresh user starts **full** (at the ceiling).
 
 What happens when the balance runs out is decided by the caller, not here: the
 single seam is :func:`enforcement_decision`, which distinguishes "allow",
 "running low", and "over". On ``NOTIFY_LOW`` callers surface a gentle nudge; on
 ``OVER`` the ``/send`` route now **hard-blocks** the turn (answering 402) until
-the balance refills, while completed turns still emit the notice. The
+the next daily reset tops the balance back up, while completed turns still emit
+the notice. The
 classification math stays caller-agnostic.
 
 Enforcement is armed by ``AIME_ACCESS_MODE`` (``keys``/``billing``), mirroring
@@ -39,9 +49,6 @@ import datetime
 from typing import Callable
 
 from . import config
-
-
-_SECONDS_PER_DAY = 86400.0
 
 
 class Decision(enum.Enum):
@@ -79,11 +86,17 @@ def enforcement_decision(
     return Decision.ALLOW
 
 
-def make_status(balance: float, daily_cap: float, ceiling: float) -> dict:
+def make_status(balance: float, daily_cap: float, ceiling: float,
+                now: datetime.datetime | None = None) -> dict:
     """A display-ready snapshot of a budget. The user never sees dollars — the
     UI renders ``pct_of_day`` (100% = one full day's allowance; reads higher
     when banked) and ``days_banked``. Raw ``balance`` is kept for the admin view.
+    ``seconds_to_reset`` is the wait until the next daily top-up, which drives the
+    meter's "chat again" countdown when over budget (no continuous trickle to
+    estimate from). ``now`` is injectable for tests; it defaults to the UTC clock.
     """
+    if now is None:
+        now = _utcnow()
     if daily_cap > 0:
         pct_of_day = max(0.0, balance) / daily_cap * 100.0
         days_banked = max(0.0, balance) / daily_cap
@@ -104,6 +117,7 @@ def make_status(balance: float, daily_cap: float, ceiling: float) -> dict:
         "pct_of_day": round(pct_of_day, 1),
         "pct_full": round(pct_full, 1),
         "days_banked": round(days_banked, 2),
+        "seconds_to_reset": round(_seconds_to_next_reset(now)),
         "over": balance <= 0,
         "decision": enforcement_decision(balance, daily_cap).value,
     }
@@ -122,13 +136,45 @@ def _parse_ts(stamp: str | None) -> datetime.datetime:
         return _utcnow()
 
 
-def _refill(balance: float, last_update: datetime.datetime,
-            daily_cap: float, ceiling: float, now: datetime.datetime) -> float:
-    """Token-bucket accrual: add the allowance earned since ``last_update`` and
-    clamp to ``ceiling``. Pure — no IO. A clock that appears to run backwards
-    (clamped at 0 elapsed) never *removes* balance."""
-    elapsed_days = max(0.0, (now - last_update).total_seconds() / _SECONDS_PER_DAY)
-    return min(ceiling, balance + elapsed_days * daily_cap)
+def _day_boundaries(last_update: datetime.datetime, now: datetime.datetime) -> int:
+    """How many UTC midnights fall in ``(last_update, now]`` — i.e. the number of
+    daily top-ups owed since the balance was last touched. Zero within the same
+    day, and zero if the clock appears to run backwards (so a backwards clock
+    never removes balance)."""
+    if now <= last_update:
+        return 0
+    return (now.date() - last_update.date()).days
+
+
+def _grant(balance: float, last_update: datetime.datetime,
+           daily_cap: float, ceiling: float, now: datetime.datetime) -> float:
+    """Daily-grant accrual with a debt-wiping floor — the bank's whole mechanic.
+
+    For each UTC day boundary crossed since ``last_update`` the balance gains one
+    day's allowance, banked forward up to ``ceiling``, but is first floored at 0
+    so a previous day's overshoot debt is cleared rather than eating the new
+    allowance::
+
+        balance -> min(ceiling, max(balance, 0) + n * daily_cap)
+
+    The floor only bites on the first crossed boundary (after that the balance is
+    already non-negative), so ``n`` whole days of allowance accrue from a clean
+    base — this closed form matches applying the per-day rule ``n`` times. Pure —
+    no IO. Within a day (``n == 0``) the balance is unchanged: no intraday
+    trickle, so the day's allowance is fixed and a fresh lump lands at the reset."""
+    n = _day_boundaries(last_update, now)
+    if n <= 0:
+        return balance
+    return min(ceiling, max(0.0, balance) + n * daily_cap)
+
+
+def _seconds_to_next_reset(now: datetime.datetime) -> float:
+    """Seconds from ``now`` until the next UTC daily reset (next midnight). Drives
+    the meter's 'chat again at your next daily top-up' countdown so the user gets
+    a concrete, accurate 'when' instead of a continuous-refill estimate."""
+    nxt = (now + datetime.timedelta(days=1)).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    return max(0.0, (nxt - now).total_seconds())
 
 
 class QuotaStore:
@@ -183,7 +229,7 @@ class QuotaStore:
         if row is None:
             return ceiling
         balance, last_update = row
-        return _refill(balance, last_update, daily_cap, ceiling, now)
+        return _grant(balance, last_update, daily_cap, ceiling, now)
 
     def debit(self, username: str, daily_cap: float, ceiling: float,
               cost: float) -> float:
@@ -193,7 +239,7 @@ class QuotaStore:
         now = _utcnow()
         with self._lock:
             row = self._row(username)
-            base = ceiling if row is None else _refill(
+            base = ceiling if row is None else _grant(
                 row[0], row[1], daily_cap, ceiling, now
             )
             new_balance = base - max(0.0, cost)

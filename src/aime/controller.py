@@ -72,6 +72,10 @@ CoreEventKind = Literal[
     "graphic",                  # CreateGraphics: a chart/diagram/SVG to render
                                 # inline; carries {format, summary, source, id}
                                 # in `payload`
+    "web_sources",              # WebSearch produced citations; carries
+                                # {"sources": [{"title", "url"}, ...]} in
+                                # `payload` so the frontend can render a source
+                                # bubble under the model's reply
 ]
 
 
@@ -755,16 +759,28 @@ class ConversationController:
         # Sources string, and pass that to the model. The bulky raw results
         # never touch this (re-cached) conversation.
         if tool_name == "WebSearch" and self._web_search_agent is not None:
-            digest = self._web_search_agent.search(
+            result = self._web_search_agent.search(
                 tool_input.get("request") or "",
                 session_id=getattr(self._backend, "session_id", None),
             )
+            digest = result.digest
             self._emit(CoreEvent(
                 kind="tool_result",
                 tool_name=tool_name,
                 tool_result_summary="searched the web",
                 tool_detail_full=_full_detail_text(digest),
             ))
+            # Surface the citations as a structured event so the frontend always
+            # renders a source bubble under the reply, instead of depending on
+            # the model to echo the Sources list embedded in the digest.
+            if result.sources:
+                self._emit(CoreEvent(
+                    kind="web_sources",
+                    payload={"sources": [
+                        {"title": title, "url": url}
+                        for title, url in result.sources
+                    ]},
+                ))
             try:
                 self._backend.submit(BackendEvent(
                     kind="tool_send_response",

@@ -140,14 +140,16 @@ GET_GRAPHIC_SCHEMA = "../resources/tools/api_get_graphic_schema.json"
 
 # --- Usage limits / tiers (see aime.quota, docs/usage-limits.md) -------------
 # Per-user daily cost allowance, in USD, keyed by tier. A user's balance is a
-# token bucket: it refills at the tier's daily rate and banks up to
-# USAGE_BANK_DAYS days' worth, so a quiet day's allowance carries forward to a
-# busy one (and a fully-rested user starts with a multi-day buffer). The cost of
-# every API call is debited from the balance (see aime.pricing). Enforcement is
-# *armed by AIME_ACCESS_MODE*, not a separate flag — disarmed in "open" mode,
-# armed in "keys"/"billing" (mirrors the /send api_access gate). At an empty
-# balance /send hard-blocks the turn (402) until the allowance refills; below a
-# day's allowance it notifies. The classification lives behind one seam,
+# daily-grant token bucket: it is topped up by one day's allowance at each daily
+# reset and banks up to USAGE_BANK_DAYS days' worth, so a quiet day's allowance
+# carries forward to a busy one (and a fully-rested user starts with a multi-day
+# buffer). The reset also floors the balance at 0 first, so a heavy day's
+# overshoot debt never starves the next day. The cost of every API call is
+# debited from the balance (see aime.pricing). Enforcement is *armed by
+# AIME_ACCESS_MODE*, not a separate flag — disarmed in "open" mode, armed in
+# "keys"/"billing" (mirrors the /send api_access gate). At an empty balance
+# /send hard-blocks the turn (402) until the next daily top-up; below a day's
+# allowance it notifies. The classification lives behind one seam,
 # aime.quota.enforcement_decision.
 
 
@@ -179,7 +181,7 @@ USAGE_TIERS = {
     "power": _env_float("AIME_TIER_POWER", 1.50),
 }
 
-# How many days' allowance a balance may bank up to (the token-bucket ceiling).
+# How many days' allowance a balance may bank up to (the daily-grant ceiling).
 # 7 => a light user can hold $5.25, a power user $10.50.
 USAGE_BANK_DAYS = _env_int("AIME_USAGE_BANK_DAYS", 7)
 
@@ -198,6 +200,64 @@ def tier_daily_cap(tier: str | None) -> float:
     if tier and tier in USAGE_TIERS:
         return USAGE_TIERS[tier]
     return USAGE_TIERS.get(USAGE_DEFAULT_TIER, next(iter(USAGE_TIERS.values())))
+
+
+# --- Stripe billing (AIME_ACCESS_MODE=billing only) ------------------------
+#
+# When the access mode is "billing", a tier IS the subscription plan: the
+# customer pays a monthly Stripe *Price* and a webhook maps that price back to a
+# tier (set_tier) and flips api_access on/off from the subscription status. See
+# docs/billing.md. Everything here is optional/empty unless billing is wired up,
+# so non-billing deployments are completely unaffected. The customer-facing
+# monthly price (the Stripe Price) is DISTINCT from the tier's internal daily
+# cost cap above (USAGE_TIERS) — the cap is Aime's Anthropic-spend budget, the
+# Price is what the user is billed.
+STRIPE_SECRET_KEY = os.environ.get("AIME_STRIPE_SECRET_KEY", "").strip()
+STRIPE_WEBHOOK_SECRET = os.environ.get("AIME_STRIPE_WEBHOOK_SECRET", "").strip()
+# Stripe Price IDs, one per tier (the recurring subscription price the customer
+# pays). Mapped to tiers below.
+STRIPE_PRICE_BY_TIER = {
+    "light": os.environ.get("AIME_STRIPE_PRICE_LIGHT", "").strip(),
+    "power": os.environ.get("AIME_STRIPE_PRICE_POWER", "").strip(),
+}
+# Free-trial length for a new subscription (card collected up front).
+STRIPE_TRIAL_DAYS = _env_int("AIME_STRIPE_TRIAL_DAYS", 30)
+# Absolute base URL of this deployment (e.g. https://aime.example.com), used to
+# build the Stripe Checkout/Portal return URLs. Stripe requires absolute URLs;
+# http://localhost:<port> is accepted in test mode. No trailing slash.
+PUBLIC_BASE_URL = os.environ.get("AIME_PUBLIC_BASE_URL", "").strip().rstrip("/")
+
+
+def stripe_price_for_tier(tier: str | None) -> str | None:
+    """The Stripe Price ID for a tier, or None if unset/unknown."""
+    return STRIPE_PRICE_BY_TIER.get(tier or "") or None
+
+
+def tier_for_stripe_price(price_id: str | None) -> str | None:
+    """Inverse of stripe_price_for_tier: map a Stripe Price ID back to its tier.
+    None when the price is unknown (the reconcile path leaves the tier unchanged
+    rather than guessing)."""
+    if not price_id:
+        return None
+    for tier, pid in STRIPE_PRICE_BY_TIER.items():
+        if pid and pid == price_id:
+            return tier
+    return None
+
+
+def stripe_configured() -> bool:
+    """True when every piece billing needs is present: the secret key, the
+    webhook secret, a Price for each tier, and the public base URL. The
+    billing-mode startup check refuses to launch without these — missing keys
+    would leave the send gate armed with no way to gain access, and a missing
+    PUBLIC_BASE_URL would let the Stripe return URLs be built from the
+    attacker-controllable Host header (a post-checkout phishing redirect)."""
+    return bool(
+        STRIPE_SECRET_KEY
+        and STRIPE_WEBHOOK_SECRET
+        and PUBLIC_BASE_URL
+        and all(STRIPE_PRICE_BY_TIER.get(t) for t in USAGE_TIERS)
+    )
 
 
 def load_system_prompt(path: str = SYSTEM_PROMPT_PATH) -> str:

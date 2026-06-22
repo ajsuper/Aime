@@ -58,12 +58,13 @@ an `open` period is permanently grandfathered. The *only* row that can hold
   people, and it is the default so a misconfigured deployment fails closed.
 - **`open`** — `/send` is not gated; new accounts are stamped `api_access=1`.
   This is local / personal / fully-trusted use, and must be chosen explicitly.
-- **`billing`** — behaves like `keys` for the send gate (the future billing
-  system will own `api_access`; the invite-key path goes dormant) and, like
-  `keys`, **arms usage limits** (see [usage-limits.md](usage-limits.md)), where a
-  user's *tier* is their subscription plan. The Stripe integration itself is
-  deferred — a webhook will set `api_access` + `tier` together; until then tiers
-  are assigned by an admin.
+- **`billing`** — behaves like `keys` for the send gate, but **Stripe owns
+  `api_access`** (the invite-key path goes dormant). Like `keys` it **arms usage
+  limits** (see [usage-limits.md](usage-limits.md)), where a user's *tier* is
+  their subscription plan: a signed Stripe webhook sets `api_access` + `tier`
+  together from the live subscription, with a card-at-signup 30-day trial. Fully
+  documented in [billing.md](billing.md). The app refuses to start in this mode
+  unless Stripe is configured (otherwise no one could gain access).
 
 ## Usage limits
 
@@ -167,10 +168,11 @@ Behavior comes from two independent knobs: `AIME_ALLOW_SIGNUP` (`0`/`1`) and
    single-use key. Free access, fully controlled.
 2. **Lock the cohort** — flip `signup=0` (still `keys`). No new freeloaders;
    existing testers keep working.
-3. **Billing** — add `mode=billing`. Cutover caveat: testers currently hold
-   `api_access=1`. Either have `billing` mode check `api_access` *and* a live
-   subscription, or run `access_keys.py revoke-all` once at cutover and let
-   billing re-grant on payment.
+3. **Billing** — set `mode=billing` and configure Stripe (see
+   [billing.md](billing.md)). Cutover caveat: testers currently hold
+   `api_access=1`, so they'd be grandfathered into free access with no
+   subscription. Run `access_keys.py revoke-all` once at cutover and let the
+   billing webhook re-grant on payment.
 
 ### Example: open-source friends self-host
 
@@ -217,8 +219,8 @@ port 5050. Four tabs:
 - **Accounts** — list / grant / revoke send access, set each user's usage **tier**
   (with a live **Usage** column), soft-delete, restore, and purge expired accounts.
 - **Keys** — mint and revoke invite keys.
-- **Billing** — placeholder documenting the tiers and the Stripe drop-in point
-  (see [usage-limits.md](usage-limits.md)).
+- **Billing** — the tier allowances and, in billing mode, each subscriber's
+  Stripe status (read-only). See [billing.md](billing.md).
 
 It wraps the **same** `auth.py` / `accounts.py` functions the CLIs use — no
 access logic is duplicated in the frontend.
@@ -249,9 +251,14 @@ loopback unless `AIME_USAGE_DASHBOARD_HOST` is set explicitly.
   `/redeem` (key redemption), `/account/delete` and `/account/recover`; and
   exposes `access_mode` + `api_access` on `/me`. Login never depends on
   `api_access` — a user without send access still logs in and can read all
-  their data.
+  their data. In `billing` mode it also serves the `/billing/*` routes and
+  refuses to start unless Stripe is configured.
+- `src/aime/billing.py` — the Stripe layer for `billing` mode: the webhook
+  reconcile that sets `api_access` + `tier` from a subscription (see
+  [billing.md](billing.md)). Dormant in `keys`/`open`.
 - `resources/style/web_chat.html` — the invite-key field and the delete-account
-  button in the Account modal, and composer locking when sending is gated.
+  button in the Account modal, the Billing tab (billing mode), and composer
+  locking when sending is gated.
 
 All of these stay thin and consistent because the access-control and
 account-lifecycle logic lives on `auth.py` / `accounts.py`, not in any

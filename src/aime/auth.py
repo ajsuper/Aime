@@ -54,6 +54,16 @@ from . import encryption as _enc
 _ENC_VERSION_CURRENT = 2
 
 
+# Canonical column projection for building a full UserRecord. Shared by every
+# single-row lookup so the column order stays in lockstep with _row_to_user.
+_USER_PROJECTION = (
+    "SELECT id, username, api_access, email, messaging_contact, "
+    "first_name, last_name, tz, date_format, time_format, tier, "
+    "stripe_customer_id, stripe_subscription_id, subscription_status, "
+    "trial_end, comp_access"
+)
+
+
 # ---------------------------------------------------------------------------
 # Public types
 # ---------------------------------------------------------------------------
@@ -127,6 +137,25 @@ class UserRecord:
     # armed (AIME_ACCESS_MODE in keys/billing). Defaults to the base tier; an
     # admin (and, later, the billing system) moves users between tiers.
     tier: str = "light"
+    # Stripe billing linkage (AIME_ACCESS_MODE=billing only; see aime.billing,
+    # docs/billing.md). All NULL until the user starts a subscription:
+    #   stripe_customer_id     — the Stripe Customer; created on first checkout
+    #                            and the key the webhook uses to find this user.
+    #   stripe_subscription_id — the active subscription, if any.
+    #   subscription_status    — last status the webhook saw (trialing / active /
+    #                            past_due / canceled / …); drives the Billing tab
+    #                            headline. api_access is the real gate, not this.
+    #   trial_end              — unix-seconds end of the free trial, if trialing.
+    # These are inert in open/keys mode.
+    stripe_customer_id: str | None = None
+    stripe_subscription_id: str | None = None
+    subscription_status: str | None = None
+    trial_end: int | None = None
+    # Admin "complimentary full access" flag (billing mode). When True the user
+    # has send access without a paid subscription, and the Stripe webhook leaves
+    # them alone (reconcile skips comped users) so a lapsed/absent subscription
+    # never revokes them. Kept in lockstep with api_access by set_comp_access.
+    comp_access: bool = False
 
     @property
     def display_name(self) -> str:
@@ -254,8 +283,19 @@ class AuthBackend(Protocol):
     # A future admin dashboard would call exactly these, behind an admin-only
     # route guard (see docs/access-control.md, "Future: admin dashboard").
     def set_api_access(self, user_id: int, allowed: bool) -> bool: ...
+    # Complimentary full access (billing mode): grant access without payment;
+    # sets comp_access + api_access together. See aime.billing (reconcile skips
+    # comped users) and docs/billing.md.
+    def set_comp_access(self, user_id: int, on: bool) -> bool: ...
     # Usage-limit tier (see aime.quota). Admin override today; billing hook later.
     def set_tier(self, user_id: int, tier: str) -> bool: ...
+    # Stripe billing linkage (see aime.billing). Only used in billing mode.
+    def lookup_by_stripe_customer(self, customer_id: str) -> UserRecord | None: ...
+    def set_stripe_customer(self, user_id: int, customer_id: str) -> bool: ...
+    def set_subscription(
+        self, user_id: int, *, subscription_id: str | None,
+        status: str | None, trial_end: int | None,
+    ) -> bool: ...
     def redeem_key(self, user_id: int, key: str) -> bool: ...
     def generate_access_key(self, note: str = "") -> str: ...
     def list_access_keys(self) -> list[AccessKeyRecord]: ...
@@ -525,6 +565,44 @@ class LocalAuthBackend:
                     "ALTER TABLE users ADD COLUMN tier TEXT NOT NULL DEFAULT 'light'"
                 )
             # END tier MIGRATION
+
+            # stripe-billing MIGRATION — Stripe linkage columns (see aime.billing,
+            # docs/billing.md). All nullable with no default, so every existing
+            # row reads as "no subscription" — exactly right for a deployment
+            # that wasn't on billing mode. Inert in open/keys mode. Dropping the
+            # feature is dropping these columns + their setters/lookups.
+            for col in (
+                "stripe_customer_id", "stripe_subscription_id",
+                "subscription_status",
+            ):
+                if col not in existing_cols:
+                    self._conn.execute(
+                        f"ALTER TABLE users ADD COLUMN {col} TEXT"
+                    )
+            # trial_end is a unix timestamp — INTEGER affinity so it round-trips
+            # as an int rather than being coerced to text.
+            if "trial_end" not in existing_cols:
+                self._conn.execute(
+                    "ALTER TABLE users ADD COLUMN trial_end INTEGER"
+                )
+            # Index the customer id: the billing webhook looks a user up by it on
+            # every subscription event. Partial (only non-NULL) to stay tiny.
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_users_stripe_customer "
+                "ON users(stripe_customer_id) WHERE stripe_customer_id IS NOT NULL"
+            )
+            # END stripe-billing MIGRATION
+
+            # comp-access MIGRATION — an admin "complimentary full access" flag
+            # for billing mode: when set, the user has api_access without paying
+            # and the Stripe webhook must NOT revoke it (reconcile skips comped
+            # users). DEFAULT 0 leaves every existing account un-comped. Inert in
+            # keys/open mode. See docs/billing.md ("Complimentary access").
+            if "comp_access" not in existing_cols:
+                self._conn.execute(
+                    "ALTER TABLE users ADD COLUMN comp_access INTEGER NOT NULL DEFAULT 0"
+                )
+            # END comp-access MIGRATION
 
             # Pending email-verification rows. Used for three flows:
             #   purpose='signup'    — username/password are being held until
@@ -796,18 +874,25 @@ class LocalAuthBackend:
         # to login (where recovery is offered).
         with self._lock:
             row = self._conn.execute(
-                "SELECT id, username, api_access, email, messaging_contact, "
-                "first_name, last_name, tz, date_format, time_format, tier "
-                "FROM users WHERE id = ? AND deleted_at IS NULL",
+                _USER_PROJECTION
+                + " FROM users WHERE id = ? AND deleted_at IS NULL",
                 (user_id,),
             ).fetchone()
         if row is None:
             return None
+        return self._row_to_user(row)
+
+    def _row_to_user(self, row) -> UserRecord:
+        """Build a UserRecord from the canonical projection (``_USER_PROJECTION``)
+        shared by lookup / lookup_by_username / lookup_by_stripe_customer."""
         return UserRecord(
             id=row[0], username=row[1],
             api_access=bool(row[2]), email=row[3], messaging_contact=row[4],
             first_name=row[5], last_name=row[6], tz=row[7],
             date_format=row[8], time_format=row[9], tier=row[10] or "light",
+            stripe_customer_id=row[11], stripe_subscription_id=row[12],
+            subscription_status=row[13], trial_end=row[14],
+            comp_access=bool(row[15]),
         )
 
     def lookup_by_username(self, username: str) -> UserRecord | None:
@@ -819,19 +904,61 @@ class LocalAuthBackend:
             return None
         with self._lock:
             row = self._conn.execute(
-                "SELECT id, username, api_access, email, messaging_contact, "
-                "first_name, last_name, tz, date_format, time_format, tier "
-                "FROM users WHERE username = ? AND deleted_at IS NULL",
+                _USER_PROJECTION
+                + " FROM users WHERE username = ? AND deleted_at IS NULL",
                 (username,),
             ).fetchone()
         if row is None:
             return None
-        return UserRecord(
-            id=row[0], username=row[1],
-            api_access=bool(row[2]), email=row[3], messaging_contact=row[4],
-            first_name=row[5], last_name=row[6], tz=row[7],
-            date_format=row[8], time_format=row[9], tier=row[10] or "light",
-        )
+        return self._row_to_user(row)
+
+    def lookup_by_stripe_customer(self, customer_id: str) -> UserRecord | None:
+        """Resolve an active account by its Stripe Customer id. This is the
+        primary way the billing webhook maps a subscription event back to a
+        user (the id is persisted before checkout opens). Soft-deleted accounts
+        return None like the other lookups."""
+        customer_id = (customer_id or "").strip()
+        if not customer_id:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                _USER_PROJECTION
+                + " FROM users WHERE stripe_customer_id = ? AND deleted_at IS NULL",
+                (customer_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_user(row)
+
+    def set_stripe_customer(self, user_id: int, customer_id: str) -> bool:
+        """Persist the user's Stripe Customer id (set once, on first checkout).
+        Returns False if there's no matching active account."""
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE users SET stripe_customer_id = ? "
+                "WHERE id = ? AND deleted_at IS NULL",
+                (customer_id, user_id),
+            )
+            self._conn.commit()
+        return cur.rowcount > 0
+
+    def set_subscription(
+        self, user_id: int, *, subscription_id: str | None,
+        status: str | None, trial_end: int | None,
+    ) -> bool:
+        """Persist the user's subscription snapshot (id / status / trial_end) as
+        the billing webhook reconciles it. Purely a record of what Stripe last
+        told us; api_access is set separately via set_api_access. Returns False
+        if there's no matching active account."""
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE users SET stripe_subscription_id = ?, "
+                "subscription_status = ?, trial_end = ? "
+                "WHERE id = ? AND deleted_at IS NULL",
+                (subscription_id, status, trial_end, user_id),
+            )
+            self._conn.commit()
+        return cur.rowcount > 0
 
     def set_messaging_contact(self, user_id: int, contact: str | None) -> bool:
         """Connect (or, with None, clear) the account's outbound-messaging
@@ -1022,6 +1149,34 @@ class LocalAuthBackend:
             self._conn.commit()
         return cur.rowcount > 0
 
+    def set_comp_access(self, user_id: int, on: bool) -> bool:
+        """Grant (True) or remove (False) complimentary full access — the admin
+        comp switch for billing mode (see UserRecord.comp_access). Sets
+        `comp_access` and `api_access` together so the single send gate
+        (`api_access`) opens/closes with the comp, and the Stripe webhook (which
+        skips comped users) can't fight it. Returns False if no such user."""
+        v = 1 if on else 0
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE users SET comp_access = ?, api_access = ? "
+                "WHERE id = ? AND deleted_at IS NULL",
+                (v, v, user_id),
+            )
+            self._conn.commit()
+        return cur.rowcount > 0
+
+    def set_comp_access_by_username(self, username: str, on: bool) -> bool:
+        """Username-keyed variant for the admin dashboard."""
+        v = 1 if on else 0
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE users SET comp_access = ?, api_access = ? "
+                "WHERE username = ? AND deleted_at IS NULL",
+                (v, v, username),
+            )
+            self._conn.commit()
+        return cur.rowcount > 0
+
     @staticmethod
     def _validate_tier(tier: str | None) -> str:
         """Normalize a tier name against the configured tiers. An unknown or
@@ -1157,12 +1312,14 @@ class LocalAuthBackend:
         accounts are excluded — see list_deleted_users(). For admin listings."""
         with self._lock:
             rows = self._conn.execute(
-                "SELECT id, username, api_access, tier FROM users "
+                "SELECT id, username, api_access, tier, "
+                "subscription_status, stripe_customer_id, comp_access FROM users "
                 "WHERE deleted_at IS NULL ORDER BY id"
             ).fetchall()
         return [
             UserRecord(id=r[0], username=r[1], api_access=bool(r[2]),
-                       tier=r[3] or "light")
+                       tier=r[3] or "light", subscription_status=r[4],
+                       stripe_customer_id=r[5], comp_access=bool(r[6]))
             for r in rows
         ]
 

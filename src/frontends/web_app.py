@@ -44,7 +44,7 @@ except Exception:  # noqa: BLE001 - image conversion is best-effort
     _PIL_AVAILABLE = False
 
 from flask import (
-    Flask, Response, request, jsonify, session, redirect, g, url_for
+    Flask, Response, request, jsonify, session, redirect, g, url_for, abort
 )
 from rich.console import Console
 from rich.markup import Tag, _parse
@@ -93,6 +93,7 @@ from aime import graphics as _graphics
 from aime import email_send as _email_send
 from aime import topic_shares as _topic_shares
 from aime import quota as _quota
+from aime import billing as _billing
 from aime import feedback as _feedback
 from aime.tool_formatting import TOOL_NAME_MAP
 
@@ -1095,7 +1096,8 @@ _CSP = (
     "default-src 'self'; "
     "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
     "style-src 'self' 'unsafe-inline'; "
-    "img-src 'self' data: blob:; "
+    # icons.duckduckgo.com serves the favicons on web-search source chips.
+    "img-src 'self' data: blob: https://icons.duckduckgo.com; "
     "media-src 'self' blob:; "
     "connect-src 'self'; "
     "font-src 'self' data:; "
@@ -1184,6 +1186,28 @@ _ACCESS_MODE = os.environ.get("AIME_ACCESS_MODE", "keys").strip().lower()
 if _ACCESS_MODE not in ("keys", "open", "billing"):
     _ACCESS_MODE = "keys"
 
+# Fail-closed: in billing mode the send gate is armed but the ONLY way to gain
+# api_access is a Stripe subscription. If Stripe is misconfigured, every user is
+# permanently locked out (and the webhook that would grant access can't verify
+# its signature). So refuse to start unless billing is fully wired — mirroring
+# how the admin dashboard requires AIME_ADMIN_PASSWORD. See docs/billing.md.
+if _ACCESS_MODE == "billing" and not _billing.billing_enabled():
+    raise RuntimeError(
+        "AIME_ACCESS_MODE=billing requires Stripe to be configured: set "
+        "AIME_STRIPE_SECRET_KEY, AIME_STRIPE_WEBHOOK_SECRET, a price per tier "
+        "(AIME_STRIPE_PRICE_LIGHT / AIME_STRIPE_PRICE_POWER), and "
+        "AIME_PUBLIC_BASE_URL (absolute, for safe Stripe return URLs). See "
+        "docs/billing.md. Refusing to start so users aren't locked out."
+    )
+if _ACCESS_MODE == "billing":
+    _billing.init_stripe()
+
+
+def _billing_armed() -> bool:
+    """True when Stripe billing is live: billing mode AND Stripe configured.
+    Gates every /billing/* route and the /me billing block; off in keys/open."""
+    return _ACCESS_MODE == "billing" and _billing.billing_enabled()
+
 
 def _send_gate_armed() -> bool:
     """True when /send is gated behind each user's api_access flag. Armed in
@@ -1226,7 +1250,8 @@ def _user_over_budget(user_id: int) -> bool:
 def _usage_exhausted_response():
     """The shared 402 body for a budget-blocked on-demand action (chat or an
     on-demand agent run), so the message stays identical across paths. The
-    frontend keys off the 402 status; the budget refills on its own."""
+    frontend keys off the 402 status; the budget tops up again at the next daily
+    reset."""
     return jsonify({
         "ok": False,
         "error": "usage_exhausted",
@@ -2325,6 +2350,22 @@ def account_recover():
     # soft-deleted account from skipping the gate on its way back.
     _auth_backend.restore(uid, api_access=(_ACCESS_MODE == "open"))
     user = _auth_backend.lookup(uid)
+    # In billing mode a recovered account is re-stamped api_access=False, which
+    # would lock out a user who still has a live (paid) subscription until their
+    # next webhook. Reconcile from Stripe now so a current trial/active sub
+    # immediately restores access. Best-effort: any Stripe hiccup just leaves
+    # them to re-subscribe / use the Billing tab.
+    if _billing_armed() and user is not None and user.stripe_customer_id:
+        try:
+            # Undo the cancel-at-period-end we set on delete, then reconcile so a
+            # still-live subscription restores access immediately.
+            _billing.resume_subscriptions(user.stripe_customer_id)
+            _billing.reconcile_customer(_auth_backend, user.stripe_customer_id)
+        except Exception:
+            app.logger.warning(
+                "billing: recovery resume/reconcile failed for user %s", uid,
+                exc_info=True,
+            )
     return Response(
         _load_login_page(
             notice="Your account has been recovered. Please sign in.",
@@ -2350,6 +2391,21 @@ def me():
         ceiling = cap * aime_config.USAGE_BANK_DAYS
         balance = _quota_store.read(g.username, cap, ceiling)
         usage = _quota.make_status(balance, cap, ceiling)
+    # Cheap billing snapshot for the Billing tab headline — built ONLY from the
+    # persisted columns the webhook keeps fresh, never a live Stripe call (/me is
+    # hit on load + several events). The richer renewal/cancel detail comes from
+    # the lazy GET /billing/summary when the tab is opened. None outside billing
+    # mode, so the frontend hides the tab.
+    billing = None
+    if _billing_armed() and user is not None:
+        billing = {
+            "status": user.subscription_status,
+            "trial_end": user.trial_end,
+            "has_subscription": bool(user.stripe_subscription_id),
+            # Complimentary access (admin comp): the Billing tab shows a
+            # "you're on the house" state instead of the trial CTA / portal.
+            "comp": bool(user.comp_access),
+        }
     return jsonify({
         "id": g.user_id,
         "username": g.username,
@@ -2362,6 +2418,7 @@ def me():
         "tier": tier,
         "usage_limits_armed": _usage_limits_armed(),
         "usage": usage,
+        "billing": billing,
     })
 
 
@@ -2446,6 +2503,177 @@ def redeem():
         return jsonify({"ok": True})
     return jsonify({"ok": False, "error": "invalid",
                     "message": "That key is invalid or has already been used."}), 400
+
+
+# ---------------------------------------------------------------------------
+# Stripe billing (AIME_ACCESS_MODE=billing only). See aime.billing + docs/
+# billing.md. The webhook is the sole authority that grants api_access; the
+# Checkout/Portal routes only create hosted sessions (we never see card data).
+# Every route here 404s unless billing is armed, so keys/open are untouched.
+# ---------------------------------------------------------------------------
+
+def _billing_base_url() -> str:
+    """Absolute base URL for Stripe return links. Prefers the configured public
+    URL (required to be correct behind a proxy); falls back to the request's own
+    root for local/dev where they coincide."""
+    return aime_config.PUBLIC_BASE_URL or request.url_root.rstrip("/")
+
+
+@app.route("/billing/checkout", methods=["POST"])
+@login_required
+def billing_checkout():
+    """Create a subscription Checkout Session for the chosen tier and return its
+    hosted URL. The client navigates to it (window.location); access is granted
+    later by the webhook, not by the success redirect."""
+    if not _billing_armed():
+        abort(404)
+    data = request.get_json(silent=True) or {}
+    tier = (data.get("tier") or "").strip().lower()
+    if tier not in aime_config.USAGE_TIERS:
+        return jsonify({"ok": False, "message": "Pick a plan to continue."}), 400
+    user = _auth_backend.lookup(g.user_id)
+    if user is None:
+        abort(404)
+    try:
+        customer_id = _billing.ensure_customer(_auth_backend, user)
+        # Guard against a second subscription (the UI hides the button once
+        # subscribed, but a direct POST would otherwise double-bill), and only
+        # grant the free trial to a customer who hasn't already used one
+        # (blocks cancel-and-restart trial farming on the same account). One
+        # Stripe round-trip answers both.
+        state = _billing.subscription_state(customer_id)
+        if state["has_active"]:
+            return jsonify({"ok": False, "code": "already_subscribed",
+                            "message": "You already have an active subscription. "
+                                       "Use “Manage billing” to change "
+                                       "your plan."}), 409
+        trial_days = 0 if state["used_trial"] else aime_config.STRIPE_TRIAL_DAYS
+        base = _billing_base_url()
+        url = _billing.create_checkout_session(
+            user_id=user.id, customer_id=customer_id, tier=tier,
+            success_url=base + "/billing/return",
+            cancel_url=base + "/",
+            trial_days=trial_days,
+        )
+    except Exception:
+        app.logger.warning("billing: checkout create failed for user %s",
+                            g.user_id, exc_info=True)
+        return jsonify({"ok": False,
+                        "message": "We couldn't start checkout just now. "
+                                   "Please try again in a moment."}), 502
+    return jsonify({"ok": True, "url": url})
+
+
+@app.route("/billing/portal", methods=["POST"])
+@login_required
+def billing_portal():
+    """Create a Stripe Customer Portal session (manage card / plan / cancel) and
+    return its hosted URL for the client to navigate to."""
+    if not _billing_armed():
+        abort(404)
+    user = _auth_backend.lookup(g.user_id)
+    if user is None or not user.stripe_customer_id:
+        return jsonify({"ok": False,
+                        "message": "No billing account yet — start your free "
+                                   "trial first."}), 400
+    try:
+        url = _billing.create_portal_session(
+            customer_id=user.stripe_customer_id,
+            return_url=_billing_base_url() + "/",
+        )
+    except Exception:
+        app.logger.warning("billing: portal create failed for user %s",
+                            g.user_id, exc_info=True)
+        return jsonify({"ok": False,
+                        "message": "We couldn't open billing just now. "
+                                   "Please try again in a moment."}), 502
+    return jsonify({"ok": True, "url": url})
+
+
+@app.route("/billing/summary", methods=["GET"])
+@login_required
+def billing_summary():
+    """Live subscription detail for the Billing tab (status, plan, renewal/trial
+    date, cancel-pending). Hits Stripe, so it's called only when the tab opens —
+    never on the frequent /me. Returns has_subscription=False before any
+    checkout."""
+    if not _billing_armed():
+        abort(404)
+    user = _auth_backend.lookup(g.user_id)
+    if user is None or not user.stripe_customer_id:
+        return jsonify({"has_subscription": False})
+    try:
+        summary = _billing.live_summary(user.stripe_customer_id)
+    except Exception:
+        app.logger.warning("billing: summary fetch failed for user %s",
+                            g.user_id, exc_info=True)
+        return jsonify({"ok": False,
+                        "message": "Couldn't load your billing details."}), 502
+    return jsonify(summary)
+
+
+@app.route("/billing/return", methods=["GET"])
+@login_required
+def billing_return():
+    """Landing page after Checkout. Access is granted by the webhook (usually
+    within a second), so this just sends the user back to the app, which polls
+    /me and unlocks the composer once the webhook lands."""
+    if not _billing_armed():
+        abort(404)
+    return redirect("/")
+
+
+@app.route("/billing/webhook", methods=["POST"])
+def billing_webhook():
+    """Stripe webhook — the SOLE authority that grants/revokes api_access.
+
+    No @login_required: Stripe calls this cookieless, so it's authenticated by
+    the request signature instead (the app's CSRF defense is SameSite cookies,
+    not a token, so there's nothing to exempt). On a subscription event we
+    re-fetch the subscription fresh from Stripe and reconcile against current
+    truth — events are at-least-once and not strictly ordered, so trusting the
+    embedded body could let a stale 'updated' overwrite newer state.
+
+    An *unexpected* failure (DB locked, Stripe API blip) returns 500 so Stripe
+    retries with backoff — reconcile is idempotent, so retries are safe, and
+    Stripe's retry is our only safety net against a lost grant/revoke. A
+    well-formed event for a user we can't resolve is NOT an error (reconcile
+    returns False), so it acks 200 and doesn't loop."""
+    if not _billing_armed():
+        abort(404)
+    payload = request.get_data()
+    sig = request.headers.get("Stripe-Signature")
+    try:
+        event = _billing.construct_event(payload, sig)
+    except Exception:
+        # Bad signature or malformed body — never act on it.
+        return jsonify({"error": "invalid signature"}), 400
+
+    etype = event["type"]
+    obj = event["data"]["object"]
+    try:
+        if etype in ("customer.subscription.created",
+                     "customer.subscription.updated"):
+            sub = _billing.retrieve_subscription(obj["id"])
+            _billing.reconcile_subscription(_auth_backend, sub)
+        elif etype == "customer.subscription.deleted":
+            # Terminal — a retrieve would 404, so the embedded object is the
+            # authoritative final state.
+            _billing.reconcile_subscription(_auth_backend, obj)
+        elif etype == "checkout.session.completed":
+            # Bind customer→user early and reconcile if a subscription exists.
+            # The subscription.* events also fire and are the main path; this
+            # just tightens the window. Best-effort.
+            sub_id = obj.get("subscription")
+            if sub_id:
+                sub = _billing.retrieve_subscription(sub_id)
+                _billing.reconcile_subscription(_auth_backend, sub)
+    except Exception:
+        # Unexpected — let Stripe retry (idempotent reconcile makes that safe).
+        app.logger.warning("billing: webhook %s handling failed", etype,
+                            exc_info=True)
+        return jsonify({"error": "internal"}), 500
+    return jsonify({"received": True})
 
 
 # ---------------------------------------------------------------------------
@@ -2744,6 +2972,22 @@ def account_delete():
     permanent purge is a separate admin step (scripts/manage_users.py purge).
     """
     uid = g.user_id
+    # Stop billing a departing user: schedule their Stripe subscription to
+    # cancel at period end (reversible if they recover within the grace period —
+    # see account_recover). Without this, a soft-deleted account keeps getting
+    # charged and can't reach the portal to stop it. Best-effort: a Stripe hiccup
+    # must not block the deletion the user asked for. Done before soft_delete so
+    # the customer id is still trivially to hand.
+    if _billing_armed():
+        user = _auth_backend.lookup(uid)
+        if user is not None and user.stripe_customer_id:
+            try:
+                _billing.cancel_subscriptions(user.stripe_customer_id)
+            except Exception:
+                app.logger.warning(
+                    "billing: cancel-on-delete failed for user %s", uid,
+                    exc_info=True,
+                )
     _auth_backend.soft_delete(uid)
     # Tear down the in-memory session — the account is now disabled and the
     # next request must not resolve to it.
@@ -2912,10 +3156,10 @@ def send():
     ctx = _context_for(g.user_id)
     # Hard budget stop. When usage limits are armed and the user's daily Aime is
     # spent, refuse the turn instead of letting it spend more — this is the
-    # enforcement action the metering was built around. The budget refills
-    # continuously (see aime.quota), so access comes back on its own as the
-    # allowance trickles in over the next day; we tell the user it'll be back
-    # tomorrow. We answer 402 (distinct from the api_access gate's 403) so the
+    # enforcement action the metering was built around. The budget tops up once a
+    # day (see aime.quota): access comes back on its own at the next daily reset,
+    # which also wipes any overshoot debt, so a heavy session never starves the
+    # next day. We answer 402 (distinct from the api_access gate's 403) so the
     # frontend locks the composer with a calm, *temporary* "back tomorrow"
     # message rather than the permanent invite-key prompt.
     if _usage_limits_armed() and ctx.quota_meter is not None \
@@ -3010,11 +3254,20 @@ def stream():
                     # died silently (phone sleep, closed tab, network drop,
                     # proxy idle timeout) is never noticed because we only
                     # learn the socket is dead when a yield tries to write to
-                    # it. Emitting a keepalive comment on idle forces that
-                    # write: if the peer is gone it raises here, the `finally`
-                    # runs, and the waitress thread is reclaimed instead of
-                    # leaking. (16 threads leak over ~a day → queue backs up.)
-                    yield ": keepalive\n\n"
+                    # it. Emitting a heartbeat on idle forces that write: if the
+                    # peer is gone it raises here, the `finally` runs, and the
+                    # waitress thread is reclaimed instead of leaking. (16
+                    # threads leak over ~a day → queue backs up.)
+                    #
+                    # Sent as a real `data:` event rather than an SSE comment
+                    # (`: …`) so the *client* can see it too: EventSource never
+                    # surfaces comment lines to JS, but the browser's own
+                    # auto-reconnect doesn't detect a half-open (zombie)
+                    # connection. The client watches the gap between heartbeats
+                    # to notice a dead stream and force a reconnect, which
+                    # rebuilds its transcript from authoritative history. The
+                    # client ignores this `ping` kind.
+                    yield f"data: {json.dumps({'kind': 'ping'})}\n\n"
                     continue
                 yield f"data: {json.dumps(payload)}\n\n"
         finally:
