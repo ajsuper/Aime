@@ -163,6 +163,13 @@ in their Billing tab instead of the trial CTA, and is never asked for a card.
 subscribe to regain it). Set their tier with the Accounts tier dropdown — it
 sticks because the webhook leaves comped users alone.
 
+The same `comp_access` toggle is also surfaced in **keys mode** (labeled
+"always-allow + reset"), where it's just durable admin-granted send access — no
+Stripe to skip. In both modes, **granting comp also resets the user's usage
+budget to 100%** (`QuotaStore.reset_full`), so the button doubles as a per-user
+refill; comp gates *send access*, not the daily budget, which still applies after
+the reset (see [usage-limits.md](usage-limits.md)).
+
 ## Account deletion & billing
 
 Deleting an account must not keep charging a departed user. When a user
