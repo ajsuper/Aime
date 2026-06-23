@@ -60,7 +60,7 @@ _USER_PROJECTION = (
     "SELECT id, username, api_access, email, messaging_contact, "
     "first_name, last_name, tz, date_format, time_format, tier, "
     "stripe_customer_id, stripe_subscription_id, subscription_status, "
-    "trial_end, comp_access"
+    "trial_end, comp_access, billing_synced_at"
 )
 
 
@@ -156,6 +156,13 @@ class UserRecord:
     # them alone (reconcile skips comped users) so a lapsed/absent subscription
     # never revokes them. Kept in lockstep with api_access by set_comp_access.
     comp_access: bool = False
+    # Unix-seconds of the last time api_access was re-derived from *live* Stripe
+    # state (any reconcile path: webhook, confirm, or the gate's lazy self-heal).
+    # The send gate treats api_access as a cache of Stripe truth and re-checks it
+    # when this is older than the recheck TTL — so a missed webhook can't leave a
+    # paying user locked out (or a lapsed one with access) indefinitely. NULL =
+    # never synced (treated as maximally stale). See aime.billing.access_is_stale.
+    billing_synced_at: int | None = None
 
     @property
     def display_name(self) -> str:
@@ -296,6 +303,7 @@ class AuthBackend(Protocol):
         self, user_id: int, *, subscription_id: str | None,
         status: str | None, trial_end: int | None,
     ) -> bool: ...
+    def mark_billing_synced(self, user_id: int, ts: int) -> bool: ...
     def redeem_key(self, user_id: int, key: str) -> bool: ...
     def generate_access_key(self, note: str = "") -> str: ...
     def list_access_keys(self) -> list[AccessKeyRecord]: ...
@@ -604,6 +612,18 @@ class LocalAuthBackend:
                 )
             # END comp-access MIGRATION
 
+            # billing-sync MIGRATION — unix-seconds of the last live-Stripe
+            # reconcile, so the send gate can lazily re-derive a stale api_access
+            # instead of trusting a cache the webhook may have failed to update.
+            # NULL on every existing row = "never synced" (maximally stale), which
+            # makes the first gate hit in billing mode self-heal. Inert in
+            # keys/open mode. See aime.billing.access_is_stale / refresh_access.
+            if "billing_synced_at" not in existing_cols:
+                self._conn.execute(
+                    "ALTER TABLE users ADD COLUMN billing_synced_at INTEGER"
+                )
+            # END billing-sync MIGRATION
+
             # Pending email-verification rows. Used for three flows:
             #   purpose='signup'    — username/password are being held until
             #                         the 6-digit code mailed to `email` is
@@ -892,7 +912,7 @@ class LocalAuthBackend:
             date_format=row[8], time_format=row[9], tier=row[10] or "light",
             stripe_customer_id=row[11], stripe_subscription_id=row[12],
             subscription_status=row[13], trial_end=row[14],
-            comp_access=bool(row[15]),
+            comp_access=bool(row[15]), billing_synced_at=row[16],
         )
 
     def lookup_by_username(self, username: str) -> UserRecord | None:
@@ -956,6 +976,22 @@ class LocalAuthBackend:
                 "subscription_status = ?, trial_end = ? "
                 "WHERE id = ? AND deleted_at IS NULL",
                 (subscription_id, status, trial_end, user_id),
+            )
+            self._conn.commit()
+        return cur.rowcount > 0
+
+    def mark_billing_synced(self, user_id: int, ts: int) -> bool:
+        """Stamp the moment api_access was last re-derived from live Stripe, so
+        the send gate's staleness check (aime.billing.access_is_stale) can bound
+        how often it re-reads Stripe. Called by every reconcile path — webhook,
+        confirm, and the gate's lazy self-heal (which stamps even when the
+        customer turned out to have no subscription, so a non-paying user isn't
+        re-checked on every request). Returns False if no active account."""
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE users SET billing_synced_at = ? "
+                "WHERE id = ? AND deleted_at IS NULL",
+                (ts, user_id),
             )
             self._conn.commit()
         return cur.rowcount > 0

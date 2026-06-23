@@ -1250,6 +1250,26 @@ def _send_gate_armed() -> bool:
     return _ACCESS_MODE in ("keys", "billing")
 
 
+def _billing_self_heal(user):
+    """Re-derive a billing user's send access from live Stripe when the cached
+    api_access has gone stale, and return the (possibly refreshed) UserRecord.
+
+    This is the safety net that makes access *reliable* rather than dependent on
+    perfect webhook delivery: api_access is only a cache of Stripe's truth, so
+    whenever it's older than the recheck TTL the gate re-reads Stripe before
+    trusting it. A paying user whose grant webhook was lost is unlocked on their
+    next /send or /me; a lapsed one is eventually cut off. Bounded by the TTL in
+    aime.billing.access_is_stale, so the steady-state cost is ~zero Stripe calls.
+    No-op outside billing mode, for comped users, and for anyone who never
+    started checkout. Best-effort — a Stripe outage leaves cached access intact."""
+    if not _billing_armed() or user is None:
+        return user
+    if not _billing.access_is_stale(user, now=int(time.time())):
+        return user
+    _billing.refresh_access(_auth_backend, user)
+    return _auth_backend.lookup(user.id) or user
+
+
 def _usage_limits_armed() -> bool:
     """True when the per-user usage budget (aime.quota) is metered and notified.
     Mirrors the send gate: armed in "keys"/"billing", off in "open". The single
@@ -1469,16 +1489,30 @@ def api_access_required(view):
     """Gate a route behind the user's send access. Applies *under*
     login_required (which populates g.api_access). In "open" access mode the
     gate is disarmed and this is a pass-through; in "keys"/"billing" mode a user
-    without api_access gets a 403 telling them to redeem an invite key."""
+    without api_access gets a 403.
+
+    In billing mode the gate is *self-healing*: before refusing (or trusting a
+    stale grant), it re-derives api_access from live Stripe when the cache has
+    aged out — so a paying user whose grant webhook was lost is let through here
+    rather than wrongly blocked. See _billing_self_heal."""
     @wraps(view)
     def wrapper(*args, **kwargs):
-        if _send_gate_armed() and not g.get("api_access", False):
-            return jsonify({
-                "ok": False,
-                "error": "no_access",
-                "message": "This account doesn't have message access yet. "
-                           "Add an invite key in your profile settings.",
-            }), 403
+        if _send_gate_armed():
+            if _billing_armed():
+                user = _billing_self_heal(_auth_backend.lookup(g.user_id))
+                if user is not None:
+                    g.api_access = user.api_access
+            if not g.get("api_access", False):
+                # Billing mode points at the trial; keys mode at the invite key.
+                msg = ("Start your free trial in billing settings to send "
+                       "messages." if _billing_armed() else
+                       "This account doesn't have message access yet. Add an "
+                       "invite key in your profile settings.")
+                return jsonify({
+                    "ok": False,
+                    "error": "no_access",
+                    "message": msg,
+                }), 403
         return view(*args, **kwargs)
     return wrapper
 
@@ -2416,6 +2450,11 @@ def me():
     # access_mode + api_access let the frontend show the invite-key field in
     # profile settings and disable the composer when sending is gated.
     user = _auth_backend.lookup(g.user_id)
+    # Self-heal stale billing access here too (refreshMe polls /me), so the
+    # composer unlocks for a paying user without them having to try to send
+    # first. Bounded by the recheck TTL — most /me calls do no Stripe work.
+    user = _billing_self_heal(user)
+    g.api_access = user.api_access if user is not None else g.api_access
     # Usage budget snapshot for the account meter. Computed straight off the
     # store (no per-session meter needed) so /me stays cheap. None when limits
     # are disarmed (open mode) — the frontend then hides the meter entirely.

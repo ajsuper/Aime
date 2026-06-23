@@ -343,6 +343,106 @@ def test_reconcile_customer_uses_latest(monkeypatch, backend, prices, billing_us
     assert backend.lookup(billing_user.id).api_access is True
 
 
+# --- self-healing send gate (access_is_stale / refresh_access) --------------
+
+def _u(*, api_access, billing_synced_at, comp_access=False,
+       stripe_customer_id="cus_1"):
+    """Minimal duck-typed UserRecord for the pure staleness policy."""
+    return SimpleNamespace(api_access=api_access, comp_access=comp_access,
+                           stripe_customer_id=stripe_customer_id,
+                           billing_synced_at=billing_synced_at)
+
+
+def test_reconcile_stamps_sync_time(backend, prices, billing_user):
+    """Every reconcile records billing_synced_at so the gate's staleness check
+    can bound how often it re-reads Stripe."""
+    assert backend.lookup(billing_user.id).billing_synced_at is None
+    billing.reconcile_subscription(backend, _sub(status="active", customer="cus_1"))
+    assert backend.lookup(billing_user.id).billing_synced_at is not None
+
+
+def test_access_is_stale_never_synced():
+    # NULL billing_synced_at = maximally stale, so the first gate hit self-heals.
+    assert billing.access_is_stale(_u(api_access=False, billing_synced_at=None),
+                                   now=10**9) is True
+    assert billing.access_is_stale(_u(api_access=True, billing_synced_at=None),
+                                   now=10**9) is True
+
+
+def test_access_is_stale_denied_rechecked_quickly():
+    last = 1000
+    short = billing.ACCESS_RECHECK_DENIED_SECONDS
+    assert billing.access_is_stale(_u(api_access=False, billing_synced_at=last),
+                                   now=last + short - 1) is False
+    assert billing.access_is_stale(_u(api_access=False, billing_synced_at=last),
+                                   now=last + short) is True
+
+
+def test_access_is_stale_granted_rechecked_lazily():
+    last = 1000
+    short = billing.ACCESS_RECHECK_DENIED_SECONDS
+    long = billing.ACCESS_RECHECK_GRANTED_SECONDS
+    # A granted user is NOT re-checked on the short (denied) cadence...
+    assert billing.access_is_stale(_u(api_access=True, billing_synced_at=last),
+                                   now=last + short + 5) is False
+    # ...only after the long cadence.
+    assert billing.access_is_stale(_u(api_access=True, billing_synced_at=last),
+                                   now=last + long) is True
+
+
+def test_access_is_stale_skips_comp_and_no_customer():
+    # Comped: admin owns access, nothing to learn from Stripe.
+    assert billing.access_is_stale(
+        _u(api_access=False, billing_synced_at=None, comp_access=True),
+        now=10**9) is False
+    # Never started checkout: no customer to reconcile against.
+    assert billing.access_is_stale(
+        _u(api_access=False, billing_synced_at=None, stripe_customer_id=None),
+        now=10**9) is False
+
+
+def test_refresh_access_grants_from_live_stripe(monkeypatch, backend, prices, billing_user):
+    """A user locked out by a missed webhook is unlocked by a live read, and the
+    sync time is stamped so the gate won't re-poll Stripe immediately."""
+    monkeypatch.setattr(billing, "_initialized", True)
+    sub = _sub(status="trialing", price="price_power", customer="cus_1")
+    monkeypatch.setattr(billing.stripe.Subscription, "list",
+                        lambda **kw: _FakeList([sub]))
+    user = backend.lookup(billing_user.id)
+    assert user.api_access is False
+    assert billing.refresh_access(backend, user) is True
+    fresh = backend.lookup(billing_user.id)
+    assert fresh.api_access is True
+    assert fresh.billing_synced_at is not None
+
+
+def test_refresh_access_keeps_cache_on_stripe_error(monkeypatch, backend, prices, billing_user):
+    """A Stripe outage must not lock out a currently-granted user nor wipe the
+    cache; refresh returns cached access and leaves synced_at unstamped (retry)."""
+    backend.set_api_access(billing_user.id, True)
+    monkeypatch.setattr(billing, "_initialized", True)
+
+    def boom(**kw):
+        raise RuntimeError("stripe down")
+    monkeypatch.setattr(billing.stripe.Subscription, "list", boom)
+    user = backend.lookup(billing_user.id)
+    assert billing.refresh_access(backend, user) is True   # cached grant kept
+    fresh = backend.lookup(billing_user.id)
+    assert fresh.api_access is True
+    assert fresh.billing_synced_at is None                 # unstamped → retries
+
+
+def test_refresh_access_stamps_when_no_subscription(monkeypatch, backend, prices, billing_user):
+    """A customer with no subscription is a definitive 'no access' — stamp it so
+    a non-paying user isn't re-polled against Stripe on every request."""
+    monkeypatch.setattr(billing, "_initialized", True)
+    monkeypatch.setattr(billing.stripe.Subscription, "list",
+                        lambda **kw: _FakeList([]))
+    user = backend.lookup(billing_user.id)
+    assert billing.refresh_access(backend, user) is False
+    assert backend.lookup(billing_user.id).billing_synced_at is not None
+
+
 # --- anti-abuse: subscription_state + cancel/resume --------------------------
 
 def test_subscription_state(monkeypatch, prices):
@@ -781,6 +881,77 @@ def test_subscribe_confirm_succeeds_when_reconcile_fails():
         "w._billing.reconcile_customer = boom\n"
         "r = c.post('/billing/subscribe/confirm', json={'setup_intent_id':'seti_1'})\n"
         "assert r.status_code == 200, (r.status_code, r.get_json())\n"
+        "print('OK')\n",
+    )
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "OK" in proc.stdout
+
+
+def test_send_gate_self_heals_paying_user():
+    """The reliability guarantee end-to-end: a billing user whose grant webhook
+    was lost (api_access still 0) but who IS trialing in Stripe is let through
+    the send gate, which re-derives access from a live read before refusing."""
+    proc = _run_snippet(
+        _BILLING_ENV,
+        "import frontends.web_app as w\n"
+        "c = w.app.test_client()\n"
+        "c.post('/signup', data={'username':'owner','password':'Sufficiently-long-pw-1','password2':'Sufficiently-long-pw-1'})\n"
+        "w._auth_backend.set_stripe_customer(1, 'cus_1')\n"
+        "assert w._auth_backend.lookup(1).api_access is False\n"
+        "calls = {'n': 0}\n"
+        "def live_says_trialing(ab, cid):\n"
+        "    calls['n'] += 1\n"
+        "    ab.set_api_access(1, True)\n"   # what reconcile would do off a trialing sub
+        "    return True\n"
+        "w._billing.reconcile_customer = live_says_trialing\n"
+        # Empty /send passes the gate (self-heal grants) and only then fails body
+        # validation with 'empty' — proving the gate no longer blocked it.
+        "r = c.post('/send', json={})\n"
+        "assert r.status_code == 400 and r.get_json().get('error') == 'empty', (r.status_code, r.get_json())\n"
+        "assert w._auth_backend.lookup(1).api_access is True\n"
+        "assert calls['n'] == 1, calls\n"
+        # Second send within the TTL must NOT hit Stripe again (now granted+fresh).
+        "c.post('/send', json={})\n"
+        "assert calls['n'] == 1, calls\n"
+        "print('OK')\n",
+    )
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "OK" in proc.stdout
+
+
+def test_send_gate_denies_non_paying_user_with_billing_message():
+    """A billing user who really has no subscription stays blocked, with copy
+    that points at the trial (not the keys-mode invite-key prompt)."""
+    proc = _run_snippet(
+        _BILLING_ENV,
+        "import frontends.web_app as w\n"
+        "c = w.app.test_client()\n"
+        "c.post('/signup', data={'username':'owner','password':'Sufficiently-long-pw-1','password2':'Sufficiently-long-pw-1'})\n"
+        "w._auth_backend.set_stripe_customer(1, 'cus_1')\n"
+        "w._billing.reconcile_customer = lambda ab, cid: False\n"   # no subscription
+        "r = c.post('/send', json={})\n"
+        "assert r.status_code == 403, r.status_code\n"
+        "j = r.get_json()\n"
+        "assert j['error'] == 'no_access', j\n"
+        "assert 'trial' in j['message'].lower(), j\n"
+        "print('OK')\n",
+    )
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "OK" in proc.stdout
+
+
+def test_me_self_heals_paying_user():
+    """refreshMe polls /me, so /me also self-heals: a paying-but-locked user's
+    composer unlocks (api_access flips true) without a send attempt."""
+    proc = _run_snippet(
+        _BILLING_ENV,
+        "import frontends.web_app as w\n"
+        "c = w.app.test_client()\n"
+        "c.post('/signup', data={'username':'owner','password':'Sufficiently-long-pw-1','password2':'Sufficiently-long-pw-1'})\n"
+        "w._auth_backend.set_stripe_customer(1, 'cus_1')\n"
+        "w._billing.reconcile_customer = lambda ab, cid: (ab.set_api_access(1, True) or True)\n"
+        "r = c.get('/me')\n"
+        "assert r.get_json()['api_access'] is True, r.get_json()\n"
         "print('OK')\n",
     )
     assert proc.returncode == 0, proc.stderr + proc.stdout

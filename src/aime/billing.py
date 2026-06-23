@@ -29,6 +29,7 @@ Design notes:
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 import stripe
@@ -424,4 +425,69 @@ def reconcile_subscription(auth_backend, subscription) -> bool:
         status=status,
         trial_end=_get(subscription, "trial_end"),
     )
+    # Record that api_access now reflects live Stripe truth, so the send gate's
+    # staleness check won't redundantly re-fetch this user for a while.
+    auth_backend.mark_billing_synced(user.id, int(time.time()))
     return True
+
+
+# ---------------------------------------------------------------------------
+# Self-healing send gate (reconcile-on-read)
+#
+# api_access is a *cache* of Stripe's subscription state. The webhook and the
+# subscribe-confirm reconcile keep it fresh on the happy path, but both are
+# fallible (a webhook that never arrives, a stale signing secret, a confirm-time
+# Stripe blip) — and any single failure would otherwise leave a paying user
+# locked out with no recovery but an admin. So the gate treats the cache as
+# advisory: when it's older than a status-dependent TTL, it re-derives access
+# from a live Stripe read before trusting it. This makes "up to date and paying
+# ⇒ has access" hold regardless of which event-delivery step failed.
+# ---------------------------------------------------------------------------
+
+# A *denied* user is re-checked aggressively — a paying customer must never stay
+# locked out, so we tolerate a Stripe call as often as once a minute while they
+# have no access. A *granted* user is re-checked lazily — re-deriving access is
+# only hygiene there (catch a cancellation whose webhook was lost), so a long
+# TTL keeps the steady-state cost near zero. Both bound how often /send and /me
+# touch Stripe.
+ACCESS_RECHECK_DENIED_SECONDS = 60
+ACCESS_RECHECK_GRANTED_SECONDS = 12 * 3600
+
+
+def access_is_stale(user, *, now: int | None = None) -> bool:
+    """True when ``user``'s cached api_access should be re-derived from live
+    Stripe before the send gate trusts it. Never stale for a comped user (admin
+    owns their access) or one who never started checkout (no Stripe customer to
+    reconcile against) — there's nothing to learn from Stripe in either case."""
+    if user.comp_access or not user.stripe_customer_id:
+        return False
+    if now is None:
+        now = int(time.time())
+    last = user.billing_synced_at or 0
+    ttl = ACCESS_RECHECK_GRANTED_SECONDS if user.api_access else ACCESS_RECHECK_DENIED_SECONDS
+    return (now - last) >= ttl
+
+
+def refresh_access(auth_backend, user) -> bool:
+    """Re-derive a billing user's api_access from live Stripe and persist the
+    sync timestamp. Best-effort and fail-safe: on *any* Stripe error the cached
+    state is left exactly as-is (a transient outage must never lock out a paying
+    user nor grant a non-paying one) and the timestamp is left unstamped so the
+    next request retries. Returns the up-to-date api_access.
+
+    Always makes a Stripe round-trip, so callers gate it behind ``access_is_stale``."""
+    try:
+        reconcile_customer(auth_backend, user.stripe_customer_id)
+    except Exception:
+        _log.warning("billing: access refresh failed for user %s — keeping "
+                     "cached api_access=%s", user.id, user.api_access,
+                     exc_info=True)
+        return bool(user.api_access)
+    # reconcile_customer returns False when the customer has *no* subscription at
+    # all (never paid, or fully purged). That's a definitive "no access" answer,
+    # not an error — stamp it so we don't re-poll Stripe on this user's every
+    # request. (reconcile_subscription already stamped the has-a-subscription
+    # case.)
+    auth_backend.mark_billing_synced(user.id, int(time.time()))
+    fresh = auth_backend.lookup(user.id)
+    return bool(fresh.api_access) if fresh is not None else bool(user.api_access)

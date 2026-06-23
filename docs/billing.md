@@ -86,8 +86,49 @@ re-fetch would 404), so its embedded object is taken as the final state.
 event for a user we can't resolve is **not** an error — `reconcile` returns
 `False` and the webhook acks `200` (no retry loop). An *unexpected* failure (DB
 locked, Stripe API blip) returns **`500`** so Stripe retries with backoff;
-because `reconcile` is idempotent, retries are safe, and Stripe's retry is the
-only safety net against a permanently-lost grant/revoke.
+because `reconcile` is idempotent, retries are safe.
+
+## Reliability: `api_access` is a self-healing cache
+
+The webhook and the confirm-time reconcile keep `api_access` in step with Stripe
+on the happy path, but **neither is load-bearing for correctness**. They are an
+event pipeline, and every link can fail in the field — a webhook endpoint that
+was never registered, a `whsec_` that drifted out of sync (signature → `400`,
+silently dropped), an event Stripe delivers late or never, a confirm-time API
+blip. Any one of those used to strand a paying user with `api_access=0` and no
+recovery but an admin. That is the class of bug this section closes.
+
+So the send gate treats `api_access` as a **cache of Stripe's truth, not the
+truth itself.** Each user row carries `billing_synced_at` — the last time their
+access was derived from a *live* Stripe read. When the gate (and `/me`) sees a
+value older than a status-dependent TTL, it re-derives access from Stripe before
+trusting it (`billing.access_is_stale` → `billing.refresh_access`, which funnels
+through the same `reconcile_subscription` seam):
+
+| Cached state | Re-check cadence | Why |
+|--------------|------------------|-----|
+| denied (`api_access=0`) | every `ACCESS_RECHECK_DENIED_SECONDS` (60s) | a paying user must never stay locked out, so re-check aggressively |
+| granted (`api_access=1`) | every `ACCESS_RECHECK_GRANTED_SECONDS` (12h) | only hygiene (catch a cancellation whose webhook was lost), so re-check lazily |
+| comped, or no Stripe customer | never | nothing to learn from Stripe |
+
+This makes the guarantee **"up to date and paying ⇒ has access"** hold no matter
+which event-delivery step failed: a stranded paying user is unlocked on their
+next `/send` or `/me` (within 60s), automatically. The TTL bounds the cost — the
+steady state is ~zero extra Stripe calls (a granted user is re-checked twice a
+day; a never-paying one at most once a minute *while actively trying to send*).
+
+`refresh_access` is **fail-safe**: on any Stripe error the cached state is left
+exactly as-is (a transient outage must never lock out a paying user nor grant a
+non-paying one) and `billing_synced_at` is left unstamped so the next request
+retries. The reconcile is idempotent, so the lazy path, the confirm path, and
+the webhook can all fire for the same user without conflicting.
+
+The net layering, fastest to last-resort: **confirm-time reconcile** (unlocks
+the instant the trial starts) → **webhook** (near-real-time grant/revoke on
+every change) → **lazy gate reconcile** (the safety net that makes a lost event
+self-correct). The security boundary is unchanged throughout: access is only
+ever set from a server-side live read of Stripe, never anything the client
+asserts.
 
 ## Subscribing: one subscription, one trial
 
