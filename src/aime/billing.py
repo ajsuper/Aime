@@ -56,6 +56,13 @@ _ACCESS_REVOKING = frozenset({
 
 _initialized = False
 
+# Customer-facing prices (amount/currency/interval) per tier, read live from
+# Stripe and memoized — Prices are near-static, only the Billing tab reads them,
+# and the amount lives in Stripe (never duplicated in config), so an hour-long
+# cache spares a Stripe round-trip on every tab open.
+_PRICE_CACHE: dict[str, Any] = {"at": 0.0, "data": None}
+_PRICE_CACHE_TTL = 3600.0
+
 
 def billing_enabled() -> bool:
     """True when Stripe is fully configured (secret + webhook secret + a Price
@@ -386,18 +393,62 @@ def change_plan(customer_id: str, tier: str) -> None:
     )
 
 
+def tier_prices(*, force: bool = False) -> dict:
+    """Per-tier customer-facing price for the Billing tab, shaped as
+    ``{tier: {"amount": <minor units>, "currency": "usd", "interval": "month"}}``.
+    Read live from Stripe (the Price is the source of truth, never duplicated in
+    config) and memoized for an hour. A tier whose Price is unset or unreadable is
+    simply omitted, so the UI falls back to the bare plan name rather than break.
+    Returns {} when billing isn't configured."""
+    if not config.STRIPE_SECRET_KEY:
+        return {}
+    now = time.time()
+    cached = _PRICE_CACHE["data"]
+    if cached is not None and not force \
+            and now - _PRICE_CACHE["at"] < _PRICE_CACHE_TTL:
+        return cached
+    init_stripe()
+    out: dict = {}
+    for tier, price_id in config.STRIPE_PRICE_BY_TIER.items():
+        if not price_id:
+            continue
+        try:
+            price = stripe.Price.retrieve(price_id)
+        except Exception:
+            _log.warning("billing: could not read Price for tier %s", tier,
+                         exc_info=True)
+            continue
+        amount = _get(price, "unit_amount")
+        if amount is None:
+            continue
+        recurring = _get(price, "recurring")
+        out[tier] = {
+            "amount": amount,
+            "currency": _get(price, "currency") or "usd",
+            "interval": _get(recurring, "interval") or "month",
+        }
+    _PRICE_CACHE["data"] = out
+    _PRICE_CACHE["at"] = now
+    return out
+
+
 def live_summary(customer_id: str) -> dict:
     """A live read of the customer's current subscription for the Billing tab.
     Heavier than the persisted columns on /me, so this is only called when the
     tab is opened. Returns plan/status/renewal detail; ``has_subscription`` is
-    False when the customer has never subscribed."""
+    False when the customer has never subscribed. ``prices``/``default_tier`` ride
+    along on both branches so the trial CTA and the plan picker can show real
+    amounts without a second round-trip."""
     init_stripe()
+    prices = tier_prices()
+    default_tier = config.USAGE_DEFAULT_TIER
     subs = stripe.Subscription.list(customer=customer_id, status="all", limit=1)
     data = _get(subs, "data") or []
     if not data:
         return {"has_subscription": False, "status": None, "tier": None,
                 "trial_end": None, "current_period_end": None,
-                "cancel_at_period_end": False}
+                "cancel_at_period_end": False,
+                "prices": prices, "default_tier": default_tier}
     sub = data[0]
     return {
         "has_subscription": True,
@@ -406,6 +457,7 @@ def live_summary(customer_id: str) -> dict:
         "trial_end": _get(sub, "trial_end"),
         "current_period_end": _current_period_end(sub),
         "cancel_at_period_end": bool(_get(sub, "cancel_at_period_end")),
+        "prices": prices, "default_tier": default_tier,
     }
 
 

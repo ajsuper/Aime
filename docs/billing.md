@@ -260,6 +260,25 @@ full cutover is two commands: `revoke-all` (zero send access) + `deny-trial
 A tier *is* the Stripe plan, so changing tier means changing the subscription's
 Price. There are two paths, by who is driving:
 
+**Prices are shown live, never duplicated in config.** The customer-facing amount
+lives only in the Stripe Price; `billing.tier_prices()` reads it back (memoized an
+hour — Prices are near-static) and `live_summary` folds it into the Billing tab
+payload (`prices` + `default_tier`). The tab then labels the trial CTA, the plan
+picker, and the current-plan line with the real amount, so editing a Price in the
+Stripe Dashboard updates the UI with no redeploy. A tier whose Price can't be read
+just falls back to its bare name. The "Change plan" panel also spells out the
+proration in plain words: switching mid-cycle isn't charged immediately — the
+difference lands on the next invoice (credit for unused time on the old plan,
+charge for the rest of the period on the new one), so **switching up then back
+before the next invoice only bills for the time actually spent on each plan**, and
+during a trial nothing is charged at all.
+
+A UI note: while a Stripe Payment Element (an iframe) is mounted, the Billing tab
+drops the settings backdrop's live `backdrop-filter` blur (`#settings-backdrop.no-blur`).
+The iframe composites over that blur, so without this every keystroke forced the
+whole backdrop to re-blur on the main thread — which visibly stuttered typing into
+the card field.
+
 - **A paying user** changes their own plan **inline** in the Billing tab
   ("Change plan"), which `POST`s `/billing/change-plan`. The route calls
   `billing.change_plan` (`Subscription.modify` swapping the item's Price,

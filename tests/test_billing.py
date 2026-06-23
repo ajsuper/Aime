@@ -364,7 +364,8 @@ def test_live_summary_shape(monkeypatch, prices):
     s = billing.live_summary("cus_1")
     assert s == {"has_subscription": True, "status": "trialing",
                  "tier": "light", "trial_end": 42, "current_period_end": 99,
-                 "cancel_at_period_end": True}
+                 "cancel_at_period_end": True,
+                 "prices": {}, "default_tier": config.USAGE_DEFAULT_TIER}
 
 
 def test_live_summary_no_subscription(monkeypatch, prices):
@@ -373,6 +374,29 @@ def test_live_summary_no_subscription(monkeypatch, prices):
                         lambda **kw: _FakeList([]))
     s = billing.live_summary("cus_1")
     assert s["has_subscription"] is False
+
+
+def test_tier_prices_reads_live_and_omits_unreadable(monkeypatch, prices):
+    monkeypatch.setattr(config, "STRIPE_SECRET_KEY", "sk_test_x")
+    monkeypatch.setattr(billing, "_initialized", True)
+    monkeypatch.setattr(billing, "_PRICE_CACHE", {"at": 0.0, "data": None})
+
+    def fake_retrieve(pid):
+        if pid == "price_light":
+            return {"unit_amount": 800, "currency": "usd",
+                    "recurring": {"interval": "month"}}
+        raise RuntimeError("no such price")  # power Price unreadable → omitted
+
+    monkeypatch.setattr(billing.stripe.Price, "retrieve", fake_retrieve)
+    out = billing.tier_prices(force=True)
+    assert out == {"light": {"amount": 800, "currency": "usd",
+                             "interval": "month"}}
+
+
+def test_tier_prices_empty_without_secret(monkeypatch, prices):
+    monkeypatch.setattr(config, "STRIPE_SECRET_KEY", "")
+    monkeypatch.setattr(billing, "_PRICE_CACHE", {"at": 0.0, "data": None})
+    assert billing.tier_prices(force=True) == {}
 
 
 def test_reconcile_customer_uses_latest(monkeypatch, backend, prices, billing_user):

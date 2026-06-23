@@ -1919,6 +1919,13 @@
                          display: none; align-items: center; justify-content: center;
                          padding: 2rem; animation: settings-fade 0.15s ease-out; }
     #settings-backdrop.open { display: flex; }
+    /* While a Stripe Payment Element (an iframe) is mounted, drop the live
+       backdrop blur: the iframe is a separate compositing layer over the blur,
+       so every keystroke repaint forces the whole backdrop to re-blur on the
+       main thread — which stutters typing into the card field. A heavier solid
+       scrim stands in for the blur so the modal still reads as raised. */
+    #settings-backdrop.no-blur { backdrop-filter: none; -webkit-backdrop-filter: none;
+                                 background: rgba(15, 12, 10, 0.74); }
     @keyframes settings-fade {
       from { opacity: 0; }
       to { opacity: 1; }
@@ -3212,7 +3219,7 @@
                       <option value="power">Power</option>
                     </select>
                   </div>
-                  <p class="desc" style="margin:0.6rem 0 0">Switching takes effect
+                  <p class="desc" id="billing-change-desc" style="margin:0.6rem 0 0">Switching takes effect
                     right away. We'll prorate the difference on your next invoice —
                     during a free trial nothing is charged.</p>
                   <div style="display:flex;gap:0.5rem;margin-top:0.9rem;align-items:center">
@@ -9764,6 +9771,7 @@ sttModelSelect.addEventListener("change", async () => {
 });
 function closeSettings() {
   settingsBackdrop.classList.remove("open");
+  settingsBackdrop.classList.remove("no-blur");
 }
 settingsCloseBtn.addEventListener("click", closeSettings);
 settingsBackdrop.addEventListener("click", (e) => {
@@ -10015,6 +10023,7 @@ const billingChangeSelect= document.getElementById("billing-change-select");
 const billingChangeConfirm = document.getElementById("billing-change-confirm");
 const billingChangeCancel  = document.getElementById("billing-change-cancel");
 const billingChangeStatus  = document.getElementById("billing-change-status");
+const billingChangeDesc    = document.getElementById("billing-change-desc");
 const billingUpdateCardBtn = document.getElementById("billing-update-card-btn");
 const billingUpdatePanel = document.getElementById("billing-updatecard-panel");
 const billingUpdateElement = document.getElementById("billing-updatecard-element");
@@ -10048,8 +10057,47 @@ function fmtBillingDate(unixSeconds) {
   catch { return "—"; }
 }
 
+// Live per-tier prices from /billing/summary ({tier:{amount,currency,interval}});
+// default_tier is the plan a new free trial starts on. Both stay null until the
+// Billing tab first loads its live detail.
+let __billingPrices = null;
+let __billingDefaultTier = null;
+
+// "$8/mo" from a {amount,currency,interval} price. amount is in the currency's
+// minor unit; we divide by 100 (true for USD/EUR/GBP and every currency this
+// deployment bills in — revisit only if a zero-decimal currency like JPY is ever
+// used). Returns "" when there's no price, so callers fall back to the bare name.
+function fmtTierPrice(p) {
+  if (!p || p.amount == null) return "";
+  let money;
+  try {
+    money = new Intl.NumberFormat(undefined,
+      {style: "currency", currency: (p.currency || "usd").toUpperCase()})
+      .format(p.amount / 100);
+  } catch { money = "$" + (p.amount / 100).toFixed(2); }
+  const per = p.interval === "year" ? "/yr"
+            : p.interval === "week" ? "/wk"
+            : p.interval === "day"  ? "/day" : "/mo";
+  return money + per;
+}
+
+// "Light — $8/mo" (or just "Light" with no price). Rebuilt from the option value
+// each time so repeated renders never stack the price suffix.
+function decorateTierOption(opt) {
+  if (!opt) return;
+  const tier = opt.value;
+  const name = tier.charAt(0).toUpperCase() + tier.slice(1);
+  const price = __billingPrices && __billingPrices[tier];
+  const money = price ? fmtTierPrice(price) : "";
+  opt.textContent = money ? (name + " — " + money) : name;
+}
+
 function renderBillingSummary(s) {
   billingLoading.style.display = "none";
+  // Live prices ride along on both branches — stash them before anything that
+  // renders a price (the trial CTA and the plan picker both read them).
+  __billingPrices = (s && s.prices) || null;
+  __billingDefaultTier = (s && s.default_tier) || null;
   const has = s && s.has_subscription;
   billingStatusBlock.style.display = has ? "" : "none";
   billingStartBlock.style.display  = has ? "none" : "";
@@ -10061,10 +10109,31 @@ function renderBillingSummary(s) {
   billingStatusEl.style.color = needsAttention ? "var(--error)" : "var(--text)";
 
   if (s.tier) {
-    billingPlanEl.textContent = s.tier.charAt(0).toUpperCase() + s.tier.slice(1);
+    const name = s.tier.charAt(0).toUpperCase() + s.tier.slice(1);
+    const price = __billingPrices && __billingPrices[s.tier];
+    billingPlanEl.textContent = price ? (name + " · " + fmtTierPrice(price)) : name;
     billingPlanRow.style.display = "";
     if (billingChangeSelect && s.tier) billingChangeSelect.value = s.tier;
   } else billingPlanRow.style.display = "none";
+
+  // Price-label the plan picker, and spell out exactly what switching does —
+  // including the "switch back before billing" case the proration handles.
+  if (billingChangeSelect) {
+    Array.from(billingChangeSelect.options).forEach(decorateTierOption);
+  }
+  if (billingChangeDesc) {
+    const onDate = s.current_period_end
+      ? (" on " + fmtBillingDate(s.current_period_end)) : "";
+    billingChangeDesc.textContent = (s.status === "trialing")
+      ? ("Your new plan takes effect right away. While you're in your free trial "
+         + "nothing is charged — your first invoice" + onDate + " bills whichever "
+         + "plan you're on by then.")
+      : ("Your new plan takes effect right away. We don't charge you now — the "
+         + "difference is prorated onto your next invoice" + onDate + ": you're "
+         + "credited for the unused time on your old plan and charged for the rest "
+         + "of this period on the new one. Switch back before then and you're only "
+         + "billed for the time you actually spent on each plan.");
+  }
 
   // The native management controls (switch plan / update card / cancel) only
   // apply while there's a *live* subscription to act on. For a terminated one
@@ -10108,9 +10177,14 @@ function renderBillingSummary(s) {
 // instead of trial language. Driven by /me's billing.trial_eligible.
 function applyTrialCopy() {
   const eligible = !__billing || __billing.trial_eligible !== false;
+  const trialPrice = __billingPrices && __billingDefaultTier
+    && __billingPrices[__billingDefaultTier];
+  const priceStr = trialPrice ? fmtTierPrice(trialPrice) : "";
   if (billingIntroEl) billingIntroEl.textContent = eligible
-    ? "Aime runs on a simple monthly plan with a 30-day free trial."
-    : "Aime runs on a simple monthly plan.";
+    ? ("Aime runs on a simple monthly plan"
+       + (priceStr ? " (" + priceStr + ")" : "") + " with a 30-day free trial.")
+    : ("Aime runs on a simple monthly plan"
+       + (priceStr ? " — " + priceStr + "." : "."));
   if (billingStartLabel) billingStartLabel.textContent = eligible
     ? "Start your free trial" : "Subscribe";
   if (billingStartBtn) billingStartBtn.textContent = eligible
@@ -10214,6 +10288,13 @@ function setBillingPayStatus(msg, isError) {
   billingPayStatus.style.display = "";
 }
 
+// A live `backdrop-filter` blur behind a Stripe Element iframe stutters typing
+// (each keystroke repaint re-blurs the whole backdrop). Drop the blur while any
+// card field is mounted, restore it once every Element is gone.
+function setCardElementMounted(on) {
+  if (settingsBackdrop) settingsBackdrop.classList.toggle("no-blur", !!on);
+}
+
 function closeBillingCardPanel() {
   billingCardPanel.style.display = "none";
   setBillingPayStatus("", false);
@@ -10222,6 +10303,7 @@ function closeBillingCardPanel() {
   __billingSetupId = null;
   billingStartBtn.disabled = false;
   billingPayBtn.disabled = false;
+  if (!__updateElements) setCardElementMounted(false);
 }
 
 // Step 1: ask the server for a SetupIntent, then mount the Payment Element.
@@ -10259,6 +10341,7 @@ async function startInlineSubscribe() {
       appearance: billingAppearance(),
     });
     __billingElements.create("payment").mount(billingPayElement);
+    setCardElementMounted(true);
     billingCardPanel.style.display = "";
     setBillingPayStatus("", false);
   } catch {
@@ -10392,6 +10475,7 @@ function closeBillingUpdatePanel() {
   __updateElements = null;
   billingUpdateCardBtn.disabled = false;
   billingUpdateSave.disabled = false;
+  if (!__billingElements) setCardElementMounted(false);
 }
 async function startUpdateCard() {
   billingMsg.style.display = "none";
@@ -10424,6 +10508,7 @@ async function startUpdateCard() {
       appearance: billingAppearance(),
     });
     __updateElements.create("payment").mount(billingUpdateElement);
+    setCardElementMounted(true);
     billingUpdatePanel.style.display = "";
     setBillingManageStatus(billingUpdateStatus, "", false);
   } catch {
