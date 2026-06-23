@@ -209,7 +209,9 @@ def create_subscription(
     convert. With no trial (a returning customer who already used theirs) the
     first invoice is charged immediately off-session; ``error_if_incomplete``
     makes a declined/auth-required card raise here instead of leaving a stuck
-    ``incomplete`` subscription. Access is still granted only by the webhook."""
+    ``incomplete`` subscription. Access is granted by reconciling the live
+    subscription state — the confirm route does so immediately, and the webhook
+    re-confirms it; this function only creates the subscription."""
     init_stripe()
     price_id = config.stripe_price_for_tier(tier)
     if not price_id:

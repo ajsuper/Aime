@@ -2542,7 +2542,9 @@ def redeem():
 
 # ---------------------------------------------------------------------------
 # Stripe billing (AIME_ACCESS_MODE=billing only). See aime.billing + docs/
-# billing.md. The webhook is the sole authority that grants api_access; the
+# billing.md. api_access is granted off a live read of Stripe — the
+# subscribe-confirm route reconciles once immediately, and the webhook is the
+# standing authority for every later renewal/cancellation/revocation; the
 # Checkout/Portal routes only create hosted sessions (we never see card data).
 # Every route here 404s unless billing is armed, so keys/open are untouched.
 # ---------------------------------------------------------------------------
@@ -2559,8 +2561,8 @@ def _billing_base_url() -> str:
 def billing_subscribe():
     """Step 1 of the inline subscribe flow: create a SetupIntent so the browser
     can collect a card with the Payment Element. No subscription exists yet —
-    access is granted only later by the webhook, after the card is confirmed and
-    /billing/subscribe/confirm creates the subscription. Returns the client
+    access is granted only later, when /billing/subscribe/confirm creates the
+    subscription and reconciles it (the webhook re-confirms). Returns the client
     secret + publishable key the Payment Element needs."""
     if not _billing_armed():
         abort(404)
@@ -2600,7 +2602,8 @@ def billing_subscribe_confirm():
     is read off the SetupIntent metadata (server-side, never the client), and
     the one-trial / no-double-subscription guards run here too — this is the
     request that actually creates the subscription, so it's the real gate, not
-    step 1. Access still comes from the webhook that follows."""
+    step 1. Access is granted here by reconciling the live subscription right
+    after creating it (the webhook re-confirms), so the chat unlocks at once."""
     if not _billing_armed():
         abort(404)
     data = request.get_json(silent=True) or {}
@@ -2643,6 +2646,25 @@ def billing_subscribe_confirm():
         return jsonify({"ok": False,
                         "message": "We saved your card but couldn't start your "
                                    "plan. Please try again in a moment."}), 502
+
+    # Fast-path grant: reconcile right now off a *live* read of the subscription
+    # we just created, so send access opens the instant the trial starts instead
+    # of hanging on the webhook round-trip. This is not client-asserted — like
+    # the webhook, reconcile_customer re-fetches state from Stripe — so the trust
+    # boundary is unchanged. The webhook remains the ongoing authority (renewals,
+    # cancellations, revocation) and a safety net if this read blips; reconcile is
+    # idempotent, so the two can't conflict. Without this, a misconfigured webhook
+    # (the classic sandbox case: no `stripe listen`, or a stale whsec_ that fails
+    # signature verification) leaves api_access=0 even though the subscription is
+    # live — the user is told to subscribe when they already have.
+    try:
+        _billing.reconcile_customer(_auth_backend, customer_id)
+    except Exception:
+        # Non-fatal: the subscription exists and the webhook will still grant
+        # access. Don't fail the request — the card was saved and the plan made.
+        app.logger.warning("billing: post-create reconcile failed for user %s "
+                            "(webhook will grant access)", g.user_id,
+                            exc_info=True)
     return jsonify({"ok": True})
 
 

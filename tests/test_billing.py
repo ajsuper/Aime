@@ -13,6 +13,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 
 import pytest
 
@@ -389,6 +390,159 @@ def test_resume_subscriptions_clears_cancel(monkeypatch, prices):
     assert calls == [("sub_a", {"cancel_at_period_end": False})]
 
 
+# --- inline subscribe: the two-step Payment Element helpers ------------------
+# create_setup_intent (collect the card) → saved_payment_method (verify the
+# confirmed card is ours) → create_subscription (start it on that card). These
+# carry the real correctness risk in the inline flow, so they're stubbed at the
+# Stripe SDK boundary (same pattern as the subscription_state tests above).
+
+def test_create_setup_intent(monkeypatch, prices):
+    monkeypatch.setattr(billing, "_initialized", True)  # skip init_stripe
+    seen = {}
+    monkeypatch.setattr(
+        billing.stripe.SetupIntent, "create",
+        lambda **kw: seen.update(kw) or {"id": "seti_1",
+                                         "client_secret": "seti_secret"})
+    out = billing.create_setup_intent(customer_id="cus_1", tier="power")
+    assert out == {"client_secret": "seti_secret", "setup_intent_id": "seti_1"}
+    # Bound to the customer (so the saved card lands on the right account),
+    # collected for later off-session charges, and the chosen tier rides on the
+    # metadata to be read back server-side at confirm (never from the client).
+    assert seen["customer"] == "cus_1"
+    assert seen["usage"] == "off_session"
+    assert seen["metadata"] == {"aime_tier": "power"}
+    assert seen["automatic_payment_methods"] == {"enabled": True}
+
+
+def test_saved_payment_method_success(monkeypatch):
+    monkeypatch.setattr(billing, "_initialized", True)
+    monkeypatch.setattr(
+        billing.stripe.SetupIntent, "retrieve",
+        lambda sid: {"customer": "cus_1", "status": "succeeded",
+                     "payment_method": "pm_1", "metadata": {"aime_tier": "power"}})
+    assert billing.saved_payment_method("seti_1", "cus_1") == ("pm_1", "power")
+
+
+def test_saved_payment_method_resolves_expanded_objects(monkeypatch):
+    """customer / payment_method arrive as nested objects when expanded — they
+    must be resolved down to their ids."""
+    monkeypatch.setattr(billing, "_initialized", True)
+    monkeypatch.setattr(
+        billing.stripe.SetupIntent, "retrieve",
+        lambda sid: {"customer": {"id": "cus_1"}, "status": "succeeded",
+                     "payment_method": {"id": "pm_1"},
+                     "metadata": {"aime_tier": "light"}})
+    assert billing.saved_payment_method("seti_1", "cus_1") == ("pm_1", "light")
+
+
+@pytest.mark.parametrize("intent, why", [
+    ({"customer": "cus_other", "status": "succeeded", "payment_method": "pm_1"},
+     "a SetupIntent for a different customer"),
+    ({"customer": "cus_1", "status": "requires_payment_method",
+      "payment_method": "pm_1"}, "a card that was never confirmed"),
+    ({"customer": "cus_1", "status": "succeeded", "payment_method": None},
+     "a succeeded intent with no payment method"),
+])
+def test_saved_payment_method_rejects(monkeypatch, intent, why):
+    """Anything that isn't a *succeeded* SetupIntent for THIS customer carrying a
+    payment method must raise — the confirm route turns that into a 400 and never
+    creates a subscription on an unconfirmed or foreign card."""
+    monkeypatch.setattr(billing, "_initialized", True)
+    monkeypatch.setattr(billing.stripe.SetupIntent, "retrieve", lambda sid: intent)
+    with pytest.raises(ValueError):
+        billing.saved_payment_method("seti_1", "cus_1")
+
+
+def test_create_subscription_trial(monkeypatch, prices):
+    """A first-time subscriber: the trial is set, the confirmed card is the
+    subscription default, and missing_payment_method=cancel guards a card-less
+    conversion. Nothing is charged now, so no payment_behavior override."""
+    monkeypatch.setattr(billing, "_initialized", True)
+    seen = {}
+    monkeypatch.setattr(billing.stripe.Subscription, "create",
+                        lambda **kw: seen.update(kw) or {"id": "sub_new"})
+    sid = billing.create_subscription(
+        user_id=7, customer_id="cus_1", tier="power",
+        payment_method_id="pm_1", trial_days=30)
+    assert sid == "sub_new"
+    assert seen["customer"] == "cus_1"
+    assert seen["items"] == [{"price": "price_power"}]
+    assert seen["default_payment_method"] == "pm_1"
+    assert seen["metadata"] == {"aime_user_id": "7"}
+    assert seen["off_session"] is True
+    assert seen["trial_period_days"] == 30
+    assert seen["trial_settings"] == {
+        "end_behavior": {"missing_payment_method": "cancel"}}
+    assert "payment_behavior" not in seen
+
+
+def test_create_subscription_no_trial_charges_now(monkeypatch, prices):
+    """A returning customer who already used their trial: no trial, and the first
+    invoice is charged immediately with error_if_incomplete so a decline raises
+    here instead of leaving a stuck incomplete subscription."""
+    monkeypatch.setattr(billing, "_initialized", True)
+    seen = {}
+    monkeypatch.setattr(billing.stripe.Subscription, "create",
+                        lambda **kw: seen.update(kw) or {"id": "sub_new"})
+    billing.create_subscription(
+        user_id=7, customer_id="cus_1", tier="light",
+        payment_method_id="pm_1", trial_days=0)
+    assert seen["payment_behavior"] == "error_if_incomplete"
+    assert "trial_period_days" not in seen
+    assert "trial_settings" not in seen
+
+
+def test_create_subscription_unknown_tier_raises(monkeypatch, prices):
+    monkeypatch.setattr(billing, "_initialized", True)
+    monkeypatch.setattr(billing.stripe.Subscription, "create",
+                        lambda **kw: {"id": "sub_new"})
+    with pytest.raises(ValueError):
+        billing.create_subscription(
+            user_id=7, customer_id="cus_1", tier="enterprise",
+            payment_method_id="pm_1", trial_days=30)
+
+
+# --- ensure_customer / create_portal_session --------------------------------
+
+def test_ensure_customer_creates_and_persists(monkeypatch, backend):
+    monkeypatch.setattr(billing, "_initialized", True)
+    user, _ = backend.create("bob", "Sufficiently-long-pw-1")
+    seen = {}
+    monkeypatch.setattr(
+        billing.stripe.Customer, "create",
+        lambda **kw: seen.update(kw) or SimpleNamespace(id="cus_new"))
+    cid = billing.ensure_customer(backend, backend.lookup(user.id))
+    assert cid == "cus_new"
+    # Persisted *before* the card flow so a later webhook can resolve the
+    # subscription back to this user.
+    assert backend.lookup_by_stripe_customer("cus_new").id == user.id
+    assert seen["metadata"]["aime_user_id"] == str(user.id)
+
+
+def test_ensure_customer_reuses_existing(monkeypatch, backend, billing_user):
+    """A user already linked to a Stripe customer never creates a second one."""
+    monkeypatch.setattr(billing, "_initialized", True)
+
+    def boom(**kw):
+        raise AssertionError("must not create a second customer")
+
+    monkeypatch.setattr(billing.stripe.Customer, "create", boom)
+    assert billing.ensure_customer(
+        backend, backend.lookup(billing_user.id)) == "cus_1"
+
+
+def test_create_portal_session(monkeypatch):
+    monkeypatch.setattr(billing, "_initialized", True)
+    seen = {}
+    monkeypatch.setattr(
+        billing.stripe.billing_portal.Session, "create",
+        lambda **kw: seen.update(kw) or SimpleNamespace(url="https://portal"))
+    url = billing.create_portal_session(
+        customer_id="cus_1", return_url="https://app/")
+    assert url == "https://portal"
+    assert seen == {"customer": "cus_1", "return_url": "https://app/"}
+
+
 # --- web_app guards + webhook route (subprocess, clean env per scenario) -----
 
 def _run_snippet(env_extra, snippet):
@@ -572,6 +726,61 @@ def test_subscribe_confirm_trial_gate():
         "w._billing.subscription_state = lambda cid: {'has_active': False, 'used_trial': True}\n"
         "assert c.post('/billing/subscribe/confirm', json={'setup_intent_id':'seti_1'}).status_code == 200\n"
         "assert seen['trial_days'] == 0, seen\n"
+        "print('OK')\n",
+    )
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "OK" in proc.stdout
+
+
+def test_subscribe_confirm_grants_access_immediately():
+    """Step 2 reconciles off a live Stripe read right after creating the
+    subscription, so send access (api_access) opens at once instead of hanging on
+    the webhook round-trip — the fix for "trial started but chat still locked"
+    when the webhook is misconfigured (the classic sandbox case)."""
+    proc = _run_snippet(
+        _BILLING_ENV,
+        "import frontends.web_app as w\n"
+        "c = w.app.test_client()\n"
+        "c.post('/signup', data={'username':'owner','password':'Sufficiently-long-pw-1','password2':'Sufficiently-long-pw-1'})\n"
+        "w._auth_backend.set_stripe_customer(1, 'cus_1')\n"
+        "assert w._auth_backend.lookup(1).api_access is False\n"
+        "w._billing.saved_payment_method = lambda sid, cid: ('pm_1', 'power')\n"
+        "w._billing.subscription_state = lambda cid: {'has_active': False, 'used_trial': False}\n"
+        "w._billing.create_subscription = lambda **k: 'sub_1'\n"
+        "seen = {}\n"
+        "def fake_reconcile(ab, cid):\n"
+        "    seen['cid'] = cid\n"
+        "    ab.set_api_access(1, True)\n"
+        "    return True\n"
+        "w._billing.reconcile_customer = fake_reconcile\n"
+        "r = c.post('/billing/subscribe/confirm', json={'setup_intent_id':'seti_1'})\n"
+        "assert r.status_code == 200, (r.status_code, r.get_json())\n"
+        "assert seen.get('cid') == 'cus_1', seen\n"
+        "assert w._auth_backend.lookup(1).api_access is True\n"
+        "print('OK')\n",
+    )
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "OK" in proc.stdout
+
+
+def test_subscribe_confirm_succeeds_when_reconcile_fails():
+    """The fast-path reconcile is best-effort: if the live read blips, the
+    subscription still exists (and the webhook will grant access), so confirm
+    must not fail the request."""
+    proc = _run_snippet(
+        _BILLING_ENV,
+        "import frontends.web_app as w\n"
+        "c = w.app.test_client()\n"
+        "c.post('/signup', data={'username':'owner','password':'Sufficiently-long-pw-1','password2':'Sufficiently-long-pw-1'})\n"
+        "w._auth_backend.set_stripe_customer(1, 'cus_1')\n"
+        "w._billing.saved_payment_method = lambda sid, cid: ('pm_1', 'power')\n"
+        "w._billing.subscription_state = lambda cid: {'has_active': False, 'used_trial': False}\n"
+        "w._billing.create_subscription = lambda **k: 'sub_1'\n"
+        "def boom(ab, cid):\n"
+        "    raise RuntimeError('stripe blip')\n"
+        "w._billing.reconcile_customer = boom\n"
+        "r = c.post('/billing/subscribe/confirm', json={'setup_intent_id':'seti_1'})\n"
+        "assert r.status_code == 200, (r.status_code, r.get_json())\n"
         "print('OK')\n",
     )
     assert proc.returncode == 0, proc.stderr + proc.stdout

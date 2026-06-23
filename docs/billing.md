@@ -7,9 +7,14 @@ payment layer on top of the two columns Aime already gates on — `api_access`
 
 We never touch card data. Every card field is rendered by Stripe — the inline
 **Payment Element** (mounted in Aime's own Billing tab) for subscribing, and the
-hosted **Customer Portal** for managing/cancelling. A signed **webhook** is the
-*only* authority that grants access (creating a subscription or confirming a
-card grants nothing on its own), so a spoofed return can't unlock an account.
+hosted **Customer Portal** for managing/cancelling. Access is only ever granted
+off a **server-side live read of Stripe** — never anything the client asserts —
+so a spoofed return can't unlock an account. The signed **webhook** is the
+standing authority (it reconciles every renewal/cancellation/revocation), and
+the subscribe-confirm route reconciles once immediately off the same live read
+so the trial unlocks the chat at once instead of waiting on (or hanging behind a
+misconfigured) webhook. Both paths funnel through the same idempotent
+`reconcile_subscription` seam, so they can't disagree.
 
 ## The model
 
@@ -23,7 +28,9 @@ card grants nothing on its own), so a spoofed return can't unlock an account.
   account before it redeems a key. The user opens the **Billing** tab, starts a
   trial, and enters a card in the inline Payment Element (card required up front
   even though the trial is free — see *Subscribing* below for why this is a
-  two-step flow). The webhook sees `trialing` and flips `api_access=1`. After 30
+  two-step flow). The subscription goes `trialing`, which flips `api_access=1` —
+  granted immediately by the confirm route's reconcile and re-confirmed by the
+  `customer.subscription.created` webhook. After 30
   days Stripe auto-charges; on success the subscription goes `active` and access
   continues. On cancellation or a failed payment the subscription goes
   `canceled`/`past_due`/`unpaid`, and the webhook flips `api_access=0`.
