@@ -30,9 +30,10 @@ misconfigured) webhook. Both paths funnel through the same idempotent
 - **Card at signup, then a 30-day free trial.** A new billing-mode account is
   created with `api_access=0` (no send access), exactly like a `keys`-mode
   account before it redeems a key. The user opens the **Billing** tab, starts a
-  trial, and enters a card in the inline Payment Element (card required up front
-  even though the trial is free — see *Subscribing* below for why this is a
-  two-step flow). The subscription goes `trialing`, which flips `api_access=1` —
+  trial (always on the **default tier** — there's no plan picker at signup; see
+  *Subscribing*), and enters a card in the inline Payment Element (card required
+  up front even though the trial is free — see *Subscribing* below for why this
+  is a two-step flow). The subscription goes `trialing`, which flips `api_access=1` —
   granted immediately by the confirm route's reconcile and re-confirmed by the
   `customer.subscription.created` webhook. After 30
   days Stripe auto-charges; on success the subscription goes `active` and access
@@ -157,9 +158,16 @@ user, but step 2 is the authoritative gate:
   email + a new card) can only be seen by Stripe — close it with a **Radar rule**
   (below), which the card-at-signup requirement makes possible.
 
-The chosen tier is carried on the SetupIntent metadata and read back server-side
-in step 2 — never taken from the step-2 request body — so it can't be swapped
-after the card is entered.
+**There is no plan picker at signup.** Every trial starts on the **default tier**
+(`USAGE_DEFAULT_TIER`, normally `light`), forced server-side in
+`/billing/subscribe` — the request body's tier, if any, is ignored. This caps the
+unpaid trial's cost exposure at the cheapest tier (its daily cap is Aime's
+Anthropic-spend budget, so a free trial on the pricier tier would cost ~2× with
+no revenue) and keeps the expensive tier off the trial-farming path. A user who
+wants a bigger plan uses the inline **Change plan** control once subscribed —
+free while trialing, prorated after. The forced tier rides the SetupIntent
+metadata into step 2 and is read back server-side (never from the step-2 body),
+so it can't be swapped after the card is entered.
 
 ## Operator setup
 

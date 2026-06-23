@@ -2595,6 +2595,16 @@ def _billing_base_url() -> str:
     return aime_config.PUBLIC_BASE_URL or request.url_root.rstrip("/")
 
 
+def _default_billing_tier() -> str:
+    """The tier every new subscription starts on (no plan picker at signup —
+    users upgrade via 'Change plan'). USAGE_DEFAULT_TIER, guarded back to a real
+    priced tier if it's ever misconfigured so subscribe can't 500."""
+    t = aime_config.USAGE_DEFAULT_TIER
+    if t in aime_config.USAGE_TIERS:
+        return t
+    return next(iter(aime_config.USAGE_TIERS))
+
+
 @app.route("/billing/subscribe", methods=["POST"])
 @login_required
 def billing_subscribe():
@@ -2605,10 +2615,12 @@ def billing_subscribe():
     secret + publishable key the Payment Element needs."""
     if not _billing_armed():
         abort(404)
-    data = request.get_json(silent=True) or {}
-    tier = (data.get("tier") or "").strip().lower()
-    if tier not in aime_config.USAGE_TIERS:
-        return jsonify({"ok": False, "message": "Pick a plan to continue."}), 400
+    # Every new subscription starts on the default tier — there's no plan picker
+    # at signup. A user moves to a bigger plan via "Change plan" once subscribed
+    # (free during a trial). This caps the unpaid trial's cost exposure at the
+    # cheapest tier and keeps the expensive tier off the trial-farming path; the
+    # tier is forced server-side, never taken from the request body.
+    tier = _default_billing_tier()
     user = _auth_backend.lookup(g.user_id)
     if user is None:
         abort(404)

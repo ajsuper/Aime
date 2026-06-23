@@ -880,6 +880,29 @@ def test_subscribe_returns_client_secret():
     assert "OK" in proc.stdout
 
 
+def test_subscribe_forces_default_tier():
+    """No plan picker at signup: /billing/subscribe always opens the trial on the
+    default tier, ignoring any tier the client tries to send (so a trial can't be
+    started on the pricier plan)."""
+    proc = _run_snippet(
+        _BILLING_ENV,
+        "import frontends.web_app as w\n"
+        "c = w.app.test_client()\n"
+        "c.post('/signup', data={'username':'owner','password':'Sufficiently-long-pw-1','password2':'Sufficiently-long-pw-1'})\n"
+        "w._billing.ensure_customer = lambda ab, u: 'cus_1'\n"
+        "w._billing.subscription_state = lambda cid: {'has_active': False, 'used_trial': False}\n"
+        "seen = {}\n"
+        "w._billing.create_setup_intent = lambda **k: (seen.update(k) or {'client_secret':'s','setup_intent_id':'seti_1'})\n"
+        "r = c.post('/billing/subscribe', json={'tier':'power'})\n"
+        "assert r.status_code == 200, r.status_code\n"
+        "assert seen['tier'] == w.aime_config.USAGE_DEFAULT_TIER, seen\n"
+        "assert seen['tier'] != 'power', seen\n"
+        "print('OK')\n",
+    )
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "OK" in proc.stdout
+
+
 def test_subscribe_confirm_trial_gate():
     """Step 2 (/billing/subscribe/confirm) reads the tier off the SetupIntent,
     grants the trial to a first-time customer and withholds it from one who

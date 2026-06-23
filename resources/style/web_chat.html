@@ -3156,8 +3156,7 @@
           <div class="settings-section">
             <h3>Plan &amp; billing</h3>
             <p class="desc" id="billing-intro">Aime runs on a simple monthly
-              plan with a 30-day free trial. Your card is handled securely by
-              Stripe — Aime never sees it.</p>
+              plan with a 30-day free trial.</p>
             <!-- Complimentary access: an admin has comped this account; no
                  subscription or card is needed. Shown instead of everything
                  below when /me reports billing.comp. -->
@@ -3288,19 +3287,13 @@
                 </div>
               </div>
             </div>
-            <!-- No subscription yet: the plan picker + start-trial CTA. -->
+            <!-- No subscription yet: the start-trial CTA. Every trial starts on
+                 the default plan; the user moves up to a bigger plan whenever
+                 they like via "Change plan" once subscribed (during a trial the
+                 switch is free). So no plan picker here — one fewer decision at
+                 signup, and a lower cost exposure on the unpaid trial. -->
             <div id="billing-start-block" style="display:none">
               <div class="settings-row">
-                <span class="label">Choose a plan</span>
-                <select id="billing-plan-select"
-                        style="background:var(--bg-input);color:var(--text);
-                               border:1px solid var(--border);border-radius:8px;
-                               padding:0.4rem 0.6rem;font-size:0.85rem">
-                  <option value="light">Light</option>
-                  <option value="power">Power</option>
-                </select>
-              </div>
-              <div class="settings-row" style="margin-top:0.6rem">
                 <span class="label">Start your free trial</span>
                 <button class="btn-primary" id="billing-start-btn"
                         style="background:var(--accent);color:#fff;border:0;border-radius:8px;
@@ -10014,7 +10007,6 @@ const billingCancelLabel = document.getElementById("billing-cancel-label");
 const billingCancelBtn   = document.getElementById("billing-cancel-btn");
 const billingResumeBtn   = document.getElementById("billing-resume-btn");
 const billingStartBtn    = document.getElementById("billing-start-btn");
-const billingPlanSelect  = document.getElementById("billing-plan-select");
 const billingCardPanel   = document.getElementById("billing-card-panel");
 const billingPayBtn      = document.getElementById("billing-pay-btn");
 const billingPayCancel   = document.getElementById("billing-pay-cancel");
@@ -10201,11 +10193,13 @@ async function startInlineSubscribe() {
   }
   billingStartBtn.disabled = true;
   try {
+    // No tier sent: every trial starts on the server's default plan. Choosing a
+    // bigger plan is the "Change plan" control's job, once subscribed.
     const r = await fetch("/billing/subscribe", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
       credentials: "same-origin",
-      body: JSON.stringify({tier: billingPlanSelect.value}),
+      body: JSON.stringify({}),
     });
     const data = await r.json();
     if (!data.ok) {
