@@ -141,6 +141,47 @@ def test_list_users_carries_subscription_fields(backend):
     assert rec.stripe_customer_id == "cus_abc"
 
 
+def test_trial_used_defaults_false_for_new_account(backend):
+    user, _ = backend.create("alice", "Sufficiently-long-pw-1")
+    assert backend.lookup(user.id).trial_used is False
+
+
+def test_set_trial_used_and_by_username(backend):
+    user, _ = backend.create("alice", "Sufficiently-long-pw-1")
+    assert backend.set_trial_used(user.id, True) is True
+    assert backend.lookup(user.id).trial_used is True
+    assert backend.set_trial_used_by_username("alice", False) is True
+    assert backend.lookup(user.id).trial_used is False
+    assert backend.set_trial_used_by_username("ghost", True) is False
+
+
+def test_mark_all_trial_used_flags_everyone(backend):
+    backend.create("alice", "Sufficiently-long-pw-1")
+    backend.create("bob", "Sufficiently-long-pw-1")
+    assert backend.mark_all_trial_used() == 2
+    users = backend.list_users()
+    assert users and all(u.trial_used for u in users)  # carried by list_users too
+
+
+def test_trial_used_migration_backfills_existing_only(backend):
+    """The cutover hinge: when trial_used is first added, every PRE-EXISTING row
+    is backfilled to 1 (no fresh trial for beta testers) while accounts created
+    AFTER the migration default to 0 (still get the trial)."""
+    user, _ = backend.create("alice", "Sufficiently-long-pw-1")
+    path = backend._db_path
+    backend._conn.close()
+    conn = sqlite3.connect(path)
+    conn.execute("ALTER TABLE users DROP COLUMN trial_used")
+    conn.commit()
+    conn.close()
+    reopened = LocalAuthBackend(path)
+    # Pre-existing account: deemed to have used its trial.
+    assert reopened.lookup(user.id).trial_used is True
+    # A brand-new signup after the migration is still eligible.
+    new_user, _ = reopened.create("bob", "Sufficiently-long-pw-1")
+    assert reopened.lookup(new_user.id).trial_used is False
+
+
 def test_migration_adds_columns_on_old_db(backend):
     """Simulate a pre-billing database: drop the new columns + their index, then
     reopen — the migration must re-add them."""
@@ -897,6 +938,48 @@ def test_subscribe_forces_default_tier():
         "assert r.status_code == 200, r.status_code\n"
         "assert seen['tier'] == w.aime_config.USAGE_DEFAULT_TIER, seen\n"
         "assert seen['tier'] != 'power', seen\n"
+        "print('OK')\n",
+    )
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "OK" in proc.stdout
+
+
+def test_subscribe_confirm_denies_trial_when_flagged():
+    """A trial-ineligible account (e.g. a beta tester flagged at cutover) is
+    charged immediately even though Stripe sees no prior trial: trial_used ORs
+    into the eligibility decision, so trial_days is 0."""
+    proc = _run_snippet(
+        _BILLING_ENV,
+        "import frontends.web_app as w\n"
+        "c = w.app.test_client()\n"
+        "c.post('/signup', data={'username':'owner','password':'Sufficiently-long-pw-1','password2':'Sufficiently-long-pw-1'})\n"
+        "w._auth_backend.set_stripe_customer(1, 'cus_1')\n"
+        "w._auth_backend.set_trial_used_by_username('owner', True)\n"
+        "w._billing.saved_payment_method = lambda sid, cid: ('pm_1', 'power')\n"
+        "seen = {}\n"
+        "w._billing.create_subscription = lambda **k: (seen.update(k) or 'sub_1')\n"
+        "w._billing.subscription_state = lambda cid: {'has_active': False, 'used_trial': False}\n"
+        "w._billing.reconcile_customer = lambda ab, cid: None\n"
+        "r = c.post('/billing/subscribe/confirm', json={'setup_intent_id':'seti_1'})\n"
+        "assert r.status_code == 200, (r.status_code, r.get_json())\n"
+        "assert seen['trial_days'] == 0, seen\n"
+        "print('OK')\n",
+    )
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "OK" in proc.stdout
+
+
+def test_me_reports_trial_eligibility():
+    """/me's billing block tells the frontend whether to say 'Start your free
+    trial' (eligible) or 'Subscribe' (flagged ineligible)."""
+    proc = _run_snippet(
+        _BILLING_ENV,
+        "import frontends.web_app as w\n"
+        "c = w.app.test_client()\n"
+        "c.post('/signup', data={'username':'owner','password':'Sufficiently-long-pw-1','password2':'Sufficiently-long-pw-1'})\n"
+        "assert c.get('/me').get_json()['billing']['trial_eligible'] is True\n"
+        "w._auth_backend.set_trial_used_by_username('owner', True)\n"
+        "assert c.get('/me').get_json()['billing']['trial_eligible'] is False\n"
         "print('OK')\n",
     )
     assert proc.returncode == 0, proc.stderr + proc.stdout

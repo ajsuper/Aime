@@ -3815,7 +3815,7 @@ _FRAGMENT_ACCOUNTS = """
       <tr>
         <td>#{{ u.id }}</td>
         <td>{{ u.username }}</td>
-        <td class="{{ 'good' if u.api_access else 'bad' }}">{{ 'yes' if u.api_access else 'no' }}{% if u.comp_access %} <span class="note" title="Complimentary full access — granted by an admin, not billed. Stripe won't revoke it.">comp</span>{% endif %}</td>
+        <td class="{{ 'good' if u.api_access else 'bad' }}">{{ 'yes' if u.api_access else 'no' }}{% if u.comp_access %} <span class="note" title="Complimentary full access — granted by an admin, not billed. Stripe won't revoke it.">comp</span>{% endif %}{% if billing_mode and u.trial_used %} <span class="note" title="No free trial — a (re)subscribe is charged immediately. New accounts get the trial by default; this one used it or was flagged ineligible.">no trial</span>{% endif %}</td>
         <td>
           <form method="post" action="accounts/set-tier" class="inline-action">
             <input type="hidden" name="csrf" value="{{ csrf }}">
@@ -3838,6 +3838,12 @@ _FRAGMENT_ACCOUNTS = """
             <input type="hidden" name="username" value="{{ u.username }}">
             <input type="hidden" name="grant" value="{{ '0' if u.comp_access else '1' }}">
             <button type="submit" title="Complimentary full access: gives this user send access with no subscription, and stops Stripe from revoking them.">{{ 'Remove full access' if u.comp_access else 'Grant full access' }}</button>
+          </form>
+          <form method="post" action="accounts/trial">
+            <input type="hidden" name="csrf" value="{{ csrf }}">
+            <input type="hidden" name="username" value="{{ u.username }}">
+            <input type="hidden" name="used" value="{{ '0' if u.trial_used else '1' }}">
+            <button type="submit" title="Free-trial eligibility. 'Deny free trial' marks this account as having used its trial, so a (re)subscribe is charged immediately. 'Allow free trial' restores it. New signups are eligible by default.">{{ 'Allow free trial' if u.trial_used else 'Deny free trial' }}</button>
           </form>
           {% else %}
           <form method="post" action="accounts/access">
@@ -3881,6 +3887,14 @@ _FRAGMENT_ACCOUNTS = """
     <button type="submit" class="danger">Revoke send access for everyone</button>
     <span class="note">Zeroes api_access for every account (billing cutover).</span>
   </form>
+  {% if billing_mode %}
+  <form method="post" action="accounts/deny-trial-all" class="inline-action"
+    onsubmit="return confirm('Deny a fresh free trial to ALL existing accounts? New signups will still get one.')">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <button type="submit" class="danger">Deny free trial to everyone</button>
+    <span class="note">The other half of the cutover: existing accounts subscribe with no trial; new signups still get one.</span>
+  </form>
+  {% endif %}
   {% endif %}
 
   <h2 title="Accounts that have been soft-deleted. Their data is retained until the grace period expires, then a purge can permanently remove them.">Soft-deleted accounts</h2>
@@ -5934,6 +5948,35 @@ def account_purge():
 def account_revoke_all():
     n = _auth_backend().revoke_all_access()
     _flash("ok", f"Revoked send access for {n} user(s).")
+    return redirect(url_for("index", tab="accounts"))
+
+
+@app.route("/accounts/trial", methods=["POST"])
+@admin_post
+def account_trial():
+    """Toggle one account's free-trial eligibility. used=1 → a (re)subscribe is
+    charged immediately, no fresh trial; used=0 → eligible again. The web
+    equivalent of `access_keys.py deny-trial / allow-trial <user>`."""
+    username = (request.form.get("username") or "").strip()
+    used = request.form.get("used") == "1"
+    if _auth_backend().set_trial_used_by_username(username, used):
+        _flash("ok", (f"{username!r} will be charged immediately on subscribe "
+                      f"(no free trial)." if used else
+                      f"{username!r} is eligible for the free trial again."))
+    else:
+        _flash("bad", f"No such user: {username!r}.")
+    return redirect(url_for("index", tab="accounts"))
+
+
+@app.route("/accounts/deny-trial-all", methods=["POST"])
+@admin_post
+def account_deny_trial_all():
+    """Billing-cutover bulk: deny a fresh free trial to every existing account
+    (new signups still get one). Pairs with revoke-all. Mirrors
+    `access_keys.py deny-trial --all`."""
+    n = _auth_backend().mark_all_trial_used()
+    _flash("ok", f"Marked {n} account(s) trial-used — no fresh trial on "
+                 f"subscribe (new signups still get one).")
     return redirect(url_for("index", tab="accounts"))
 
 

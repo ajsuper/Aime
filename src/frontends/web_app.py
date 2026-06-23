@@ -1503,11 +1503,17 @@ def api_access_required(view):
                 if user is not None:
                     g.api_access = user.api_access
             if not g.get("api_access", False):
-                # Billing mode points at the trial; keys mode at the invite key.
-                msg = ("Start your free trial in billing settings to send "
-                       "messages." if _billing_armed() else
-                       "This account doesn't have message access yet. Add an "
-                       "invite key in your profile settings.")
+                # Billing mode points at the trial (or a plain subscribe, for an
+                # account that's no longer trial-eligible); keys mode at the
+                # invite key.
+                if _billing_armed():
+                    trial_ok = user is not None and not user.trial_used
+                    msg = ("Start your free trial in Billing settings to send "
+                           "messages." if trial_ok else
+                           "Subscribe in Billing settings to send messages.")
+                else:
+                    msg = ("This account doesn't have message access yet. Add an "
+                           "invite key in your profile settings.")
                 return jsonify({
                     "ok": False,
                     "error": "no_access",
@@ -2479,6 +2485,11 @@ def me():
             # Complimentary access (admin comp): the Billing tab shows a
             # "you're on the house" state instead of the trial CTA / portal.
             "comp": bool(user.comp_access),
+            # Whether a *first* subscription would come with the free trial.
+            # False once the trial's been used or the account was flagged
+            # ineligible (e.g. a beta tester at cutover) — the frontend then says
+            # "Subscribe" instead of "Start your free trial".
+            "trial_eligible": not user.trial_used,
         }
     return jsonify({
         "id": g.user_id,
@@ -2686,11 +2697,22 @@ def billing_subscribe_confirm():
                             "message": "You already have an active subscription. "
                                        "Use “Manage billing” to change "
                                        "your plan."}), 409
-        trial_days = 0 if state["used_trial"] else aime_config.STRIPE_TRIAL_DAYS
+        # Trial eligibility ORs Stripe's own one-trial check with this account's
+        # persisted trial_used flag: the flag denies a trial to a beta tester who
+        # never had a Stripe subscription (so Stripe sees no prior trial) but is
+        # deemed to have already had their run. Either source ⇒ no new trial,
+        # charged immediately.
+        trial_eligible = not state["used_trial"] and not user.trial_used
+        trial_days = aime_config.STRIPE_TRIAL_DAYS if trial_eligible else 0
         _billing.create_subscription(
             user_id=user.id, customer_id=customer_id, tier=tier,
             payment_method_id=payment_method_id, trial_days=trial_days,
         )
+        # Stamp the account as having used its trial the moment we grant one, so
+        # the flag (not just Stripe) reflects it everywhere (the /me headline, a
+        # future resubscribe). Harmless if it was already set.
+        if trial_eligible:
+            _auth_backend.set_trial_used(user.id, True)
     except Exception:
         app.logger.warning("billing: subscription create failed for user %s",
                             g.user_id, exc_info=True)

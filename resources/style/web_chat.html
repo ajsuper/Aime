@@ -3294,11 +3294,27 @@
                  signup, and a lower cost exposure on the unpaid trial. -->
             <div id="billing-start-block" style="display:none">
               <div class="settings-row">
-                <span class="label">Start your free trial</span>
+                <span class="label" id="billing-start-label">Start your free trial</span>
                 <button class="btn-primary" id="billing-start-btn"
                         style="background:var(--accent);color:#fff;border:0;border-radius:8px;
                                padding:0.4rem 0.9rem;cursor:pointer;font-size:0.85rem">
                   Start 30-day free trial
+                </button>
+              </div>
+              <!-- Skip path: you don't have to pay to look around. Browsing and
+                   viewing anything shared with you work without a subscription;
+                   only sending messages needs one. This makes that explicit. -->
+              <p class="desc" id="billing-skip-note" style="margin-top:0.6rem">
+                Not ready? You can keep using Aime in <strong>view-only
+                mode</strong> — browse and view anything shared with you, free.
+                Start a plan whenever you want to chat.</p>
+              <div class="settings-row">
+                <span class="label">Just looking around</span>
+                <button class="btn-secondary" id="billing-skip-btn"
+                        style="background:transparent;color:var(--text);
+                               border:1px solid var(--border);border-radius:8px;
+                               padding:0.4rem 0.9rem;cursor:pointer;font-size:0.85rem">
+                  Continue without subscribing
                 </button>
               </div>
               <!-- Inline card panel: revealed when "Start trial" is clicked. The
@@ -3308,10 +3324,10 @@
               <div id="billing-card-panel" style="display:none;margin-top:0.9rem;
                    border:1px solid var(--border);border-radius:12px;
                    padding:1rem;background:var(--bg-input)">
-                <p class="desc" style="margin:0 0 0.75rem">
+                <p class="desc" id="billing-card-copy" style="margin:0 0 0.75rem">
                   Enter your card to start your free trial. You won't be charged
                   until the trial ends, and you can cancel anytime. Your card is
-                  handled securely by Stripe — Aime never sees it.</p>
+                  handled securely — Aime never sees it.</p>
                 <div id="billing-payment-element"></div>
                 <div style="display:flex;gap:0.5rem;margin-top:0.9rem;align-items:center">
                   <button class="btn-primary" id="billing-pay-btn"
@@ -9806,9 +9822,11 @@ function applyAccessState() {
   if (input) {
     input.disabled = locked;
     if (keyLocked) input.placeholder = "Add invite key in Account settings, or ask admin to unlock access";
-    else if (billingLocked) input.placeholder = "Start your free trial in Billing settings to message Aime";
+    else if (billingLocked) input.placeholder = (__billing && __billing.trial_eligible === false)
+      ? "View-only mode — subscribe in Billing settings to chat"
+      : "View-only mode — start a free trial in Billing settings to chat";
     else if (__usageOver) input.placeholder = "Out of Aime for now — it tops up with a fresh charge each day, so check back then";
-    else if (input.placeholder.startsWith("Add invite key") || input.placeholder.startsWith("Start your free trial") || input.placeholder.startsWith("Out of Aime")) input.placeholder = "Message Aime…";
+    else if (input.placeholder.startsWith("Add invite key") || input.placeholder.startsWith("View-only mode") || input.placeholder.startsWith("Out of Aime")) input.placeholder = "Message Aime…";
   }
   if (sendBtn) sendBtn.disabled = locked;
 
@@ -10007,6 +10025,10 @@ const billingCancelLabel = document.getElementById("billing-cancel-label");
 const billingCancelBtn   = document.getElementById("billing-cancel-btn");
 const billingResumeBtn   = document.getElementById("billing-resume-btn");
 const billingStartBtn    = document.getElementById("billing-start-btn");
+const billingStartLabel  = document.getElementById("billing-start-label");
+const billingSkipNote    = document.getElementById("billing-skip-note");
+const billingSkipBtn     = document.getElementById("billing-skip-btn");
+const billingCardCopy    = document.getElementById("billing-card-copy");
 const billingCardPanel   = document.getElementById("billing-card-panel");
 const billingPayBtn      = document.getElementById("billing-pay-btn");
 const billingPayCancel   = document.getElementById("billing-pay-cancel");
@@ -10031,7 +10053,7 @@ function renderBillingSummary(s) {
   const has = s && s.has_subscription;
   billingStatusBlock.style.display = has ? "" : "none";
   billingStartBlock.style.display  = has ? "none" : "";
-  if (!has) return;
+  if (!has) { applyTrialCopy(); return; }
 
   billingStatusEl.textContent = BILLING_STATUS_LABEL[s.status] || s.status || "—";
   const needsAttention = (s.status === "past_due" || s.status === "unpaid"
@@ -10078,6 +10100,26 @@ function renderBillingSummary(s) {
   else if (s.cancel_at_period_end) note = "Your plan is set to cancel at the end of the period — you can resume it any time below.";
   billingStatusNote.textContent = note;
   billingStatusNote.style.display = note ? "" : "none";
+}
+
+// Adapt the start-block wording to whether this account still gets the free
+// trial. An account flagged ineligible (a beta tester at the billing cutover) or
+// one that's already used its trial sees "Subscribe" + immediate-charge copy
+// instead of trial language. Driven by /me's billing.trial_eligible.
+function applyTrialCopy() {
+  const eligible = !__billing || __billing.trial_eligible !== false;
+  if (billingIntroEl) billingIntroEl.textContent = eligible
+    ? "Aime runs on a simple monthly plan with a 30-day free trial."
+    : "Aime runs on a simple monthly plan.";
+  if (billingStartLabel) billingStartLabel.textContent = eligible
+    ? "Start your free trial" : "Subscribe";
+  if (billingStartBtn) billingStartBtn.textContent = eligible
+    ? "Start 30-day free trial" : "Subscribe";
+  if (billingPayBtn) billingPayBtn.textContent = eligible
+    ? "Start free trial" : "Subscribe";
+  if (billingCardCopy) billingCardCopy.textContent = eligible
+    ? "Enter your card to start your free trial. You won't be charged until the trial ends, and you can cancel anytime. Your card is handled securely — Aime never sees it."
+    : "Enter your card to start your subscription. You'll be charged today, and you can cancel anytime. Your card is handled securely — Aime never sees it.";
 }
 
 let __billingLoaded = false;
@@ -10483,6 +10525,10 @@ resumeBillingRedirect();
 billingStartBtn.addEventListener("click", startInlineSubscribe);
 billingPayBtn.addEventListener("click", confirmInlineSubscribe);
 billingPayCancel.addEventListener("click", closeBillingCardPanel);
+// "Continue without subscribing" — there's no wall to dismiss (browsing and
+// viewing shared content already work without a subscription); this just closes
+// settings so the user drops back into Aime in view-only mode.
+billingSkipBtn.addEventListener("click", closeSettings);
 billingChangePlanBtn.addEventListener("click", toggleBillingChangePanel);
 billingChangeConfirm.addEventListener("click", confirmChangePlan);
 billingChangeCancel.addEventListener("click", closeBillingChangePanel);

@@ -151,12 +151,33 @@ user, but step 2 is the authoritative gate:
   (`trialing`/`active`/`past_due`/`unpaid`/`paused`) the route returns `409` and
   points the user at **Manage billing** instead — so a direct POST can't create
   a second, double-billing subscription behind the UI's back.
-- **One trial per customer.** The 30-day trial is granted only if *none* of the
-  customer's subscriptions has ever carried a trial. A user who starts a trial,
-  cancels, and subscribes again is charged immediately (no second trial). This
-  blocks trial farming **on the same account**; the cross-account vector (a new
-  email + a new card) can only be seen by Stripe — close it with a **Radar rule**
-  (below), which the card-at-signup requirement makes possible.
+- **One trial per customer.** The 30-day trial is granted only if the account is
+  **trial-eligible** — both of: *none* of the customer's Stripe subscriptions has
+  ever carried a trial, **and** the account's persisted `trial_used` flag is
+  unset. A user who starts a trial, cancels, and subscribes again is charged
+  immediately (no second trial). This blocks trial farming **on the same
+  account**; the cross-account vector (a new email + a new card) can only be seen
+  by Stripe — close it with a **Radar rule** (below), which the card-at-signup
+  requirement makes possible.
+
+  The `trial_used` flag (on the user row) is the local override that the Stripe
+  check can't express: a **beta tester** who used the app for months in
+  `open`/`keys` mode has *no* Stripe subscription, so Stripe sees no prior trial
+  and would hand them a fresh 30 days at cutover. Flagging them `trial_used`
+  denies that. Mechanics:
+  - **Migration backfill.** When the `trial_used` column is first added, every
+    *pre-existing* account is set to `1`; the column defaults `0`, so only
+    accounts created *after* the migration are trial-eligible. So the moment a
+    deployment ships this, its existing users subscribe with no fresh trial while
+    new signups still get one — usually no admin action needed.
+  - **Admin control.** `scripts/access_keys.py deny-trial <user>` /
+    `allow-trial <user>` (and `deny-trial --all` for the cutover bulk), or the
+    dashboard **Accounts** tab's per-row *Deny/Allow free trial* button and the
+    *Deny free trial to everyone* bulk. The dashboard shows a **no trial** chip
+    on flagged accounts.
+  - When a trial *is* granted at confirm time, the account is stamped
+    `trial_used` immediately, so the flag (not just Stripe) reflects it
+    everywhere afterward (`/me`, a later resubscribe).
 
 **There is no plan picker at signup.** Every trial starts on the **default tier**
 (`USAGE_DEFAULT_TIER`, normally `light`), forced server-side in
@@ -224,6 +245,16 @@ When switching a live deployment to `billing`, run
 real subscription. (This is the same sharp edge documented in
 [access-control.md](access-control.md).)
 
+The companion is the **trial** cutover: those same long-time accounts would each
+be handed a fresh 30-day trial on their first subscribe (Stripe has never seen a
+trial for them). The `trial_used` migration backfill handles this automatically
+(every account that existed when the column was added is marked ineligible), but
+if you need to (re)assert it explicitly — e.g. accounts created in a window where
+the column already existed — run `scripts/access_keys.py deny-trial --all` (or
+the dashboard's *Deny free trial to everyone*). New signups stay eligible. So the
+full cutover is two commands: `revoke-all` (zero send access) + `deny-trial
+--all` (no free trials for existing accounts).
+
 ## Switching tiers / plans
 
 A tier *is* the Stripe plan, so changing tier means changing the subscription's
@@ -269,6 +300,24 @@ Stripe to skip. In both modes, **granting comp also resets the user's usage
 budget to 100%** (`QuotaStore.reset_full`), so the button doubles as a per-user
 refill; comp gates *send access*, not the daily budget, which still applies after
 the reset (see [usage-limits.md](usage-limits.md)).
+
+## View-only access (skip billing)
+
+A user does **not** have to subscribe to use Aime as a reader. `api_access` gates
+only the cost-incurring routes — `/send`, `/upload`, and the agent/schedule
+*run* endpoints (`api_access_required`). Login, browsing one's own topics and
+conversations, and **viewing anything shared to the account by others** are
+behind `login_required` only, so an account with no subscription already lands in
+the app and can view everything shared with it; just the composer is locked.
+
+The Billing tab makes this explicit rather than leaving a silently-disabled
+composer: alongside *Start your free trial* it offers **Continue without
+subscribing**, with copy that browsing and viewing shared content are free and a
+plan is only needed to chat. The button just closes settings (there's no wall to
+dismiss). The locked composer's placeholder reads *"View-only mode — start a free
+trial …"* (or *"… subscribe …"* for a trial-ineligible account, keyed off
+`/me`'s `billing.trial_eligible`). There is no separate "view-only" account
+state — it's simply `api_access=0`, which the send gate already handles.
 
 ## Account deletion & billing
 
@@ -328,15 +377,19 @@ of record. Plan/payment changes happen in Stripe or the user's own portal.
   `tier_for_stripe_price`, `stripe_configured()`.
 - `src/aime/auth.py` — the `stripe_customer_id` / `stripe_subscription_id` /
   `subscription_status` / `trial_end` columns, `lookup_by_stripe_customer`,
-  `set_stripe_customer`, `set_subscription`, and the `comp_access` flag +
-  `set_comp_access` (sets comp + `api_access` together).
+  `set_stripe_customer`, `set_subscription`, the `comp_access` flag +
+  `set_comp_access` (sets comp + `api_access` together), and the `trial_used`
+  flag (migration backfills pre-existing rows to 1) + `set_trial_used` /
+  `set_trial_used_by_username` / `mark_all_trial_used`.
 - `src/frontends/web_app.py` — `_billing_armed()`, the fail-closed startup
   check, the `/billing/{subscribe,subscribe/confirm,update-card,
   update-card/confirm,change-plan,cancel,resume,portal,summary,webhook}` routes
-  (`subscribe/confirm` enforces one-subscription / one-trial; the inline-manage
-  routes reconcile immediately via `_billing_reconcile_quiet`; the webhook 500s
-  on unexpected errors so Stripe retries), the `/me` billing block,
-  cancel-on-delete, and the recovery resume+reconcile.
+  (`subscribe/confirm` enforces one-subscription / one-trial *and* honors
+  `trial_used`; the inline-manage routes reconcile immediately via
+  `_billing_reconcile_quiet`; the webhook 500s on unexpected errors so Stripe
+  retries), the `/me` billing block (incl. `trial_eligible`), the
+  `api_access_required` gate that leaves view-only access open, cancel-on-delete,
+  and the recovery resume+reconcile.
 - `src/aime/billing.py` helpers — `create_setup_intent` /
   `saved_payment_method` / `create_subscription` (the two-step inline subscribe),
   `create_card_update_intent` / `update_payment_method` (inline card swap),
@@ -344,8 +397,14 @@ of record. Plan/payment changes happen in Stripe or the user's own portal.
   subscribe guards), `cancel_subscriptions` / `resume_subscriptions` (inline
   cancel/resume *and* account delete/recover), `_current_live_subscription`.
 - `resources/style/web_chat.html` — the Billing settings tab (incl. the inline
-  Payment Element + its Appearance theming) and the billing-mode composer-lock
-  copy.
+  Payment Element + its Appearance theming), the trial-vs-subscribe copy
+  (`applyTrialCopy`, off `/me`'s `trial_eligible`), the **Continue without
+  subscribing** (view-only) affordance, and the billing-mode composer-lock copy.
 - `src/frontends/usage_dashboard.py` — the read-only Billing tab, and the
   Accounts-tab **Grant/Remove full access** (comp) control + `/accounts/comp`
-  route (billing mode).
+  route, the **Deny/Allow free trial** per-row control + `/accounts/trial` route,
+  and the **Deny free trial to everyone** bulk + `/accounts/deny-trial-all`
+  (billing mode).
+- `scripts/access_keys.py` — admin CLI: `deny-trial [--all] [<user>]` /
+  `allow-trial <user>` (the trial-eligibility cutover + per-user override),
+  alongside `revoke-all`.
