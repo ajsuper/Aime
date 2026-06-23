@@ -2733,6 +2733,162 @@ def billing_portal():
     return jsonify({"ok": True, "url": url})
 
 
+# --- Inline management (the common Portal actions, rebuilt in-card) ----------
+# The hosted Portal can't be embedded, so these routes back the native Billing-
+# tab controls: update card, switch plan, cancel, resume. Each operates on the
+# customer's single live subscription and reconciles immediately off a live
+# Stripe read (the webhook re-confirms), so /me reflects the change at once
+# without waiting on the webhook. Invoices/receipts/tax stay on /billing/portal.
+
+@app.route("/billing/update-card", methods=["POST"])
+@login_required
+def billing_update_card():
+    """Step 1 of inline card update: a SetupIntent so the browser can collect a
+    replacement card with the Payment Element. No tier — this swaps the card, it
+    doesn't pick a plan. Step 2 (/confirm) sets it as the default."""
+    if not _billing_armed():
+        abort(404)
+    user = _auth_backend.lookup(g.user_id)
+    if user is None or not user.stripe_customer_id:
+        return jsonify({"ok": False,
+                        "message": "No billing account yet — start your free "
+                                   "trial first."}), 400
+    try:
+        intent = _billing.create_card_update_intent(
+            customer_id=user.stripe_customer_id)
+    except Exception:
+        app.logger.warning("billing: card-update setup-intent failed for user %s",
+                            g.user_id, exc_info=True)
+        return jsonify({"ok": False,
+                        "message": "We couldn't start the card update just now. "
+                                   "Please try again in a moment."}), 502
+    return jsonify({"ok": True,
+                    "client_secret": intent["client_secret"],
+                    "publishable_key": aime_config.STRIPE_PUBLISHABLE_KEY})
+
+
+@app.route("/billing/update-card/confirm", methods=["POST"])
+@login_required
+def billing_update_card_confirm():
+    """Step 2 of inline card update: the browser confirmed the SetupIntent, so
+    make that saved card the default on the customer and their subscription. The
+    card belonging to this customer is verified server-side (saved_payment_method
+    inside update_payment_method) — a forged intent id is rejected."""
+    if not _billing_armed():
+        abort(404)
+    data = request.get_json(silent=True) or {}
+    setup_intent_id = (data.get("setup_intent_id") or "").strip()
+    if not setup_intent_id:
+        return jsonify({"ok": False, "message": "Missing card confirmation."}), 400
+    user = _auth_backend.lookup(g.user_id)
+    if user is None or not user.stripe_customer_id:
+        abort(404)
+    try:
+        _billing.update_payment_method(user.stripe_customer_id, setup_intent_id)
+    except ValueError:
+        return jsonify({"ok": False,
+                        "message": "We couldn't confirm your card. "
+                                   "Please try again."}), 400
+    except Exception:
+        app.logger.warning("billing: card update failed for user %s",
+                            g.user_id, exc_info=True)
+        return jsonify({"ok": False,
+                        "message": "We couldn't update your card just now. "
+                                   "Please try again in a moment."}), 502
+    return jsonify({"ok": True})
+
+
+@app.route("/billing/change-plan", methods=["POST"])
+@login_required
+def billing_change_plan():
+    """Switch the user's live subscription to another tier, prorated. The new
+    tier is reconciled immediately off the live Price (never trusted from this
+    request body) so /me reflects it at once; the webhook re-confirms."""
+    if not _billing_armed():
+        abort(404)
+    data = request.get_json(silent=True) or {}
+    tier = (data.get("tier") or "").strip().lower()
+    if tier not in aime_config.USAGE_TIERS:
+        return jsonify({"ok": False, "message": "Pick a plan to continue."}), 400
+    user = _auth_backend.lookup(g.user_id)
+    if user is None or not user.stripe_customer_id:
+        return jsonify({"ok": False,
+                        "message": "No subscription to change — start your free "
+                                   "trial first."}), 400
+    try:
+        _billing.change_plan(user.stripe_customer_id, tier)
+    except ValueError:
+        return jsonify({"ok": False,
+                        "message": "No active subscription to change. "
+                                   "Start a plan first."}), 409
+    except Exception:
+        app.logger.warning("billing: plan change failed for user %s",
+                            g.user_id, exc_info=True)
+        return jsonify({"ok": False,
+                        "message": "We couldn't switch your plan just now. "
+                                   "Please try again in a moment."}), 502
+    _billing_reconcile_quiet(user.stripe_customer_id)
+    return jsonify({"ok": True})
+
+
+@app.route("/billing/cancel", methods=["POST"])
+@login_required
+def billing_cancel():
+    """Schedule the user's subscription to cancel at period end — they keep the
+    access they've paid for through the current period and can resume any time
+    before it lapses. Reversible via /billing/resume."""
+    if not _billing_armed():
+        abort(404)
+    user = _auth_backend.lookup(g.user_id)
+    if user is None or not user.stripe_customer_id:
+        return jsonify({"ok": False,
+                        "message": "No subscription to cancel."}), 400
+    try:
+        _billing.cancel_subscriptions(user.stripe_customer_id)
+    except Exception:
+        app.logger.warning("billing: cancel failed for user %s",
+                            g.user_id, exc_info=True)
+        return jsonify({"ok": False,
+                        "message": "We couldn't cancel just now. "
+                                   "Please try again in a moment."}), 502
+    _billing_reconcile_quiet(user.stripe_customer_id)
+    return jsonify({"ok": True})
+
+
+@app.route("/billing/resume", methods=["POST"])
+@login_required
+def billing_resume():
+    """Undo a pending cancel_at_period_end, keeping the subscription running."""
+    if not _billing_armed():
+        abort(404)
+    user = _auth_backend.lookup(g.user_id)
+    if user is None or not user.stripe_customer_id:
+        return jsonify({"ok": False,
+                        "message": "No subscription to resume."}), 400
+    try:
+        _billing.resume_subscriptions(user.stripe_customer_id)
+    except Exception:
+        app.logger.warning("billing: resume failed for user %s",
+                            g.user_id, exc_info=True)
+        return jsonify({"ok": False,
+                        "message": "We couldn't resume just now. "
+                                   "Please try again in a moment."}), 502
+    _billing_reconcile_quiet(user.stripe_customer_id)
+    return jsonify({"ok": True})
+
+
+def _billing_reconcile_quiet(customer_id: str) -> None:
+    """Reconcile a customer off a live Stripe read so /me reflects a just-made
+    change immediately. Non-fatal: the webhook is the standing authority, so a
+    blip here only delays the persisted-column update, it doesn't lose it."""
+    try:
+        _billing.reconcile_customer(_auth_backend, customer_id)
+    except Exception:
+        app.logger.warning("billing: post-change reconcile failed for customer "
+                            "%s (webhook will catch up)", customer_id,
+                            exc_info=True)
+
+
 @app.route("/billing/summary", methods=["GET"])
 @login_required
 def billing_summary():

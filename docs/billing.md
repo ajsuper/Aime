@@ -6,8 +6,12 @@ payment layer on top of the two columns Aime already gates on — `api_access`
 `open`/`keys` mode; nothing here runs and no Stripe calls are made.
 
 We never touch card data. Every card field is rendered by Stripe — the inline
-**Payment Element** (mounted in Aime's own Billing tab) for subscribing, and the
-hosted **Customer Portal** for managing/cancelling. Access is only ever granted
+**Payment Element** (mounted in Aime's own Billing tab) for subscribing *and*
+for updating a card. The common management actions (switch plan, update card,
+cancel, resume) all run **inline in the Billing tab**; only the long tail —
+invoices, receipts, tax IDs — opens the hosted **Customer Portal** (the "More
+options" link), because Stripe serves the Portal with frame-busting headers and
+won't let it be embedded. Access is only ever granted
 off a **server-side live read of Stripe** — never anything the client asserts —
 so a spoofed return can't unlock an account. The signed **webhook** is the
 standing authority (it reconciles every renewal/cancellation/revocation), and
@@ -52,7 +56,11 @@ signup (billing mode)            account created, api_access=0
                                                                    ▼
                                           POST /billing/webhook (signature-verified)
                                                    └─ reconcile: status→api_access, price→tier
-   Manage / cancel / update card ─► POST /billing/portal ─► Stripe Customer Portal (hosted)
+   Switch plan ──► POST /billing/change-plan ──► Subscription.modify (price, prorated)
+   Update card ──► POST /billing/update-card[/confirm] ──► SetupIntent → default PM
+   Cancel / resume ─► POST /billing/{cancel,resume} ──► cancel_at_period_end on/off
+        (all four reconcile immediately off a live read; the webhook re-confirms)
+   Invoices / receipts / tax ─► POST /billing/portal ─► Stripe Customer Portal (hosted)
 ```
 
 The subscribe flow is **two steps on purpose.** A free-trial subscription
@@ -183,12 +191,14 @@ after the card is entered.
    `whsec_`.)
 4. **Configure the Customer Portal** in the Stripe Dashboard. In **live** mode
    the Portal needs an explicit configuration saved before
-   `billingPortal.sessions.create` works; test mode has a default. Enable
-   **plan switching** between the two Prices (so users can upgrade/downgrade —
-   the webhook reconciles the new Price → tier). Set the branding (logo, colors)
-   there too — the hosted Portal inherits it. (The inline Payment Element is
-   themed separately, from Aime's own CSS variables via Stripe's Appearance
-   API — see the Billing tab JS in `web_chat.html`.)
+   `billingPortal.sessions.create` works; test mode has a default. Aime now
+   drives plan switching, card update, and cancel/resume **inline** (its own
+   routes), so the Portal is only the "More options" fallback for invoices /
+   receipts / tax — but leave **plan switching** enabled there too as a backstop
+   (the webhook reconciles a Portal-side Price change the same way). Set the
+   branding (logo, colors) there — the hosted Portal inherits it. (The inline
+   Payment Element is themed separately, from Aime's own CSS variables via
+   Stripe's Appearance API — see the Billing tab JS in `web_chat.html`.)
 5. **Limit free trials (anti-abuse).** Aime already blocks a *second* trial on
    the same Stripe customer, but a determined user can make a new account with a
    new email + card. Only Stripe can see the card, so close that vector with a
@@ -211,11 +221,16 @@ real subscription. (This is the same sharp edge documented in
 A tier *is* the Stripe plan, so changing tier means changing the subscription's
 Price. There are two paths, by who is driving:
 
-- **A paying user** changes their own plan in the **Stripe Customer Portal**
-  ("Manage billing" in the Billing tab). Enable plan switching between the two
-  Prices in the Portal configuration. The change fires
-  `customer.subscription.updated`; the webhook reconciles the new Price → the new
-  tier. (Stripe handles proration.)
+- **A paying user** changes their own plan **inline** in the Billing tab
+  ("Change plan"), which `POST`s `/billing/change-plan`. The route calls
+  `billing.change_plan` (`Subscription.modify` swapping the item's Price,
+  `proration_behavior="create_prorations"` — Stripe handles the proration; during
+  a trial nothing is charged) and then reconciles immediately so the new tier
+  shows at once. The change also fires `customer.subscription.updated`, which the
+  webhook reconciles the same way — new Price → new tier — so the inline path and
+  the webhook can't disagree. (A Portal-side switch via "More options" works
+  identically.) The new tier is always read off the live Price server-side, never
+  from the request body.
 - **An admin** sets a tier from the dashboard **Accounts** tab. For a **comped**
   or not-yet-subscribed user this is authoritative (no subscription to fight it).
   For a **paying** user a manual tier change is informational only — their next
@@ -308,14 +323,18 @@ of record. Plan/payment changes happen in Stripe or the user's own portal.
   `set_stripe_customer`, `set_subscription`, and the `comp_access` flag +
   `set_comp_access` (sets comp + `api_access` together).
 - `src/frontends/web_app.py` — `_billing_armed()`, the fail-closed startup
-  check, the `/billing/{subscribe,subscribe/confirm,portal,summary,webhook}`
-  routes (`subscribe/confirm` enforces one-subscription / one-trial; the webhook
-  500s on unexpected errors so Stripe retries), the `/me` billing block,
+  check, the `/billing/{subscribe,subscribe/confirm,update-card,
+  update-card/confirm,change-plan,cancel,resume,portal,summary,webhook}` routes
+  (`subscribe/confirm` enforces one-subscription / one-trial; the inline-manage
+  routes reconcile immediately via `_billing_reconcile_quiet`; the webhook 500s
+  on unexpected errors so Stripe retries), the `/me` billing block,
   cancel-on-delete, and the recovery resume+reconcile.
 - `src/aime/billing.py` helpers — `create_setup_intent` /
   `saved_payment_method` / `create_subscription` (the two-step inline subscribe),
-  `subscription_state` (the subscribe guards), `cancel_subscriptions` /
-  `resume_subscriptions` (account delete/recover).
+  `create_card_update_intent` / `update_payment_method` (inline card swap),
+  `change_plan` (inline prorated tier switch), `subscription_state` (the
+  subscribe guards), `cancel_subscriptions` / `resume_subscriptions` (inline
+  cancel/resume *and* account delete/recover), `_current_live_subscription`.
 - `resources/style/web_chat.html` — the Billing settings tab (incl. the inline
   Payment Element + its Appearance theming) and the billing-mode composer-lock
   copy.

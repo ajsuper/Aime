@@ -490,6 +490,82 @@ def test_resume_subscriptions_clears_cancel(monkeypatch, prices):
     assert calls == [("sub_a", {"cancel_at_period_end": False})]
 
 
+# --- inline management: change plan / update card ----------------------------
+
+def _sub_with_item(item_id="si_1", **kw):
+    """_sub plus an id on the subscription item (Stripe items carry an si_… id;
+    change_plan needs it to target the right item when swapping the Price)."""
+    sub = _sub(**kw)
+    sub["items"]["data"][0]["id"] = item_id
+    return sub
+
+
+def test_change_plan_swaps_price_with_proration(monkeypatch, prices):
+    monkeypatch.setattr(billing, "_initialized", True)
+    sub = _sub_with_item(sub_id="sub_a", status="active", price="price_light")
+    monkeypatch.setattr(billing.stripe.Subscription, "list",
+                        lambda **kw: _FakeList([sub]))
+    calls = []
+    monkeypatch.setattr(billing.stripe.Subscription, "modify",
+                        lambda sid, **kw: calls.append((sid, kw)))
+    billing.change_plan("c", "power")
+    assert calls == [("sub_a", {
+        "items": [{"id": "si_1", "price": "price_power"}],
+        "proration_behavior": "create_prorations",
+    })]
+
+
+def test_change_plan_noop_when_already_on_tier(monkeypatch, prices):
+    monkeypatch.setattr(billing, "_initialized", True)
+    sub = _sub_with_item(status="active", price="price_power")
+    monkeypatch.setattr(billing.stripe.Subscription, "list",
+                        lambda **kw: _FakeList([sub]))
+    def boom(*a, **k): raise AssertionError("must not modify when unchanged")
+    monkeypatch.setattr(billing.stripe.Subscription, "modify", boom)
+    billing.change_plan("c", "power")  # price_power → power: no-op, no modify
+
+
+def test_change_plan_no_live_subscription_raises(monkeypatch, prices):
+    monkeypatch.setattr(billing, "_initialized", True)
+    monkeypatch.setattr(billing.stripe.Subscription, "list",
+                        lambda **kw: _FakeList([_sub(status="canceled")]))
+    with pytest.raises(ValueError):
+        billing.change_plan("c", "power")
+
+
+def test_change_plan_unknown_tier_raises(monkeypatch, prices):
+    monkeypatch.setattr(billing, "_initialized", True)
+    with pytest.raises(ValueError):
+        billing.change_plan("c", "nope")
+
+
+def test_update_payment_method_sets_defaults(monkeypatch, prices):
+    monkeypatch.setattr(billing, "_initialized", True)
+    # saved_payment_method resolves the SetupIntent → (pm, tier); stub it.
+    monkeypatch.setattr(billing, "saved_payment_method",
+                        lambda si, cid: ("pm_new", ""))
+    sub = _sub(sub_id="sub_a", status="active")
+    monkeypatch.setattr(billing.stripe.Subscription, "list",
+                        lambda **kw: _FakeList([sub]))
+    cust_calls, sub_calls = [], []
+    monkeypatch.setattr(billing.stripe.Customer, "modify",
+                        lambda cid, **kw: cust_calls.append((cid, kw)))
+    monkeypatch.setattr(billing.stripe.Subscription, "modify",
+                        lambda sid, **kw: sub_calls.append((sid, kw)))
+    billing.update_payment_method("cus_1", "seti_1")
+    assert cust_calls == [("cus_1",
+        {"invoice_settings": {"default_payment_method": "pm_new"}})]
+    assert sub_calls == [("sub_a", {"default_payment_method": "pm_new"})]
+
+
+def test_update_payment_method_rejects_unconfirmed(monkeypatch, prices):
+    monkeypatch.setattr(billing, "_initialized", True)
+    def reject(si, cid): raise ValueError("card not confirmed")
+    monkeypatch.setattr(billing, "saved_payment_method", reject)
+    with pytest.raises(ValueError):
+        billing.update_payment_method("cus_1", "seti_bad")
+
+
 # --- inline subscribe: the two-step Payment Element helpers ------------------
 # create_setup_intent (collect the card) → saved_payment_method (verify the
 # confirmed card is ours) → create_subscription (start it on that card). These
@@ -993,6 +1069,77 @@ def test_account_delete_cancels_subscription():
         "r = c.post('/account/delete')\n"
         "assert r.status_code == 200, r.status_code\n"
         "assert seen.get('cid') == 'cus_1', seen\n"
+        "print('OK')\n",
+    )
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "OK" in proc.stdout
+
+
+def test_change_plan_route_validates_and_reconciles():
+    """A valid tier switches the plan and reconciles immediately; an unknown
+    tier is rejected before any Stripe call."""
+    proc = _run_snippet(
+        _BILLING_ENV,
+        "import frontends.web_app as w\n"
+        "c = w.app.test_client()\n"
+        "c.post('/signup', data={'username':'owner','password':'Sufficiently-long-pw-1','password2':'Sufficiently-long-pw-1'})\n"
+        "uid = w._auth_backend.lookup_by_username('owner').id\n"
+        "w._auth_backend.set_stripe_customer(uid, 'cus_1')\n"
+        "seen = {}\n"
+        "w._billing.change_plan = lambda cid, tier: seen.update(changed=(cid, tier))\n"
+        "w._billing.reconcile_customer = lambda ab, cid: seen.update(reconciled=cid)\n"
+        "r = c.post('/billing/change-plan', json={'tier':'power'})\n"
+        "assert r.status_code == 200, r.status_code\n"
+        "assert seen.get('changed') == ('cus_1','power'), seen\n"
+        "assert seen.get('reconciled') == 'cus_1', seen\n"
+        "seen.clear()\n"
+        "r = c.post('/billing/change-plan', json={'tier':'bogus'})\n"
+        "assert r.status_code == 400, r.status_code\n"
+        "assert 'changed' not in seen, seen\n"
+        "print('OK')\n",
+    )
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "OK" in proc.stdout
+
+
+def test_cancel_and_resume_routes_reconcile():
+    proc = _run_snippet(
+        _BILLING_ENV,
+        "import frontends.web_app as w\n"
+        "c = w.app.test_client()\n"
+        "c.post('/signup', data={'username':'owner','password':'Sufficiently-long-pw-1','password2':'Sufficiently-long-pw-1'})\n"
+        "uid = w._auth_backend.lookup_by_username('owner').id\n"
+        "w._auth_backend.set_stripe_customer(uid, 'cus_1')\n"
+        "seen = {}\n"
+        "w._billing.cancel_subscriptions = lambda cid: seen.update(cancelled=cid) or 1\n"
+        "w._billing.resume_subscriptions = lambda cid: seen.update(resumed=cid) or 1\n"
+        "w._billing.reconcile_customer = lambda ab, cid: seen.setdefault('reconciled', []).append(cid)\n"
+        "assert c.post('/billing/cancel', json={}).status_code == 200\n"
+        "assert c.post('/billing/resume', json={}).status_code == 200\n"
+        "assert seen.get('cancelled') == 'cus_1', seen\n"
+        "assert seen.get('resumed') == 'cus_1', seen\n"
+        "assert seen.get('reconciled') == ['cus_1','cus_1'], seen\n"
+        "print('OK')\n",
+    )
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "OK" in proc.stdout
+
+
+def test_update_card_confirm_rejects_unconfirmed():
+    """A forged/unconfirmed SetupIntent (ValueError from update_payment_method)
+    is a 400, never a silent default-card swap."""
+    proc = _run_snippet(
+        _BILLING_ENV,
+        "import frontends.web_app as w\n"
+        "c = w.app.test_client()\n"
+        "c.post('/signup', data={'username':'owner','password':'Sufficiently-long-pw-1','password2':'Sufficiently-long-pw-1'})\n"
+        "uid = w._auth_backend.lookup_by_username('owner').id\n"
+        "w._auth_backend.set_stripe_customer(uid, 'cus_1')\n"
+        "def boom(cid, si):\n"
+        "    raise ValueError('card has not been confirmed yet')\n"
+        "w._billing.update_payment_method = boom\n"
+        "r = c.post('/billing/update-card/confirm', json={'setup_intent_id':'seti_x'})\n"
+        "assert r.status_code == 400, r.status_code\n"
         "print('OK')\n",
     )
     assert proc.returncode == 0, proc.stderr + proc.stdout

@@ -1,9 +1,12 @@
 """Stripe billing for Aime (AIME_ACCESS_MODE=billing only).
 
 This is the deferred "billing system" the access-control and usage-limit docs
-point at: a thin wrapper around Stripe's hosted Checkout + Customer Portal, plus
-the one seam that matters — ``reconcile_subscription`` — which maps a Stripe
-subscription's live state back onto the two columns Aime already gates on:
+point at: a thin wrapper around Stripe's inline Payment Element (subscribe + card
+update) and the management actions Aime drives itself — switch plan, cancel,
+resume — with the hosted Customer Portal kept only for the long tail (invoices /
+receipts / tax), plus the one seam that matters — ``reconcile_subscription`` —
+which maps a Stripe subscription's live state back onto the two columns Aime
+already gates on:
 
 * ``api_access`` (the send gate) — granted while the subscription is *trialing*
   or *active*, revoked when it is *past_due*/*canceled*/*unpaid*/etc.
@@ -300,6 +303,87 @@ def resume_subscriptions(customer_id: str) -> int:
             stripe.Subscription.modify(_get(s, "id"), cancel_at_period_end=False)
             n += 1
     return n
+
+
+# ---------------------------------------------------------------------------
+# Inline management — the actions the hosted Customer Portal used to own, rebuilt
+# from the same primitives so they run *inside* Aime's Billing tab. The Portal is
+# hosted-only (Stripe blocks framing it), so it can't be embedded the way the
+# subscribe Payment Element is; instead each common action gets its own route +
+# Stripe call here. Invoices/receipts/tax still live on the hosted Portal (the
+# "More options" link). Every action funnels through the same trust boundary as
+# the webhook: tier is always re-derived server-side from the live Price by the
+# reconcile seam, never taken from the client.
+# ---------------------------------------------------------------------------
+
+def _current_live_subscription(customer_id: str):
+    """The customer's single current live subscription (Aime never lets a
+    customer hold two), or None. Used by the inline management actions, which all
+    operate on "the" subscription."""
+    for s in _list_subscriptions(customer_id):
+        if _get(s, "status") in _LIVE_STATUSES:
+            return s
+    return None
+
+
+def create_card_update_intent(customer_id: str) -> dict:
+    """SetupIntent to collect a *replacement* card inline (Payment Element).
+    Like create_setup_intent but carries no tier — this swaps the card on an
+    existing subscription, it doesn't pick a plan. Returns
+    ``{client_secret, setup_intent_id}``."""
+    init_stripe()
+    intent = stripe.SetupIntent.create(
+        customer=customer_id,
+        usage="off_session",
+        automatic_payment_methods={"enabled": True},
+    )
+    return {
+        "client_secret": _get(intent, "client_secret"),
+        "setup_intent_id": _get(intent, "id"),
+    }
+
+
+def update_payment_method(customer_id: str, setup_intent_id: str) -> None:
+    """Make the card just confirmed via SetupIntent the customer's default and
+    the default on their live subscription, so the next charge uses the new card.
+    Reuses ``saved_payment_method`` to verify the intent is ours and succeeded
+    (raises ValueError otherwise — the route turns that into a 400)."""
+    init_stripe()
+    pm, _tier = saved_payment_method(setup_intent_id, customer_id)
+    stripe.Customer.modify(
+        customer_id, invoice_settings={"default_payment_method": pm},
+    )
+    sub = _current_live_subscription(customer_id)
+    if sub is not None:
+        stripe.Subscription.modify(_get(sub, "id"), default_payment_method=pm)
+
+
+def change_plan(customer_id: str, tier: str) -> None:
+    """Switch the customer's live subscription to the Price for ``tier``,
+    prorating the difference (``create_prorations`` — the standard fair behavior:
+    no immediate charge, the credit/debit lands on the next invoice; during a
+    trial nothing is charged at all). A no-op if already on that plan. Raises
+    ValueError if there's no live subscription or no Price for the tier. The new
+    tier takes effect via the reconcile seam (the route reconciles immediately;
+    the customer.subscription.updated webhook re-confirms), always read off the
+    live Price — never the client's request."""
+    init_stripe()
+    price_id = config.stripe_price_for_tier(tier)
+    if not price_id:
+        raise ValueError(f"no Stripe price configured for tier {tier!r}")
+    sub = _current_live_subscription(customer_id)
+    if sub is None:
+        raise ValueError("no live subscription to change")
+    if _price_id(sub) == price_id:
+        return  # already on this plan
+    item = _first_item(sub)
+    if item is None:
+        raise ValueError("subscription has no item to modify")
+    stripe.Subscription.modify(
+        _get(sub, "id"),
+        items=[{"id": _get(item, "id"), "price": price_id}],
+        proration_behavior="create_prorations",
+    )
 
 
 def live_summary(customer_id: str) -> dict:
