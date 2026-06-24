@@ -63,6 +63,7 @@ from aime import auth as _auth  # noqa: E402
 from aime import accounts as _accounts  # noqa: E402
 from aime import quota as _quota  # noqa: E402
 from aime import feedback as _feedback  # noqa: E402
+from aime import errors as _errors  # noqa: E402
 
 app = Flask(__name__)
 
@@ -206,6 +207,20 @@ def _feedback_store() -> _feedback.FeedbackStore:
             os.path.join(_config.DATABASE_DIR, "feedback.sql")
         )
     return _feedback_store_singleton
+
+
+# Lazily-built error/diagnostics store (aime.errors), opened only when the
+# Errors tab renders or an error row is triaged. Written by the per-user web app.
+_error_store_singleton: _errors.ErrorStore | None = None
+
+
+def _error_store() -> _errors.ErrorStore:
+    global _error_store_singleton
+    if _error_store_singleton is None:
+        _error_store_singleton = _errors.ErrorStore(
+            os.path.join(_config.DATABASE_DIR, "errors.sql")
+        )
+    return _error_store_singleton
 
 
 def _log_path() -> str:
@@ -3732,6 +3747,92 @@ _FRAGMENT_FEEDBACK = """
   {% endif %}"""
 
 
+# Errors tab. The server-side companion to Feedback: every error Aime itself hit
+# (a transient Anthropic outage, a malformed request, an unexpected exception),
+# captured automatically with the diagnostic bits that help — exception class,
+# HTTP status, Anthropic request-id, model, the user/session, and a traceback.
+# Identical errors are folded onto one row with a Count so an outage burst stays
+# readable. Triaged like feedback: new → seen → resolved, plus a note. The short
+# `reference` is what the user is shown in chat, so a user report lines up here.
+_FRAGMENT_ERRORS = """
+  <h2 title="Errors Aime hit, captured automatically. Triage them here.">Errors &amp; diagnostics</h2>
+
+  <div class="userfilter" style="margin-bottom: 1rem;">
+    <a class="chipbtn {{ 'active' if not status_filter else '' }}" href="/?{{ qs_all }}">All <span class="note">{{ counts.total }}</span></a>
+    <a class="chipbtn {{ 'active' if status_filter == 'new' else '' }}" href="/?{{ qs_new }}">New <span class="note">{{ counts.new }}</span></a>
+    <a class="chipbtn {{ 'active' if status_filter == 'seen' else '' }}" href="/?{{ qs_seen }}">Seen <span class="note">{{ counts.seen }}</span></a>
+    <a class="chipbtn {{ 'active' if status_filter == 'resolved' else '' }}" href="/?{{ qs_resolved }}">Resolved <span class="note">{{ counts.resolved }}</span></a>
+  </div>
+
+  {% if not errors %}
+    <p class="empty">No {{ status_filter if status_filter else '' }} errors. {% if not status_filter %}Nothing has gone wrong — or nothing has been captured yet.{% endif %}</p>
+  {% else %}
+  <table>
+    <thead>
+      <tr>
+        <th title="Most recent occurrence (UTC).">Last seen</th>
+        <th title="How the error was classified for the user-facing message.">Category</th>
+        <th title="The exception class and, where present, the HTTP status.">Error</th>
+        <th title="Where it was caught in the pipeline.">Source</th>
+        <th title="Anthropic request id — quote this to provider support.">Request id</th>
+        <th title="Model in play for the failed turn.">Model</th>
+        <th title="Account it happened to.">User</th>
+        <th title="How many times this exact error has fired in the dedup window.">Count</th>
+        <th title="The error message, with full traceback inside.">Message</th>
+        <th title="The reference id shown to the user in chat.">Ref</th>
+        <th title="Triage state.">Status</th>
+        <th title="Move the row through its lifecycle and jot a note.">Triage</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for e in errors %}
+      <tr>
+        <td title="{{ e.last_seen }} UTC">{{ e.last_seen }}</td>
+        <td><span class="pill pill-{{ e.category }}">{{ e.category }}</span></td>
+        <td>{{ e.error_class or '(unknown)' }}{% if e.status_code %} <span class="note">{{ e.status_code }}</span>{% endif %}</td>
+        <td>{{ e.source or '' }}</td>
+        <td>{% if e.request_id %}<code>{{ e.request_id }}</code>{% else %}<span class="note">—</span>{% endif %}</td>
+        <td>{{ e.model or '' }}</td>
+        <td>{{ e.username or '(unknown)' }}</td>
+        <td>{% if e.count and e.count > 1 %}<strong>{{ e.count }}×</strong>{% else %}{{ e.count }}{% endif %}</td>
+        <td>
+          <p class="ticket-msg">{{ e.message or '' }}</p>
+          {% if e.traceback %}
+          <details class="ticket-detail">
+            <summary>Traceback</summary>
+            <pre>{{ e.traceback }}</pre>
+          </details>
+          {% endif %}
+        </td>
+        <td><code>{{ e.reference }}</code></td>
+        <td><span class="pill pill-{{ e.status }}">{{ e.status }}</span></td>
+        <td class="actions">
+          <form method="post" action="errors/status" class="inline-action">
+            <input type="hidden" name="csrf" value="{{ csrf }}">
+            <input type="hidden" name="id" value="{{ e.id }}">
+            <input type="hidden" name="status_filter" value="{{ status_filter }}">
+            <select name="status" onchange="this.form.submit()" title="Set the error status.">
+              {% for s in statuses %}
+              <option value="{{ s }}" {{ 'selected' if e.status == s else '' }}>{{ s }}</option>
+              {% endfor %}
+            </select>
+            <noscript><button type="submit">Set</button></noscript>
+          </form>
+          <form method="post" action="errors/note" class="ticket-note">
+            <input type="hidden" name="csrf" value="{{ csrf }}">
+            <input type="hidden" name="id" value="{{ e.id }}">
+            <input type="hidden" name="status_filter" value="{{ status_filter }}">
+            <textarea name="note" rows="1" placeholder="Triage note…">{{ e.admin_note or '' }}</textarea>
+            <button type="submit">Save note</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}"""
+
+
 # Billing tab. In billing mode this shows each subscriber's Stripe status as the
 # webhook last recorded it (read-only — Stripe is the system of record; see
 # aime.billing, docs/billing.md). In keys/open mode it documents the tiers and
@@ -4346,6 +4447,8 @@ _PAGE = """<!doctype html>
       title="Audit log of failed logins, lockouts, and signup throttles.">Security</a>
     <a href="/?{{ qs_feedback }}" class="{{ 'active' if tab == 'feedback' else '' }}"
       title="User-submitted feedback and error reports — a basic ticket queue.">Feedback{% if feedback_open %} <span class="tab-badge">{{ feedback_open }}</span>{% endif %}</a>
+    <a href="/?{{ qs_errors }}" class="{{ 'active' if tab == 'errors' else '' }}"
+      title="Errors Aime captured automatically — transient outages, bad requests, exceptions.">Errors{% if errors_open %} <span class="tab-badge">{{ errors_open }}</span>{% endif %}</a>
   </nav>
 
   {% for f in flashes %}
@@ -5510,7 +5613,7 @@ def _tab(args) -> str:
     return t if t in ("overview", "cache", "activity", "tools", "agents",
                       "trends", "users", "conversations", "routing", "accounts",
                       "keys", "billing", "system", "security",
-                      "feedback") else "users"
+                      "feedback", "errors") else "users"
 
 
 def _render_fragment(ctx, tab) -> str:
@@ -5529,6 +5632,7 @@ def _render_fragment(ctx, tab) -> str:
         "system": _FRAGMENT_SYSTEM,
         "security": _FRAGMENT_SECURITY,
         "feedback": _FRAGMENT_FEEDBACK,
+        "errors": _FRAGMENT_ERRORS,
         "overview": _FRAGMENT_OVERVIEW,
     }.get(tab, _FRAGMENT_USERS)
     return render_template_string(template, **ctx)
@@ -5614,6 +5718,11 @@ def index():
         ctx["csrf"] = csrf
         auto = 0
         page_ctx = empty_page_ctx
+    elif tab == "errors":
+        ctx = _errors_context(request.args)
+        ctx["csrf"] = csrf
+        auto = 0
+        page_ctx = empty_page_ctx
     else:
         ctx = _compute(request.args)
         auto = _refresh_seconds(request.args)
@@ -5652,7 +5761,7 @@ def index():
     qs = {t: urlencode({**keep, "tab": t})
           for t in ("overview", "cache", "activity", "tools", "agents", "trends",
                     "users", "conversations", "routing", "accounts", "keys",
-                    "billing", "system", "security", "feedback")}
+                    "billing", "system", "security", "feedback", "errors")}
 
     # Unresolved-ticket count for the nav badge — shown on every tab. Guarded so
     # a feedback-store hiccup never takes down the whole dashboard.
@@ -5660,11 +5769,17 @@ def index():
         feedback_open = _feedback_store().counts()["unresolved"]
     except Exception:
         feedback_open = 0
+    # Likewise for unresolved (new + seen) captured errors.
+    try:
+        errors_open = _error_store().counts()["unresolved"]
+    except Exception:
+        errors_open = 0
 
     return render_template_string(
         _PAGE, fragment=fragment, tab=tab, auto=auto,
         auto_label=_AUTO_LABELS.get(auto, "second"),
         csrf=csrf, flashes=flashes, feedback_open=feedback_open,
+        errors_open=errors_open,
         qs_overview=qs["overview"], qs_cache=qs["cache"],
         qs_activity=qs["activity"], qs_tools=qs["tools"],
         qs_agents=qs["agents"],
@@ -5673,7 +5788,7 @@ def index():
         qs_routing=qs["routing"],
         qs_accounts=qs["accounts"], qs_keys=qs["keys"], qs_billing=qs["billing"],
         qs_system=qs["system"], qs_security=qs["security"],
-        qs_feedback=qs["feedback"], **page_ctx,
+        qs_feedback=qs["feedback"], qs_errors=qs["errors"], **page_ctx,
     )
 
 
@@ -5694,6 +5809,26 @@ def _feedback_context(args) -> dict:
         "qs_open": urlencode({"tab": "feedback", "status": "open"}),
         "qs_in_progress": urlencode({"tab": "feedback", "status": "in_progress"}),
         "qs_resolved": urlencode({"tab": "feedback", "status": "resolved"}),
+    }
+
+
+def _errors_context(args) -> dict:
+    """Captured errors for the Errors tab, optionally filtered by status, plus
+    the per-status counts for the summary chips."""
+    store = _error_store()
+    status = args.get("status", "")
+    if status not in _errors.STATUSES:
+        status = ""
+    rows = store.list(status or None)
+    return {
+        "errors": rows,
+        "counts": store.counts(),
+        "status_filter": status,
+        "statuses": _errors.STATUSES,
+        "qs_all": urlencode({"tab": "errors"}),
+        "qs_new": urlencode({"tab": "errors", "status": "new"}),
+        "qs_seen": urlencode({"tab": "errors", "status": "seen"}),
+        "qs_resolved": urlencode({"tab": "errors", "status": "resolved"}),
     }
 
 
@@ -6060,6 +6195,48 @@ def feedback_note():
     else:
         _flash("bad", f"No such ticket: #{ticket_id}.")
     return _feedback_redirect()
+
+
+def _errors_redirect():
+    """Back to the Errors tab, preserving the active status filter."""
+    status_filter = (request.form.get("status_filter") or "").strip()
+    args = {"tab": "errors"}
+    if status_filter in _errors.STATUSES:
+        args["status"] = status_filter
+    return redirect(url_for("index", **args))
+
+
+@app.route("/errors/status", methods=["POST"])
+@admin_post
+def errors_status():
+    try:
+        error_id = int(request.form.get("id", ""))
+    except (TypeError, ValueError):
+        _flash("bad", "Bad error id.")
+        return _errors_redirect()
+    status = (request.form.get("status") or "").strip()
+    if _error_store().set_status(error_id, status):
+        _flash("ok", f"Error #{error_id} moved to {status!r}.")
+    else:
+        _flash("bad", f"Couldn't update error #{error_id} "
+                      f"(unknown status or missing row).")
+    return _errors_redirect()
+
+
+@app.route("/errors/note", methods=["POST"])
+@admin_post
+def errors_note():
+    try:
+        error_id = int(request.form.get("id", ""))
+    except (TypeError, ValueError):
+        _flash("bad", "Bad error id.")
+        return _errors_redirect()
+    note = request.form.get("note") or ""
+    if _error_store().set_note(error_id, note):
+        _flash("ok", f"Saved note on error #{error_id}.")
+    else:
+        _flash("bad", f"No such error: #{error_id}.")
+    return _errors_redirect()
 
 
 def main() -> None:

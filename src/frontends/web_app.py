@@ -95,6 +95,7 @@ from aime import topic_shares as _topic_shares
 from aime import quota as _quota
 from aime import billing as _billing
 from aime import feedback as _feedback
+from aime import errors as _errors
 from aime.tool_formatting import TOOL_NAME_MAP
 
 from . import stt as _stt
@@ -143,6 +144,13 @@ _quota_store = _quota.QuotaStore(
 # beside auth.sql; read by the admin dashboard's Feedback tab.
 _feedback_store = _feedback.FeedbackStore(
     os.path.join(aime_config.DATABASE_DIR, "feedback.sql")
+)
+
+# Server-side error/diagnostics capture (aime.errors). Cross-user, root-level
+# beside feedback.sql; written by the per-user backend/controller via the sink
+# below and read by the admin dashboard's Errors tab.
+_error_store = _errors.ErrorStore(
+    os.path.join(aime_config.DATABASE_DIR, "errors.sql")
 )
 
 
@@ -716,6 +724,7 @@ class UserContext:
             ),
             terminal_tool_schema=aime_config.ONBOARDING_TOOL_SCHEMA,
             quota=quota_meter,
+            error_sink=_error_store.capture,
         )
         backend.new_session()
 
@@ -771,6 +780,7 @@ class UserContext:
             reminder_service=reminder_service,
             record_sync=self.record_sync,
             graphic_store_provider=_make_graphic_store_provider(user_id),
+            error_sink=_error_store.capture,
         )
 
         # Seed the session with the user's last-seen zone so any turn that runs

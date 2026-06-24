@@ -5363,11 +5363,11 @@ function onStreamMessage(ev) {
       // info notices are always shown as-is.
       if (e.severity === "error" && verbosity !== "verbose") {
         console.error("Aime notice:", e.text);
-        appendNotice("Aime encountered an issue", "error");
-        offerErrorReport(e.text);
+        appendNotice(errorNoticeText(e), "error");
+        offerErrorReport(e.text, errorReference(e));
       } else {
         appendNotice(e.text, e.severity);
-        if (e.severity === "error") offerErrorReport(e.text);
+        if (e.severity === "error") offerErrorReport(e.text, errorReference(e));
       }
       break;
     case "session_restart":
@@ -5406,9 +5406,9 @@ function onStreamMessage(ev) {
         appendNotice("error: " + e.text, "error");
       } else {
         console.error("Aime error:", e.text);
-        appendNotice("Aime encountered an issue", "error");
+        appendNotice(errorNoticeText(e), "error");
       }
-      offerErrorReport(e.text);
+      offerErrorReport(e.text, errorReference(e));
       break;
   }
 }
@@ -5577,8 +5577,25 @@ feedbackMessage.addEventListener("keydown", (e) => {
 const errorReportPop = document.getElementById("error-report-pop");
 let lastErrorDetail = null;
 let errorPopTimer = null;
-function offerErrorReport(detail) {
-  lastErrorDetail = detail || null;
+// The calm, specific user-facing line for an error event. The backend's error
+// pipeline attaches a `payload` with a classified `user_message` (e.g. "Aime's
+// servers are briefly busy…") and a short `reference` id; we show that when
+// present and otherwise fall back to the generic line. The real error text
+// still goes to the console (and the error report) for debugging.
+function errorNoticeText(e) {
+  const meta = e.payload || {};
+  const base = meta.user_message || "Aime encountered an issue";
+  return meta.reference ? base + " (reference: " + meta.reference + ")" : base;
+}
+function errorReference(e) {
+  return (e.payload || {}).reference || null;
+}
+function offerErrorReport(detail, reference) {
+  // Prefix the captured trace with the reference id so a user's report lines up
+  // with the matching row in the admin Errors tab.
+  lastErrorDetail = (reference ? "Reference: " + reference + "\n\n" : "")
+    + (detail || "");
+  lastErrorDetail = lastErrorDetail || null;
   clearTimeout(errorPopTimer);
   errorReportPop.hidden = false;
   requestAnimationFrame(() => errorReportPop.classList.add("show"));

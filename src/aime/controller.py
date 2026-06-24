@@ -198,8 +198,17 @@ class ConversationController:
         reminder_service=None,
         record_sync=None,
         graphic_store_provider=None,
+        error_sink=None,
     ):
         self._backend = backend
+        # Optional diagnostics capture, called as
+        #   error_sink(exc, source=..., session_id=..., username=..., model=...)
+        # returning {"reference", "category", "user_message"}. Wired by the web
+        # layer to the ErrorStore; None for the TUI / background agents and in
+        # tests, where errors simply surface as before. The backend captures its
+        # own turn failures directly; this covers the controller-level sites
+        # (dispatch, stream loop, tool-result sends).
+        self._error_sink = error_sink
         self._tools = tool_gateway
         self._spawn_worker = worker_spawner
         # Optional graphic-store *provider* (built by the web layer). Given a
@@ -287,6 +296,29 @@ class ConversationController:
         for sub in self._subscribers:
             sub(event)
 
+    def _capture(self, exc: Exception, *, source: str) -> dict | None:
+        """Hand a controller-level exception to the diagnostics sink (when
+        wired), returning its ``{reference, category, user_message}`` meta or
+        None. Best-effort — never raises into the path it's observing."""
+        if self._error_sink is None:
+            return None
+        try:
+            return self._error_sink(
+                exc, source=source,
+                session_id=getattr(self._backend, "session_id", None),
+            )
+        except Exception:
+            return None
+
+    def _emit_error(self, exc: Exception, *, source: str, label: str) -> None:
+        """Capture a controller-level exception and emit its error CoreEvent.
+
+        ``label`` is the developer-facing prefix kept in ``text`` (shown in
+        verbose mode, logged in the console); the calm user-facing line and the
+        reference id ride along in ``payload`` from the sink's classification."""
+        meta = self._capture(exc, source=source)
+        self._emit(CoreEvent(kind="error", text=f"{label}: {exc}", payload=meta))
+
     # --- lifecycle ---
 
     def start(self) -> None:
@@ -328,7 +360,8 @@ class ConversationController:
             ))
             self._is_idle = False
         except Exception as exc:
-            self._emit(CoreEvent(kind="error", text=f"onboarding send failed: {exc}"))
+            self._emit_error(exc, source="onboarding",
+                             label="onboarding send failed")
 
     def _set_terminal_tool(self, active: bool) -> None:
         """Toggle the model-facing terminal tool (CompleteOnboarding in an
@@ -440,7 +473,8 @@ class ConversationController:
             self._is_idle = False
             self._idle_event.clear()
         except Exception as exc:
-            self._emit(CoreEvent(kind="error", text=f"send failed: {exc}"))
+            self._emit_error(exc, source="controller_send",
+                             label="send failed")
 
     def set_client_timezone(self, tz: str) -> None:
         """Forward the client's IANA timezone to the backend so per-turn
@@ -593,7 +627,8 @@ class ConversationController:
                 if event.kind == "session_terminated":
                     return
         except Exception as exc:
-            self._emit(CoreEvent(kind="error", text=f"stream error: {exc}"))
+            self._emit_error(exc, source="controller_stream",
+                             label="stream error")
 
     def _handle_backend_event(self, event: BackendEvent) -> None:
         kind = event.kind
@@ -656,7 +691,11 @@ class ConversationController:
                 kind="notice", severity="recovery", text=event.text or "",
             ))
         elif kind == "error":
-            self._emit(CoreEvent(kind="error", text=event.error or ""))
+            # The backend already captured this turn failure (it held the live
+            # exception); just forward its diagnostics meta so the frontend can
+            # show the calm, specific line + reference. Do not re-capture here.
+            self._emit(CoreEvent(kind="error", text=event.error or "",
+                                 payload=event.error_meta))
 
     def set_messaging_target(self, messenger, recipient: str | None) -> None:
         """Update the outbound-messaging destination for the live session, so a
@@ -720,7 +759,8 @@ class ConversationController:
                     tool_result="Onboarding marked complete. Do not call this tool again.",
                 ))
             except Exception as exc:
-                self._emit(CoreEvent(kind="error", text=f"tool result send failed: {exc}"))
+                self._emit_error(exc, source="tool_result",
+                                 label="tool result send failed")
             return
         # SubmitResult is the terminal tool of a headless background-agent run:
         # the worker calls it once to deliver its result and finish. We surface
@@ -788,7 +828,8 @@ class ConversationController:
                     tool_result=digest,
                 ))
             except Exception as exc:
-                self._emit(CoreEvent(kind="error", text=f"tool result send failed: {exc}"))
+                self._emit_error(exc, source="tool_result",
+                                 label="tool result send failed")
             return
         # SendMessage is a client tool (like WebSearch) handled here rather than
         # forwarded to the data backend: it pushes a short text to the user's
@@ -818,7 +859,8 @@ class ConversationController:
                     tool_result=result_text,
                 ))
             except Exception as exc:
-                self._emit(CoreEvent(kind="error", text=f"tool result send failed: {exc}"))
+                self._emit_error(exc, source="tool_result",
+                                 label="tool result send failed")
             return
         # CreateGraphics is a client tool (like WebSearch / SendMessage): the
         # model supplies a chart/diagram/SVG spec, we validate it and emit it
@@ -852,7 +894,8 @@ class ConversationController:
                     tool_result=digest,
                 ))
             except Exception as exc:
-                self._emit(CoreEvent(kind="error", text=f"tool result send failed: {exc}"))
+                self._emit_error(exc, source="tool_result",
+                                 label="tool result send failed")
             return
         # Event reminders are client tools too: handled in-process against the
         # user's ScheduleStore via the injected ReminderService, never forwarded
@@ -872,7 +915,8 @@ class ConversationController:
                     tool_result=model_text,
                 ))
             except Exception as exc:
-                self._emit(CoreEvent(kind="error", text=f"tool result send failed: {exc}"))
+                self._emit_error(exc, source="tool_result",
+                                 label="tool result send failed")
             return
         # Topic sharing. A per-topic tool whose id is a "<owner>:<topic>" handle
         # addresses a topic in another user's silo, so it's rerouted (after a
@@ -935,7 +979,8 @@ class ConversationController:
                 tool_result=result if model_result is None else model_result,
             ))
         except Exception as exc:
-            self._emit(CoreEvent(kind="error", text=f"tool result send failed: {exc}"))
+            self._emit_error(exc, source="tool_result",
+                             label="tool result send failed")
 
     def _send_tool_result(self, tool_use_id, text: str) -> None:
         """Hand a tool_result back to the model, surfacing a transport failure
@@ -947,7 +992,8 @@ class ConversationController:
                 tool_result=text,
             ))
         except Exception as exc:
-            self._emit(CoreEvent(kind="error", text=f"tool result send failed: {exc}"))
+            self._emit_error(exc, source="tool_result",
+                             label="tool result send failed")
 
     def _handle_create_graphics(self, event: BackendEvent, tool_input: dict) -> None:
         """Client tool: the model supplies a chart/diagram/SVG spec; we validate

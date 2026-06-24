@@ -187,6 +187,11 @@ class BackendEvent:
     expects_response: bool = True
     stop_reason: str | None = None
     error: str | None = None
+    # Structured diagnostics for `error` events, from the error sink:
+    #   {"reference": str|None, "category": str, "user_message": str|None}.
+    # Lets the controller surface a calm, specific line + a reference id without
+    # re-deriving anything. None on non-error events (and when no sink is wired).
+    error_meta: dict | None = None
     # Optional image attachments for user_send_message events. Each entry:
     #   {"media_type": "image/png" | "image/jpeg" | ..., "data": "<base64>"}
     images: list[dict] | None = None
@@ -323,8 +328,14 @@ class AnthropicMessagesBackend:
         persist_enabled: bool = True,
         usage_source: str = "interactive",
         quota=None,
+        error_sink=None,
     ):
         self._client = Anthropic(max_retries=3)
+        # Optional diagnostics capture. Called as
+        #   error_sink(exc, source=..., session_id=..., username=..., model=...)
+        # returning {"reference", "category", "user_message"}. None = no capture
+        # (keeps the backend decoupled from the store and trivially testable).
+        self._error_sink = error_sink
         self._system_prompt = system_prompt
         # `model` is the *default* / fallback. When a router is attached, each
         # turn picks between Haiku and Sonnet; the default is what we fall
@@ -985,7 +996,8 @@ class AnthropicMessagesBackend:
         except Exception as exc:
             if not self._is_malformed_history_error(exc):
                 self._discard_failed_assistant_placeholder()
-                yield BackendEvent(kind="error", error=str(exc))
+                yield BackendEvent(kind="error", error=str(exc),
+                                   error_meta=self._capture_error(exc))
                 yield BackendEvent(kind="turn_end", stop_reason="error")
                 return
             # The API rejected the request itself as malformed. Flatten the
@@ -998,8 +1010,27 @@ class AnthropicMessagesBackend:
             yield from self._run_turn()
         except Exception as exc:
             self._discard_failed_assistant_placeholder()
-            yield BackendEvent(kind="error", error=str(exc))
+            yield BackendEvent(kind="error", error=str(exc),
+                               error_meta=self._capture_error(exc))
             yield BackendEvent(kind="turn_end", stop_reason="error")
+
+    def _capture_error(self, exc: Exception) -> dict | None:
+        """Hand a live turn exception to the diagnostics sink (when wired) and
+        log it. This is the richest capture point — the exception still carries
+        its status_code / Anthropic request_id / traceback here, all of which is
+        lost once it's flattened to the BackendEvent's `error` string. Returns
+        the sink's ``{reference, category, user_message}`` meta, or None."""
+        logger.error("turn failed: %s", exc, exc_info=True)
+        if self._error_sink is None:
+            return None
+        try:
+            return self._error_sink(
+                exc, source="provider_turn", session_id=self._session_id,
+                username=self._usage_label, model=self._current_turn_model,
+            )
+        except Exception:  # never let diagnostics break the error path
+            logger.debug("error sink failed", exc_info=True)
+            return None
 
     @staticmethod
     def _is_malformed_history_error(exc: Exception) -> bool:
