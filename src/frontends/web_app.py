@@ -96,6 +96,7 @@ from aime import quota as _quota
 from aime import billing as _billing
 from aime import feedback as _feedback
 from aime import errors as _errors
+from aime import health as _health
 from aime.tool_formatting import TOOL_NAME_MAP
 
 from . import stt as _stt
@@ -1195,6 +1196,10 @@ _RESET_PAGE_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "resources", "style", "reset_password.html",
 )
+_HEALTH_PAGE_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "resources", "style", "health.html",
+)
 
 
 def _load_page() -> str:
@@ -1212,6 +1217,30 @@ def _load_reset_page(error: str = "", notice: str = "") -> str:
     with open(_RESET_PAGE_PATH) as f:
         html = f.read()
     return html.replace("__ERROR__", _h(error)).replace("__NOTICE__", _h(notice))
+
+
+def _render_health_page(snap: dict) -> str:
+    """Fill the static status page with the server-rendered snapshot so it shows
+    real state with JS disabled; the page's script then polls /health.json to
+    keep it live. Component lookup is by id, so ordering in the snapshot doesn't
+    matter here."""
+    with open(_HEALTH_PAGE_PATH) as f:
+        html = f.read()
+    by_id = {c["id"]: c for c in snap.get("components", [])}
+    aime = by_id.get("aime", {})
+    anthropic = by_id.get("anthropic", {})
+    replacements = {
+        "__OVERALL_STATUS__": snap["overall"]["status"],
+        "__OVERALL_LABEL__": _h(snap["overall"]["label"]),
+        "__AIME_STATUS__": aime.get("status", "unknown"),
+        "__AIME_DETAIL__": _h(aime.get("detail", "")),
+        "__ANTHROPIC_STATUS__": anthropic.get("status", "unknown"),
+        "__ANTHROPIC_DETAIL__": _h(anthropic.get("detail", "")),
+        "__CHECKED__": "Checking…",
+    }
+    for token, value in replacements.items():
+        html = html.replace(token, value)
+    return html
 
 
 # Account creation is gated by AIME_ALLOW_SIGNUP. Default is off ("0") so a
@@ -1531,6 +1560,27 @@ def api_access_required(view):
                 }), 403
         return view(*args, **kwargs)
     return wrapper
+
+
+@app.route("/health")
+def health_page():
+    """Public, unauthenticated service-status page — it's what you reach for
+    when you *can't* get in, so it deliberately needs no session. It stays
+    low-detail on purpose: a status per component and a calm one-line summary,
+    never tracebacks, usernames, or references (those live in the admin Errors
+    tab). Rendered server-side so it's honest with JS off; the page then polls
+    /health.json to stay live."""
+    return Response(
+        _render_health_page(_health.snapshot(_error_store)),
+        mimetype="text/html",
+    )
+
+
+@app.route("/health.json")
+def health_json():
+    """Machine-readable companion to /health: the same snapshot the page polls
+    to refresh in place, and a handy probe for external uptime monitors."""
+    return jsonify(_health.snapshot(_error_store))
 
 
 @app.route("/login", methods=["GET"])

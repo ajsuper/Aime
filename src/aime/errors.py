@@ -263,6 +263,42 @@ class ErrorStore:
         out["unresolved"] = out["new"] + out["seen"]
         return out
 
+    def recent(self, window_hours: int = 24) -> dict:
+        """Aggregate error activity over the last ``window_hours`` for the
+        public health page. Sums each row's ``count`` (so an outage burst that
+        folded onto one signature is counted in full) bucketed by category,
+        alongside the number of distinct signatures and the most recent
+        occurrence.
+
+        Returns ``{'events', 'signatures', 'transient', 'client', 'unknown',
+        'last_seen'}``. Best-effort: a query failure returns a zeroed summary so
+        the health page can never be broken by the very store it reports on.
+        """
+        out = {"events": 0, "signatures": 0, "last_seen": None}
+        for cat in CATEGORIES:
+            out[cat] = 0
+        try:
+            rows = self._conn.execute(
+                "SELECT category, COUNT(*) AS sigs, "
+                "SUM(count) AS events, MAX(last_seen) AS last_seen "
+                "FROM errors WHERE last_seen >= datetime('now', ?) "
+                "GROUP BY category",
+                (f"-{int(window_hours)} hours",),
+            ).fetchall()
+        except Exception:
+            return out
+        for r in rows:
+            cat = r["category"] if r["category"] in CATEGORIES else "unknown"
+            events = r["events"] or 0
+            out["events"] += events
+            out["signatures"] += r["sigs"] or 0
+            out[cat] += events
+            if r["last_seen"] and (
+                out["last_seen"] is None or r["last_seen"] > out["last_seen"]
+            ):
+                out["last_seen"] = r["last_seen"]
+        return out
+
     # -- triage (admin dashboard) -------------------------------------------
 
     def set_status(self, error_id: int, status: str) -> bool:

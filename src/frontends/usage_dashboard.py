@@ -3767,82 +3767,101 @@ _FRAGMENT_ERRORS = """
   {% if not errors %}
     <p class="empty">No {{ status_filter if status_filter else '' }} errors. {% if not status_filter %}Nothing has gone wrong — or nothing has been captured yet.{% endif %}</p>
   {% else %}
-  <table>
+  <p class="note" style="margin: 0 0 .6rem;">Click a row to see the full error and triage it.</p>
+  <table class="err-table">
     <thead>
       <tr>
         <th title="Most recent occurrence (UTC).">Last seen</th>
         <th title="How the error was classified for the user-facing message.">Category</th>
         <th title="The exception class and, where present, the HTTP status.">Error</th>
-        <th title="Where it was caught in the pipeline.">Source</th>
-        <th title="Anthropic request id — quote this to provider support.">Request id</th>
-        <th title="Model in play for the failed turn.">Model</th>
         <th title="Account it happened to.">User</th>
         <th title="How many times this exact error has fired in the dedup window.">Count</th>
-        <th title="The error message, with full traceback inside.">Message</th>
-        <th title="The reference id shown to the user in chat.">Ref</th>
         <th title="Triage state.">Status</th>
-        <th title="Move the row through its lifecycle and jot a note.">Triage</th>
       </tr>
     </thead>
     <tbody>
       {% for e in errors %}
-      <tr>
+      <tr class="err-row" tabindex="0" role="button"
+        title="Click to open this error."
+        data-id="{{ e.id }}"
+        data-title="{{ e.error_class or 'Error' }}{% if e.status_code %} · {{ e.status_code }}{% endif %}"
+        data-last-seen="{{ e.last_seen }} UTC"
+        data-category="{{ e.category }}"
+        data-source="{{ e.source or '—' }}"
+        data-request-id="{{ e.request_id or '—' }}"
+        data-model="{{ e.model or '—' }}"
+        data-username="{{ e.username or '(unknown)' }}"
+        data-count="{{ e.count }}"
+        data-reference="{{ e.reference }}"
+        data-status="{{ e.status }}"
+        data-message="{{ e.message or '(no message)' }}"
+        data-traceback="{{ e.traceback or '' }}"
+        data-note="{{ e.admin_note or '' }}">
         <td title="{{ e.last_seen }} UTC">{{ e.last_seen }}</td>
         <td><span class="pill pill-{{ e.category }}">{{ e.category }}</span></td>
         <td>{{ e.error_class or '(unknown)' }}{% if e.status_code %} <span class="note">{{ e.status_code }}</span>{% endif %}</td>
-        <td>{{ e.source or '' }}</td>
-        <td>{% if e.request_id %}<code>{{ e.request_id }}</code>{% else %}<span class="note">—</span>{% endif %}</td>
-        <td>{{ e.model or '' }}</td>
         <td>{{ e.username or '(unknown)' }}</td>
         <td>{% if e.count and e.count > 1 %}<strong>{{ e.count }}×</strong>{% else %}{{ e.count }}{% endif %}</td>
-        <td>
-          <button type="button" class="err-open"
-            data-title="{{ e.error_class or 'Error' }}{% if e.status_code %} · {{ e.status_code }}{% endif %} · ref {{ e.reference }}"
-            data-message="{{ e.message or '(no message)' }}"
-            data-traceback="{{ e.traceback or '' }}"
-            title="Click to see the full message and traceback.">{{ (e.message or '(no message)')|truncate(80, True) }}</button>
-        </td>
-        <td><code>{{ e.reference }}</code></td>
         <td><span class="pill pill-{{ e.status }}">{{ e.status }}</span></td>
-        <td class="actions">
-          <form method="post" action="errors/status" class="inline-action">
-            <input type="hidden" name="csrf" value="{{ csrf }}">
-            <input type="hidden" name="id" value="{{ e.id }}">
-            <input type="hidden" name="status_filter" value="{{ status_filter }}">
-            <select name="status" onchange="this.form.submit()" title="Set the error status.">
-              {% for s in statuses %}
-              <option value="{{ s }}" {{ 'selected' if e.status == s else '' }}>{{ s }}</option>
-              {% endfor %}
-            </select>
-            <noscript><button type="submit">Set</button></noscript>
-          </form>
-          <form method="post" action="errors/note" class="ticket-note">
-            <input type="hidden" name="csrf" value="{{ csrf }}">
-            <input type="hidden" name="id" value="{{ e.id }}">
-            <input type="hidden" name="status_filter" value="{{ status_filter }}">
-            <textarea name="note" rows="1" placeholder="Triage note…">{{ e.admin_note or '' }}</textarea>
-            <button type="submit">Save note</button>
-          </form>
-        </td>
       </tr>
       {% endfor %}
     </tbody>
   </table>
 
-  <!-- One shared card the row previews open, populated from the clicked
-       button's data-* via textContent (no innerHTML, so message/traceback
-       text can't inject markup). Admin tabs render server-side on load, so
-       this inline script runs; the tab never polls /fragment. -->
+  <!-- One shared card the rows open, populated from the clicked row's data-*
+       via textContent (no innerHTML, so message/traceback/user-derived text
+       can't inject markup). The status + note forms POST as before; their
+       hidden id and current values are filled in when the card opens. Admin
+       tabs render server-side on load, so this inline script runs; the tab
+       never polls /fragment. -->
   <div id="err-modal" class="err-modal" hidden>
     <div class="err-card" role="dialog" aria-modal="true" aria-labelledby="err-card-title">
       <div class="err-card-head">
         <strong id="err-card-title"></strong>
         <button type="button" class="err-close" aria-label="Close">&times;</button>
       </div>
+
+      <dl class="err-meta">
+        <div><dt>Last seen</dt><dd id="err-card-last-seen"></dd></div>
+        <div><dt>Category</dt><dd id="err-card-category"></dd></div>
+        <div><dt>Status</dt><dd id="err-card-statusval"></dd></div>
+        <div><dt>User</dt><dd id="err-card-username"></dd></div>
+        <div><dt>Source</dt><dd id="err-card-source"></dd></div>
+        <div><dt>Model</dt><dd id="err-card-model"></dd></div>
+        <div><dt>Count</dt><dd id="err-card-count"></dd></div>
+        <div><dt>Reference</dt><dd><code id="err-card-reference"></code></dd></div>
+        <div><dt>Request id</dt><dd><code id="err-card-request-id"></code></dd></div>
+      </dl>
+
       <h4>Message</h4>
       <pre id="err-card-message"></pre>
       <h4 id="err-card-tb-head">Traceback</h4>
       <pre id="err-card-tb"></pre>
+
+      <div class="err-triage">
+        <form method="post" action="errors/status" class="err-triage-status">
+          <input type="hidden" name="csrf" value="{{ csrf }}">
+          <input type="hidden" name="id" id="err-status-id" value="">
+          <input type="hidden" name="status_filter" value="{{ status_filter }}">
+          <label>Status
+            <select name="status" id="err-status-select" onchange="this.form.submit()" title="Set the error status.">
+              {% for s in statuses %}
+              <option value="{{ s }}">{{ s }}</option>
+              {% endfor %}
+            </select>
+          </label>
+          <noscript><button type="submit">Set</button></noscript>
+        </form>
+        <form method="post" action="errors/note" class="err-triage-note">
+          <input type="hidden" name="csrf" value="{{ csrf }}">
+          <input type="hidden" name="id" id="err-note-id" value="">
+          <input type="hidden" name="status_filter" value="{{ status_filter }}">
+          <label>Triage note
+            <textarea name="note" id="err-note-text" rows="5" placeholder="Jot a triage note…"></textarea>
+          </label>
+          <button type="submit">Save note</button>
+        </form>
+      </div>
     </div>
   </div>
   <script>
@@ -3850,26 +3869,41 @@ _FRAGMENT_ERRORS = """
     var modal = document.getElementById("err-modal");
     if (!modal || modal._wired) return;
     modal._wired = true;
-    var title = document.getElementById("err-card-title");
-    var msg = document.getElementById("err-card-message");
-    var tb = document.getElementById("err-card-tb");
-    var tbHead = document.getElementById("err-card-tb-head");
-    function openCard(btn) {
-      title.textContent = btn.getAttribute("data-title") || "Error";
-      msg.textContent = btn.getAttribute("data-message") || "(no message)";
-      var t = btn.getAttribute("data-traceback") || "";
-      tb.textContent = t;
-      tb.hidden = !t;
-      tbHead.hidden = !t;
+    function set(id, val) { document.getElementById(id).textContent = val || ""; }
+    var statuses = {{ statuses|tojson }};
+    function openCard(row) {
+      var d = row.dataset;
+      set("err-card-title", d.title + " · ref " + d.reference);
+      set("err-card-last-seen", d.lastSeen);
+      set("err-card-category", d.category);
+      set("err-card-statusval", d.status);
+      set("err-card-username", d.username);
+      set("err-card-source", d.source);
+      set("err-card-model", d.model);
+      set("err-card-count", d.count);
+      set("err-card-reference", d.reference);
+      set("err-card-request-id", d.requestId);
+      set("err-card-message", d.message || "(no message)");
+      var tb = document.getElementById("err-card-tb");
+      tb.textContent = d.traceback || "";
+      tb.hidden = !d.traceback;
+      document.getElementById("err-card-tb-head").hidden = !d.traceback;
+      document.getElementById("err-status-id").value = d.id;
+      var sel = document.getElementById("err-status-select");
+      sel.value = statuses.indexOf(d.status) >= 0 ? d.status : statuses[0];
+      document.getElementById("err-note-id").value = d.id;
+      document.getElementById("err-note-text").value = d.note || "";
       modal.hidden = false;
     }
     function closeCard() { modal.hidden = true; }
     document.addEventListener("click", function (e) {
-      var btn = e.target.closest(".err-open");
-      if (btn) { openCard(btn); return; }
+      var row = e.target.closest(".err-row");
+      if (row) { openCard(row); return; }
       if (e.target === modal || e.target.closest(".err-close")) closeCard();
     });
     document.addEventListener("keydown", function (e) {
+      var row = e.target.closest && e.target.closest(".err-row");
+      if (row && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); openCard(row); return; }
       if (e.key === "Escape" && !modal.hidden) closeCard();
     });
   })();
@@ -4230,11 +4264,29 @@ _PAGE = """<!doctype html>
       font-size: .78rem; }
     .ticket-note textarea { width: 100%; box-sizing: border-box; min-height: 2.2rem;
       font: inherit; font-size: .82rem; }
-    /* Errors tab: clickable one-line message preview that opens a card. */
-    .err-open { display: block; max-width: 44ch; text-align: left; cursor: pointer;
-      background: none; border: none; padding: 0; font: inherit; color: #2f6fd0;
-      white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .err-open:hover { text-decoration: underline; }
+    /* Errors tab: each table row opens the shared error card. */
+    .err-table { width: 100%; }
+    .err-row { cursor: pointer; }
+    .err-row:hover td { background: #8881; }
+    .err-row:focus-visible { outline: 2px solid #2f6fd0; outline-offset: -2px; }
+    /* Two-column meta grid inside the error card. */
+    .err-meta { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: .35rem 1.2rem; margin: .4rem 0 0; }
+    .err-meta div { display: flex; gap: .5rem; min-width: 0; }
+    .err-meta dt { flex: 0 0 6.5rem; margin: 0; color: #888; font-size: .78rem;
+      text-transform: uppercase; letter-spacing: .04em; }
+    .err-meta dd { margin: 0; font-size: .85rem; word-break: break-word; min-width: 0; }
+    .err-meta code { word-break: break-all; }
+    /* Status + note controls live in the card, stacked under the detail. */
+    .err-triage { margin-top: 1rem; border-top: 1px solid #8883; padding-top: .9rem;
+      display: flex; flex-direction: column; gap: .9rem; }
+    .err-triage label { display: flex; flex-direction: column; gap: .3rem;
+      font-size: .78rem; color: #888; text-transform: uppercase; letter-spacing: .04em; }
+    .err-triage select { font: inherit; font-size: .9rem; padding: .25rem .4rem;
+      max-width: 12rem; }
+    .err-triage textarea { width: 100%; box-sizing: border-box; font: inherit;
+      font-size: .88rem; min-height: 5rem; resize: vertical; padding: .5rem .6rem; }
+    .err-triage button { align-self: flex-start; }
     .err-modal { position: fixed; inset: 0; z-index: 1000; padding: 1.2rem;
       display: flex; align-items: center; justify-content: center;
       background: #0008; }
