@@ -3796,13 +3796,11 @@ _FRAGMENT_ERRORS = """
         <td>{{ e.username or '(unknown)' }}</td>
         <td>{% if e.count and e.count > 1 %}<strong>{{ e.count }}×</strong>{% else %}{{ e.count }}{% endif %}</td>
         <td>
-          <p class="ticket-msg">{{ e.message or '' }}</p>
-          {% if e.traceback %}
-          <details class="ticket-detail">
-            <summary>Traceback</summary>
-            <pre>{{ e.traceback }}</pre>
-          </details>
-          {% endif %}
+          <button type="button" class="err-open"
+            data-title="{{ e.error_class or 'Error' }}{% if e.status_code %} · {{ e.status_code }}{% endif %} · ref {{ e.reference }}"
+            data-message="{{ e.message or '(no message)' }}"
+            data-traceback="{{ e.traceback or '' }}"
+            title="Click to see the full message and traceback.">{{ (e.message or '(no message)')|truncate(80, True) }}</button>
         </td>
         <td><code>{{ e.reference }}</code></td>
         <td><span class="pill pill-{{ e.status }}">{{ e.status }}</span></td>
@@ -3830,6 +3828,52 @@ _FRAGMENT_ERRORS = """
       {% endfor %}
     </tbody>
   </table>
+
+  <!-- One shared card the row previews open, populated from the clicked
+       button's data-* via textContent (no innerHTML, so message/traceback
+       text can't inject markup). Admin tabs render server-side on load, so
+       this inline script runs; the tab never polls /fragment. -->
+  <div id="err-modal" class="err-modal" hidden>
+    <div class="err-card" role="dialog" aria-modal="true" aria-labelledby="err-card-title">
+      <div class="err-card-head">
+        <strong id="err-card-title"></strong>
+        <button type="button" class="err-close" aria-label="Close">&times;</button>
+      </div>
+      <h4>Message</h4>
+      <pre id="err-card-message"></pre>
+      <h4 id="err-card-tb-head">Traceback</h4>
+      <pre id="err-card-tb"></pre>
+    </div>
+  </div>
+  <script>
+  (function () {
+    var modal = document.getElementById("err-modal");
+    if (!modal || modal._wired) return;
+    modal._wired = true;
+    var title = document.getElementById("err-card-title");
+    var msg = document.getElementById("err-card-message");
+    var tb = document.getElementById("err-card-tb");
+    var tbHead = document.getElementById("err-card-tb-head");
+    function openCard(btn) {
+      title.textContent = btn.getAttribute("data-title") || "Error";
+      msg.textContent = btn.getAttribute("data-message") || "(no message)";
+      var t = btn.getAttribute("data-traceback") || "";
+      tb.textContent = t;
+      tb.hidden = !t;
+      tbHead.hidden = !t;
+      modal.hidden = false;
+    }
+    function closeCard() { modal.hidden = true; }
+    document.addEventListener("click", function (e) {
+      var btn = e.target.closest(".err-open");
+      if (btn) { openCard(btn); return; }
+      if (e.target === modal || e.target.closest(".err-close")) closeCard();
+    });
+    document.addEventListener("keydown", function (e) {
+      if (e.key === "Escape" && !modal.hidden) closeCard();
+    });
+  })();
+  </script>
   {% endif %}"""
 
 
@@ -4186,6 +4230,30 @@ _PAGE = """<!doctype html>
       font-size: .78rem; }
     .ticket-note textarea { width: 100%; box-sizing: border-box; min-height: 2.2rem;
       font: inherit; font-size: .82rem; }
+    /* Errors tab: clickable one-line message preview that opens a card. */
+    .err-open { display: block; max-width: 44ch; text-align: left; cursor: pointer;
+      background: none; border: none; padding: 0; font: inherit; color: #2f6fd0;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .err-open:hover { text-decoration: underline; }
+    .err-modal { position: fixed; inset: 0; z-index: 1000; padding: 1.2rem;
+      display: flex; align-items: center; justify-content: center;
+      background: #0008; }
+    .err-modal[hidden] { display: none; }
+    .err-card { background: Canvas; color: CanvasText; border: 1px solid #8886;
+      border-radius: 10px; width: 100%; max-width: 800px; max-height: 84vh;
+      overflow: auto; padding: 1rem 1.2rem; box-shadow: 0 12px 40px #0007;
+      text-align: left; }
+    .err-card-head { display: flex; align-items: center; justify-content: space-between;
+      gap: 1rem; margin-bottom: .3rem; }
+    .err-card-head strong { font-size: .95rem; word-break: break-word; }
+    .err-card h4 { margin: .9rem 0 .25rem; font-size: .72rem; color: #888;
+      text-transform: uppercase; letter-spacing: .05em; }
+    .err-card pre { white-space: pre-wrap; word-break: break-word; margin: 0;
+      background: #8881; border: 1px solid #8883; border-radius: 6px;
+      padding: .6rem .7rem; font-size: .8rem; }
+    .err-close { background: none; border: none; color: #888; cursor: pointer;
+      font-size: 1.5rem; line-height: 1; padding: 0 .2rem; }
+    .err-close:hover { color: inherit; }
 
     /* Used by the session-detail timeline to soften the tool-record rows. */
     tr.dim td { color: #888; }
