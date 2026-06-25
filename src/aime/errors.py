@@ -36,17 +36,43 @@ import traceback as _tb
 # badge counts everything not yet ``resolved``. Order here is dashboard order.
 STATUSES = ("new", "seen", "resolved")
 
-# How a captured error is bucketed for the user-facing message (see `classify`).
-CATEGORIES = ("transient", "client", "unknown")
+# How a captured error is bucketed — both for the user-facing message (see
+# `classify`) and for the public health page's at-a-glance breakdown. Ordered
+# least-to-most "Aime's fault"; only the last two (``auth``, ``unknown``) point
+# at us rather than the provider or the request, so only those move the
+# service-health dial (see aime.health). Each means, roughly:
+#
+#   transient   provider briefly busy / a temporary blip — retry and it passes
+#               (5xx incl. 529 overloaded, timeouts, dropped connections).
+#   rate_limit  a usage/rate ceiling was hit (429) — a momentary pause, not a
+#               fault; eases on its own.
+#   input       the *request* couldn't be processed — a too-large or unsupported
+#               attachment, a malformed message (400/413/422). Consistent and
+#               explainable; the user can adjust and retry. This is where an
+#               oversized picture the API rejects lands — NOT ``unknown``.
+#   auth        a credential/permission problem reaching the model (401/403).
+#               Operator-side and usually total, so it counts as a service fault.
+#   unknown     a genuinely unexpected internal error (a bug, an exception we
+#               didn't anticipate). The only "something's broken in Aime" bucket.
+CATEGORIES = ("transient", "rate_limit", "input", "auth", "unknown")
+
+# Categories an earlier version wrote, mapped to their current name so the
+# health page buckets historical rows correctly during/after the rename.
+_LEGACY_CATEGORY_ALIASES = {"client": "input"}
 
 # Recurrences of the same signature within this window fold onto one row rather
 # than inserting a fresh one. Long enough to collapse an outage burst, short
 # enough that a genuinely new flare-up after a quiet spell starts a new row.
 _DEDUP_WINDOW = "-1 hour"
 
-# Anthropic HTTP statuses we treat as transient (retryable on the provider side):
-# request timeout, conflict, rate limit, and the 5xx family incl. 529 overloaded.
-_TRANSIENT_STATUS = frozenset({408, 409, 429, 500, 502, 503, 504, 529})
+# HTTP statuses per bucket. Transient: request timeout, conflict, and the 5xx
+# family incl. 529 overloaded. Rate limit, input (bad/too-large/unprocessable
+# request) and auth (unauthenticated/forbidden) are split out so the breakdown
+# tells the user *which* kind of problem they're seeing.
+_TRANSIENT_STATUS = frozenset({408, 409, 500, 502, 503, 504, 529})
+_RATE_LIMIT_STATUS = frozenset({429})
+_INPUT_STATUS = frozenset({400, 413, 422})
+_AUTH_STATUS = frozenset({401, 403})
 
 # Defensive caps so one capture can't bloat the store.
 _MAX_MESSAGE = 4000
@@ -57,7 +83,12 @@ _MAX_TRACEBACK = 8000
 # ``None`` means "no better line than the frontend's existing generic one".
 _MSG_TRANSIENT = ("Aime's servers are briefly busy — give it a moment and try "
                   "again.")
-_MSG_CLIENT = "Aime couldn't process that message."
+_MSG_RATE_LIMIT = ("Aime has hit its rate limit for the moment — give it a "
+                   "minute and try again.")
+_MSG_INPUT = ("Aime couldn't process that — the message or file may be too "
+              "large or in a format it can't read.")
+_MSG_AUTH = ("Aime is having trouble reaching its service right now. Please "
+             "try again shortly.")
 _MSG_GENERIC: str | None = None
 
 
@@ -75,10 +106,13 @@ try:  # pragma: no cover - exercised only when the SDK is present
         RateLimitError,
         InternalServerError,
         BadRequestError,
+        AuthenticationError,
+        PermissionDeniedError,
     )
 except Exception:  # pragma: no cover - SDK absent or changed shape
     APIStatusError = APIConnectionError = APITimeoutError = _Never
     RateLimitError = InternalServerError = BadRequestError = _Never
+    AuthenticationError = PermissionDeniedError = _Never
 
 
 def _clamp(text: str | None, limit: int) -> str | None:
@@ -90,22 +124,36 @@ def _clamp(text: str | None, limit: int) -> str | None:
     return text[:limit]
 
 
+def _status_of(exc: BaseException) -> int | None:
+    """The HTTP status carried by an exception, from the Anthropic SDK's
+    ``status_code`` or a Werkzeug ``HTTPException.code`` (so a Flask-side 413
+    "request too large" is classified as ``input``, not ``unknown``)."""
+    status = getattr(exc, "status_code", None)
+    if not isinstance(status, int):
+        status = getattr(exc, "code", None)
+    return status if isinstance(status, int) else None
+
+
 def classify(exc: BaseException) -> tuple[str, str | None]:
     """Bucket an exception into a ``(category, user_message)`` pair.
 
     ``category`` is one of :data:`CATEGORIES`; ``user_message`` is the calm line
     to show the user, or ``None`` to keep the frontend's existing generic one.
+    Checked most-specific first: a ``RateLimitError`` (a subclass of
+    ``APIStatusError``) is a rate limit, not a generic transient blip, and an
+    auth failure is distinct from a plain bad request.
     """
-    status = getattr(exc, "status_code", None)
-    if isinstance(exc, (RateLimitError, InternalServerError,
-                        APIConnectionError, APITimeoutError)):
+    status = _status_of(exc)
+    if isinstance(exc, RateLimitError) or status in _RATE_LIMIT_STATUS:
+        return "rate_limit", _MSG_RATE_LIMIT
+    if isinstance(exc, (InternalServerError, APIConnectionError,
+                        APITimeoutError)) or status in _TRANSIENT_STATUS:
         return "transient", _MSG_TRANSIENT
-    if isinstance(exc, APIStatusError) and status in _TRANSIENT_STATUS:
-        return "transient", _MSG_TRANSIENT
-    if status in _TRANSIENT_STATUS:
-        return "transient", _MSG_TRANSIENT
-    if isinstance(exc, BadRequestError) or status == 400:
-        return "client", _MSG_CLIENT
+    if isinstance(exc, (AuthenticationError, PermissionDeniedError)) \
+            or status in _AUTH_STATUS:
+        return "auth", _MSG_AUTH
+    if isinstance(exc, BadRequestError) or status in _INPUT_STATUS:
+        return "input", _MSG_INPUT
     return "unknown", _MSG_GENERIC
 
 
@@ -175,9 +223,7 @@ class ErrorStore:
         """
         category, user_message = classify(exc)
         error_class = type(exc).__name__
-        status_code = getattr(exc, "status_code", None)
-        if not isinstance(status_code, int):
-            status_code = None
+        status_code = _status_of(exc)
         request_id = getattr(exc, "request_id", None)
         message = _clamp(str(exc), _MAX_MESSAGE)
         tb = _clamp(
@@ -288,7 +334,9 @@ class ErrorStore:
         except Exception:
             return out
         for r in rows:
-            cat = r["category"] if r["category"] in CATEGORIES else "unknown"
+            cat = _LEGACY_CATEGORY_ALIASES.get(r["category"], r["category"])
+            if cat not in CATEGORIES:
+                cat = "unknown"
             events = r["events"] or 0
             out["events"] += events
             out["signatures"] += r["sigs"] or 0

@@ -56,9 +56,41 @@ _ANTHROPIC_MAP = {
     "maintenance": "degraded",
 }
 
-# Unexpected-error thresholds (last hour) that move the Aime-service dial.
-_DEGRADED_AT = 1     # any unexpected error in the last hour -> degraded
+# Error categories that count as an Aime-service *fault* (something broken on
+# our side), as opposed to provider blips or request problems. Only these move
+# the service dial; the rest are reported for context but don't degrade us.
+_FAULT_CATEGORIES = ("unknown", "auth")
+
+# Service-fault thresholds (last hour) that move the Aime-service dial.
+_DEGRADED_AT = 1     # any service fault in the last hour -> degraded
 _OUTAGE_AT = 25      # a sustained flood -> call it a disruption
+
+# Human label per error category, for the at-a-glance breakdown. Singular form;
+# pluralised on use. Order here is the order they're listed in (most to least
+# pointed at us), so the line leads with what matters most.
+_CATEGORY_LABEL = {
+    "unknown": "unexpected error",
+    "auth": "service-auth issue",
+    "input": "input issue",
+    "rate_limit": "rate-limit pause",
+    "transient": "provider hiccup",
+}
+
+
+def _plural(noun: str, n: int) -> str:
+    return noun if n == 1 else (noun[:-1] + "ies" if noun.endswith("y")
+                                else noun + "s")
+
+
+def _breakdown(window: dict) -> list[str]:
+    """Human "N thing" fragments for every non-zero category in ``window``,
+    ordered by :data:`_CATEGORY_LABEL` (most pointed-at-us first)."""
+    parts = []
+    for cat, label in _CATEGORY_LABEL.items():
+        n = window.get(cat, 0)
+        if n:
+            parts.append(f"{n} {_plural(label, n)}")
+    return parts
 
 
 def _worst(statuses: list[str]) -> str:
@@ -127,36 +159,51 @@ def anthropic_component() -> dict:
 # ---------------------------------------------------------------------------
 
 def aime_component(error_store) -> dict:
-    """The Aime-service component, derived from recent *unexpected* errors.
+    """The Aime-service component, derived from recently captured errors.
+
+    The *status* tracks only genuine service faults (:data:`_FAULT_CATEGORIES`)
+    — unexpected internal errors and auth failures — so provider blips or a user
+    sending an oversized attachment never make Aime itself look broken. The
+    *detail* line, though, breaks down everything seen in the last hour by
+    category, so the page explains what's actually happening even when the
+    service is fine. A ``breakdown`` field carries the raw counts for machine
+    consumers.
 
     ``error_store`` is an :class:`aime.errors.ErrorStore` (or anything with the
     same ``recent`` shape). Passing ``None`` yields an honest "unknown".
     """
+    base = {"id": "aime", "name": "Aime service"}
     if error_store is None:
-        return {"id": "aime", "name": "Aime service", "status": "unknown",
-                "detail": "Diagnostics unavailable."}
+        return {**base, "status": "unknown",
+                "detail": "Diagnostics unavailable.", "breakdown": {}}
     try:
         hour = error_store.recent(1)
         day = error_store.recent(24)
     except Exception:
-        return {"id": "aime", "name": "Aime service", "status": "unknown",
-                "detail": "Diagnostics unavailable."}
+        return {**base, "status": "unknown",
+                "detail": "Diagnostics unavailable.", "breakdown": {}}
 
-    faults = hour.get("unknown", 0)
+    faults = sum(hour.get(c, 0) for c in _FAULT_CATEGORIES)
+    parts = _breakdown(hour)
     if faults >= _OUTAGE_AT:
-        status, detail = "outage", "Many unexpected errors in the last hour."
+        status = "outage"
+        detail = "Many errors in the last hour — " + ", ".join(parts) + "."
     elif faults >= _DEGRADED_AT:
-        noun = "error" if faults == 1 else "errors"
         status = "degraded"
-        detail = f"{faults} unexpected {noun} in the last hour."
-    elif day.get("unknown", 0):
+        detail = "Last hour: " + ", ".join(parts) + "."
+    elif parts:
+        # No service fault, but other (provider/request) errors are happening —
+        # name them so the user knows it's not a problem on Aime's end.
+        status = "operational"
+        detail = "Working normally. Last hour: " + ", ".join(parts) + "."
+    elif any(day.get(c, 0) for c in _FAULT_CATEGORIES):
         status = "operational"
         detail = "Recovered — no errors in the last hour."
     else:
         status = "operational"
         detail = "Operating normally."
-    return {"id": "aime", "name": "Aime service",
-            "status": status, "detail": detail}
+    breakdown = {c: hour.get(c, 0) for c in _CATEGORY_LABEL if hour.get(c, 0)}
+    return {**base, "status": status, "detail": detail, "breakdown": breakdown}
 
 
 # ---------------------------------------------------------------------------
