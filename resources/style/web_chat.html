@@ -2268,6 +2268,15 @@
       .composer-row { gap: 0.4rem; }
       .msg.user { max-width: 88%; }
 
+      /* Source chips keep their rounded-pill look but shrink to claim less of
+         the narrow column — tighter padding, smaller text/favicon, a shorter
+         title clamp so two pills sit comfortably on one row. */
+      .msg.sources { gap: 0.3rem; font-size: 0.72rem; }
+      .sources-label { font-size: 0.64rem; }
+      .source-chip { max-width: 160px; padding: 0.16rem 0.5rem; gap: 0.3rem; }
+      .source-fav { width: 12px; height: 12px; }
+      .source-more { padding: 0.16rem 0.5rem; }
+
       /* Composer stacks into two rows: the controls (settings, toggles,
          new-chat) on top, the input pill full-width below. `order` pushes
          the input last and a 100% basis forces it onto its own line. */
@@ -2987,6 +2996,14 @@
                 </select>
               </div>
             </div>
+            <div class="settings-row">
+              <span class="label">Sources before dropdown</span>
+              <select id="source-cap-select">
+                <option value="none">None — all behind a dropdown</option>
+                <option value="some">Some — a few, rest collapsed</option>
+                <option value="many">Many — show more before collapsing</option>
+              </select>
+            </div>
           </div>
           <div class="settings-section">
             <h3>Appearance</h3>
@@ -3420,6 +3437,10 @@
 const mobileMQ = window.matchMedia("(max-width: 768px)");
 function applyMobileClass(mq) {
   document.body.classList.toggle("mobile", mq.matches);
+  // The source-chip cap is viewport-dependent — reflow any on-screen source
+  // bubbles when we cross the breakpoint. Guarded so it's a no-op before the
+  // helper is defined (initial call runs during boot, before chat is built).
+  if (typeof relayoutSourceBubbles === "function") relayoutSourceBubbles();
 }
 applyMobileClass(mobileMQ);
 mobileMQ.addEventListener("change", applyMobileClass);
@@ -4008,7 +4029,23 @@ function mergeTurnSources(list) {
 }
 
 // How many source chips show before the rest collapse behind a "+N more" pill.
-const SOURCE_CHIP_CAP = 5;
+// User-tunable via the "Sources before dropdown" detail setting, and viewport
+// aware: a phone has far less room than a widescreen, so each level caps lower
+// on a narrow screen. "none" hides every chip behind the dropdown; the widescreen
+// "many" preserves the original cap of 5. Values between are interpolated.
+const SOURCE_CAP_KEY = "aime.sourcesCap";
+const SOURCE_CAP_LEVELS = {
+  none: { wide: 0, narrow: 0 },
+  some: { wide: 3, narrow: 1 },
+  many: { wide: 5, narrow: 2 },
+};
+let sourcesCap = localStorage.getItem(SOURCE_CAP_KEY) || "some";
+
+// Resolve the current cap for the live viewport (mobileMQ is the 768px breakpoint).
+function sourceChipCap() {
+  const lvl = SOURCE_CAP_LEVELS[sourcesCap] || SOURCE_CAP_LEVELS.some;
+  return mobileMQ.matches ? lvl.narrow : lvl.wide;
+}
 
 // Build one source chip (favicon + host + title) linking out to the source.
 function buildSourceChip(s) {
@@ -4047,10 +4084,10 @@ function buildSourceChip(s) {
 // reply); otherwise it's left where it is (in-place refresh) or appended to the
 // log if it isn't mounted yet. No-op when nothing has been cited.
 //
-// Past SOURCE_CHIP_CAP sources the overflow collapses behind a faded "+N more"
-// pill so a search with many hits doesn't flood the transcript; clicking it
-// expands the rest in place. The expanded flag lives on the element so it
-// survives the in-place refreshes that fire as more sources stream in.
+// Past the current cap (sourceChipCap) the overflow collapses behind a faded
+// "+N more" pill so a search with many hits doesn't flood the transcript;
+// clicking it expands the rest in place. The expanded flag lives on the element
+// so it survives the in-place refreshes that fire as more sources stream in.
 function renderSourceBubble(anchor) {
   if (!turnSources.length) return;
   if (!turnSourceBubble) {
@@ -4058,17 +4095,38 @@ function renderSourceBubble(anchor) {
     turnSourceBubble.className = "msg sources";
     turnSourceBubble._expanded = false;
   }
-  turnSourceBubble.innerHTML = "";
+  // Stash the list on the element so the bubble can be re-laid-out later when
+  // the cap setting or the viewport changes, without the global turn state.
+  turnSourceBubble._sources = turnSources;
+  layoutSourceBubble(turnSourceBubble);
+
+  if (anchor && anchor.parentNode) {
+    anchor.parentNode.insertBefore(turnSourceBubble, anchor.nextSibling);
+  } else if (!turnSourceBubble.parentNode) {
+    logInner.appendChild(turnSourceBubble);
+  }
+  scrollToBottom();
+}
+
+// (Re)build the chips inside one `.msg.sources` bubble from its stored
+// `_sources` list, honouring the current viewport cap and the bubble's own
+// expand state. Reused by renderSourceBubble (live turns), the detail-setting
+// change handler, and viewport crossings — see relayoutSourceBubbles.
+function layoutSourceBubble(bubble) {
+  const sources = bubble._sources || [];
+  if (!sources.length) return;
+  bubble.innerHTML = "";
   const label = document.createElement("span");
   label.className = "sources-label";
-  label.textContent = turnSources.length === 1 ? "Source" : "Sources";
-  turnSourceBubble.appendChild(label);
+  label.textContent = sources.length === 1 ? "Source" : "Sources";
+  bubble.appendChild(label);
 
-  const overflow = turnSources.length - SOURCE_CHIP_CAP;
-  const collapsed = overflow > 0 && !turnSourceBubble._expanded;
-  const shown = collapsed ? SOURCE_CHIP_CAP : turnSources.length;
+  const cap = sourceChipCap();
+  const overflow = sources.length - cap;
+  const collapsed = overflow > 0 && !bubble._expanded;
+  const shown = collapsed ? cap : sources.length;
   for (let i = 0; i < shown; i++) {
-    turnSourceBubble.appendChild(buildSourceChip(turnSources[i]));
+    bubble.appendChild(buildSourceChip(sources[i]));
   }
   if (overflow > 0) {
     const more = document.createElement("button");
@@ -4080,18 +4138,18 @@ function renderSourceBubble(anchor) {
     arrow.textContent = collapsed ? "▾" : "▴";
     more.appendChild(arrow);
     more.addEventListener("click", () => {
-      turnSourceBubble._expanded = !turnSourceBubble._expanded;
-      renderSourceBubble(null);  // refresh in place, keep position
+      bubble._expanded = !bubble._expanded;
+      layoutSourceBubble(bubble);  // refresh in place, keep position
     });
-    turnSourceBubble.appendChild(more);
+    bubble.appendChild(more);
   }
+}
 
-  if (anchor && anchor.parentNode) {
-    anchor.parentNode.insertBefore(turnSourceBubble, anchor.nextSibling);
-  } else if (!turnSourceBubble.parentNode) {
-    logInner.appendChild(turnSourceBubble);
-  }
-  scrollToBottom();
+// Re-lay-out every mounted source bubble. Fires when the cap setting changes or
+// the viewport crosses the mobile breakpoint, so on-screen sources reflow to the
+// new cap without needing a reload.
+function relayoutSourceBubbles() {
+  document.querySelectorAll(".msg.sources").forEach(layoutSourceBubble);
 }
 
 // Safety net for a turn that cited sources but produced no answer text to
@@ -9594,6 +9652,19 @@ detailDevSelect.addEventListener("change", () => {
 
 applyDetail();
 _detailReady = true;
+
+// -- Sources before dropdown --------------------------------------------
+// Always-editable (not gated by the preset above): how many web-search source
+// chips show before the rest collapse behind the "+N more" dropdown. The actual
+// count is viewport-dependent — see SOURCE_CAP_LEVELS / sourceChipCap. Changing
+// it reflows any sources already on screen.
+const sourceCapSelect = document.getElementById("source-cap-select");
+sourceCapSelect.value = sourcesCap;
+sourceCapSelect.addEventListener("change", () => {
+  sourcesCap = sourceCapSelect.value;
+  localStorage.setItem(SOURCE_CAP_KEY, sourcesCap);
+  relayoutSourceBubbles();
+});
 
 // -- Date & time format -------------------------------------------------
 // Display-only preference. Internal storage (DD/MM/YYYY from the backend,
