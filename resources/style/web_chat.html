@@ -2156,7 +2156,7 @@
                      text-transform: uppercase; letter-spacing: 0.04em;
                      margin-right: 0.1rem; }
     .source-chip { display: inline-flex; align-items: center; gap: 0.4rem;
-                   max-width: 280px; padding: 0.28rem 0.65rem;
+                   max-width: 280px; overflow: hidden; padding: 0.28rem 0.65rem;
                    background: var(--bg-input, rgba(127,127,127,0.08));
                    border: 1px solid var(--border); border-radius: 999px;
                    color: var(--text); text-decoration: none; line-height: 1.3;
@@ -2166,7 +2166,7 @@
     .source-fav { width: 14px; height: 14px; border-radius: 3px; flex-shrink: 0;
                   object-fit: cover; }
     .source-host { color: var(--accent); font-weight: 600; flex-shrink: 0; }
-    .source-title { color: var(--muted); overflow: hidden;
+    .source-title { color: var(--muted); min-width: 0; overflow: hidden;
                     text-overflow: ellipsis; white-space: nowrap; }
     /* Overflow toggle: same pill shape, collapses/expands the extra sources.
        `.faded` (collapsed state) dims it so it reads as "there's more behind
@@ -2995,14 +2995,14 @@
                   <option value="on">Shown</option>
                 </select>
               </div>
-            </div>
-            <div class="settings-row">
-              <span class="label">Sources before dropdown</span>
-              <select id="source-cap-select">
-                <option value="none">None — all behind a dropdown</option>
-                <option value="some">Some — a few, rest collapsed</option>
-                <option value="many">Many — show more before collapsing</option>
-              </select>
+              <div class="settings-row">
+                <span class="label">Sources before dropdown</span>
+                <select id="detail-sources-select">
+                  <option value="none">None — all behind a dropdown</option>
+                  <option value="some">Some — a few, rest collapsed</option>
+                  <option value="many">Many — show more before collapsing</option>
+                </select>
+              </div>
             </div>
           </div>
           <div class="settings-section">
@@ -3454,10 +3454,9 @@ const form = document.getElementById("f");
 // While the model streams, the log keeps growing. We only auto-scroll if the
 // user is already parked at the bottom ("following"). If they scroll up to
 // read earlier messages we leave them there and surface a jump-to-bottom
-// button instead. `following` is re-derived purely from `scroll` events:
-// content growth never fires a scroll event, so scrolling up latches
+// button instead. `chat.state.following` is re-derived purely from `scroll`
+// events: content growth never fires a scroll event, so scrolling up latches
 // following=false until the user (or the button) returns to the bottom.
-let following = true;
 
 function isAtBottom() {
   return log.scrollHeight - log.scrollTop - log.clientHeight < 40;
@@ -3470,15 +3469,15 @@ function updateScrollBtn() {
 // Snap to the bottom. Auto-follow scrolls are instant (so they can't be
 // out-raced by streaming text); an explicit jump uses smooth scrolling.
 function scrollToBottom(force) {
-  if (force || following) {
+  if (force || chat.state.following) {
     log.scrollTo({ top: log.scrollHeight, behavior: force ? "smooth" : "instant" });
-    following = true;
+    chat.setFollowing(true);
   }
   updateScrollBtn();
 }
 
 log.addEventListener("scroll", () => {
-  following = isAtBottom();
+  chat.setFollowing(isAtBottom());
   updateScrollBtn();
 });
 
@@ -3841,13 +3840,92 @@ let pendingHtmlTarget = null;
 // until something cites). Both reset at each turn boundary. See renderSourceBubble.
 let turnSources = [];
 let turnSourceBubble = null;
-// True while the assistant is responding to a turn. Used to gate form
-// submission: if the user sends a message while busy, it's held back as
-// a draft (#queued-bar) instead of being POSTed to /send.
-let modelBusy = false;
-// History snapshot replays as raw payloads; switch to live (typewriter-eligible)
-// mode after the server emits the `history_done` sentinel.
-let liveMode = false;
+// ── Chat state machine ─────────────────────────────────────────────────────
+// Single source of truth for all *non-visual* chat state. This used to live in
+// scattered globals (modelBusy, liveMode, queuedDraft, following) written from a
+// dozen places; the "without this the composer wedges" safety nets were a symptom
+// of that. Now each field has exactly one writer — a transition method here — so
+// the bad states are unrepresentable. Rendering (bubbles, typewriter, indicators)
+// stays in the renderer below, which *reads* this state rather than owning it.
+const chat = {
+  state: {
+    link: "connecting",  // connecting | open | reconnecting
+    turn: "idle",        // idle | busy | interrupting
+    nav:  "ready",       // ready | switching  (conversation switch in flight)
+    replay: true,        // true while the history snapshot is replaying (old !liveMode)
+    draft: null,         // held-back message {text, images, displayText} | null
+    following: true,     // scroll-follow latch
+    locked: false,       // composer locked by access/budget
+  },
+
+  // -- queries ---------------------------------------------------------------
+  busy()      { return this.state.turn !== "idle"; },
+  replaying() { return this.state.replay; },
+
+  // -- turn lifecycle --------------------------------------------------------
+  // A live (non-replayed) user message opens a turn.
+  beginTurn() { this.state.turn = "busy"; },
+
+  // Server's authoritative turn state on (re)connect. The snapshot replay has no
+  // turn_end, so this is the only thing that re-syncs the busy gate after a
+  // reconnect — the sole reconciler of client vs. server "busy".
+  reconcile(busy) {
+    this.state.replay = false;
+    this.state.turn = busy ? "busy" : "idle";
+    this.state.nav = "ready";
+    clearWorkingIndicator();
+    if (this.state.turn === "idle" && this.state.draft) flushQueuedDraft();
+  },
+
+  // Natural or interrupted end of a turn.
+  endTurn(stopReason) {
+    if (stopReason !== "end_turn" && stopReason !== "interrupted") return;
+    this.state.turn = "idle";
+    // Auto-send a held draft when the turn finishes naturally ("answer this,
+    // then send my follow-up"). Not on "interrupted" — the stop button already
+    // dispatched the draft on that path.
+    if (stopReason === "end_turn" && this.state.draft) flushQueuedDraft();
+  },
+
+  // A turn that ended via an `error` event (which carries no turn_end).
+  // Reconciles the same state so the composer never wedges in queue-everything mode.
+  failTurn() {
+    this.state.turn = "idle";
+    clearOptimisticUserMessage();
+    if (this.state.draft) flushQueuedDraft();
+  },
+
+  // A /send POST that never produced a turn (network fail / 402 / 403). The
+  // caller has already cleared the optimistic bubble; just drop the busy gate.
+  abortTurn() { this.state.turn = "idle"; },
+
+  // -- conversation switch ---------------------------------------------------
+  // Server confirmed a new/loaded conversation (session_restart). Full reset of
+  // every field in one place — no more half-resets split across handlers.
+  reset() {
+    this.state.turn = "idle";
+    this.state.nav = "ready";
+    this.state.following = true;
+    this.state.replay = true;
+    clearQueuedDraft();        // also nulls state.draft
+    clearTranscriptView();
+    updateScrollBtn();
+    loadChats();
+  },
+
+  // -- stream liveness (Link wires these) ------------------------------------
+  // (Re)connection opened: snapshot is about to replay, so go back to replay
+  // mode; on a *reconnect* wipe the transcript so the snapshot rebuilds in place.
+  linkOpen(wasReconnect) {
+    this.state.link = "open";
+    this.state.replay = true;
+    if (wasReconnect) clearTranscriptView();
+  },
+  linkDown() { this.state.link = "reconnecting"; },
+
+  // -- scroll ----------------------------------------------------------------
+  setFollowing(v) { this.state.following = v; },
+};
 
 // -- Typewriter: progressively reveal characters of the server-rendered HTML.
 // One stream-in-flight at a time, since the controller serializes turns.
@@ -4029,17 +4107,17 @@ function mergeTurnSources(list) {
 }
 
 // How many source chips show before the rest collapse behind a "+N more" pill.
-// User-tunable via the "Sources before dropdown" detail setting, and viewport
-// aware: a phone has far less room than a widescreen, so each level caps lower
-// on a narrow screen. "none" hides every chip behind the dropdown; the widescreen
-// "many" preserves the original cap of 5. Values between are interpolated.
-const SOURCE_CAP_KEY = "aime.sourcesCap";
+// The level ("none"/"some"/"many") is a detail axis driven by the Display-detail
+// presets (set in applyDetail) — Simple shows "some", Full shows "many", Custom
+// lets the user pick. It's viewport aware: a phone has far less room than a
+// widescreen, so each level caps lower on a narrow screen. "none" hides every
+// chip behind the dropdown; widescreen "many" preserves the original cap of 5.
 const SOURCE_CAP_LEVELS = {
   none: { wide: 0, narrow: 0 },
   some: { wide: 3, narrow: 1 },
   many: { wide: 5, narrow: 2 },
 };
-let sourcesCap = localStorage.getItem(SOURCE_CAP_KEY) || "some";
+let sourcesCap = "some";  // overwritten by applyDetail() from the effective detail
 
 // Resolve the current cap for the live viewport (mobileMQ is the 768px breakpoint).
 function sourceChipCap() {
@@ -5036,9 +5114,9 @@ function clearOptimisticUserMessage() {
 
 // Tear down the rendered transcript and all per-turn streaming state so it can
 // be rebuilt cleanly from a fresh server snapshot. Used on reconnect (below).
-// Deliberately leaves the composer and any queued draft alone — those are
-// client-only and unrelated to the replayed history — and leaves modelBusy for
-// the authoritative `history_done` to set.
+// Deliberately leaves the composer and any held draft alone — those are
+// client-only and unrelated to the replayed history — and leaves the busy gate
+// (chat.state.turn) for the authoritative `history_done` to reconcile.
 function clearTranscriptView() {
   logInner.innerHTML = "";
   workingIndicator = null;
@@ -5058,10 +5136,10 @@ function clearTranscriptView() {
 // The browser's EventSource silently auto-reconnects after a *clean* drop
 // (phone/laptop sleep, Wi-Fi↔cellular handoff, a proxy idle timeout). On every
 // (re)connect the server replays the full history snapshot, so a naive
-// reconnect would append a second copy of the whole conversation — and, with
-// liveMode still true, re-run the typewriter over all of it. Guard both: reset
-// liveMode so the snapshot renders instantly until `history_done`, and on a
-// *reconnect* wipe the transcript first so the snapshot rebuilds it in place
+// reconnect would append a second copy of the whole conversation — and, while
+// still in live mode, re-run the typewriter over all of it. chat.linkOpen guards
+// both: it flips back to replay mode so the snapshot renders instantly until
+// `history_done`, and on a *reconnect* wipes the transcript first so it rebuilds
 // instead of duplicating it. Rebuilding from the authoritative snapshot is also
 // what corrects a transcript that has drifted from the server (e.g. a
 // conversation switch whose `session_restart` was missed on a zombie stream).
@@ -5075,8 +5153,9 @@ let streamWatchdog = null;
 let reconnectNotice = null;
 
 function onStreamOpen() {
-  liveMode = false;
-  if (streamConnectedOnce) clearTranscriptView();
+  // Back to replay mode; on a reconnect wipe the transcript so the replayed
+  // snapshot rebuilds in place instead of duplicating it (chat.linkOpen).
+  chat.linkOpen(streamConnectedOnce);
   streamConnectedOnce = true;
   lastStreamMsgAt = Date.now();
   // Recovered — drop any "reconnecting" banner.
@@ -5089,6 +5168,7 @@ function onStreamError() {
   // outage isn't silent. A truly dead (half-open) socket that never errors is
   // handled by the watchdog instead. State is reconciled authoritatively by the
   // snapshot replay + history_done once a connection is re-established.
+  chat.linkDown();
   if (!reconnectNotice) {
     reconnectNotice = appendNotice("Connection lost — reconnecting…", "warning");
   }
@@ -5161,7 +5241,7 @@ function onStreamMessage(ev) {
       // the first message in the loaded conversation gets held as a queued
       // draft instead of being sent.
       if (!e.from_replay) {
-        modelBusy = true;
+        chat.beginTurn();
         // Fade out the "Loaded conversation…" line / new-conversation splash
         // — once the user has sent a message the transcript should read as
         // one continuous chat.
@@ -5211,7 +5291,7 @@ function onStreamMessage(ev) {
     case "assistant_html_partial": {
       clearThinking();
       const bubble = ensureAssistant();
-      if (liveMode && !e.from_replay) {
+      if (!chat.replaying() && !e.from_replay) {
         typewriterUpdate(bubble, e.text, /*finalize=*/false);
       } else {
         bubble._content.innerHTML = e.text;
@@ -5224,7 +5304,7 @@ function onStreamMessage(ev) {
       // one and skip the typewriter entirely (replay should appear instantly).
       let target = pendingHtmlTarget || currentAssistant;
       if (!target) target = appendMessage("aime", "aime", "");
-      if (liveMode && !e.from_replay) {
+      if (!chat.replaying() && !e.from_replay) {
         typewriterUpdate(target, e.text, /*finalize=*/true);
       } else {
         target._content.innerHTML = e.text;
@@ -5238,15 +5318,13 @@ function onStreamMessage(ev) {
       break;
     }
     case "history_done":
-      liveMode = true;
-      // Authoritative busy state from the server. Replayed history contains
-      // user_message_shown (which flips modelBusy true) but never the
-      // matching turn_end, so without this a reloaded conversation would
-      // wrongly hold the first new message back as a queued draft.
-      modelBusy = e.busy === true;
-      // Replayed history has no turn_end, so a "Working…" line added while
-      // replaying tool calls would otherwise linger — drop it here.
-      clearWorkingIndicator();
+      // Switch out of replay mode and reconcile the busy gate to the server's
+      // authoritative turn state. Replayed history contains user_message_shown
+      // (which opens a turn) but never the matching turn_end, so this is the
+      // only thing that stops a reloaded conversation from wrongly holding the
+      // first new message back as a queued draft. Also drops a lingering
+      // "Working…" line left by replayed tool calls (chat.reconcile).
+      chat.reconcile(e.busy === true);
       break;
     case "resync":
       // The server's per-client send buffer overflowed (this browser fell too
@@ -5366,18 +5444,10 @@ function onStreamMessage(ev) {
       // alone wouldn't see it.
       scheduleActivePaneRefresh();
       if (e.stop_reason === "end_turn") currentAssistant = null;
-      if (e.stop_reason === "end_turn" || e.stop_reason === "interrupted") {
-        modelBusy = false;
-        // Auto-send the queued draft on natural turn completion. The stop
-        // button remains the explicit interrupt-and-send path; this is
-        // the "wait for the model to finish, then send my follow-up"
-        // path. For "interrupted" we don't auto-send — that turn ended
-        // because the user explicitly clicked stop, which already
-        // dispatched the draft, so we just clear the flag.
-        if (e.stop_reason === "end_turn" && queuedDraft) {
-          flushQueuedDraft();
-        }
-      }
+      // Drop the busy gate and, on natural completion, auto-send any held draft.
+      // (chat.endTurn owns the policy; "interrupted" never auto-sends because the
+      // stop button already dispatched the draft.)
+      chat.endTurn(e.stop_reason);
       break;
     case "ready":
       break;
@@ -5429,19 +5499,15 @@ function onStreamMessage(ev) {
       }
       break;
     case "session_restart":
-      clearTranscriptView();
-      // Drop the onboarding nudge on any transcript clear; if onboarding
-      // re-fires (e.g. /reset for a not-yet-onboarded user) the server re-emits
-      // the "onboarding" signal right after and re-adds it.
+      // A real conversation switch (/load or /reset confirmed by the server).
+      // chat.reset() wipes the transcript and resets every state field in one
+      // place — busy gate, held draft, scroll-follow, replay mode — and reloads
+      // the chats list. Unlike a reconnect, this is a *different* conversation.
+      chat.reset();
+      // Drop the onboarding nudge on the transcript clear; if onboarding re-fires
+      // (e.g. /reset for a not-yet-onboarded user) the server re-emits the
+      // "onboarding" signal right after and re-adds it.
       document.body.classList.remove("onboarding");
-      // Unlike a reconnect, a real session switch also drops the busy gate and
-      // any held draft — this is a different conversation.
-      modelBusy = false;
-      clearQueuedDraft();
-      following = true;
-      updateScrollBtn();
-      // The chats list may now include a new entry; refresh.
-      loadChats();
       break;
     case "session_terminated":
       // Fires routinely whenever an old stream is swapped out (every /load
@@ -5452,14 +5518,13 @@ function onStreamMessage(ev) {
     case "error":
       // An error can end a turn without a `turn_end` (e.g. the backend submit
       // throwing in dispatch_input emits `error` and nothing else). turn_end is
-      // the only thing that clears modelBusy / the indicators, so without this
+      // the only thing that clears the busy gate / indicators, so without this
       // the composer would wedge into "queue everything" mode and the spinner
-      // would hang until reload. Reconcile the turn state here too.
+      // would hang until reload. chat.failTurn reconciles the turn state (drops
+      // the optimistic bubble, clears busy, flushes any held draft).
       clearThinking();
       clearWorkingIndicator();
-      clearOptimisticUserMessage();
-      modelBusy = false;
-      if (queuedDraft) flushQueuedDraft();
+      chat.failTurn();
       if (verbosity === "verbose") {
         appendNotice("error: " + e.text, "error");
       } else {
@@ -5509,13 +5574,14 @@ form.addEventListener("submit", async (ev) => {
   // While the model is mid-response, hold the new message back as a draft
   // instead of POSTing it. The user must click the queued pill's stop
   // button to actually send (which also interrupts the current reply).
-  if (modelBusy) {
+  if (chat.busy()) {
     setQueuedDraft({text, images, displayText: userText});
     return;
   }
-  // Set optimistically so a rapid second submit before user_message_shown
-  // arrives is correctly held back as a draft, not POSTed as a queued send.
-  modelBusy = true;
+  // Open the turn optimistically so a rapid second submit before
+  // user_message_shown arrives is correctly held back as a draft, not POSTed
+  // as a queued send.
+  chat.beginTurn();
   showOptimisticUserMessage(userText, images);
   await sendText(text, images);
 });
@@ -5726,7 +5792,7 @@ async function sendText(text, images) {
     // Network failure before the request landed — drop the "Sending…"
     // placeholder and surface the error so the message isn't silently lost.
     clearOptimisticUserMessage();
-    modelBusy = false;
+    chat.abortTurn();
     appendNotice("failed to send message: " + e, "error");
     return;
   }
@@ -5736,7 +5802,7 @@ async function sendText(text, images) {
   // over-budget state so the lock also survives a page reload.
   if (r.status === 402) {
     clearOptimisticUserMessage();
-    modelBusy = false;
+    chat.abortTurn();
     appendNotice("Your Aime is empty for now. It tops up again with a fresh "
       + "charge at the start of the next day — check back then.", "warning");
     refreshMe();
@@ -5748,7 +5814,7 @@ async function sendText(text, images) {
     __apiAccess = false;
     applyAccessState();
     clearOptimisticUserMessage();
-    modelBusy = false;
+    chat.abortTurn();
     return;
   }
   // Success. The live `user_message_shown` normally already swapped the
@@ -5763,21 +5829,21 @@ async function sendText(text, images) {
 }
 
 // --- Queued draft (above the prompt) ------------------------------------
-// A single hold-back draft. Submitting again while one is held replaces
-// it so the most recent message is what gets sent on stop. The draft does
-// *not* auto-send when the model finishes naturally — it waits for the
-// user to click the stop button.
+// A single hold-back draft (the live value lives at chat.state.draft).
+// Submitting again while one is held replaces it so the most recent message
+// is what gets sent on stop. The draft auto-sends when the model finishes
+// naturally (see chat.endTurn) — "answer this, then send my follow-up" — and
+// the Force-send button interrupts the current reply to send it immediately.
 
 const queuedBar = document.getElementById("queued-bar");
-let queuedDraft = null;  // {text, images, displayText} or null
 
 function setQueuedDraft(draft) {
-  queuedDraft = draft;
+  chat.state.draft = draft;
   renderQueuedDraft();
 }
 
 function clearQueuedDraft() {
-  queuedDraft = null;
+  chat.state.draft = null;
   queuedBar.hidden = true;
   queuedBar.innerHTML = "";
 }
@@ -5786,16 +5852,16 @@ async function flushQueuedDraft() {
   // Dispatch the held draft without going through /interrupt — called
   // when the model finishes its turn naturally and there's a draft
   // waiting. Optimistically mark busy so a chained submit doesn't race.
-  if (!queuedDraft) return;
-  const draft = queuedDraft;
+  if (!chat.state.draft) return;
+  const draft = chat.state.draft;
   clearQueuedDraft();
-  modelBusy = true;
+  chat.beginTurn();
   showOptimisticUserMessage(draft.displayText, draft.images);
   await sendText(draft.text, draft.images);
 }
 
 function renderQueuedDraft() {
-  if (!queuedDraft) { clearQueuedDraft(); return; }
+  if (!chat.state.draft) { clearQueuedDraft(); return; }
   queuedBar.innerHTML = "";
   const label = document.createElement("span");
   label.className = "queued-label";
@@ -5803,7 +5869,7 @@ function renderQueuedDraft() {
   queuedBar.appendChild(label);
   const text = document.createElement("span");
   text.className = "queued-text";
-  text.textContent = queuedDraft.displayText || queuedDraft.text;
+  text.textContent = chat.state.draft.displayText || chat.state.draft.text;
   queuedBar.appendChild(text);
   const stop = document.createElement("button");
   stop.type = "button";
@@ -5815,11 +5881,11 @@ function renderQueuedDraft() {
     '<rect x="6" y="6" width="12" height="12" rx="1"/></svg>' +
     '<span>Force send</span>';
   stop.addEventListener("click", async () => {
-    if (!queuedDraft) return;
+    if (!chat.state.draft) return;
     stop.disabled = true;
-    const draft = queuedDraft;
+    const draft = chat.state.draft;
     try {
-      if (modelBusy) {
+      if (chat.busy()) {
         // Best-effort interrupt — even if it errors we still try the send,
         // and a no-op interrupt on an idle backend is harmless.
         await fetch("/interrupt", {method: "POST"}).catch(() => {});
@@ -9512,17 +9578,18 @@ themeSelect.addEventListener("change", () => {
 // Real features are never gated by this — only ID badges, the export-format
 // count, tool/working chatter, and the Developer tab.
 
-const DETAIL_MODE_KEY   = "aime.detailMode";
-const DETAIL_TOOL_KEY   = "aime.detail.tool";
-const DETAIL_IDS_KEY    = "aime.detail.ids";
-const DETAIL_EXPORT_KEY = "aime.detail.export";
-const DETAIL_DEV_KEY    = "aime.detail.dev";
+const DETAIL_MODE_KEY    = "aime.detailMode";
+const DETAIL_TOOL_KEY    = "aime.detail.tool";
+const DETAIL_IDS_KEY     = "aime.detail.ids";
+const DETAIL_EXPORT_KEY  = "aime.detail.export";
+const DETAIL_DEV_KEY     = "aime.detail.dev";
+const DETAIL_SOURCES_KEY = "aime.detail.sources";
 
-// Named points in the (tool, ids, export, dev) space. Custom reads the stored
-// per-axis values instead of a preset.
+// Named points in the (tool, ids, export, dev, sources) space. Custom reads the
+// stored per-axis values instead of a preset.
 const DETAIL_PRESETS = {
-  simple: { tool: "minimal", ids: false, export: false, dev: false },
-  full:   { tool: "verbose", ids: true,  export: true,  dev: true  },
+  simple: { tool: "minimal", ids: false, export: false, dev: false, sources: "some" },
+  full:   { tool: "verbose", ids: true,  export: true,  dev: true,  sources: "many" },
 };
 
 // Verbosity global the SSE handler reads; kept in sync by applyDetail().
@@ -9530,10 +9597,11 @@ let verbosity = "minimal";
 
 const detailSeg          = document.getElementById("detail-seg");
 const detailControls     = document.getElementById("detail-controls");
-const detailToolSelect   = document.getElementById("detail-tool-select");
-const detailIdsSelect    = document.getElementById("detail-ids-select");
-const detailExportSelect = document.getElementById("detail-export-select");
-const detailDevSelect    = document.getElementById("detail-dev-select");
+const detailToolSelect    = document.getElementById("detail-tool-select");
+const detailIdsSelect     = document.getElementById("detail-ids-select");
+const detailExportSelect  = document.getElementById("detail-export-select");
+const detailDevSelect     = document.getElementById("detail-dev-select");
+const detailSourcesSelect = document.getElementById("detail-sources-select");
 
 // One-time migration from the old split settings (uiMode + verbosity).
 (function migrateDetailSettings() {
@@ -9572,6 +9640,7 @@ function effectiveDetail() {
     ids: flag(DETAIL_IDS_KEY, base.ids),
     export: flag(DETAIL_EXPORT_KEY, base.export),
     dev: flag(DETAIL_DEV_KEY, base.dev),
+    sources: localStorage.getItem(DETAIL_SOURCES_KEY) || base.sources,
   };
 }
 
@@ -9582,21 +9651,28 @@ let _detailReady = false;
 function applyDetail() {
   const eff = effectiveDetail();
   const prevVerbosity = verbosity;
+  const prevSources = sourcesCap;
   verbosity = eff.tool;
+  sourcesCap = eff.sources;
   document.body.classList.toggle("show-ids", eff.ids);
   document.body.classList.toggle("show-export-all", eff.export);
   document.body.classList.toggle("show-dev", eff.dev);
 
   // Mirror values into the pickers so Simple/Full visibly document themselves,
   // and lock them unless Custom is selected.
-  detailToolSelect.value   = eff.tool;
-  detailIdsSelect.value    = eff.ids ? "on" : "off";
-  detailExportSelect.value = eff.export ? "on" : "off";
-  detailDevSelect.value    = eff.dev ? "on" : "off";
+  detailToolSelect.value    = eff.tool;
+  detailIdsSelect.value     = eff.ids ? "on" : "off";
+  detailExportSelect.value  = eff.export ? "on" : "off";
+  detailDevSelect.value     = eff.dev ? "on" : "off";
+  detailSourcesSelect.value = eff.sources;
   const locked = detailMode !== "custom";
   detailControls.classList.toggle("locked", locked);
   detailToolSelect.disabled = detailIdsSelect.disabled =
-    detailExportSelect.disabled = detailDevSelect.disabled = locked;
+    detailExportSelect.disabled = detailDevSelect.disabled =
+    detailSourcesSelect.disabled = locked;
+
+  // Reflow any on-screen source bubbles when the cap level actually changes.
+  if (_detailReady && sourcesCap !== prevSources) relayoutSourceBubbles();
   detailSeg.querySelectorAll(".seg-btn").forEach(b => {
     b.classList.toggle("active", b.dataset.mode === detailMode);
   });
@@ -9629,6 +9705,7 @@ detailSeg.querySelectorAll(".seg-btn").forEach(btn => {
       localStorage.setItem(DETAIL_IDS_KEY, eff.ids ? "on" : "off");
       localStorage.setItem(DETAIL_EXPORT_KEY, eff.export ? "on" : "off");
       localStorage.setItem(DETAIL_DEV_KEY, eff.dev ? "on" : "off");
+      localStorage.setItem(DETAIL_SOURCES_KEY, eff.sources);
     }
     detailMode = next;
     localStorage.setItem(DETAIL_MODE_KEY, detailMode);
@@ -9649,22 +9726,12 @@ detailExportSelect.addEventListener("change", () => {
 detailDevSelect.addEventListener("change", () => {
   localStorage.setItem(DETAIL_DEV_KEY, detailDevSelect.value); applyDetail();
 });
+detailSourcesSelect.addEventListener("change", () => {
+  localStorage.setItem(DETAIL_SOURCES_KEY, detailSourcesSelect.value); applyDetail();
+});
 
 applyDetail();
 _detailReady = true;
-
-// -- Sources before dropdown --------------------------------------------
-// Always-editable (not gated by the preset above): how many web-search source
-// chips show before the rest collapse behind the "+N more" dropdown. The actual
-// count is viewport-dependent — see SOURCE_CAP_LEVELS / sourceChipCap. Changing
-// it reflows any sources already on screen.
-const sourceCapSelect = document.getElementById("source-cap-select");
-sourceCapSelect.value = sourcesCap;
-sourceCapSelect.addEventListener("change", () => {
-  sourcesCap = sourceCapSelect.value;
-  localStorage.setItem(SOURCE_CAP_KEY, sourcesCap);
-  relayoutSourceBubbles();
-});
 
 // -- Date & time format -------------------------------------------------
 // Display-only preference. Internal storage (DD/MM/YYYY from the backend,
@@ -9913,6 +9980,7 @@ function applyAccessState() {
   // (permanent until resolved) or the daily budget is spent (temporary, lifts
   // at the next daily top-up). Each gets its own placeholder so the user knows which.
   const locked = keyLocked || billingLocked || __usageOver;
+  chat.state.locked = locked;   // single source of truth mirrors the access gate
   const input = document.getElementById("i");
   const sendBtn = document.querySelector(".send-btn");
   if (input) {
