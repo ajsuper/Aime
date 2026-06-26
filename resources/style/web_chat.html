@@ -3859,7 +3859,10 @@ const chat = {
   },
 
   // -- queries ---------------------------------------------------------------
-  busy()      { return this.state.turn !== "idle"; },
+  // A conversation switch counts as busy: a message sent mid-switch must be held
+  // (not POSTed), or it races the /reset|/load on the backend — the second
+  // request gets parked in _pending_user_messages and discarded by the reset.
+  busy()      { return this.state.turn !== "idle" || this.state.nav === "switching"; },
   replaying() { return this.state.replay; },
 
   // -- turn lifecycle --------------------------------------------------------
@@ -3874,6 +3877,11 @@ const chat = {
     this.state.turn = busy ? "busy" : "idle";
     this.state.nav = "ready";
     clearWorkingIndicator();
+    // Restore the "responding" cue if we reconnected/reloaded mid-turn — the
+    // replay has no live user_message_shown to show it, so without this the
+    // indicator silently vanishes while the model is still working. Cleared by
+    // the next streamed token / tool call / turn_end.
+    if (this.state.turn === "busy") showThinking();
     if (this.state.turn === "idle" && this.state.draft) flushQueuedDraft();
   },
 
@@ -3906,11 +3914,16 @@ const chat = {
     this.state.turn = "idle";
     this.state.nav = "ready";
     this.state.following = true;
-    this.state.replay = true;
-    clearQueuedDraft();        // also nulls state.draft
+    // NB: don't touch `replay` — a session switch happens on the already-live
+    // stream (no fresh history_done follows), so flipping to replay mode here
+    // would wrongly disable the typewriter for the new conversation's replies.
     clearTranscriptView();
     updateScrollBtn();
     loadChats();
+    // A message typed during the switch was held (busy() is true while
+    // switching) so it couldn't race the /reset|/load on the backend. The new
+    // session is ready now, so dispatch it here rather than dropping it.
+    if (this.state.draft) flushQueuedDraft();
   },
 
   // User-initiated conversation switch (New chat / open a saved chat). First-
@@ -5933,10 +5946,13 @@ function renderQueuedDraft() {
     '<span>Force send</span>';
   stop.addEventListener("click", async () => {
     if (!chat.state.draft) return;
+    // Mid-switch the draft is about to be auto-sent by reset() once the new
+    // session is ready; sending now would race the /reset|/load on the backend.
+    if (chat.state.nav === "switching") return;
     stop.disabled = true;
     const draft = chat.state.draft;
     try {
-      if (chat.busy()) {
+      if (chat.state.turn !== "idle") {
         // Best-effort interrupt — even if it errors we still try the send,
         // and a no-op interrupt on an idle backend is harmless.
         await fetch("/interrupt", {method: "POST"}).catch(() => {});
