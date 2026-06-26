@@ -5635,6 +5635,11 @@ form.addEventListener("submit", async (ev) => {
   // button to actually send (which also interrupts the current reply).
   if (chat.busy()) {
     setQueuedDraft({text, images, displayText: userText});
+    // A message sent during a conversation switch is also held (so it can't race
+    // the backend /reset|/load), but it auto-sends the instant the new session is
+    // ready — so show it as a normal optimistic send rather than the "Queued"
+    // pill, which would otherwise flash for the round-trip.
+    if (chat.state.nav === "switching") showOptimisticUserMessage(userText, images);
     return;
   }
   // Open the turn optimistically so a rapid second submit before
@@ -5926,6 +5931,10 @@ async function flushQueuedDraft() {
 
 function renderQueuedDraft() {
   if (!chat.state.draft) { clearQueuedDraft(); return; }
+  // A draft held only because a conversation switch is in flight isn't "queued
+  // behind a reply" — it auto-sends when the new session lands and is shown as an
+  // optimistic bubble instead. Keep the "Queued" pill hidden for it.
+  if (chat.state.nav === "switching") { queuedBar.hidden = true; return; }
   queuedBar.innerHTML = "";
   const label = document.createElement("span");
   label.className = "queued-label";
