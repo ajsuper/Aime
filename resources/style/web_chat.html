@@ -3913,6 +3913,37 @@ const chat = {
     loadChats();
   },
 
+  // User-initiated conversation switch (New chat / open a saved chat). First-
+  // class intents rather than raw "/reset"/"/load" strings poked at sendText:
+  //  • the nav="switching" guard makes a double-tap a no-op (no double /reset);
+  //  • the transcript clears optimistically for instant feedback instead of
+  //    waiting a full round-trip for session_restart;
+  //  • any held draft is dropped now, at click time, not when the server replies.
+  // The authoritative session_restart that follows runs reset() above, which
+  // flips nav back to "ready". If the switch never lands (network/budget/access),
+  // we rebuild the real transcript from the server snapshot and drop the guard.
+  newChat()      { this.switchTo("/reset"); },
+  loadChat(id)   { this.switchTo("/load " + id); },
+  async switchTo(command) {
+    if (this.state.nav === "switching") return;
+    this.state.nav = "switching";
+    this.state.turn = "idle";
+    clearQueuedDraft();        // drop any held draft (also nulls state.draft)
+    clearTranscriptView();     // optimistic — instant feedback
+    const ok = await sendText(command, []);
+    if (ok === false) {
+      this.state.nav = "ready";
+      Link.reconnect();        // restore the un-switched conversation from snapshot
+      return;
+    }
+    // session_restart / history_done normally flip nav back to "ready" within a
+    // beat. Safety net in case neither arrives (e.g. re-loading the already-open
+    // conversation server-side): release the guard so switching stays responsive.
+    setTimeout(() => {
+      if (this.state.nav === "switching") this.state.nav = "ready";
+    }, 4000);
+  },
+
   // -- stream liveness (Link wires these) ------------------------------------
   // (Re)connection opened: snapshot is about to replay, so go back to replay
   // mode; on a *reconnect* wipe the transcript so the snapshot rebuilds in place.
@@ -5143,78 +5174,94 @@ function clearTranscriptView() {
 // instead of duplicating it. Rebuilding from the authoritative snapshot is also
 // what corrects a transcript that has drifted from the server (e.g. a
 // conversation switch whose `session_restart` was missed on a zombie stream).
-let es = null;
-let streamConnectedOnce = false;
-// Timestamp of the last byte heard from the stream (any event, including the
-// server's `ping` heartbeat). The watchdog below uses it to spot a half-open
-// connection that the browser hasn't noticed and force a fresh reconnect.
-let lastStreamMsgAt = 0;
-let streamWatchdog = null;
-let reconnectNotice = null;
+// ── Link: the single owner of the /stream connection and its liveness ──────
+// Previously the stream wiring, a liveness watchdog, and a tab-visibility
+// reconnect lived as three independent actors, and a *second* visibilitychange
+// handler refetched the open pane — so a tab-return could fire an uncoordinated
+// reconnect and refetch. They're now one coordinator: one visibility listener,
+// one staleness check shared with the watchdog, and one place that owns `es`.
+const Link = {
+  es: null,
+  connectedOnce: false,
+  // Timestamp of the last byte heard from the stream (any event, including the
+  // server's `ping` heartbeat). Used to spot a half-open connection the browser
+  // hasn't noticed and force a fresh reconnect.
+  lastMsgAt: 0,
+  watchdog: null,
+  reconnectNotice: null,
+  // The server pings at least every ~20s, so a gap well past that means the
+  // stream is dead even if the browser still thinks it's open (sleep/wake, a
+  // half-closing proxy). This is that threshold.
+  STALE_MS: 50000,
 
-function onStreamOpen() {
-  // Back to replay mode; on a reconnect wipe the transcript so the replayed
-  // snapshot rebuilds in place instead of duplicating it (chat.linkOpen).
-  chat.linkOpen(streamConnectedOnce);
-  streamConnectedOnce = true;
-  lastStreamMsgAt = Date.now();
-  // Recovered — drop any "reconnecting" banner.
-  if (reconnectNotice) { reconnectNotice.remove(); reconnectNotice = null; }
-}
+  start() {
+    this.connect();
+    if (this.watchdog != null) clearInterval(this.watchdog);
+    this.watchdog = setInterval(() => {
+      if (document.hidden) return;   // throttled tabs don't get timely heartbeats
+      this.reconnectIfStale();
+    }, 10000);
+    document.addEventListener("visibilitychange", () => this.onVisible());
+  },
 
-function onStreamError() {
-  // Fires when the connection drops or fails to open. The browser will try to
-  // auto-reconnect on its own; we just surface a calm, deduped banner so a long
-  // outage isn't silent. A truly dead (half-open) socket that never errors is
-  // handled by the watchdog instead. State is reconciled authoritatively by the
-  // snapshot replay + history_done once a connection is re-established.
-  chat.linkDown();
-  if (!reconnectNotice) {
-    reconnectNotice = appendNotice("Connection lost — reconnecting…", "warning");
-  }
-}
+  // Tear down and reopen the stream. Closing stops the browser's own reconnect
+  // for the old EventSource so we own the new one. The reopened stream replays
+  // the server snapshot, which is also what corrects a transcript that drifted
+  // (e.g. a conversation switch whose `session_restart` was missed on a zombie
+  // stream).
+  connect() {
+    if (this.es) { try { this.es.close(); } catch (_) {} }
+    this.es = new EventSource("/stream");
+    this.es.onopen = () => this.onOpen();
+    this.es.onmessage = (ev) => this.onMessage(ev);
+    this.es.onerror = () => this.onError();
+    this.lastMsgAt = Date.now();
+  },
+  reconnect() { this.connect(); },
+  reconnectIfStale() {
+    if (Date.now() - this.lastMsgAt > this.STALE_MS) this.connect();
+  },
 
-// Tear down and reopen the stream. Used by the watchdog / visibility handler to
-// recover a zombie connection the browser hasn't given up on. Closing stops the
-// browser's own reconnect for the old EventSource, so we own the new one.
-function connectStream() {
-  if (es) { try { es.close(); } catch (_) {} }
-  es = new EventSource("/stream");
-  es.onopen = onStreamOpen;
-  es.onmessage = onStreamMessage;
-  es.onerror = onStreamError;
-  lastStreamMsgAt = Date.now();
-}
+  onOpen() {
+    // Back to replay mode; on a reconnect wipe the transcript so the replayed
+    // snapshot rebuilds in place instead of duplicating it (chat.linkOpen).
+    chat.linkOpen(this.connectedOnce);
+    this.connectedOnce = true;
+    this.lastMsgAt = Date.now();
+    if (this.reconnectNotice) { this.reconnectNotice.remove(); this.reconnectNotice = null; }
+  },
 
-// Liveness watchdog. The server emits a `ping` at least every ~20s, so a gap
-// well past that means the stream is dead even if the browser still thinks it's
-// open (common after sleep/wake or behind a proxy that half-closes). Force a
-// reconnect, which rebuilds the transcript from the server's current history —
-// the same path that fixes a stale transcript after a missed conversation
-// switch.
-const STREAM_STALE_MS = 50000;
-function startStreamWatchdog() {
-  if (streamWatchdog != null) clearInterval(streamWatchdog);
-  streamWatchdog = setInterval(() => {
-    if (document.hidden) return;  // throttled tabs don't get timely heartbeats
-    if (Date.now() - lastStreamMsgAt > STREAM_STALE_MS) connectStream();
-  }, 10000);
-}
+  onError() {
+    // Fires when the connection drops or fails to open. The browser will try to
+    // auto-reconnect on its own; we just surface a calm, deduped banner so a long
+    // outage isn't silent. A truly dead (half-open) socket that never errors is
+    // handled by the watchdog instead. State is reconciled authoritatively by the
+    // snapshot replay + history_done once a connection is re-established.
+    chat.linkDown();
+    if (!this.reconnectNotice) {
+      this.reconnectNotice = appendNotice("Connection lost — reconnecting…", "warning");
+    }
+  },
 
-// Coming back to a backgrounded tab is the classic moment for a silently-dead
-// stream: reconnect promptly if we haven't heard from it recently, so the user
-// doesn't stare at a stale transcript while the backend has moved on.
-document.addEventListener("visibilitychange", () => {
-  if (!document.hidden && Date.now() - lastStreamMsgAt > STREAM_STALE_MS) {
-    connectStream();
-  }
-});
+  onMessage(ev) {
+    this.lastMsgAt = Date.now();
+    const e = JSON.parse(ev.data);
+    if (e.kind === "ping") return;   // heartbeat — purely a liveness signal
+    onStreamMessage(e);
+  },
 
-function onStreamMessage(ev) {
-  lastStreamMsgAt = Date.now();
-  const e = JSON.parse(ev.data);
-  // Heartbeat — purely a liveness signal (timestamp already bumped above).
-  if (e.kind === "ping") return;
+  // Returning to a backgrounded tab is the classic moment for both a silently-
+  // dead stream and stale pane data. One coordinated catch-up: reconnect if the
+  // stream looks dead (which rebuilds the transcript from the snapshot), and
+  // refresh whichever data pane is open so it reflects offscreen changes.
+  onVisible() {
+    if (document.visibilityState !== "visible") return;
+    this.reconnectIfStale();
+    refreshActivePane(true);
+  },
+};
+
+function onStreamMessage(e) {
   switch (e.kind) {
     case "user_message_shown": {
       // A new turn begins — close out any sources still pending from the last
@@ -5329,11 +5376,11 @@ function onStreamMessage(ev) {
     case "resync":
       // The server's per-client send buffer overflowed (this browser fell too
       // far behind mid-stream), so its event backlog was dropped to avoid a
-      // silent permanent desync. Reconnect: connectStream() tears down the live
+      // silent permanent desync. Reconnect: Link.reconnect() tears down the live
       // stream and reopens it, which clears the transcript and rebuilds it from
       // the server's authoritative history snapshot — the same recovery path the
       // liveness watchdog uses, just triggered by the server instead of a gap.
-      connectStream();
+      Link.reconnect();
       break;
     case "turn_routing":
       // Per-turn model-routing decision. Only surfaced in Verbose so the
@@ -5536,8 +5583,7 @@ function onStreamMessage(ev) {
   }
 }
 
-connectStream();
-startStreamWatchdog();
+Link.start();
 
 form.addEventListener("submit", async (ev) => {
   ev.preventDefault();
@@ -5587,7 +5633,7 @@ form.addEventListener("submit", async (ev) => {
 });
 
 document.getElementById("new-chat-btn").addEventListener("click", () => {
-  sendText("/reset", []);
+  chat.newChat();
 });
 
 // --- Feedback & error reporting -------------------------------------------
@@ -5776,6 +5822,10 @@ function viewingTopic() {
   return {id: String(selectedTopicId), title: t.title || t.name || ""};
 }
 
+// POST a message (or a "/reset" / "/load" command) to /send. Returns true if the
+// request was accepted (the turn/switch will proceed via the stream), false if it
+// failed (network / 402 budget / 403 access) — chat.switchTo uses that to recover
+// from an optimistic conversation switch that never landed.
 async function sendText(text, images) {
   let r;
   try {
@@ -5794,7 +5844,7 @@ async function sendText(text, images) {
     clearOptimisticUserMessage();
     chat.abortTurn();
     appendNotice("failed to send message: " + e, "error");
-    return;
+    return false;
   }
   // Budget spent: the daily Aime is used up. Distinct from a permanent access
   // revocation (403) — the composer locks with a calm "back tomorrow" message
@@ -5806,7 +5856,7 @@ async function sendText(text, images) {
     appendNotice("Your Aime is empty for now. It tops up again with a fresh "
       + "charge at the start of the next day — check back then.", "warning");
     refreshMe();
-    return;
+    return false;
   }
   // Defense in depth: if access was revoked since the page loaded, the
   // server answers 403 — sync the UI so the composer locks immediately.
@@ -5815,7 +5865,7 @@ async function sendText(text, images) {
     applyAccessState();
     clearOptimisticUserMessage();
     chat.abortTurn();
-    return;
+    return false;
   }
   // Success. The live `user_message_shown` normally already swapped the
   // optimistic bubble for the authoritative one (it's emitted synchronously
@@ -5826,6 +5876,7 @@ async function sendText(text, images) {
   // never sticks; the authoritative bubble still renders from the live or
   // replayed event.
   if (r.ok) clearOptimisticUserMessage();
+  return r.ok;
 }
 
 // --- Queued draft (above the prompt) ------------------------------------
@@ -6256,11 +6307,8 @@ function scheduleActivePaneRefresh() {
   }, 250);
 }
 
-// Fallback for the case the user switched tabs while the model was busy —
-// when they come back, pull fresh data without a visible reload flash.
-document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "visible") refreshActivePane(true);
-});
+// (Tab-return pane refresh is handled by Link.onVisible, which also reconnects a
+// stale stream in the same coordinated catch-up — see the Link coordinator.)
 
 // Best-effort lock release if the tab is closed mid-edit. sendBeacon survives
 // unload where a normal fetch wouldn't; if it's lost, the server's TTL frees
@@ -6371,7 +6419,7 @@ async function loadChats(silent) {
       item.appendChild(del);
 
       const openSession = () => {
-        sendText("/load " + s.id);
+        chat.loadChat(s.id);
         // Mobile: drop back to the conversation after picking one.
         if (mobileMQ.matches) closeSide();
       };
