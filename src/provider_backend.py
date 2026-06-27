@@ -272,10 +272,12 @@ class AgentBackend(Protocol):
         ...
 
     def interrupt_turn(self) -> None:
-        """Best-effort cancel of the in-flight assistant turn. Any partial
-        assistant response is discarded so the next turn starts from a clean
-        history. No-op if no turn is active or the backend cannot interrupt
-        in the middle of a stream."""
+        """Best-effort cancel of the in-flight assistant turn. Any text the model
+        already streamed is kept, and an in-progress tool call is summarized into
+        a note, so the next turn still sees what it was doing; only the unanswered
+        tool_use scaffolding is dropped to keep history API-valid. No-op if no
+        turn is active or the backend cannot interrupt in the middle of a
+        stream."""
         ...
 
 
@@ -1597,22 +1599,51 @@ class AnthropicMessagesBackend:
         substitute a single `[interrupted]` text block so the assistant
         slot isn't empty (the API rejects messages with empty content).
         Caller must hold self._lock. Updates `_expected_tool_use_ids` to
-        drop any IDs we just orphaned."""
+        drop any IDs we just orphaned.
+
+        The raw tool_use block can't stay — it has no matching tool_result and
+        the API rejects an orphan — but we don't want the model to forget what it
+        was mid-way through when the user cut in. So each stripped tool_use is
+        summarized into a text note appended after whatever the model streamed,
+        keeping the work visible to the next turn."""
         content = message.get("content")
         if not isinstance(content, list):
             return
+        interrupted_tools: list[str] = []
         for blk in content:
             if isinstance(blk, dict) and blk.get("type") in ("tool_use", "server_tool_use"):
                 self._expected_tool_use_ids.discard(blk.get("id"))
+                interrupted_tools.append(self._describe_interrupted_tool(blk))
         kept = [
             b for b in content
             if isinstance(b, dict)
             and b.get("type") == "text"
             and (b.get("text") or "").strip()
         ]
+        if interrupted_tools:
+            note = ("[Interrupted by the user while working on: "
+                    + "; ".join(interrupted_tools) + "]")
+            kept.append({"type": "text", "text": note})
         if not kept:
             kept = [{"type": "text", "text": "[interrupted]"}]
         message["content"] = kept
+
+    @staticmethod
+    def _describe_interrupted_tool(blk: dict) -> str:
+        """One-line summary of an orphaned tool_use block — the tool name plus a
+        bounded rendering of its input — for the interrupt note. Bounded so a
+        large input (e.g. a document edit) doesn't bloat the history."""
+        name = blk.get("name") or "a tool"
+        raw = blk.get("input")
+        if not raw:
+            return name
+        try:
+            detail = json.dumps(raw, ensure_ascii=False)
+        except (TypeError, ValueError):
+            detail = str(raw)
+        if len(detail) > 300:
+            detail = detail[:300] + "…"
+        return f"{name}({detail})"
 
     def _generate_title(self, prompt_text: str) -> None:
         """Background: one cheap Haiku call turning the user's opening prompt

@@ -3856,6 +3856,7 @@ const chat = {
     draft: null,         // held-back message {text, images, displayText} | null
     following: true,     // scroll-follow latch
     locked: false,       // composer locked by access/budget
+    responded: false,    // has the model shown actual reply content this turn?
   },
 
   // -- queries ---------------------------------------------------------------
@@ -3866,8 +3867,30 @@ const chat = {
   replaying() { return this.state.replay; },
 
   // -- turn lifecycle --------------------------------------------------------
-  // A live (non-replayed) user message opens a turn.
-  beginTurn() { this.state.turn = "busy"; },
+  // A live (non-replayed) user message opens a turn. `responded` resets: the
+  // model hasn't shown any reply content yet, so a quick follow-up this turn
+  // auto-interrupts rather than queuing (see the submit handler).
+  beginTurn() { this.state.turn = "busy"; this.state.responded = false; },
+
+  // The model has started showing the user actual reply content (prose or a
+  // graphic) this turn — past the "thinking / working" phase. From here a
+  // follow-up message is held as a queued draft instead of interrupting.
+  markResponded() { this.state.responded = true; },
+
+  // The user fired a follow-up while the model was still working but hadn't
+  // shown a reply yet (the classic "texting" double-send). Interrupt the
+  // half-formed turn and send the new message as a fresh one. The backend
+  // commits the interrupted turn's partial work (streamed text + a note of any
+  // in-progress tool call) to history, so the model still sees what it was
+  // doing. Mirrors the Force-send button's interrupt-then-send.
+  async interruptAndSend(payload) {
+    this.state.turn = "interrupting";
+    await fetch("/interrupt", {method: "POST"}).catch(() => {});
+    this.state.turn = "busy";
+    this.state.responded = false;
+    showOptimisticUserMessage(payload.displayText, payload.images);
+    await sendText(payload.text, payload.images);
+  },
 
   // Server's authoritative turn state on (re)connect. The snapshot replay has no
   // turn_end, so this is the only thing that re-syncs the busy gate after a
@@ -3882,6 +3905,10 @@ const chat = {
     // indicator silently vanishes while the model is still working. Cleared by
     // the next streamed token / tool call / turn_end.
     if (this.state.turn === "busy") showThinking();
+    // We can't tell from a replay whether the in-flight turn already produced a
+    // reply, so play it safe: treat it as responded so a follow-up queues rather
+    // than interrupting a turn that may have visible output we'd discard.
+    this.state.responded = (this.state.turn === "busy");
     if (this.state.turn === "idle" && this.state.draft) flushQueuedDraft();
   },
 
@@ -5329,6 +5356,7 @@ function onStreamMessage(e) {
       break;
     case "assistant_text": {
       clearThinking();
+      if (!e.from_replay) chat.markResponded();
       const bubble = ensureAssistant();
       bubble._content.appendChild(document.createTextNode(e.text));
       pendingHtmlTarget = currentAssistant;
@@ -5350,6 +5378,7 @@ function onStreamMessage(e) {
       break;
     case "assistant_html_partial": {
       clearThinking();
+      if (!e.from_replay) chat.markResponded();
       const bubble = ensureAssistant();
       if (!chat.replaying() && !e.from_replay) {
         typewriterUpdate(bubble, e.text, /*finalize=*/false);
@@ -5360,6 +5389,7 @@ function onStreamMessage(e) {
     }
     case "assistant_html": {
       clearThinking();
+      if (!e.from_replay) chat.markResponded();
       // Final/full render. On history replay we have no streaming bubble — make
       // one and skip the typewriter entirely (replay should appear instantly).
       let target = pendingHtmlTarget || currentAssistant;
@@ -5436,9 +5466,11 @@ function onStreamMessage(e) {
       break;
     case "graphic":
       // A chart / diagram / SVG the model drew with CreateGraphics. Rendered
-      // as a card inline in the transcript, regardless of verbosity.
+      // as a card inline in the transcript, regardless of verbosity. Counts as
+      // visible reply content — a follow-up now queues rather than interrupting.
       clearThinking();
       clearWorkingIndicator();
+      if (!e.from_replay) chat.markResponded();
       renderGraphic(e.payload || {});
       break;
     case "web_sources":
@@ -5630,16 +5662,26 @@ form.addEventListener("submit", async (ev) => {
                       : userText;
 
   if (images.length || textFiles.length) clearAttachments();
-  // While the model is mid-response, hold the new message back as a draft
-  // instead of POSTing it. The user must click the queued pill's stop
-  // button to actually send (which also interrupts the current reply).
   if (chat.busy()) {
+    // A message sent during a conversation switch is held (so it can't race the
+    // backend /reset|/load) but auto-sends the instant the new session is ready
+    // — show it as a normal optimistic send, not the "Queued" pill.
+    if (chat.state.nav === "switching") {
+      setQueuedDraft({text, images, displayText: userText});
+      showOptimisticUserMessage(userText, images);
+      return;
+    }
+    // The model is still working but hasn't shown a reply yet (3 dots / a tool
+    // call). Users often fire a quick second message as if texting — interrupt
+    // the half-formed turn and send this instead of queuing it. The interrupted
+    // turn's partial work is preserved in history so the model keeps the context.
+    if (chat.state.turn === "busy" && !chat.state.responded) {
+      chat.interruptAndSend({text, images, displayText: userText});
+      return;
+    }
+    // The model is actively replying (visible output on screen): hold the new
+    // message as a queued draft, sent via the pill's Force-send or on turn end.
     setQueuedDraft({text, images, displayText: userText});
-    // A message sent during a conversation switch is also held (so it can't race
-    // the backend /reset|/load), but it auto-sends the instant the new session is
-    // ready — so show it as a normal optimistic send rather than the "Queued"
-    // pill, which would otherwise flash for the round-trip.
-    if (chat.state.nav === "switching") showOptimisticUserMessage(userText, images);
     return;
   }
   // Open the turn optimistically so a rapid second submit before
