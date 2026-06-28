@@ -9,12 +9,26 @@
     "date": {
       "type": "string",
       "pattern": "^\\d{2}/\\d{2}/\\d{4}$",
-      "description": "DD/MM/YYYY. For a multi-day event, the start date."
+      "description": "DD/MM/YYYY start date. For a multi-day event, set end_date (or duration) for the end."
     },
     "time": {
       "type": "string",
       "pattern": "^\\d{2}:\\d{2}$",
       "description": "Start time, HH:MM. Optional."
+    },
+    "duration": {
+      "type": "string",
+      "description": "How long the event lasts; the server converts it to an absolute end. Compact form: '90m', '2h', '1h30m', '3d', '2w', '2mo', '1y'. Use this OR end_date/end_time, never both. To move an event AND keep its length, change `date`/`time` and pass `duration` again (the end is recomputed from the new start). To move it but anchor the end, repeat the existing end_date/end_time instead. Omit to leave the existing end unchanged; pass an empty end_date to clear the length."
+    },
+    "end_date": {
+      "type": "string",
+      "pattern": "^\\d{2}/\\d{2}/\\d{4}$",
+      "description": "DD/MM/YYYY the event ends on. Optional; alternative to `duration`. Must be on or after `date`. This is an absolute end and does not move on its own. Omit to keep the existing value; pass empty string to clear it."
+    },
+    "end_time": {
+      "type": "string",
+      "pattern": "^\\d{2}:\\d{2}$",
+      "description": "End time, HH:MM. Optional; requires `time`. Omit to keep the existing value; pass empty string to clear it."
     },
     "category": {
       "type": "string",

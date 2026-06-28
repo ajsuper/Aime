@@ -15,6 +15,12 @@ import requests
 
 from .tool_formatting import TOOL_NAME_MAP
 from .config import API_URL
+from .event_length import normalize_event_length, EventLengthError
+
+
+# Backend tools that accept an event-length `duration` sugar we resolve to an
+# absolute end before forwarding (the backend only ever stores end_date/end_time).
+_EVENT_WRITE_TOOLS = frozenset({"create_event", "replace_event"})
 
 
 # Backend tool-name prefixes that only read state. Anything not matching is
@@ -75,6 +81,16 @@ class ToolGateway:
         return datetime.datetime.now()
 
     def _post(self, body: dict) -> dict:
+        if body.get("tool_name") in _EVENT_WRITE_TOOLS:
+            # Resolve a `duration` sugar (or validate an explicit end) into the
+            # absolute end_date/end_time the backend stores. Done here, the one
+            # choke point both the agent (execute) and UI (call) paths share, so
+            # neither can write an event with an unresolved or inverted end. A
+            # bad combination is reported back to the caller, never sent to C++.
+            try:
+                body = normalize_event_length(body)
+            except EventLengthError as exc:
+                return {"error": str(exc)}
         if self._user_id is not None:
             body["user_id"] = self._user_id
         # Stamp every events read with the user-local date/time so the backend

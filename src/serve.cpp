@@ -46,8 +46,15 @@ struct CalenderEvent {
     std::string eventTitle;
     std::string eventSummary;
     std::string eventCategory;
-    std::string eventDate;  // DD/MM/YYYY
-    std::string eventTime;  // HH:MM
+    std::string eventDate;  // DD/MM/YYYY (start date)
+    std::string eventTime;  // HH:MM (start time)
+    // Event length. Stored as an ABSOLUTE end, mirroring the start's shape:
+    // endDate is the (multi-day) end date, endTime the end-of-day wall time.
+    // Both default "" = unset, so every legacy event stays a valid point in time.
+    // A `duration` input is normalized to these in the Python tool layer before
+    // it ever reaches here — the C++ side only ever knows the concrete end.
+    std::string eventEndDate;  // DD/MM/YYYY, "" if open-ended / point event
+    std::string eventEndTime;  // HH:MM, "" if all-day or point event
     bool eventArchived = false;
     // Commitment-tracking metadata (all additive; older rows default to these).
     std::string commitmentId;                 // stable slug linking recurring instances
@@ -152,7 +159,11 @@ void createCalender(sqlite3* database) {
         "EVENT_STATUS_CHANGE_REASON TEXT NOT NULL DEFAULT '',"
         "EVENT_RESCHEDULED_FROM TEXT NOT NULL DEFAULT '',"
         "EVENT_CREATED_AT TEXT NOT NULL DEFAULT '',"
-        "EVENT_LAST_MODIFIED_AT TEXT NOT NULL DEFAULT ''"
+        "EVENT_LAST_MODIFIED_AT TEXT NOT NULL DEFAULT '',"
+        // Event-length columns (indices 13-14). Must stay last so they line up
+        // with the migration ALTERs, which always append.
+        "EVENT_END_DATE TEXT NOT NULL DEFAULT '',"
+        "EVENT_END_TIME TEXT NOT NULL DEFAULT ''"
         ")";
 
     int result = sqlite3_exec(database, sqlCommand.c_str(), NULL, 0, &errMsg);
@@ -174,6 +185,8 @@ void createCalender(sqlite3* database) {
         {"EVENT_RESCHEDULED_FROM",      "EVENT_RESCHEDULED_FROM TEXT NOT NULL DEFAULT ''"},
         {"EVENT_CREATED_AT",       "EVENT_CREATED_AT TEXT NOT NULL DEFAULT ''"},
         {"EVENT_LAST_MODIFIED_AT", "EVENT_LAST_MODIFIED_AT TEXT NOT NULL DEFAULT ''"},
+        {"EVENT_END_DATE",         "EVENT_END_DATE TEXT NOT NULL DEFAULT ''"},
+        {"EVENT_END_TIME",         "EVENT_END_TIME TEXT NOT NULL DEFAULT ''"},
     };
 
     std::set<std::string> existingColumns;
@@ -324,6 +337,8 @@ static CalenderEvent rowToEvent(sqlite3_stmt* stmt) {
     event.rescheduledFrom = columnTextOrEmpty(stmt, 10);
     event.createdAt       = columnTextOrEmpty(stmt, 11);
     event.lastModifiedAt  = columnTextOrEmpty(stmt, 12);
+    event.eventEndDate    = columnTextOrEmpty(stmt, 13);
+    event.eventEndTime    = columnTextOrEmpty(stmt, 14);
     return event;
 }
 
@@ -454,8 +469,8 @@ void addEvent(sqlite3* database, CalenderEvent& event) {
     const std::string sql =
         "INSERT INTO EVENT(EVENT_TITLE, EVENT_SUMMARY, EVENT_CATEGORY, EVENT_DATE, EVENT_TIME, EVENT_ARCHIVED,"
         " EVENT_COMMITMENT_ID, EVENT_STATUS, EVENT_STATUS_CHANGE_REASON, EVENT_RESCHEDULED_FROM,"
-        " EVENT_CREATED_AT, EVENT_LAST_MODIFIED_AT)"
-        " VALUES(?, ?, ?, ?, ?, 'FALSE', ?, ?, ?, ?, ?, ?)";
+        " EVENT_CREATED_AT, EVENT_LAST_MODIFIED_AT, EVENT_END_DATE, EVENT_END_TIME)"
+        " VALUES(?, ?, ?, ?, ?, 'FALSE', ?, ?, ?, ?, ?, ?, ?, ?)";
 
     if (sqlite3_prepare_v2(database, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
         std::cout << "addEvent prepare failed: " << sqlite3_errmsg(database) << std::endl;
@@ -478,6 +493,8 @@ void addEvent(sqlite3* database, CalenderEvent& event) {
     sqlite3_bind_text(stmt, 9, event.rescheduledFrom.c_str(),-1, SQLITE_STATIC);
     sqlite3_bind_text(stmt, 10, event.createdAt.c_str(),     -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt, 11, event.lastModifiedAt.c_str(),-1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 12, event.eventEndDate.c_str(),  -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 13, event.eventEndTime.c_str(),  -1, SQLITE_STATIC);
 
     if (sqlite3_step(stmt) != SQLITE_DONE) {
         std::cout << "addEvent failed: " << sqlite3_errmsg(database) << std::endl;
@@ -516,7 +533,7 @@ void updateEvent(sqlite3* database, const CalenderEvent& event) {
     const std::string sql =
         "UPDATE EVENT SET EVENT_TITLE=?, EVENT_SUMMARY=?, EVENT_CATEGORY=?, EVENT_DATE=?, EVENT_TIME=?,"
         " EVENT_COMMITMENT_ID=?, EVENT_STATUS=?, EVENT_STATUS_CHANGE_REASON=?, EVENT_RESCHEDULED_FROM=?,"
-        " EVENT_LAST_MODIFIED_AT=?"
+        " EVENT_LAST_MODIFIED_AT=?, EVENT_END_DATE=?, EVENT_END_TIME=?"
         " WHERE ID=?";
 
     if (sqlite3_prepare_v2(database, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
@@ -537,7 +554,9 @@ void updateEvent(sqlite3* database, const CalenderEvent& event) {
     sqlite3_bind_text(stmt, 8, event.statusChangeReason.c_str(), -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt, 9, event.rescheduledFrom.c_str(),-1, SQLITE_STATIC);
     sqlite3_bind_text(stmt, 10, now.c_str(),                 -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int (stmt, 11, event.id);
+    sqlite3_bind_text(stmt, 11, event.eventEndDate.c_str(),  -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 12, event.eventEndTime.c_str(),  -1, SQLITE_STATIC);
+    sqlite3_bind_int (stmt, 13, event.id);
 
     if (sqlite3_step(stmt) != SQLITE_DONE) {
         std::cout << "updateEvent failed: " << sqlite3_errmsg(database) << std::endl;
@@ -1078,6 +1097,8 @@ static crow::json::wvalue eventToJson(const CalenderEvent& e) {
     j["category"] = e.eventCategory;
     j["date"]     = e.eventDate;
     j["time"]     = e.eventTime;
+    j["end_date"] = e.eventEndDate;
+    j["end_time"] = e.eventEndTime;
     j["archived"] = e.eventArchived;
     j["commitment_id"]    = e.commitmentId;
     j["status"]           = e.status.empty() ? "scheduled" : e.status;
@@ -1154,6 +1175,8 @@ static CalenderEvent parseEditEvent(const crow::json::rvalue& j,
     if (j.has("category")) event.eventCategory = std::string(j["category"].s());
     if (j.has("date"))     event.eventDate     = std::string(j["date"].s());
     if (j.has("time"))     event.eventTime     = std::string(j["time"].s());
+    if (j.has("end_date")) event.eventEndDate  = std::string(j["end_date"].s());
+    if (j.has("end_time")) event.eventEndTime  = std::string(j["end_time"].s());
     if (j.has("archived")) event.eventArchived = j["archived"].b();
     if (j.has("commitment_id"))    event.commitmentId    = std::string(j["commitment_id"].s());
     if (j.has("status"))           event.status          = std::string(j["status"].s());

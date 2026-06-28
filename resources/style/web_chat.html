@@ -1246,6 +1246,32 @@
                                    left: -4px; top: -4px; width: 8px; height: 8px;
                                    border-radius: 50%;
                                    background: var(--rainbow-pink, #f06292); }
+
+    /* Ladder markers: where a multi-day timed event begins / ends on this day's
+       clock, drawn as a dashed category-colored line with a small right-aligned
+       label so it reads against the day's other blocks without claiming a whole
+       slot. End markers dash up from the line; begin markers hang below it. */
+    .cal-sched .ladder-marker { position: absolute; left: 0; right: 0; height: 0;
+                                border-top: 1.5px dashed
+                                  var(--cat-color, var(--accent));
+                                z-index: 2; pointer-events: none; }
+    .cal-sched .ladder-marker .marker-label {
+                                position: absolute; right: 3px; top: 1px;
+                                max-width: calc(100% - 8px);
+                                font-size: 0.6rem; font-weight: 600; line-height: 1.3;
+                                padding: 0 5px; border-radius: 0 0 5px 5px;
+                                background: var(--cat-color, var(--accent));
+                                color: white; white-space: nowrap;
+                                overflow: hidden; text-overflow: ellipsis;
+                                pointer-events: auto; cursor: pointer;
+                                box-shadow: 0 1px 2px rgba(0,0,0,0.2); }
+    .cal-sched .ladder-marker.end .marker-label { top: auto; bottom: 1px;
+                                border-radius: 5px 5px 0 0; }
+    .cal-sched .ladder-marker.completed,
+    .cal-sched .ladder-marker.canceled,
+    .cal-sched .ladder-marker.archived { opacity: 0.5; filter: grayscale(0.6); }
+    .cal-sched .ladder-marker.canceled .marker-label { text-decoration: line-through; }
+
     /* All-day strip above the hour ladder for events without a time. */
     .cal-sched .allday { display: grid;
                          grid-template-columns: 56px minmax(0, 1fr);
@@ -1280,6 +1306,42 @@
                                   border-radius: 999px; font-size: 0.68rem;
                                   max-width: 100%; overflow: hidden;
                                   text-overflow: ellipsis; white-space: nowrap; }
+
+    /* Multi-day spanning bars (cases 2 & 3): a horizontal block placed across
+       the day columns it covers via grid-column/grid-row (set in JS). Styled
+       like a laid-down ev-block; a timed span leads with its start time. */
+    .cal-sched .allday .allday-span {
+                       margin: 2px 3px; padding: 2px 8px; border-radius: 6px;
+                       background: var(--accent); color: white;
+                       font-size: 0.68rem; line-height: 1.3;
+                       display: flex; align-items: baseline; gap: 5px;
+                       min-width: 0; overflow: hidden; white-space: nowrap;
+                       cursor: pointer; box-sizing: border-box;
+                       box-shadow: 0 1px 2px rgba(0,0,0,0.18);
+                       transition: transform 0.1s, box-shadow 0.1s; }
+    .cal-sched .allday .allday-span:hover { transform: translateY(-1px);
+                       box-shadow: 0 3px 8px rgba(0,0,0,0.22); z-index: 3; }
+    .cal-sched .allday .allday-span .span-time { flex: 0 0 auto;
+                       font-weight: 600; font-size: 0.64rem; opacity: 0.95; }
+    .cal-sched .allday .allday-span .span-label { font-weight: 600;
+                       overflow: hidden; text-overflow: ellipsis; }
+    .cal-sched .allday .allday-span[style*="--cat-h"] {
+                       background: color-mix(in srgb, var(--cat-color) 78%,
+                                   color-mix(in srgb, var(--bg) 50%, transparent));
+                       color: var(--text);
+                       box-shadow: inset 3px 0 0 var(--cat-color),
+                                   0 1px 2px rgba(0,0,0,0.18); }
+    .cal-sched .allday .allday-span.completed,
+    .cal-sched .allday .allday-span.canceled,
+    .cal-sched .allday .allday-span.archived {
+                       opacity: 0.45; filter: grayscale(0.7); }
+    .cal-sched .allday .allday-span.completed:hover,
+    .cal-sched .allday .allday-span.canceled:hover,
+    .cal-sched .allday .allday-span.archived:hover { opacity: 0.75; }
+    .cal-sched .allday .allday-span.canceled { text-decoration: line-through; }
+    .cal-sched .allday .allday-span.unknown {
+                       box-shadow: inset 2px 0 0
+                         color-mix(in srgb, var(--warning, #e29a4a) 45%, transparent); }
 
     /* To-do rows: all-day events render as checkable list items rather
        than passive pills. The checkbox toggles completion status
@@ -1866,6 +1928,27 @@
       color: var(--text);
       box-shadow: inset 3px 0 0 var(--cat-color),
                   0 1px 2px rgba(0,0,0,0.18);
+    }
+
+    /* Month-grid multi-day band: bleed to the cell's side edges so consecutive
+       days join into one continuous bar (the cell clips the overflow), and
+       round + carry the category left-edge only at the span's true start. */
+    .cal-cell .ev-span,
+    .cal-cell .ev-span[style*="--cat-h"] {
+      margin-left: -0.4rem; margin-right: -0.4rem;
+      padding-left: 0.4rem; padding-right: 0.4rem;
+      border-radius: 0; box-shadow: none;
+      background: color-mix(in srgb, var(--cat-color, var(--accent)) 26%, transparent);
+      font-weight: 600;
+    }
+    .cal-cell .ev-span.span-start {
+      margin-left: 0; padding-left: 8px;
+      border-top-left-radius: 4px; border-bottom-left-radius: 4px;
+      box-shadow: inset 3px 0 0 var(--cat-color, var(--accent));
+    }
+    .cal-cell .ev-span.span-end {
+      margin-right: 0; padding-right: 6px;
+      border-top-right-radius: 4px; border-bottom-right-radius: 4px;
     }
 
     /* Resolved events (completed or canceled) stay visible so users see their
@@ -2773,6 +2856,10 @@
           <label class="ev-field ev-time-field">
             <span class="lbl">Time</span>
             <input type="time" id="ev-f-time" readonly>
+          </label>
+          <label class="ev-field ev-time-field">
+            <span class="lbl">Ends</span>
+            <input type="time" id="ev-f-end-time" readonly>
           </label>
         </div>
         <label class="ev-field">
@@ -7215,7 +7302,10 @@ function moveCalCursor(delta) {
 // range touches so week views spanning a month boundary stay correct.
 async function fetchEventsInRange(start, end) {
   const months = new Set();
-  const cursor = new Date(start.getFullYear(), start.getMonth(), 1);
+  // Start one month early so a multi-day event that began in the previous month
+  // and spills into the visible range is still fetched (the backend keys events
+  // by their start date, so we can't rely on the range alone to surface them).
+  const cursor = new Date(start.getFullYear(), start.getMonth() - 1, 1);
   while (cursor <= end) {
     months.add(`${cursor.getFullYear()}/${cursor.getMonth() + 1}`);
     cursor.setMonth(cursor.getMonth() + 1);
@@ -7228,12 +7318,21 @@ async function fetchEventsInRange(start, end) {
       (data.events || []).forEach(ev => all.push(ev));
     } catch (_) { /* silent: partial is better than nothing */ }
   }
+  const rangeStart = new Date(start.getFullYear(), start.getMonth(), start.getDate());
+  const rangeEnd = new Date(end.getFullYear(), end.getMonth(), end.getDate());
+  const seen = new Set();
   return all.filter(ev => {
-    const [dd, mm, yy] = (ev.date || "").split("/");
-    if (!dd) return false;
-    const d = new Date(parseInt(yy, 10), parseInt(mm, 10) - 1, parseInt(dd, 10));
-    return d >= new Date(start.getFullYear(), start.getMonth(), start.getDate())
-        && d <= new Date(end.getFullYear(), end.getMonth(), end.getDate());
+    const sd = parseBackendDate(ev.date);
+    if (!sd) return false;
+    if (ev.id != null) {                    // dedupe across overlapping month fetches
+      if (seen.has(ev.id)) return false;
+      seen.add(ev.id);
+    }
+    // Keep an event whose [start, end] interval intersects the range — not just
+    // those that start inside it — so multi-day spans render on every day they
+    // cover, including when the start sits before the visible window.
+    const ed = parseBackendDate(ev.end_date) || sd;
+    return sd <= rangeEnd && ed >= rangeStart;
   });
 }
 
@@ -7252,11 +7351,11 @@ function computeHourWindow(events) {
   let startHour = DEFAULT_DAY_START;
   let endHour = DEFAULT_DAY_END;
   events.forEach(ev => {
-    const m = parseEventMinutes(ev);
-    if (m === null) return;       // all-day events live in the strip, not the ladder
-    const h = Math.floor(m / 60);
+    const bounds = eventLadderBounds(ev);
+    if (!bounds) return;          // all-day events live in the strip, not the ladder
+    const h = Math.floor(bounds[0] / 60);
     if (h < startHour) startHour = h;
-    const tail = Math.ceil((m + DEFAULT_EV_MIN) / 60);
+    const tail = Math.ceil(bounds[1] / 60);
     if (tail > endHour) endHour = tail;
   });
   startHour = Math.max(0, startHour);
@@ -7303,24 +7402,56 @@ async function renderMonthView(silent) {
   grid.hidden = false;
   if (!silent) grid.innerHTML = "";
 
+  // Fetch this month plus the previous one, so a multi-day event that began
+  // last month and spills into this one still appears on its covered days.
   let events = [];
   try {
-    const r = await fetch(`/calendar/${calYear}/${calMonth}`);
-    const data = await r.json();
-    events = data.events || [];
+    const prevY = calMonth === 1 ? calYear - 1 : calYear;
+    const prevM = calMonth === 1 ? 12 : calMonth - 1;
+    const [rCur, rPrev] = await Promise.all([
+      fetch(`/calendar/${calYear}/${calMonth}`).then(r => r.json()).catch(() => ({})),
+      fetch(`/calendar/${prevY}/${prevM}`).then(r => r.json()).catch(() => ({})),
+    ]);
+    const seen = new Set();
+    [...(rCur.events || []), ...(rPrev.events || [])].forEach(ev => {
+      if (ev.id != null && seen.has(ev.id)) return;
+      if (ev.id != null) seen.add(ev.id);
+      events.push(ev);
+    });
   } catch (e) {
     if (silent) return;
   }
 
-  const byDay = {};
-  events.forEach(ev => {
-    const d = (ev.date || "").split("/")[0];
-    const n = parseInt(d, 10);
-    if (!Number.isNaN(n)) (byDay[n] = byDay[n] || []).push(ev);
-  });
-
   const firstDow = new Date(calYear, calMonth - 1, 1).getDay();
   const daysInMonth = new Date(calYear, calMonth, 0).getDate();
+
+  // Bucket events onto every day they cover within this month. Single-day
+  // events land on their one day; a multi-day event lands on each covered day
+  // tagged with its position in the span (start/mid/end + whether it runs off
+  // either month edge) so the chip can render as a continuous rounded band.
+  const monthStart = new Date(calYear, calMonth - 1, 1);
+  const monthEnd = new Date(calYear, calMonth - 1, daysInMonth);
+  const byDay = {};
+  const push = (n, entry) => { (byDay[n] = byDay[n] || []).push(entry); };
+  events.forEach(ev => {
+    if (isMultiDayEvent(ev)) {
+      const sd = parseBackendDate(ev.date);
+      const ed = parseBackendDate(ev.end_date) || sd;
+      const from = sd < monthStart ? monthStart : sd;
+      const to = ed > monthEnd ? monthEnd : ed;
+      if (to < monthStart || from > monthEnd) return;
+      for (let dt = new Date(from); dt <= to; dt.setDate(dt.getDate() + 1)) {
+        push(dt.getDate(), {
+          ev, span: true,
+          isStart: dt.getTime() === sd.getTime(),
+          isEnd: dt.getTime() === ed.getTime(),
+        });
+      }
+    } else {
+      const n = parseInt((ev.date || "").split("/")[0], 10);
+      if (!Number.isNaN(n)) push(n, { ev, span: false });
+    }
+  });
 
   const frag = document.createDocumentFragment();
   ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"].forEach(d => {
@@ -7345,8 +7476,24 @@ async function renderMonthView(silent) {
     num.className = "daynum";
     num.textContent = d;
     cell.appendChild(num);
-    (byDay[d] || []).slice(0, 3).forEach(ev => {
-      if (parseEventMinutes(ev) === null) {
+    const dow = (firstDow + d - 1) % 7;     // 0 = Sunday (a week-row start)
+    (byDay[d] || []).slice(0, 3).forEach(entry => {
+      const ev = entry.ev;
+      if (entry.span) {
+        // Multi-day band: a chip on each covered day, rounded only at the true
+        // start/end so it reads as one bar across the row. The title shows on
+        // the start day and at each week-row start (so continuation rows are
+        // labeled too); interior days carry just the colored band.
+        const e = document.createElement("div");
+        e.className = "ev ev-span" + eventStateClasses(ev)
+                    + (entry.isStart ? " span-start" : "")
+                    + (entry.isEnd ? " span-end" : "");
+        const labelHere = entry.isStart || dow === 0;
+        e.textContent = labelHere ? (ev.title || ev.name || "(untitled)") : " ";
+        applyCategoryColor(e, ev.category);
+        e.addEventListener("click", (evt) => { evt.stopPropagation(); openEventModal(ev); });
+        cell.appendChild(e);
+      } else if (parseEventMinutes(ev) === null) {
         // All-day events render as compact to-do rows so a quick check
         // toggles done state without leaving the month grid.
         // Month view: render all-day items as static rows — they keep the
@@ -7401,6 +7548,125 @@ function parseEventMinutes(ev) {
   const hh = Math.max(0, Math.min(23, parseInt(m[1], 10)));
   const mm = Math.max(0, Math.min(59, parseInt(m[2], 10)));
   return hh * 60 + mm;
+}
+
+// Minute-of-day an event ends at, for sizing its block on the ladder. Uses the
+// event's real end when set: an end_time on the same day gives a true duration;
+// a later end_date means it runs past today, so we fill to the day's end. With
+// no end stored it falls back to DEFAULT_EV_MIN — the old point-event slot.
+function eventEndMinutes(ev, start) {
+  const ed = (ev.end_date || "").trim();
+  const et = (ev.end_time || "").trim();
+  if (ed && ed !== (ev.date || "").trim()) return 24 * 60;   // multi-day: continues past today
+  if (et) {
+    const m = /^(\d{1,2}):(\d{2})/.exec(et);
+    if (m) {
+      const end = Math.min(24 * 60, parseInt(m[1], 10) * 60 + parseInt(m[2], 10));
+      if (end > start) return end;
+    }
+  }
+  return start + DEFAULT_EV_MIN;
+}
+
+// Parse a backend DD/MM/YYYY string into a local-midnight Date, or null.
+function parseBackendDate(s) {
+  const [dd, mm, yy] = (s || "").split("/");
+  if (!dd || !mm || !yy) return null;
+  const d = new Date(parseInt(yy, 10), parseInt(mm, 10) - 1, parseInt(dd, 10));
+  return isNaN(d.getTime()) ? null : d;
+}
+
+// An event spans more than one calendar day iff it has an end_date strictly
+// after its start date. Timed or not — a multi-day event of either kind is
+// rendered as a horizontal spanning bar in the all-day strip, never on the
+// hour ladder (which is per-day). Single-day events (the common case) never
+// match and keep their existing ladder/to-do treatment.
+function isMultiDayEvent(ev) {
+  const sd = parseBackendDate(ev.date);
+  const ed = parseBackendDate(ev.end_date);
+  return !!(sd && ed && ed.getTime() > sd.getTime());
+}
+
+// Display an "HH:MM" wall time in the user's chosen 12/24h format.
+function fmtEventTime(hhmm) {
+  const t = (hhmm || "").trim();
+  if (!t) return "";
+  return clientTimeFormat() === "24" ? t : fmt12(t);
+}
+
+// The [startColIdx, endColIdx] a multi-day event occupies within a 7-column
+// week whose first column is `weekStart`, clipped to the visible [0,6] range
+// (so an event that begins before or ends after the week is cropped to the
+// edge). Returns null if it doesn't intersect the week at all.
+function weekSpanFor(ev, weekStart) {
+  const sd = parseBackendDate(ev.date);
+  const ed = parseBackendDate(ev.end_date) || sd;
+  if (!sd) return null;
+  const dayMs = 86400000;
+  const ws = new Date(weekStart.getFullYear(), weekStart.getMonth(), weekStart.getDate());
+  const startIdx = Math.round((sd - ws) / dayMs);
+  const endIdx = Math.round((ed - ws) / dayMs);
+  if (endIdx < 0 || startIdx > 6) return null;     // entirely outside this week
+  return [Math.max(0, startIdx), Math.min(6, endIdx)];
+}
+
+// Single-column (day-view) analogue: [0,0] if the event's [start,end] range
+// covers `d`, else null.
+function daySpanFor(ev, d) {
+  const sd = parseBackendDate(ev.date);
+  const ed = parseBackendDate(ev.end_date) || sd;
+  if (!sd) return null;
+  const day = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+  if (day < sd.getTime() || day > ed.getTime()) return null;
+  return [0, 0];
+}
+
+// Greedy interval-partition of multi-day spans into rows: each row holds bars
+// whose column ranges don't overlap, so nothing collides horizontally. Returns
+// the input items each tagged with a `row` index.
+function packSpanRows(items) {
+  const rows = [];   // rows[r] = last occupied column index in that row
+  items.sort((a, b) => a.startIdx - b.startIdx || a.endIdx - b.endIdx);
+  items.forEach(it => {
+    let r = 0;
+    while (r < rows.length && rows[r] >= it.startIdx) r++;
+    rows[r] = it.endIdx;
+    it.row = r;
+  });
+  return items;
+}
+
+// A local Date rendered back to the backend's DD/MM/YYYY (for date comparison).
+function backendDateOf(date) {
+  return `${String(date.getDate()).padStart(2, "0")}/`
+       + `${String(date.getMonth() + 1).padStart(2, "0")}/`
+       + `${date.getFullYear()}`;
+}
+
+// Parse an "HH:MM" string to minute-of-day (clamped to [0,1440]), or null.
+function timeStrToMinutes(s) {
+  const m = /^(\d{1,2}):(\d{2})/.exec((s || "").trim());
+  if (!m) return null;
+  return Math.min(24 * 60, parseInt(m[1], 10) * 60 + parseInt(m[2], 10));
+}
+
+// The [low, high] minute-of-day span an event contributes to the ladder's
+// visible window. A single-day timed event contributes its start→end. A
+// multi-day timed event contributes only its start time (its begin marker) and
+// its end time (its end marker) — NOT a fill-to-midnight, so one overnight
+// event doesn't stretch the whole ladder to 24h. All-day events contribute
+// nothing (they live in the strip). Returns null when off the ladder.
+function eventLadderBounds(ev) {
+  const start = parseEventMinutes(ev);
+  if (start === null) return null;
+  const mins = [start];
+  if (isMultiDayEvent(ev)) {
+    const et = timeStrToMinutes(ev.end_time);
+    mins.push(et !== null ? et : start + DEFAULT_EV_MIN);
+  } else {
+    mins.push(eventEndMinutes(ev, start));
+  }
+  return [Math.min(...mins), Math.max(...mins)];
 }
 
 function eventKey(date) {
@@ -7463,6 +7729,7 @@ const eventBackdrop = document.getElementById("event-backdrop");
 const evFTitle = document.getElementById("ev-f-title");
 const evFDate = document.getElementById("ev-f-date");
 const evFTime = document.getElementById("ev-f-time");
+const evFEndTime = document.getElementById("ev-f-end-time");
 const evFCategory = document.getElementById("ev-f-category");
 const evFMetaWrap = document.getElementById("ev-f-meta-wrap");
 const evFMeta = document.getElementById("ev-f-meta");
@@ -7573,6 +7840,10 @@ function openEventModal(ev) {
   evFTitle.value = ev.title || ev.name || "";
   evFDate.value = backendDateToInput(ev.date || "");
   evFTime.value = (ev.time || "").trim();
+  // Only a same-day end time is editable here; a multi-day end (end_date) is
+  // left to chat, so we don't surface a misleading time for it.
+  const sameDayEnd = !(ev.end_date || "").trim() || (ev.end_date || "").trim() === (ev.date || "").trim();
+  evFEndTime.value = sameDayEnd ? (ev.end_time || "").trim() : "";
   evFCategory.value = ev.category || "";
   evFSummary.value = ev.summary || "";
   renderEventSummary(ev.summary || "");
@@ -7835,7 +8106,7 @@ function closeEventModal() {
 }
 
 function setEventEditMode(on) {
-  [evFTitle, evFDate, evFTime, evFCategory].forEach(el => {
+  [evFTitle, evFDate, evFTime, evFEndTime, evFCategory].forEach(el => {
     el.readOnly = !on;
   });
   // The summary swaps between a rendered-markdown view (read-only) and a
@@ -7850,7 +8121,7 @@ function setEventEditMode(on) {
 
 // Clicking any field while the modal is read-only swaps into edit mode
 // and focuses what the user clicked, so there's no separate Edit button.
-[evFTitle, evFDate, evFTime, evFCategory].forEach(el => {
+[evFTitle, evFDate, evFTime, evFEndTime, evFCategory].forEach(el => {
   el.addEventListener("mousedown", () => {
     if (!el.readOnly) return;
     setEventEditMode(true);
@@ -7892,6 +8163,19 @@ async function saveActiveEvent() {
     time: evFTime.value || "",
     archived: !!activeEventRecord.archived,
   };
+  // Length. The modal only edits a same-day end time; a multi-day span set via
+  // chat isn't shown here, so preserve it verbatim rather than letting an empty
+  // field clear it. For the same-day case, an end time pins end_date to the
+  // start date; clearing it clears the length.
+  const origEndDate = (activeEventRecord.end_date || "").trim();
+  if (origEndDate && origEndDate !== payload.date) {
+    payload.end_date = activeEventRecord.end_date || "";
+    payload.end_time = activeEventRecord.end_time || "";
+  } else {
+    const endTimeVal = (evFEndTime.value || "").trim();
+    payload.end_time = endTimeVal;
+    payload.end_date = endTimeVal ? payload.date : "";
+  }
   if (!payload.title) {
     evModalError.textContent = "Title can't be empty.";
     evModalError.hidden = false;
@@ -8280,7 +8564,82 @@ function buildTodoItem(ev, { compact = false, interactive = true } = {}) {
   return item;
 }
 
-function buildDayColumn(date, events, sched, allDayCol, hourPx, startHour, endHour) {
+// A multi-day event rendered as a horizontal bar for the all-day strip. Carries
+// its category color, status styling, and a label that leads with the start
+// time when the event is timed (case 3) and is just the title when it's a true
+// all-day span (case 2). The caller positions it via grid-column / grid-row.
+function buildSpanBar(ev) {
+  const bar = document.createElement("div");
+  bar.className = "allday-span" + eventStateClasses(ev);
+  applyCategoryColor(bar, ev.category);
+  const t = fmtEventTime(ev.time);
+  const title = ev.title || ev.name || "(untitled)";
+  if (t) {
+    const time = document.createElement("span");
+    time.className = "span-time";
+    time.textContent = t;
+    bar.appendChild(time);
+  }
+  const lbl = document.createElement("span");
+  lbl.className = "span-label";
+  lbl.textContent = title;
+  bar.appendChild(lbl);
+  bar.title = (t ? t + " · " : "") + title;
+  bar.addEventListener("click", (e) => {
+    e.stopPropagation();
+    openEventModal(ev);
+  });
+  return bar;
+}
+
+// Lay multi-day events into the all-day strip as packed spanning rows. `cols`
+// is the number of day columns (7 for week, 1 for day); `gridBase` is the grid
+// column the first day occupies (2: after the 56px label column). `spanFor`
+// maps an event to its [startIdx, endIdx] within the visible columns, or null
+// if it doesn't intersect. Bars sit in grid rows after `rowOffset` existing
+// rows (the single-day to-do cells, when present).
+function layoutSpanBars(container, multiDay, spanFor, gridBase, rowOffset) {
+  const items = [];
+  multiDay.forEach(ev => {
+    const span = spanFor(ev);
+    if (!span) return;
+    items.push({ ev, startIdx: span[0], endIdx: span[1] });
+  });
+  if (!items.length) return 0;
+  packSpanRows(items);
+  let rows = 0;
+  items.forEach(it => {
+    const bar = buildSpanBar(it.ev);
+    bar.style.gridColumn = `${gridBase + it.startIdx} / span ${it.endIdx - it.startIdx + 1}`;
+    bar.style.gridRow = `${rowOffset + it.row + 1}`;
+    container.appendChild(bar);
+    rows = Math.max(rows, it.row + 1);
+  });
+  return rows;
+}
+
+// A thin ladder marker pinning a multi-day timed event to its actual begin or
+// end time on this day's hour ladder, so you can read where it falls relative
+// to the day's other events (the spanning bar in the strip shows the span; this
+// shows the clock position). `kind` is "begin" or "end".
+function buildLadderMarker(ev, kind, atMin, startMin, hourPx) {
+  const mark = document.createElement("div");
+  mark.className = "ladder-marker " + kind + eventStateClasses(ev);
+  mark.style.top = ((atMin - startMin) / 60 * hourPx) + "px";
+  applyCategoryColor(mark, ev.category);
+  const lab = document.createElement("span");
+  lab.className = "marker-label";
+  const verb = kind === "begin" ? "Begins" : "Ends";
+  const arrow = kind === "begin" ? "▸ " : "◂ ";
+  lab.textContent = arrow + verb + " · " + (ev.title || ev.name || "(untitled)");
+  lab.title = `${verb} ${fmtEventTime(kind === "begin" ? ev.time : ev.end_time)} · `
+            + (ev.title || ev.name || "(untitled)");
+  lab.addEventListener("click", (e) => { e.stopPropagation(); openEventModal(ev); });
+  mark.appendChild(lab);
+  return mark;
+}
+
+function buildDayColumn(date, events, multiDay, sched, allDayCol, hourPx, startHour, endHour) {
   const col = document.createElement("div");
   col.className = "day-col";
   if (sameYMD(date, now)) col.classList.add("today");
@@ -8296,9 +8655,11 @@ function buildDayColumn(date, events, sched, allDayCol, hourPx, startHour, endHo
 
   // Split into timed vs all-day. All-day events become to-do items in the
   // strip above; timed events get laid out below with overlap-aware
-  // column assignment.
+  // column assignment. Multi-day events of either kind are skipped here — the
+  // caller renders them as spanning bars across the strip (see layoutSpanBars).
   const timed = [];
   dayEvents.forEach(ev => {
+    if (isMultiDayEvent(ev)) return;
     const start = parseEventMinutes(ev);
     if (start === null) {
       if (allDayCol) {
@@ -8306,7 +8667,7 @@ function buildDayColumn(date, events, sched, allDayCol, hourPx, startHour, endHo
       }
       return;
     }
-    timed.push({ ev, start, end: start + DEFAULT_EV_MIN });
+    timed.push({ ev, start, end: eventEndMinutes(ev, start) });
   });
 
   // Overlap layout: sort by start, then walk forward grouping into clusters
@@ -8322,7 +8683,7 @@ function buildDayColumn(date, events, sched, allDayCol, hourPx, startHour, endHo
     block.className = "ev-block" + eventStateClasses(ev)
                     + (colCount > 1 ? " is-overlap" : "");
     block.style.top = ((start - startMin) / 60 * hourPx) + "px";
-    block.style.height = Math.max(18, DEFAULT_EV_MIN / 60 * hourPx) + "px";
+    block.style.height = Math.max(18, (eventEndMinutes(ev, start) - start) / 60 * hourPx) + "px";
     if (colCount > 1) {
       // 4px inset on each side of the column, 2px gap between siblings.
       block.style.left = `calc(4px + (100% - 8px) * ${colIdx} / ${colCount}`
@@ -8341,6 +8702,27 @@ function buildDayColumn(date, events, sched, allDayCol, hourPx, startHour, endHo
     });
     col.appendChild(block);
   });
+
+  // Multi-day timed events: drop a begin marker on their start day at the start
+  // time, and an end marker on their end day at the end time. They aren't in
+  // this column's `dayEvents` bucket on the end day (events bucket by start
+  // date), so we scan the view's full multi-day list and match on date.
+  const colMs = new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime();
+  (multiDay || []).forEach(ev => {
+    const startTime = parseEventMinutes(ev);
+    if (startTime === null) return;            // all-day span: strip only, no clock anchor
+    const sd = parseBackendDate(ev.date);
+    const ed = parseBackendDate(ev.end_date);
+    if (sd && sd.getTime() === colMs && startTime >= startMin && startTime <= endHour * 60) {
+      col.appendChild(buildLadderMarker(ev, "begin", startTime, startMin, hourPx));
+    }
+    const endTime = timeStrToMinutes(ev.end_time);
+    if (endTime !== null && ed && ed.getTime() === colMs
+        && endTime >= startMin && endTime <= endHour * 60) {
+      col.appendChild(buildLadderMarker(ev, "end", endTime, startMin, hourPx));
+    }
+  });
+
   // Now-line drawn only on today's column, and only if "now" falls in the
   // shown window (no point pointing at an hour we've cropped out).
   if (sameYMD(date, now)) {
@@ -8414,8 +8796,13 @@ async function renderWeekSchedule(silent) {
     head.appendChild(dh);
   }
 
-  // All-day strip: only show when at least one event in the range lacks a time.
-  const hasAllDay = events.some(ev => parseEventMinutes(ev) === null);
+  // All-day strip. It holds two things: per-day to-do cells for single-day
+  // events without a time, and horizontal spanning bars for multi-day events
+  // (timed or not). Show it if either is present in range.
+  const multiDay = events.filter(isMultiDayEvent);
+  const hasSingleAllDay = events.some(
+    ev => !isMultiDayEvent(ev) && parseEventMinutes(ev) === null);
+  const hasAllDay = hasSingleAllDay || multiDay.length > 0;
   allDay.hidden = !hasAllDay;
   allDay.innerHTML = "";
   let allDayCols = [];
@@ -8423,7 +8810,11 @@ async function renderWeekSchedule(silent) {
     const lab = document.createElement("div");
     lab.className = "allday-label";
     lab.textContent = "to-do";
+    lab.style.gridColumn = "1";
+    lab.style.gridRow = "1 / -1";       // span all rows (to-do cells + span bars)
     allDay.appendChild(lab);
+  }
+  if (hasSingleAllDay) {
     for (let i = 0; i < 7; i++) {
       const c = document.createElement("div");
       c.className = "allday-col";
@@ -8431,6 +8822,9 @@ async function renderWeekSchedule(silent) {
       allDayCols.push(c);
     }
   }
+  // Multi-day bars sit in grid rows after the to-do cell row (when present).
+  layoutSpanBars(allDay, multiDay, (ev) => weekSpanFor(ev, start),
+                 2, hasSingleAllDay ? 1 : 0);
 
   // Body: gutter + 7 day columns.
   body.innerHTML = "";
@@ -8442,7 +8836,7 @@ async function renderWeekSchedule(silent) {
   for (let i = 0; i < 7; i++) {
     const date = new Date(start);
     date.setDate(start.getDate() + i);
-    body.appendChild(buildDayColumn(date, byKey, "week",
+    body.appendChild(buildDayColumn(date, byKey, multiDay, "week",
                                     hasAllDay ? allDayCols[i] : null,
                                     HOUR_PX_WEEK, startHour, endHour));
   }
@@ -8491,7 +8885,10 @@ async function renderDaySchedule(silent) {
   dh.appendChild(rel);
   head.appendChild(dh);
 
-  const hasAllDay = events.some(ev => parseEventMinutes(ev) === null);
+  const multiDay = events.filter(isMultiDayEvent);
+  const hasSingleAllDay = events.some(
+    ev => !isMultiDayEvent(ev) && parseEventMinutes(ev) === null);
+  const hasAllDay = hasSingleAllDay || multiDay.length > 0;
   allDay.hidden = !hasAllDay;
   allDay.innerHTML = "";
   let allDayCol = null;
@@ -8499,16 +8896,23 @@ async function renderDaySchedule(silent) {
     const lab = document.createElement("div");
     lab.className = "allday-label";
     lab.textContent = "to-do";
+    lab.style.gridColumn = "1";
+    lab.style.gridRow = "1 / -1";
     allDay.appendChild(lab);
+  }
+  if (hasSingleAllDay) {
     allDayCol = document.createElement("div");
     allDayCol.className = "allday-col";
     allDay.appendChild(allDayCol);
   }
+  // One-column strip: a multi-day event covering this day is a full-width bar.
+  layoutSpanBars(allDay, multiDay, (ev) => daySpanFor(ev, d),
+                 2, hasSingleAllDay ? 1 : 0);
 
   body.innerHTML = "";
   const { startHour, endHour } = computeHourWindow(events);
   body.appendChild(buildHourGutter(HOUR_PX_DAY, startHour, endHour));
-  body.appendChild(buildDayColumn(d, byKey, "day", allDayCol, HOUR_PX_DAY,
+  body.appendChild(buildDayColumn(d, byKey, multiDay, "day", allDayCol, HOUR_PX_DAY,
                                   startHour, endHour));
 }
 
@@ -8580,24 +8984,33 @@ async function showDayDetailSchedule(date) {
   // order puts it at the bottom (matches main day view).
   const allDay = document.createElement("div");
   allDay.className = "allday";
-  const hasAllDay = events.some(ev => parseEventMinutes(ev) === null);
+  const multiDay = events.filter(isMultiDayEvent);
+  const hasSingleAllDay = events.some(
+    ev => !isMultiDayEvent(ev) && parseEventMinutes(ev) === null);
+  const hasAllDay = hasSingleAllDay || multiDay.length > 0;
   allDay.hidden = !hasAllDay;
   let allDayCol = null;
   if (hasAllDay) {
     const lab = document.createElement("div");
     lab.className = "allday-label";
     lab.textContent = "to-do";
+    lab.style.gridColumn = "1";
+    lab.style.gridRow = "1 / -1";
     allDay.appendChild(lab);
+  }
+  if (hasSingleAllDay) {
     allDayCol = document.createElement("div");
     allDayCol.className = "allday-col";
     allDay.appendChild(allDayCol);
   }
+  layoutSpanBars(allDay, multiDay, (ev) => daySpanFor(ev, date),
+                 2, hasSingleAllDay ? 1 : 0);
 
   const body = document.createElement("div");
   body.className = "sched-body";
   const { startHour, endHour } = computeHourWindow(events);
   body.appendChild(buildHourGutter(HOUR_PX_DAY, startHour, endHour));
-  body.appendChild(buildDayColumn(date, byKey, "day", allDayCol, HOUR_PX_DAY,
+  body.appendChild(buildDayColumn(date, byKey, multiDay, "day", allDayCol, HOUR_PX_DAY,
                                   startHour, endHour));
 
   wrap.appendChild(allDay);

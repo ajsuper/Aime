@@ -416,6 +416,12 @@ class CalendarView(Container):
             header = f"[bold cyan]{d}[/bold cyan]"
             if time_:
                 header += f" [cyan]{time_}[/cyan]"
+            end_date = ev.get("end_date", "")
+            end_time = ev.get("end_time", "")
+            if end_date and end_date != d:
+                header += f" [cyan]→ {end_date}{(' ' + end_time) if end_time else ''}[/cyan]"
+            elif end_time:
+                header += f" [cyan]→ {end_time}[/cyan]"
             if category:
                 header += f"  [dim]#{category}[/dim]"
             lines.append(f"{header}\n  [bold]{title}[/bold]")

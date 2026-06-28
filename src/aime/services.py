@@ -87,6 +87,8 @@ class CalendarService:
         date: str, time: str, archived: bool,
         status: str | None = None, commitment_id: str | None = None,
         status_change_reason: str | None = None, rescheduled_from: str | None = None,
+        end_date: str | None = None, end_time: str | None = None,
+        duration: str | None = None,
     ) -> dict:
         """Edit / archive an existing event. Mirrors the backend's
         `replace_event` tool — caller supplies the full record so a partial
@@ -94,7 +96,9 @@ class CalendarService:
 
         The lifecycle-metadata kwargs (status, commitment_id, …) are optional:
         only the ones passed are sent, and the backend preserves any field it
-        doesn't receive, so a plain title/summary edit never resets them."""
+        doesn't receive, so a plain title/summary edit never resets them. The
+        length kwargs (end_date/end_time, or duration) are likewise optional and
+        get normalized to an absolute end by the gateway."""
         payload = dict(
             id=event_id,
             title=title,
@@ -109,6 +113,9 @@ class CalendarService:
             ("commitment_id", commitment_id),
             ("status_change_reason", status_change_reason),
             ("rescheduled_from", rescheduled_from),
+            ("end_date", end_date),
+            ("end_time", end_time),
+            ("duration", duration),
         ):
             if value is not None:
                 payload[key] = value
