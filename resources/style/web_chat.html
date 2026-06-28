@@ -761,15 +761,25 @@
                               font-size: 0.8rem; }
     #past-day-banner button:hover { border-color: var(--accent); color: var(--accent); }
     body.viewing-past #past-day-banner { display: flex; }
-    /* Reading the past is read-only: hide the composer; the banner button (or a
-       day click) returns to the live Today. */
-    body.viewing-past #f { display: none; }
+    /* Reading the past is read-only: keep the bottom bar, but nothing is
+       pressable — the composer controls are swapped for a read-only message.
+       Returning to Today is via the banner button (or clicking Today). */
+    #readonly-msg { display: none; align-items: center; justify-content: center;
+                    gap: 0.5rem; padding: 0.85rem 0.75rem; color: var(--muted);
+                    font-size: 0.88rem; text-align: center; }
+    #readonly-msg svg { width: 16px; height: 16px; flex-shrink: 0; }
+    body.viewing-past #f { pointer-events: none; }
+    body.viewing-past #f > #scroll-bottom-btn,
+    body.viewing-past #f > .composer-row { display: none; }
+    body.viewing-past #readonly-msg { display: flex; }
     /* Day rows in the History pane. */
-    .day-item { padding: 0.6rem 0.5rem 0.6rem 1rem; cursor: pointer;
-                border-radius: var(--r-sm); transition: background 0.12s; }
+    .day-item { padding: 0.6rem 0.75rem; cursor: pointer;
+                border-radius: 14px; transition: background 0.12s; }
     .day-item:hover { background: var(--bg-elev); }
+    /* Selected day reads as a filled bubble (not a left bar). */
     .day-item.active { background: var(--bg-elev);
-                       box-shadow: inset 2px 0 0 0 var(--accent); }
+                       background: color-mix(in srgb, var(--accent) 22%, var(--bg-elev)); }
+    .day-item.active:hover { background: color-mix(in srgb, var(--accent) 30%, var(--bg-elev)); }
     .day-label { color: var(--text); font-size: 0.92rem; display: flex;
                  align-items: center; gap: 0.5rem; }
     .day-live { font-size: 0.62rem; text-transform: uppercase; letter-spacing: 0.04em;
@@ -2789,7 +2799,7 @@
           <path d="M3.05 13A9 9 0 1 0 6 5.3L3 8"/>
           <path d="M12 7v5l4 2"/>
         </svg>
-        <span>Viewing <strong id="past-day-label"></strong> — read only.</span>
+        <span>Viewing <strong id="past-day-label"></strong></span>
         <button type="button" id="past-day-today-btn">Back to Today</button>
       </div>
       <div id="log"><div id="log-inner"></div><div id="empty-hint">
@@ -2879,6 +2889,16 @@
               <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
             </svg>
           </button>
+        </div>
+        <!-- Shown in place of the composer controls while reading a past day
+             (body.viewing-past): the bar stays, but nothing is pressable. -->
+        <div id="readonly-msg" aria-live="polite">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="5" y="11" width="14" height="9" rx="2"/>
+            <path d="M8 11V8a4 4 0 0 1 8 0v3"/>
+          </svg>
+          <span>Read only — viewing a past day. Return to Today to chat.</span>
         </div>
       </form>
     </div>
