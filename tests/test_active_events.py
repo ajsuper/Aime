@@ -52,8 +52,12 @@ def test_multi_day_timed_no_end_time_runs_to_end_of_day():
     assert s[1] == datetime.datetime(2026, 6, 11, 23, 59)
 
 
-def test_point_event_has_no_span():
-    assert event_span(ev(date="10/06/2026", time="14:00")) is None
+def test_point_event_spans_whole_day():
+    # A timed-but-endless event is treated as a whole-day item so the model
+    # still hears about it (e.g. "Pick up brother from airport").
+    s = event_span(ev(date="10/06/2026", time="14:00"))
+    assert s == (datetime.datetime(2026, 6, 10, 0, 0),
+                 datetime.datetime(2026, 6, 10, 23, 59))
 
 
 def test_dateless_event_has_no_span():
@@ -80,8 +84,11 @@ def test_active_includes_multi_day_in_progress():
     assert len(active_events([ev(date="08/06/2026", end_date="12/06/2026")], NOW)) == 1
 
 
-def test_point_event_never_active():
-    assert active_events([ev(date="10/06/2026", time="14:30")], NOW) == []
+def test_point_event_active_all_day():
+    # Timed point event today -> active regardless of the hour (whole-day span).
+    assert len(active_events([ev(date="10/06/2026", time="08:00")], NOW)) == 1
+    # ...but a point event on a different day is not active now.
+    assert active_events([ev(date="11/06/2026", time="08:00")], NOW) == []
 
 
 def test_archived_excluded():
@@ -114,10 +121,28 @@ def test_render_block_shape_and_details():
     block = render_active_events_block([e], NOW)
     assert block.startswith("<active_events>\n")
     assert block.endswith("\n</active_events>")
-    assert "1 event happening right now" in block
+    assert "1 event active now or on today's agenda" in block
     assert '#7 "Sprint Demo" (work)' in block
     assert "14:00–15:30 today" in block
     assert "Show the build to the team" in block
+
+
+def test_render_point_event_reads_honestly():
+    e = ev(id=3, title="Pick up brother", date="10/06/2026", time="08:00")
+    block = render_active_events_block([e], NOW)
+    assert "today at 08:00 (no set duration)" in block
+
+
+def test_render_timeless_event_is_all_day():
+    block = render_active_events_block([ev(id=4, title="Errands", date="10/06/2026")], NOW)
+    assert "all day today" in block
+
+
+def test_render_caps_and_summarizes_overflow():
+    many = [ev(id=i, date="10/06/2026") for i in range(20)]
+    block = render_active_events_block(many, NOW)
+    assert "and 5 more" in block
+    assert block.count("\n- ") == 15
 
 
 def test_render_multiday_shows_day_count():

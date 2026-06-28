@@ -7,10 +7,12 @@ moment the user opened the conversation — much like the per-turn `<clock>`.
 
 An event counts as **active** when the current wall-clock moment falls inside
 its span:
-  * an all-day event is active for the whole day(s) it covers;
   * a timed event with an end is active between its start and end;
-  * a point-in-time event (a time but no end) has no span, so it is never
-    "active" — it's a moment, not something ongoing.
+  * an all-day or multi-day event is active for the whole day(s) it covers;
+  * a point event (a time but no end, or no time at all) has no real duration,
+    so we treat it as a whole-day event — active all of its day. That keeps
+    open-ended but important items ("Pick up brother from airport") in front of
+    the model rather than dropping them for lacking an end.
 Only live events count — `scheduled` and not archived. Completed/canceled ones
 are history, not happening now.
 
@@ -29,6 +31,9 @@ _TIME_FMT = "%H:%M"
 # only active events are surfaced, so a wide window doesn't bloat model context.
 _LOOKBACK_DAYS = 400
 _SUMMARY_MAX = 140
+# Cap how many active events ride the first message, so a packed day can't bloat
+# every chat's opening context. Overflow is summarized with a count.
+_MAX_EVENTS = 15
 
 
 def _parse_dt(date_s, time_s, *, end_of_day=False):
@@ -51,8 +56,9 @@ def _parse_dt(date_s, time_s, *, end_of_day=False):
 
 
 def event_span(ev):
-    """(start, end) naive wall-clock span of an event, or None when it has no
-    span (a point-in-time timed event with no end)."""
+    """(start, end) naive wall-clock span of an event, or None when its date is
+    unparseable. An event with a recorded end uses that precise span; one without
+    (an all-day item OR a point event with a nominal time) spans its whole day."""
     date_s = ev.get("date")
     if not date_s:
         return None
@@ -64,12 +70,11 @@ def event_span(ev):
         # A multi-day timed event with no end time runs to the end of its end day.
         end = _parse_dt(end_date_s, end_time_s, end_of_day=not end_time_s)
         return (start, end) if start and end else None
-    if not time_s:
-        # All-day single day: active for the whole day.
-        start = _parse_dt(date_s, "")
-        end = _parse_dt(date_s, "", end_of_day=True)
-        return (start, end) if start and end else None
-    return None  # timed point event: an instant, not an active span
+    # No recorded end → whole-day span (covers all-day items and point events
+    # with a nominal start time but no duration).
+    start = _parse_dt(date_s, "")
+    end = _parse_dt(date_s, "", end_of_day=True)
+    return (start, end) if start and end else None
 
 
 def _is_live(ev):
@@ -94,11 +99,14 @@ def active_events(events, now):
 
 def _when_desc(ev, span, now):
     start, end = span
-    timed = bool((ev.get("time") or "").strip())
+    time_s = (ev.get("time") or "").strip()
+    has_end = bool((ev.get("end_date") or "").strip())
+    if not has_end:
+        # Whole-day event: a point event keeps its nominal time as a hint (it has
+        # no duration, so we don't pretend a window); a timeless one is all-day.
+        return f"today at {time_s} (no set duration)" if time_s else "all day today"
     same_day = start.date() == end.date()
-    if not timed and same_day:
-        return "all day today"
-    if not timed:
+    if not time_s:
         total = (end.date() - start.date()).days + 1
         day_n = (now.date() - start.date()).days + 1
         return (f"all day · {start.strftime(_DATE_FMT)}→{end.strftime(_DATE_FMT)} "
@@ -116,10 +124,10 @@ def render_active_events_block(events, now):
     if not active:
         return ""
     n = len(active)
-    header = (f"{n} event{'s' if n != 1 else ''} happening right now "
+    header = (f"{n} event{'s' if n != 1 else ''} active now or on today's agenda "
               f"(as of {now.strftime(_DATE_FMT)} {now.strftime(_TIME_FMT)}):")
     lines = [header]
-    for ev, span in active:
+    for ev, span in active[:_MAX_EVENTS]:
         eid = ev.get("id", "?")
         title = (ev.get("title") or "(untitled)").strip()
         cat = (ev.get("category") or "").strip()
@@ -131,6 +139,8 @@ def render_active_events_block(events, now):
                 summary = summary[: _SUMMARY_MAX - 1].rstrip() + "…"
             line += f" — {summary}"
         lines.append(line)
+    if n > _MAX_EVENTS:
+        lines.append(f"…and {n - _MAX_EVENTS} more (use FilterUsersEvents to see all).")
     return "<active_events>\n" + "\n".join(lines) + "\n</active_events>"
 
 
