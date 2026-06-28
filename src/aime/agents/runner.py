@@ -135,6 +135,7 @@ class BackgroundAgentRunner:
             agent_name=spec.name,
             turns=collector.idle_rounds + (1 if collector.completed else 0),
             error=error,
+            message_to_user=collector.message_to_user,
         )
         self._persist(
             run_id, spec, inputs, result, collector,

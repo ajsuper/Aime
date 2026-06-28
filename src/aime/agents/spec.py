@@ -210,6 +210,10 @@ class AgentResult:
     turns: int = 0
     error: str | None = None
     usage: dict | None = None
+    # The worker's optional proactive note to the user (SubmitResult's
+    # ``message_to_user``). Already delivered out of band during the run; the
+    # caller also threads it into the user's conversation so it shows inline.
+    message_to_user: str = ""
 
     @property
     def ok(self) -> bool:

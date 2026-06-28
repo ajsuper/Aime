@@ -10,7 +10,7 @@ block, not a separate display event).
 
 from typing import Iterator
 
-from provider_backend import RECOVERY_MARKER
+from provider_backend import RECOVERY_MARKER, PROACTIVE_TRIGGER_MARKER
 
 from .controller import CoreEvent
 
@@ -34,6 +34,11 @@ def replay_messages(messages: list[dict]) -> Iterator[CoreEvent]:
                 yield CoreEvent(
                     kind="notice", severity="recovery", from_replay=True,
                 )
+                continue
+            # Hidden trigger turn we slip in ahead of a proactive assistant
+            # message (see append_assistant_message). It exists only to keep the
+            # API history valid; the user never sent it, so don't render it.
+            if first_text.startswith(PROACTIVE_TRIGGER_MARKER):
                 continue
             # A user message can mix one or more text blocks with image blocks.
             # Collapse them into a single user_message_shown event so the

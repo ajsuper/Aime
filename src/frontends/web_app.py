@@ -801,6 +801,15 @@ class UserContext:
 
         self.controller.subscribe(self._fanout)
         self.controller.start()
+        # Continue the user's most recent thread rather than opening a blank one,
+        # so the chat reads as one continuous conversation across restarts and any
+        # proactive message recorded while they were away is already in view. The
+        # idle-rollover clock is seeded from the session's age, so a long-dormant
+        # thread still rolls onto a fresh, cheap session on the next message.
+        try:
+            self.controller.resume_latest_session()
+        except Exception:
+            app.logger.exception("resume_latest_session failed for user %s", user_id)
 
         # Tracks records the user has edited via the UI since the model last
         # took a turn. Drained as a compact <stale> tag on the next /send so
@@ -3720,22 +3729,55 @@ def _scheduler_run_agent(agent_id: str, user_id: int, tz: str | None) -> None:
     _launch_agent_run(definition_to_spec(record), user_id, tz, agent_id=agent_id)
 
 
-def _scheduler_send_message(user_id: int, text: str) -> None:
-    """Scheduler action: deliver a reminder to the user's stored contact over the
-    configured channel. Best-effort — messaging off, no contact connected, or a
-    transport hiccup all degrade to a quiet skip rather than a hard failure."""
-    from aime import messaging as _aime_messaging
-    messenger = _aime_messaging.get_messenger()
-    if messenger is None:
-        return
-    rec = _auth_backend.lookup(user_id)
-    contact = rec.messaging_contact if rec else None
-    if not contact:
+def _record_proactive_in_user_thread(user_id: int, text: str) -> None:
+    """Make an out-of-band message Aime sent (a scheduler reminder, a
+    background-agent notification) appear inline in the user's conversation, so
+    it reads as a text Aime sent in-thread and a reply lands with context.
+
+    Routes to the live session when the user is connected (records the assistant
+    turn and pushes it to their open chat immediately); otherwise writes straight
+    to their most recent persisted session, visible the next time they open it.
+    Always best-effort — recording is additive to the out-of-band delivery, so any
+    failure is logged and swallowed rather than affecting the send."""
+    body = (text or "").strip()
+    if not body:
         return
     try:
-        messenger.send(contact, text)
-    except _aime_messaging.MessageSendError as exc:
-        app.logger.warning("scheduled reminder to user %s failed: %s", user_id, exc)
+        ctx = _user_contexts.get(user_id)
+        if ctx is not None and ctx.controller.record_proactive_message(body):
+            return
+        # No live session (or it was mid-turn): persist into the latest session
+        # file directly so the message threads in on next load.
+        from provider_backend import append_proactive_message_offline
+        append_proactive_message_offline(
+            _conversations_dir(user_id), _auth_backend.get_dek(user_id), body,
+        )
+    except Exception:
+        app.logger.exception(
+            "failed to record proactive message inline for user %s", user_id
+        )
+
+
+def _scheduler_send_message(user_id: int, text: str) -> None:
+    """Scheduler action: deliver a reminder to the user's stored contact over the
+    configured channel, and record it inline in their conversation so it reads as
+    a text Aime sent in-thread. Best-effort — messaging off, no contact connected,
+    or a transport hiccup all degrade to a quiet skip rather than a hard failure."""
+    from aime import messaging as _aime_messaging
+    messenger = _aime_messaging.get_messenger()
+    rec = _auth_backend.lookup(user_id)
+    contact = rec.messaging_contact if rec else None
+    # Out-of-band delivery to the user's phone/email, exactly as before.
+    if messenger is not None and contact:
+        try:
+            messenger.send(contact, text)
+        except _aime_messaging.MessageSendError as exc:
+            app.logger.warning(
+                "scheduled reminder to user %s failed: %s", user_id, exc
+            )
+    # Inline record so the reminder shows in the thread and stays replyable, even
+    # when no messaging channel/contact is wired up (the chat becomes the surface).
+    _record_proactive_in_user_thread(user_id, text)
 
 
 def _scheduler_upcoming_events(user_id: int) -> list:
@@ -3868,7 +3910,7 @@ def _launch_agent_run(
 
     def _run() -> None:
         try:
-            BackgroundAgentRunner().run(
+            result = BackgroundAgentRunner().run(
                 spec,
                 user_id=user_id,
                 dek=dek,
@@ -3885,6 +3927,11 @@ def _launch_agent_run(
                 # bucket so an agent can't be a free, uncapped channel.
                 quota=ctx.quota_meter,
             )
+            # If the worker chose to notify the user, thread that note into their
+            # conversation too (it was already delivered out of band during the
+            # run) so it reads as a text Aime sent and stays replyable in context.
+            if result is not None and result.message_to_user:
+                _record_proactive_in_user_thread(user_id, result.message_to_user)
         except Exception:
             # The runner already converts its own failures into a persisted
             # error run; a failure here means it never got that far. Nothing

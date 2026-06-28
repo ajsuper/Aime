@@ -19,7 +19,9 @@ frontends are responsible for thread-marshaling if their UI toolkit needs it.
 
 import datetime
 import json
+import os
 import threading
+import time
 import zoneinfo
 from dataclasses import dataclass, field
 from typing import Callable, Literal
@@ -49,6 +51,20 @@ from .active_events import active_events_prefix
 # FilterUsersEvents result — keeps the enrichment bounded for commitments with
 # long histories. The model can still call GetCommitmentHistory for the full set.
 _AUTO_HISTORY_LIMIT = 10
+
+# After this many seconds of quiet, the next user message silently starts a
+# fresh backend session — a cost-bounded boundary that the user never sees (no
+# "New conversation" break; the thread keeps scrolling). The durable per-user
+# context (About Me / Pending / active events) re-injects on the new session, so
+# continuity is preserved; only verbatim recent banter is dropped. Compaction
+# still bounds *active* threads by length; this bounds *idle* ones by time.
+# Overridable for tests via AIME_IDLE_ROLLOVER_SECONDS (0 disables rollover).
+try:
+    IDLE_ROLLOVER_SECONDS = float(
+        os.environ.get("AIME_IDLE_ROLLOVER_SECONDS", "3600")
+    )
+except ValueError:
+    IDLE_ROLLOVER_SECONDS = 3600.0
 
 CoreEventKind = Literal[
     "user_message_shown",       # user msg accepted and sent to backend
@@ -273,6 +289,12 @@ class ConversationController:
         # Conversation-level state. Presentation flags (e.g. whether the
         # "thinking…" line is visible) live in the frontend, not here.
         self._is_idle = True
+        # Wall-clock timestamp (epoch seconds) of the last conversation activity
+        # (a user message dispatched, or a turn ended). Drives the idle-gap silent
+        # rollover: a returning user past IDLE_ROLLOVER_SECONDS rolls onto a fresh
+        # session. Wall clock (not monotonic) so it can be seeded from a resumed
+        # session's persisted saved_at — see seed_last_activity().
+        self._last_activity = time.time()
         # Mirrors _is_idle as a threading.Event so stop_model() can block
         # until the in-flight turn has actually ended (so a follow-up
         # /send POSTed by the frontend is dispatched as the next turn
@@ -471,6 +493,11 @@ class ConversationController:
         check-then-act that a concurrent turn_end could slip between. A queued
         message is dispatched when the current turn ends (see the turn_end
         handler), not discarded."""
+        # A returning user (quiet past the idle threshold) silently rolls onto a
+        # fresh session before this message is accepted, so their live context
+        # stays cheap without any visible conversation break. No-op mid-turn or
+        # on an already-fresh session.
+        self._maybe_roll_idle_session()
         with self._state_lock:
             if not self._is_idle:
                 self._pending_user_messages.append((text, images, hidden_prefix))
@@ -495,6 +522,7 @@ class ConversationController:
         # claimed the turn busy under _state_lock, so we only need to *release*
         # that claim if the backend submit fails — otherwise the model would
         # never start and the composer would wedge.
+        self._last_activity = time.time()
         attachments: list[dict] = []
         for img in (images or []):
             mt = img.get("media_type")
@@ -594,20 +622,11 @@ class ConversationController:
 
     def reset(self) -> None:
         with self._dispatch_lock:
-            # Drop any queued messages first — they belong to the conversation
-            # we're leaving. Cleared *before* the interrupt so the worker's
-            # turn_end (woken by stop_model) can't re-dispatch one into the new
-            # session; _dispatch_lock keeps a concurrent /send from refilling it.
-            with self._state_lock:
-                self._pending_user_messages = []
-            # Stop any in-flight turn so the old conversation's reply can't
-            # bleed events into the fresh one.
-            self.stop_model()
-            self._backend.reset()
-            self._reset_internal_state()
+            self._swap_to_fresh_session()
             # session_restart = "clear the transcript / wipe presentation state".
             # The banner text follows separately as a notice so the frontend can
-            # render it after the clear.
+            # render it after the clear. Only an *explicit* reset clears the view
+            # and shows the splash — a silent idle rollover does neither.
             self._emit(CoreEvent(kind="session_restart", restart_reason="reset"))
             # "new_session" severity (not "success") so the frontend renders it
             # as a centered Aime-logo welcome splash rather than a corner notice.
@@ -619,6 +638,47 @@ class ConversationController:
             self._spawn_worker(self.run_stream_loop)
             # A returning user who never finished onboarding gets it again here,
             # rather than a blank new chat. No-op (and cheap) once they've engaged.
+            self._maybe_start_onboarding()
+
+    def _swap_to_fresh_session(self) -> None:
+        """Tear down the active backend session and start an empty one. Shared by
+        the user-visible `reset()` and the silent idle rollover; the difference is
+        purely what's emitted afterwards (a reset clears the transcript + shows a
+        splash; a rollover stays invisible). Caller holds `_dispatch_lock`."""
+        # Drop any queued messages first — they belong to the conversation we're
+        # leaving. Cleared *before* the interrupt so the worker's turn_end (woken
+        # by stop_model) can't re-dispatch one into the new session; _dispatch_lock
+        # keeps a concurrent /send from refilling it.
+        with self._state_lock:
+            self._pending_user_messages = []
+        # Stop any in-flight turn so the old conversation's reply can't bleed
+        # events into the fresh one.
+        self.stop_model()
+        self._backend.reset()
+        self._reset_internal_state()
+
+    def _maybe_roll_idle_session(self) -> None:
+        """Before accepting a fresh user turn, silently roll onto a new backend
+        session if the thread has been quiet past IDLE_ROLLOVER_SECONDS. Invisible
+        to the user: no transcript clear, no splash — the continuous thread just
+        keeps scrolling while the model's live context resets to a cheap, empty
+        session. Skipped in headless agent runs and when the session is already
+        empty (nothing to bound) or rollover is disabled."""
+        if self._headless or IDLE_ROLLOVER_SECONDS <= 0:
+            return
+        with self._dispatch_lock:
+            with self._state_lock:
+                if not self._is_idle:
+                    return  # mid-turn: this message will queue, don't roll
+                idle_for = time.time() - self._last_activity
+            if idle_for < IDLE_ROLLOVER_SECONDS:
+                return
+            if not self._backend.messages_snapshot():
+                return  # already on a fresh/empty session
+            self._swap_to_fresh_session()
+            self._spawn_worker(self.run_stream_loop)
+            # No session_restart / splash: the frontend keeps the existing
+            # transcript so the thread reads as one continuous conversation.
             self._maybe_start_onboarding()
 
     def load(self, session_id: str) -> None:
@@ -640,7 +700,7 @@ class ConversationController:
                 return
             self._load_after_swap(session_id)
 
-    def _load_after_swap(self, session_id: str) -> None:
+    def _load_after_swap(self, session_id: str, *, announce: bool = True) -> None:
         self._reset_internal_state()
         self._emit(CoreEvent(kind="session_restart", restart_reason="load"))
         # Replay deferred to keep the import graph shallow — replay imports
@@ -648,26 +708,67 @@ class ConversationController:
         from .replay import replay_messages
         for event in replay_messages(self._backend.messages_snapshot()):
             self._emit(event)
-        title = ""
-        for info in self._backend.list_sessions():
-            if info.id == session_id:
-                title = (info.summary or "").strip()
-                break
-        if title:
-            preview = title if len(title) <= 40 else title[:40].rstrip() + "..."
-            loaded_text = (
-                f'Loaded conversation "{preview}". Continue where you left off.'
-            )
-        else:
-            loaded_text = "Loaded conversation. Continue where you left off."
-        # "loaded" severity (not "success") so the frontend can center it and
-        # fade it away once the user sends a message — see web_chat.html.
-        self._emit(CoreEvent(
-            kind="notice",
-            severity="loaded",
-            text=loaded_text,
-        ))
+        # A startup resume (announce=False) is silent: the thread just continues
+        # where it left off, no centered "Loaded conversation" banner — that's a
+        # switching affordance, and there's no longer a switcher.
+        if announce:
+            title = ""
+            for info in self._backend.list_sessions():
+                if info.id == session_id:
+                    title = (info.summary or "").strip()
+                    break
+            if title:
+                preview = title if len(title) <= 40 else title[:40].rstrip() + "..."
+                loaded_text = (
+                    f'Loaded conversation "{preview}". Continue where you left off.'
+                )
+            else:
+                loaded_text = "Loaded conversation. Continue where you left off."
+            # "loaded" severity (not "success") so the frontend can center it and
+            # fade it away once the user sends a message — see web_chat.html.
+            self._emit(CoreEvent(
+                kind="notice",
+                severity="loaded",
+                text=loaded_text,
+            ))
         self._spawn_worker(self.run_stream_loop)
+
+    def resume_latest_session(self) -> bool:
+        """Continue the user's most recent conversation at startup instead of
+        opening a blank one, so the thread reads as one continuous history across
+        restarts and any message recorded while they were away (a proactive
+        reminder) is visible. Replays that session silently (no banner) and seeds
+        the idle-rollover clock from its age, so a long-dormant thread still rolls
+        onto a fresh session on the user's next message. Returns True if resumed.
+
+        Called once at startup, after start(); the backend's epoch logic retires
+        the empty-session worker start() spawned (same swap dance as load())."""
+        if self._headless:
+            return False
+        with self._dispatch_lock:
+            sessions = self._backend.list_sessions()
+            if not sessions:
+                return False
+            latest = sessions[0]  # list_sessions is newest-first
+            self.stop_model()
+            try:
+                self._backend.load_session(latest.id)
+            except (OSError, ValueError):
+                return False
+            self.seed_last_activity(latest.saved_at)
+            self._load_after_swap(latest.id, announce=False)
+            return True
+
+    def seed_last_activity(self, saved_at: str) -> None:
+        """Seed the idle-rollover clock from a persisted ISO ``saved_at`` so a
+        resumed session's real age (not the moment we loaded it) decides whether
+        the next message rolls onto a fresh session. Unparseable timestamps leave
+        the clock at 'now' (no rollover), which is the safe default."""
+        try:
+            ts = datetime.datetime.fromisoformat(saved_at)
+            self._last_activity = ts.timestamp()
+        except (ValueError, TypeError):
+            self._last_activity = time.time()
 
     def _reset_internal_state(self) -> None:
         self._user_first_interaction = True
@@ -755,6 +856,9 @@ class ConversationController:
                 kind="turn_end",
                 stop_reason=event.stop_reason or "",
             ))
+            # Mark the moment the thread last had activity, so the idle-rollover
+            # clock starts when Aime finishes replying (not when the user typed).
+            self._last_activity = time.time()
             if event.stop_reason in ("end_turn", "interrupted"):
                 # Turn finished. Either start the next queued message (a /send
                 # that arrived mid-turn — usually a race, since the frontend
@@ -821,6 +925,29 @@ class ConversationController:
         except Exception as exc:
             return False, str(exc)
         return True, "message sent to the user"
+
+    def record_proactive_message(self, text: str) -> bool:
+        """Make an out-of-band message that was sent to the user (a scheduler
+        reminder, a background-agent notification) appear inline in *this* live
+        session: append it as an assistant turn so the model has coherent context
+        when the user replies, and surface it to any attached frontend so it shows
+        in the thread immediately. Returns True if recorded inline.
+
+        Turn-safe and best-effort: if a model turn is in flight we skip the inline
+        record (appending mid-turn would corrupt the in-flight history) — the user
+        still got the message out of band, it just won't thread into this exact
+        moment. Intended for the interactive user's own controller; background
+        agents route here via their owning user's live context, not their run."""
+        body = (text or "").strip()
+        if not body:
+            return False
+        with self._state_lock:
+            if not self._is_idle:
+                return False
+        if not self._backend.append_assistant_message(body):
+            return False
+        self._emit(CoreEvent(kind="assistant_text", text=body))
+        return True
 
     def _handle_tool_use(self, event: BackendEvent) -> None:
         tool_name = event.tool_name or "tool"

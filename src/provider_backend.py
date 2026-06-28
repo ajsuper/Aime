@@ -34,6 +34,14 @@ _CONV_SUFFIX = ".json.enc"
 # transcript into one giant verbatim bubble.
 RECOVERY_MARKER = "[Aime conversation recovered]"
 
+# Prefix on the synthetic user turn we insert ahead of an out-of-band proactive
+# assistant message (a scheduler reminder, a background-agent notification) when
+# the history would otherwise be empty or end on an assistant turn. It keeps the
+# message list API-valid (opens on a user turn, no two assistant turns in a row)
+# and tells the model its following message was delivered to the user out of
+# band. Replay skips any user turn that starts with it so the user never sees it.
+PROACTIVE_TRIGGER_MARKER = "[Aime reached out proactively]"
+
 
 def _jsonable(obj):
     """Recursively coerce `obj` into something json.dump can handle.
@@ -251,6 +259,16 @@ class AgentBackend(Protocol):
         """Push a user/system/tool-result event into the conversation."""
         ...
 
+    def append_assistant_message(self, text: str) -> bool:
+        """Record an out-of-band message *as if Aime said it* — an assistant
+        turn appended to history without triggering a model turn. Used to make
+        a proactive send (scheduler reminder, agent notification) appear inline
+        in the thread so the user's reply has coherent context. Returns True if
+        recorded. No-op (returns False) for backends without persistent history.
+        Must only be called between turns; appending mid-turn would corrupt the
+        in-flight assistant message / tool_result ordering."""
+        return False
+
     def delete_session(self, session_id: str) -> None:
         """Delete a saved session by id. No-op for backends without enumerable
         history. If the deleted session is currently active, also resets to a
@@ -286,6 +304,80 @@ class AgentBackend(Protocol):
 import aime.encryption as _enc
 import aime.dateformat as dateformat
 from aime import graphics as _graphics
+
+
+def append_proactive_message_offline(
+    conversations_dir: str, dek: bytes, text: str,
+) -> bool:
+    """Append an out-of-band assistant message to a user's most recent persisted
+    session *without* a live backend in memory — used when the user is offline so
+    a scheduler reminder still threads into their conversation and is visible the
+    next time they open it. Mirrors ``append_assistant_message`` /
+    ``_persist`` exactly (same hidden-trigger guard, same encryption + atomic
+    write, AAD = session id) so the live and offline paths produce identical
+    files. Creates a fresh session to hold the message if the user has none.
+    Returns True if written.
+
+    Best-effort: the caller uses this only when no in-memory session is loaded,
+    so there is no live writer to race; a decrypt/parse failure on any one file
+    is skipped rather than fatal."""
+    body = (text or "").strip()
+    if not body:
+        return False
+    try:
+        names = [
+            n for n in os.listdir(conversations_dir) if n.endswith(_CONV_SUFFIX)
+        ]
+    except OSError:
+        names = []
+    target_id: str | None = None
+    target_data: dict | None = None
+    best_saved = ""
+    for name in names:
+        session_id = name[: -len(_CONV_SUFFIX)]
+        try:
+            with open(os.path.join(conversations_dir, name), "rb") as f:
+                blob = f.read()
+            plaintext = _enc.decrypt_blob(dek, blob, aad=session_id.encode("utf-8"))
+            data = json.loads(plaintext)
+        except (OSError, ValueError, InvalidTag):
+            continue
+        saved = data.get("saved_at", "")
+        if target_id is None or saved >= best_saved:
+            best_saved = saved
+            target_id = data.get("id") or session_id
+            target_data = data
+    if target_id is None or target_data is None:
+        stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        target_id = f"msgs-{stamp}-" + hashlib.sha1(os.urandom(8)).hexdigest()[:8]
+        target_data = {"id": target_id, "summary": "none", "messages": []}
+    messages = target_data.get("messages") or []
+    if not messages or messages[-1].get("role") == "assistant":
+        messages.append({
+            "role": "user",
+            "content": [{"type": "text", "text": PROACTIVE_TRIGGER_MARKER}],
+        })
+    messages.append({
+        "role": "assistant",
+        "content": [{"type": "text", "text": body}],
+    })
+    target_data["messages"] = messages
+    target_data["id"] = target_id
+    target_data["saved_at"] = datetime.datetime.now().isoformat(timespec="seconds")
+    if not target_data.get("summary"):
+        target_data["summary"] = "none"
+    try:
+        os.makedirs(conversations_dir, exist_ok=True)
+        path = os.path.join(conversations_dir, f"{target_id}{_CONV_SUFFIX}")
+        plaintext = json.dumps(target_data, default=_jsonable).encode("utf-8")
+        blob = _enc.encrypt_blob(dek, plaintext, aad=target_id.encode("utf-8"))
+        tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+        with open(tmp, "wb") as f:
+            f.write(blob)
+        os.replace(tmp, path)
+    except (OSError, TypeError, ValueError):
+        return False
+    return True
 
 
 class AnthropicMessagesBackend:
@@ -810,6 +902,32 @@ class AnthropicMessagesBackend:
         self._terminate_active_stream()
         self.new_session()
 
+    def append_assistant_message(self, text: str) -> bool:
+        body = (text or "").strip()
+        if not body:
+            return False
+        with self._lock:
+            msgs = self._messages
+            # Keep the message list API-valid: it must open on a user turn and
+            # never carry two assistant turns back to back. When the history is
+            # empty (e.g. just after a silent idle rollover) or already ends on
+            # an assistant turn, slip in a hidden trigger turn the model reads as
+            # "your next message goes to the user out of band". Replay skips it.
+            if not msgs or msgs[-1].get("role") == "assistant":
+                msgs.append({
+                    "role": "user",
+                    "content": [{"type": "text", "text": PROACTIVE_TRIGGER_MARKER}],
+                })
+            msgs.append({
+                "role": "assistant",
+                "content": [{"type": "text", "text": body}],
+            })
+        self._persist()
+        # Deliberately do NOT set _turn_trigger: this records what Aime already
+        # said out of band, it must not provoke a fresh model reply. The model
+        # sees it as prior context on the user's next real message.
+        return True
+
     def delete_session(self, session_id: str) -> None:
         if not session_id:
             return
@@ -868,6 +986,7 @@ class AnthropicMessagesBackend:
                     if msg["role"] == "user"
                     for block in msg["content"]
                     if isinstance(block, dict) and block.get("type") == "text"
+                    and not block["text"].startswith(PROACTIVE_TRIGGER_MARKER)
                 ]
                 needs_title = (
                     not self._summary

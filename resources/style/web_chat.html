@@ -2756,15 +2756,11 @@
               </svg>
             </button>
           </div>
-          <button type="button" class="new-chat-pill tip-anchor" id="new-chat-btn"
-                  data-tip="Start a new conversation" aria-label="New conversation">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                 stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <line x1="12" y1="5"  x2="12" y2="19"/>
-              <line x1="5"  y1="12" x2="19" y2="12"/>
-            </svg>
-            <span>New conversation</span>
-          </button>
+          <!-- The "New conversation" button was removed: Aime is one continuous
+               thread now (like a texting app), so there's no user-facing way to
+               start a fresh chat. The backend silently rolls onto a fresh session
+               after an idle gap to keep cost bounded; the user never sees a break.
+               (Dev/recovery can still reset via the "/reset" command path.) -->
           <button type="button" class="feedback-btn tip-anchor" id="feedback-btn"
                   data-tip="Send feedback" aria-label="Send feedback">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
@@ -5779,9 +5775,9 @@ form.addEventListener("submit", async (ev) => {
   await sendText(text, images);
 });
 
-document.getElementById("new-chat-btn").addEventListener("click", () => {
-  chat.newChat();
-});
+// The "New conversation" button was removed (Aime is one continuous thread).
+// chat.newChat()/switchTo("/reset") remain for the recovery path and the dev
+// "/reset" command, but there's no longer a user-facing control wired to them.
 
 // --- Feedback & error reporting -------------------------------------------
 // One modal serves both the deliberate "Send feedback" button and the

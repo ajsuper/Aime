@@ -56,6 +56,7 @@ class ResultCollector:
         self._done = False
         self._completed = False          # True once SubmitResult fired
         self._result_payload: dict | None = None
+        self._message_to_user = ""
         self._submitted_summary = ""
         self._last_block_text = ""
         self._idle_rounds = 0            # reply rounds that ended without submit
@@ -80,6 +81,13 @@ class ResultCollector:
                 self._result_payload = (
                     payload.get("result") if isinstance(payload, dict) else None
                 )
+                # The worker's optional proactive note to the user. Already
+                # delivered out of band by the controller; captured here so the
+                # caller can also thread it into the user's conversation.
+                self._message_to_user = (
+                    (payload.get("message_to_user") or "")
+                    if isinstance(payload, dict) else ""
+                ).strip()
                 self._submitted_summary = (
                     event.text or (payload.get("summary") if isinstance(payload, dict) else "") or ""
                 ).strip()
@@ -145,6 +153,14 @@ class ResultCollector:
     def result_payload(self) -> dict | None:
         with self._cond:
             return self._result_payload
+
+    @property
+    def message_to_user(self) -> str:
+        """The proactive note the worker sent the user via SubmitResult's
+        ``message_to_user`` (empty if none). The caller threads it into the
+        user's conversation so it shows inline, like a text Aime sent."""
+        with self._cond:
+            return self._message_to_user
 
     @property
     def summary_text(self) -> str:
