@@ -17,8 +17,10 @@ event (worker thread for agent output; calling thread for input handlers);
 frontends are responsible for thread-marshaling if their UI toolkit needs it.
 """
 
+import datetime
 import json
 import threading
+import zoneinfo
 from dataclasses import dataclass, field
 from typing import Callable, Literal
 
@@ -40,6 +42,7 @@ from .onboarding import (
     OnboardingState,
     ONBOARDING_PROMPT,
 )
+from .active_events import active_events_prefix
 
 
 # Cap on instances per commitment when auto-attaching history to a
@@ -507,6 +510,13 @@ class ConversationController:
             bootstrap = bootstrap_special_topics(self._tools)
             if bootstrap:
                 self._backend.set_session_context(bootstrap)
+            # On the first message of a chat, tell the model exactly what events
+            # are happening right now (best-effort; never blocks the message).
+            # Interactive chats only — background-agent prompts stay curated.
+            if not self._headless:
+                active = active_events_prefix(self._tools, self._now_local())
+                if active:
+                    hidden_prefix = (active + "\n" + hidden_prefix) if hidden_prefix else active
             self._user_first_interaction = False
         # The prefix carries out-of-band context (e.g. <stale>…</stale>) that
         # the model should see but the user shouldn't — user_message_shown
@@ -522,6 +532,19 @@ class ConversationController:
                 self._idle_event.set()
             self._emit_error(exc, source="controller_send",
                              label="send failed")
+
+    def _now_local(self) -> datetime.datetime:
+        """Current time as a naive wall-clock datetime in the user's timezone
+        (falling back to the server's local time). Used to decide which events
+        are active 'now' from the user's point of view."""
+        if self._client_tz:
+            try:
+                return datetime.datetime.now(
+                    zoneinfo.ZoneInfo(self._client_tz)
+                ).replace(tzinfo=None)
+            except Exception:
+                pass
+        return datetime.datetime.now()
 
     def set_client_timezone(self, tz: str) -> None:
         """Forward the client's IANA timezone to the backend so per-turn

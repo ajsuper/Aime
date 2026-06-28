@@ -8510,20 +8510,22 @@ async function setEventStatus(ev, status) {
   } catch (_) { return false; }
 }
 
-// Render an all-day event as a to-do row: the checkbox toggles completion
-// status (scheduled ⇄ completed); clicking the label opens the event modal as
-// before. Canceled events render struck-through but unchecked.
-function buildTodoItem(ev, { compact = false, interactive = true } = {}) {
+// Render an all-day event as a strip row. By default it's a plain clickable
+// item that opens the event modal — consistent with how timed events behave
+// (no inline checkbox). Pass `checkbox: true` to add the quick done-toggle
+// (kept for any surface that still wants it). `interactive: false` makes it a
+// passive row whose click bubbles to a parent handler (month-grid cells).
+function buildTodoItem(ev, { compact = false, interactive = true, checkbox = false } = {}) {
   const status = eventStatus(ev);
   const item = document.createElement("div");
   item.className = "todo-item" + (compact ? " compact" : "")
                  + (status === "completed" ? " done" : "")
                  + (status === "canceled" ? " canceled" : "")
                  + (status === "unknown" ? " unknown" : "")
-                 + (interactive ? "" : " static");
+                 + (interactive && checkbox ? "" : " static");
   applyCategoryColor(item, ev.category);
 
-  if (interactive) {
+  if (checkbox) {
     const done = status === "completed";
     const box = document.createElement("button");
     box.type = "button";
@@ -8554,13 +8556,16 @@ function buildTodoItem(ev, { compact = false, interactive = true } = {}) {
   const label = document.createElement("span");
   label.className = "todo-label";
   label.textContent = ev.title || ev.name || "(untitled)";
+  item.appendChild(label);
+
+  // Open the modal on click: the label only when a checkbox owns the rest of
+  // the row, otherwise the whole item (so it reads like a normal event).
   if (interactive) {
-    label.addEventListener("click", (e) => {
+    (checkbox ? label : item).addEventListener("click", (e) => {
       e.stopPropagation();
       openEventModal(ev);
     });
   }
-  item.appendChild(label);
   return item;
 }
 
@@ -8653,7 +8658,7 @@ function buildDayColumn(date, events, multiDay, sched, allDayCol, hourPx, startH
   const startMin = startHour * 60;
   const dayEvents = (events[eventKey(date)] || []);
 
-  // Split into timed vs all-day. All-day events become to-do items in the
+  // Split into timed vs all-day. All-day events become items in the all-day
   // strip above; timed events get laid out below with overlap-aware
   // column assignment. Multi-day events of either kind are skipped here — the
   // caller renders them as spanning bars across the strip (see layoutSpanBars).
@@ -8809,7 +8814,7 @@ async function renderWeekSchedule(silent) {
   if (hasAllDay) {
     const lab = document.createElement("div");
     lab.className = "allday-label";
-    lab.textContent = "to-do";
+    lab.textContent = "all day";
     lab.style.gridColumn = "1";
     lab.style.gridRow = "1 / -1";       // span all rows (to-do cells + span bars)
     allDay.appendChild(lab);
@@ -8895,7 +8900,7 @@ async function renderDaySchedule(silent) {
   if (hasAllDay) {
     const lab = document.createElement("div");
     lab.className = "allday-label";
-    lab.textContent = "to-do";
+    lab.textContent = "all day";
     lab.style.gridColumn = "1";
     lab.style.gridRow = "1 / -1";
     allDay.appendChild(lab);
@@ -8993,7 +8998,7 @@ async function showDayDetailSchedule(date) {
   if (hasAllDay) {
     const lab = document.createElement("div");
     lab.className = "allday-label";
-    lab.textContent = "to-do";
+    lab.textContent = "all day";
     lab.style.gridColumn = "1";
     lab.style.gridRow = "1 / -1";
     allDay.appendChild(lab);
