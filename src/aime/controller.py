@@ -104,6 +104,9 @@ Severity = Literal[
     # first-run onboarding flow has started / finished so it can show or hide
     # onboarding-only affordances like the empty-state upload nudge.
     "onboarding", "onboarding_done",
+    # Temporary Chat: "temporary" arms the incognito banner / styling; its
+    # text is the banner copy. "temporary_end" drops it on exit.
+    "temporary", "temporary_end",
 ]
 RestartReason = Literal["reset", "load"]
 
@@ -302,6 +305,13 @@ class ConversationController:
         self._idle_event = threading.Event()
         self._idle_event.set()
         self._pending_user_messages: list[tuple] = []
+        # Temporary Chat (incognito): a throwaway session whose transcript is
+        # never persisted and never folds into the main continuous thread. Tool
+        # actions still persist. _main_session_id remembers the thread to return
+        # to on exit. While temporary, out-of-band proactive messages are routed
+        # to the *main* thread (not this one) — see deliver_inline_proactive.
+        self._temporary = False
+        self._main_session_id: str | None = None
         # Text the model sent the user via the SendMessage tool *during* a turn.
         # We can't append it to history mid-turn (it would corrupt the in-flight
         # assistant/tool_result ordering), so it's stashed here and flushed as an
@@ -461,6 +471,12 @@ class ConversationController:
             return True
         if text == "/reset":
             self.reset()
+            return False
+        if text == "/temp on":
+            self.enter_temporary_chat()
+            return False
+        if text == "/temp off":
+            self.exit_temporary_chat()
             return False
         if text.startswith("/load"):
             parts = text.split(maxsplit=1)
@@ -646,6 +662,82 @@ class ConversationController:
             # rather than a blank new chat. No-op (and cheap) once they've engaged.
             self._maybe_start_onboarding()
 
+    def enter_temporary_chat(self) -> None:
+        """Switch into a Temporary Chat: a throwaway thread that starts fresh (no
+        main-thread history, but the durable About Me / Pending / active-events
+        context still bootstraps on the first message), is never persisted, and is
+        discarded on exit. Tool actions still persist. Proactive messages keep
+        landing in the main thread (see deliver_inline_proactive). Idempotent."""
+        with self._dispatch_lock:
+            if self._temporary or self._headless:
+                return
+            # Remember the thread to come back to. It's persisted on disk (turns
+            # save as they complete), so exit reloads it from there — including any
+            # proactive messages written to it while we were in temp mode.
+            self._main_session_id = getattr(self._backend, "session_id", None)
+            with self._state_lock:
+                self._pending_user_messages = []
+                self._pending_proactive = []
+            self.stop_model()
+            self._backend.start_ephemeral_session()
+            self._reset_internal_state()
+            self._temporary = True
+            # Clear the transcript to a fresh temp view (no main history), then a
+            # signal-only notice the frontend uses to show the temp-mode banner.
+            self._emit(CoreEvent(kind="session_restart", restart_reason="reset"))
+            self._emit(CoreEvent(
+                kind="notice",
+                severity="temporary",
+                text="Temporary chat — this conversation won't be saved.",
+            ))
+            self._spawn_worker(self.run_stream_loop)
+            self._maybe_start_onboarding()
+
+    def exit_temporary_chat(self) -> None:
+        """Leave a Temporary Chat, discarding its transcript, and restore the main
+        continuous thread (reloaded from disk so any proactive messages recorded
+        while we were away are present). Idempotent."""
+        with self._dispatch_lock:
+            if not self._temporary:
+                return
+            with self._state_lock:
+                self._pending_user_messages = []
+                self._pending_proactive = []
+            self.stop_model()
+            self._temporary = False
+            main_id = self._main_session_id
+            self._main_session_id = None
+            restored = False
+            if main_id:
+                try:
+                    self._backend.load_session(main_id)
+                    restored = True
+                except (OSError, ValueError):
+                    restored = False
+            if restored:
+                # Replays the main thread silently and spawns the worker.
+                self.seed_last_activity(self._saved_at_for(main_id))
+                self._load_after_swap(main_id, announce=False)
+            elif not self.resume_latest_session():
+                # No main thread to restore (it was empty/unsaved): land on a
+                # fresh, normal session.
+                self._swap_to_fresh_session()
+                self._spawn_worker(self.run_stream_loop)
+            # Signal-only notice so the frontend drops the temp-mode banner.
+            self._emit(CoreEvent(kind="notice", severity="temporary_end"))
+
+    def _saved_at_for(self, session_id: str) -> str:
+        """The persisted saved_at for a session id (or '' if unknown), used to
+        seed the idle-rollover clock when restoring the main thread."""
+        for info in self._backend.list_sessions():
+            if info.id == session_id:
+                return info.saved_at or ""
+        return ""
+
+    @property
+    def is_temporary(self) -> bool:
+        return self._temporary
+
     def _swap_to_fresh_session(self) -> None:
         """Tear down the active backend session and start an empty one. Shared by
         the user-visible `reset()` and the silent idle rollover; the difference is
@@ -672,6 +764,8 @@ class ConversationController:
         empty (nothing to bound) or rollover is disabled."""
         if self._headless or IDLE_ROLLOVER_SECONDS <= 0:
             return
+        if self._temporary:
+            return  # a temporary chat is already ephemeral — never roll it
         with self._dispatch_lock:
             with self._state_lock:
                 if not self._is_idle:
@@ -970,6 +1064,11 @@ class ConversationController:
         caller knows not to also write it to disk."""
         body = (text or "").strip()
         if not body:
+            return False
+        # In a Temporary Chat this live session isn't the main thread — let the
+        # caller route the message to the main thread (persisted) instead, so a
+        # reminder never lands in (or vanishes with) the throwaway chat.
+        if self._temporary:
             return False
         with self._state_lock:
             if not self._is_idle:

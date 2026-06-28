@@ -704,6 +704,33 @@
     .feedback-btn:hover { color: var(--text); border-color: var(--border);
                           background: var(--bg-elev); }
     .feedback-btn svg { width: 17px; height: 17px; }
+    /* Temporary-chat toggle — mirrors the feedback button; turns accent when on. */
+    .temp-toggle-btn { display: inline-flex; align-items: center; justify-content: center;
+                       background: transparent; color: var(--muted);
+                       border: 1px solid transparent; border-radius: var(--r-sm);
+                       padding: 0.4rem; cursor: pointer; font: inherit; flex-shrink: 0;
+                       transition: color 0.15s, border-color 0.15s, background 0.15s; }
+    .temp-toggle-btn:hover { color: var(--text); border-color: var(--border);
+                             background: var(--bg-elev); }
+    .temp-toggle-btn svg { width: 17px; height: 17px; }
+    .temp-toggle-btn[aria-pressed="true"] { color: var(--accent);
+                                            border-color: var(--accent); }
+    /* Temporary-chat banner — hidden unless we're in temp mode. */
+    #temp-banner { display: none; align-items: center; gap: 0.5rem;
+                   margin: 0.5rem 0.75rem 0; padding: 0.5rem 0.75rem;
+                   border: 1px dashed var(--accent); border-radius: var(--r-sm);
+                   background: var(--bg-elev); color: var(--muted);
+                   font-size: 0.85rem; }
+    #temp-banner svg { width: 16px; height: 16px; flex-shrink: 0; color: var(--accent); }
+    #temp-banner span { flex: 1; }
+    #temp-banner button { background: transparent; border: 1px solid var(--border);
+                          border-radius: var(--r-sm); color: var(--text);
+                          padding: 0.2rem 0.6rem; cursor: pointer; font: inherit;
+                          font-size: 0.8rem; }
+    #temp-banner button:hover { border-color: var(--accent); color: var(--accent); }
+    body.temp-mode #temp-banner { display: flex; }
+    /* A faint accent rail on the composer reinforces that you're off the record. */
+    body.temp-mode #f { box-shadow: inset 0 2px 0 0 var(--accent); }
     /* Feedback modal internals. */
     .feedback-intro { color: var(--muted); font-size: 0.88rem; margin: 0;
                       line-height: 1.4; }
@@ -2691,6 +2718,18 @@
     </div>
     <div id="divider" title="Drag to resize"></div>
     <div id="chat-col">
+      <!-- Shown only while in a Temporary Chat (body.temp-mode). Purely CSS-driven
+           so it survives the transcript wipe on enter/exit. -->
+      <div id="temp-banner" aria-live="polite">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7S2 12 2 12z"/>
+          <circle cx="12" cy="12" r="3"/>
+          <line x1="3" y1="3" x2="21" y2="21"/>
+        </svg>
+        <span>Temporary chat — this conversation won't be saved.</span>
+        <button type="button" id="temp-exit-btn">Exit</button>
+      </div>
       <div id="log"><div id="log-inner"></div><div id="empty-hint">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
              stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -2757,10 +2796,20 @@
             </button>
           </div>
           <!-- The "New conversation" button was removed: Aime is one continuous
-               thread now (like a texting app), so there's no user-facing way to
-               start a fresh chat. The backend silently rolls onto a fresh session
-               after an idle gap to keep cost bounded; the user never sees a break.
-               (Dev/recovery can still reset via the "/reset" command path.) -->
+               thread now (like a texting app). In its place, a Temporary Chat
+               toggle: a throwaway side thread that isn't saved and doesn't fold
+               into the main thread (actions you take still happen). Toggling it
+               off discards it and returns to the main thread. -->
+          <button type="button" class="temp-toggle-btn tip-anchor" id="temp-toggle-btn"
+                  data-tip="Temporary chat — not saved" aria-label="Temporary chat"
+                  aria-pressed="false">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                 stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7S2 12 2 12z"/>
+              <circle cx="12" cy="12" r="3"/>
+              <line x1="3" y1="3" x2="21" y2="21"/>
+            </svg>
+          </button>
           <button type="button" class="feedback-btn tip-anchor" id="feedback-btn"
                   data-tip="Send feedback" aria-label="Send feedback">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
@@ -4047,6 +4096,11 @@ const chat = {
   // we rebuild the real transcript from the server snapshot and drop the guard.
   newChat()      { this.switchTo("/reset"); },
   loadChat(id)   { this.switchTo("/load " + id); },
+  // Temporary Chat toggle. The transcript clears optimistically (switchTo); the
+  // server confirms by emitting session_restart + a "temporary"/"temporary_end"
+  // notice, which drives the banner/styling via setTempMode().
+  enterTemp()    { this.switchTo("/temp on"); },
+  exitTemp()     { this.switchTo("/temp off"); },
   async switchTo(command) {
     if (this.state.nav === "switching") return;
     this.state.nav = "switching";
@@ -4073,7 +4127,13 @@ const chat = {
   linkOpen(wasReconnect) {
     this.state.link = "open";
     this.state.replay = true;
-    if (wasReconnect) clearTranscriptView();
+    if (wasReconnect) {
+      clearTranscriptView();
+      // Reset temp styling before the snapshot replays; if the server is still
+      // in a temporary chat its replayed "temporary" notice re-arms it, and if
+      // it isn't (e.g. after a server restart) the stale banner clears itself.
+      setTempMode(false);
+    }
   },
   linkDown() { this.state.link = "reconnecting"; },
 
@@ -5637,6 +5697,17 @@ function onStreamMessage(e) {
         document.body.classList.remove("onboarding");
         break;
       }
+      // Temporary Chat: signal-only severities that arm / drop the incognito
+      // banner + composer styling. The text rides along on "temporary" as the
+      // banner copy (the static markup already carries a default).
+      if (e.severity === "temporary") {
+        setTempMode(true);
+        break;
+      }
+      if (e.severity === "temporary_end") {
+        setTempMode(false);
+        break;
+      }
       // The "Loaded conversation…" line — centered, and tracked so it can
       // fade out once the user sends their first message.
       if (e.severity === "loaded") {
@@ -5864,6 +5935,23 @@ async function submitFeedback() {
     feedbackSendBtn.textContent = "Send";
   }
 }
+
+// --- Temporary Chat toggle ------------------------------------------------
+// Reflect temp-mode state on <body> (drives the banner + composer styling via
+// CSS) and the toggle button's pressed state. Server-driven: the "temporary" /
+// "temporary_end" notices call this, so the UI never desyncs from the backend.
+function setTempMode(on) {
+  document.body.classList.toggle("temp-mode", on);
+  const btn = document.getElementById("temp-toggle-btn");
+  if (btn) btn.setAttribute("aria-pressed", on ? "true" : "false");
+}
+
+document.getElementById("temp-toggle-btn").addEventListener("click", () => {
+  if (document.body.classList.contains("temp-mode")) chat.exitTemp();
+  else chat.enterTemp();
+});
+const tempExitBtn = document.getElementById("temp-exit-btn");
+if (tempExitBtn) tempExitBtn.addEventListener("click", () => chat.exitTemp());
 
 document.getElementById("feedback-btn")
   .addEventListener("click", () => openFeedback("feedback", null));

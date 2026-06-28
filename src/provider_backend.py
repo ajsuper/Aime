@@ -225,6 +225,11 @@ class AgentBackend(Protocol):
         """Start a fresh session. Returns the session id."""
         ...
 
+    def start_ephemeral_session(self) -> str:
+        """Start a throwaway session that is never persisted (a Temporary Chat).
+        Backends without persistence can treat this as ``new_session``."""
+        ...
+
     def list_sessions(self) -> list[SessionInfo]:
         """Return resumable sessions, most-recently-saved first. Backends with
         no enumerable history return an empty list."""
@@ -509,6 +514,13 @@ class AnthropicMessagesBackend:
         # they never litter the user's saved-conversation list; their audit
         # trail is the separate run record (see aime.agents.store).
         self._persist_enabled = persist_enabled
+        # Runtime persistence suspend for a Temporary Chat: the session lives only
+        # in memory and is discarded on exit, even though this backend is normally
+        # persistence-capable. Separate from _persist_enabled (the static
+        # capability) so toggling temp mode never re-enables persistence on a
+        # backend that was built without it (an agent run). Reset on every
+        # new_session()/load_session(); set by start_ephemeral_session().
+        self._persist_suspended = False
         # Per-session dynamic context (e.g. bootstrapped topic contents). Lives
         # in the system array rather than the message history so it stays out
         # of compaction and doesn't get replayed inside user turns.
@@ -711,6 +723,9 @@ class AnthropicMessagesBackend:
             self._session_context = ""
             self._current_turn_model = None
             self._current_turn_label = None
+            # A normal fresh session persists (subject to the static capability);
+            # only start_ephemeral_session() re-suspends after this.
+            self._persist_suspended = False
         self._terminated.clear()
         self._turn_trigger.clear()
         stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -720,6 +735,18 @@ class AnthropicMessagesBackend:
         # /reset (or app launch) doesn't litter conversations/ with empty
         # placeholders.
         return self._session_id
+
+    def start_ephemeral_session(self) -> str:
+        """Begin a Temporary Chat: a throwaway in-memory session that is never
+        written to disk and never folds into the persisted thread. Identical to
+        new_session() except persistence stays suspended for its whole life, so
+        exiting temp mode (a load_session back to the main thread) simply drops
+        it. Tool actions taken during it still persist — they go through the data
+        stores, not the conversation file."""
+        sid = self.new_session()
+        with self._lock:
+            self._persist_suspended = True
+        return sid
 
     def messages_snapshot(self) -> list[dict]:
         """Copy of the current message list, safe for the UI to iterate
@@ -751,6 +778,9 @@ class AnthropicMessagesBackend:
             self._session_context = ""
             self._current_turn_model = None
             self._current_turn_label = None
+            # Returning to a real (persisted) session — e.g. exiting a Temporary
+            # Chat back to the main thread — resumes normal persistence.
+            self._persist_suspended = False
         self._terminated.clear()
         self._turn_trigger.clear()
 
@@ -793,7 +823,8 @@ class AnthropicMessagesBackend:
         return sessions
 
     def _persist(self) -> None:
-        if not self._session_id or not self._persist_enabled:
+        if (not self._session_id or not self._persist_enabled
+                or self._persist_suspended):
             return
         # Hold _persist_lock across the snapshot *and* the file write, so a
         # slow writer can't os.replace() a stale snapshot over a newer one
@@ -2140,6 +2171,11 @@ class SessionsBackend:
                 environment_id=self._env_id,
             )
         return self._session.id
+
+    def start_ephemeral_session(self) -> str:
+        # No client-side persistence here, so a temporary chat is just a fresh
+        # server-side session.
+        return self.new_session()
 
     def load_session(self, session_id: str) -> None:
         # Sessions are server-side; "loading" just means attaching to the id.

@@ -3744,18 +3744,26 @@ def _record_proactive_in_user_thread(user_id: int, text: str) -> None:
         return
     try:
         ctx = _user_contexts.get(user_id)
-        if ctx is not None:
-            # A live session owns it: recorded now if idle, or queued to flush on
-            # turn_end if busy (so the turn's own persist can't clobber a direct
-            # file write). Either way, don't also write to disk.
-            ctx.controller.deliver_inline_proactive(body)
+        if ctx is not None and ctx.controller.deliver_inline_proactive(body):
+            # A live (non-temporary) session owns it: recorded now if idle, or
+            # queued to flush on turn_end if busy (so the turn's own persist can't
+            # clobber a direct file write). Don't also write to disk.
             return
-        # No live session for this user in this process: persist into the latest
-        # session file directly so the message threads in on next load.
+        # No live session for this user, OR they're in a Temporary Chat: persist
+        # into the main session file directly so the message threads into the main
+        # conversation, present on next load / on exiting temp mode.
         from provider_backend import append_proactive_message_offline
         append_proactive_message_offline(
             _conversations_dir(user_id), _auth_backend.get_dek(user_id), body,
         )
+        # If they're sitting in a temporary chat, let them know a message landed
+        # in their main thread (the phone already got it too).
+        if ctx is not None and ctx.controller.is_temporary:
+            ctx._broadcast({
+                "kind": "notice",
+                "severity": "info",
+                "text": "Aime sent a message to your main chat.",
+            })
     except Exception:
         app.logger.exception(
             "failed to record proactive message inline for user %s", user_id
