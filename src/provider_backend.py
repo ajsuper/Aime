@@ -12,7 +12,7 @@ import threading
 import datetime
 import zoneinfo
 from dataclasses import dataclass
-from typing import Iterator, Literal, Protocol, runtime_checkable
+from typing import Callable, Iterator, Literal, Protocol, runtime_checkable
 
 from anthropic import Anthropic, BadRequestError
 from cryptography.exceptions import InvalidTag
@@ -562,6 +562,11 @@ class AnthropicMessagesBackend:
         # True while a background _generate_title thread is in flight, so
         # submit() doesn't spawn a duplicate one on the next message.
         self._title_generating = False
+        # Optional callback fired (session_id, title) whenever a session's title
+        # is (re)generated, so the controller can backfill a live session-divider
+        # whose label was still a timestamp. Set by the controller; None in tests
+        # / headless runs. Called off the turn thread, so it must not block.
+        self._on_title: "Callable[[str, str], None] | None" = None
         # True while a background compaction thread is in flight. Compaction
         # makes two sequential Haiku calls (summary + title refresh) so it's
         # run off the turn thread; this flag prevents stacking up duplicates
@@ -753,6 +758,12 @@ class AnthropicMessagesBackend:
         # /reset (or app launch) doesn't litter conversations/ with empty
         # placeholders.
         return self._session_id
+
+    def set_title_callback(self, cb: "Callable[[str, str], None] | None") -> None:
+        """Register a callback fired (session_id, title) when a session's title is
+        (re)generated, so the controller can backfill a live session divider whose
+        label was still a timestamp. Called off the turn thread."""
+        self._on_title = cb
 
     def start_ephemeral_session(self) -> str:
         """Begin a Temporary Chat: a throwaway in-memory session that is never
@@ -1050,7 +1061,7 @@ class AnthropicMessagesBackend:
             if needs_title and event.kind == "user_send_message":
                 threading.Thread(
                     target=self._generate_title,
-                    args=(title_prompt,),
+                    args=(title_prompt, self._session_id),
                     daemon=True,
                 ).start()
             self._turn_trigger.set()
@@ -1813,10 +1824,14 @@ class AnthropicMessagesBackend:
             detail = detail[:300] + "…"
         return f"{name}({detail})"
 
-    def _generate_title(self, prompt_text: str) -> None:
+    def _generate_title(self, prompt_text: str, session_id: str | None = None) -> None:
         """Background: one cheap Haiku call turning the user's opening prompt
         into a one-sentence session description, then persist it. Best-effort —
-        any failure just leaves the summary empty so the next submit() retries."""
+        any failure just leaves the summary empty so the next submit() retries.
+
+        ``session_id`` is the session the title is for (captured at spawn), so a
+        late title only updates the right session even if the active one has since
+        rolled over — and the on_title callback can target the matching divider."""
         try:
             try:
                 resp = self._client.messages.create(
@@ -1846,8 +1861,20 @@ class AnthropicMessagesBackend:
                 return
             if title:
                 with self._lock:
-                    self._summary = title
-                self._persist()
+                    # Only apply to the session the title was generated for — if
+                    # the active session has since rolled over, don't stamp the old
+                    # title onto the new one.
+                    same = session_id is None or self._session_id == session_id
+                    if same:
+                        self._summary = title
+                if same:
+                    self._persist()
+                cb = self._on_title
+                if cb is not None:
+                    try:
+                        cb(session_id or "", title)
+                    except Exception:
+                        pass
         finally:
             with self._lock:
                 self._title_generating = False

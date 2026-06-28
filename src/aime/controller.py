@@ -317,6 +317,12 @@ class ConversationController:
         # to the *main* thread (not this one) — see deliver_inline_proactive.
         self._temporary = False
         self._main_session_id: str | None = None
+        # Session ids we've drawn a divider for, so a late Haiku title backfills
+        # an existing divider rather than spawning a stray one (see
+        # _handle_title_generated). Wired to the backend's title callback below.
+        self._divider_session_ids: set[str] = set()
+        if hasattr(self._backend, "set_title_callback"):
+            self._backend.set_title_callback(self._handle_title_generated)
         # Text the model sent the user via the SendMessage tool *during* a turn.
         # We can't append it to history mid-turn (it would corrupt the in-flight
         # assistant/tool_result ordering), so it's stashed here and flushed as an
@@ -360,6 +366,10 @@ class ConversationController:
         """Mark a session boundary in the continuous transcript. The frontend
         labels the session beneath it (so the user sees the model started fresh
         here) and uses the id as the scroll-back cursor for /history."""
+        if session_id:
+            # Remember we put a divider here so a later title backfill only
+            # updates an existing divider, never spawns a stray one.
+            self._divider_session_ids.add(session_id)
         self._emit(CoreEvent(
             kind="session_divider",
             payload={
@@ -367,6 +377,19 @@ class ConversationController:
                 "title": (title or "").strip(),
                 "saved_at": saved_at or "",
             },
+        ))
+
+    def _handle_title_generated(self, session_id: str, title: str) -> None:
+        """Backend callback: a session's Haiku title just landed. If we showed a
+        divider for that session (a rollover one that fell back to a timestamp),
+        re-emit it with the title so the frontend updates that divider in place.
+        Runs on the title thread, so it only emits — no locks held."""
+        title = (title or "").strip()
+        if not title or session_id not in self._divider_session_ids:
+            return
+        self._emit(CoreEvent(
+            kind="session_divider",
+            payload={"session_id": session_id, "title": title, "saved_at": ""},
         ))
 
     def _capture(self, exc: Exception, *, source: str) -> dict | None:

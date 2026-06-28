@@ -5768,14 +5768,29 @@ function onStreamMessage(e) {
       mergeTurnSources(e.payload && e.payload.sources);
       if (turnSourceBubble) renderSourceBubble(null);
       break;
-    case "session_divider":
+    case "session_divider": {
       // Boundary between two backend sessions in the continuous thread. Appended
       // live (a fresh idle-rollover session) or replayed at the top of the
       // resumed session — a subtle labeled rule so the user can see where the
-      // model's live memory actually starts.
-      logInner.appendChild(buildSessionDivider(e.payload || {}));
-      scrollToBottom();
+      // model's live memory actually starts. A repeat for the same session id is
+      // a title backfill (a rollover divider started as a timestamp, then its
+      // Haiku title landed): update the existing label in place rather than
+      // appending a duplicate.
+      const p = e.payload || {};
+      const sid = p.session_id || "";
+      const existing = sid ? logInner.querySelector(
+        '.session-divider[data-session-id="' + CSS.escape(sid) + '"]') : null;
+      if (existing) {
+        if ((p.title || "").trim()) {
+          const span = existing.querySelector("span");
+          if (span) span.textContent = historyLabel(p);
+        }
+      } else {
+        logInner.appendChild(buildSessionDivider(p));
+        scrollToBottom();
+      }
       break;
+    }
     case "tool_result":
       if (verbosity === "verbose") {
         // Collapsed dropdown: one-line result summary + an arrow to expand the
