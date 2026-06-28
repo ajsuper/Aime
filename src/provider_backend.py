@@ -311,6 +311,22 @@ import aime.dateformat as dateformat
 from aime import graphics as _graphics
 
 
+def session_started_at(session_id: str) -> str:
+    """The session's start time as an absolute (tz-aware) ISO instant, derived
+    from the timestamp embedded in its id (``msgs-YYYYMMDD-HHMMSS-…``). The id
+    stamp is server-local wall time, so we localize it to the server's zone to get
+    an absolute instant the client can render in the *user's* timezone. Returns ""
+    if the id doesn't carry a parseable stamp."""
+    parts = (session_id or "").split("-")
+    if len(parts) < 3 or parts[0] != "msgs":
+        return ""
+    try:
+        dt = datetime.datetime.strptime(parts[1] + parts[2], "%Y%m%d%H%M%S")
+    except ValueError:
+        return ""
+    return dt.astimezone().isoformat()
+
+
 def read_session_messages(
     conversations_dir: str, dek: bytes, session_id: str,
 ) -> list[dict] | None:

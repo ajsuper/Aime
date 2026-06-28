@@ -3622,6 +3622,27 @@ log.addEventListener("scroll", () => {
   if (log.scrollTop < 240) loadOlderHistory();
 });
 
+// Land on the newest message and *hold* there through late layout — rendered
+// markdown, graphics, and images can grow the transcript over several frames
+// after first paint, so a single scroll lands short. We re-pin across a handful
+// of frames + short delays, but back off the instant the user scrolls up
+// (following=false) so it never fights them.
+function scrollToLatest() {
+  log.scrollTop = log.scrollHeight;
+  chat.setFollowing(true);
+  updateScrollBtn();
+  const repin = () => {
+    if (!chat.state.following) return;   // user scrolled up — leave them be
+    log.scrollTop = log.scrollHeight;
+    updateScrollBtn();
+  };
+  requestAnimationFrame(repin);
+  requestAnimationFrame(() => requestAnimationFrame(repin));
+  setTimeout(repin, 80);
+  setTimeout(repin, 250);
+  setTimeout(repin, 600);
+}
+
 scrollBottomBtn.addEventListener("click", () => scrollToBottom(true));
 const input = document.getElementById("i");
 const micBtn = document.getElementById("mic-btn");
@@ -4313,18 +4334,22 @@ function resetHistoryState() {
   if (historyRow) { historyRow.remove(); historyRow = null; }
 }
 
-// Divider copy: a plain date + time stamp for the session — a clear, reliable
-// separation clue (deliberately not the Haiku title). Taken from the session
-// id's embedded start time (msgs-YYYYMMDD-HHMMSS-…), falling back to saved_at.
+// Divider copy: a plain date + time stamp for the session, rendered in the
+// user's local timezone (a clear, reliable separation clue — deliberately not the
+// Haiku title). The server sends `started_at` as an absolute instant (with tz
+// offset); toLocaleString then renders it in the browser's local zone. Falls back
+// to saved_at, then to the id's embedded stamp (treated as local) for safety.
 function historyLabel(p) {
   let d = null;
-  const sid = (p && p.session_id) || "";
-  const m = sid.match(/^msgs-(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})/);
-  if (m) {
-    d = new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]);
-  } else if (p && p.saved_at) {
-    const t = new Date(p.saved_at);
+  const iso = (p && p.started_at) || (p && p.saved_at) || "";
+  if (iso) {
+    const t = new Date(iso);
     if (!isNaN(t.getTime())) d = t;
+  }
+  if (!d) {
+    const sid = (p && p.session_id) || "";
+    const m = sid.match(/^msgs-(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})/);
+    if (m) d = new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]);
   }
   if (d && !isNaN(d.getTime())) {
     return d.toLocaleString([], {
@@ -4394,7 +4419,8 @@ function buildHistoryFragment(sessions) {
   const frag = document.createDocumentFragment();
   (sessions || []).forEach(s => {
     frag.appendChild(buildSessionDivider(
-      {session_id: s.id, title: s.title, saved_at: s.saved_at}));
+      {session_id: s.id, title: s.title, saved_at: s.saved_at,
+       started_at: s.started_at}));
     (s.events || []).forEach(ev => {
       const node = buildHistoryNode(ev);
       if (node) frag.appendChild(node);
@@ -5735,12 +5761,8 @@ function onStreamMessage(e) {
       // firmly on the latest message, then background-fill older sessions above
       // while staying pinned there — so the user always opens on the newest
       // message and never sees the older history scroll in.
-      requestAnimationFrame(() => {
-        log.scrollTop = log.scrollHeight;
-        chat.setFollowing(true);
-        updateScrollBtn();
-        maybeFillViewport();
-      });
+      scrollToLatest();
+      requestAnimationFrame(maybeFillViewport);
       break;
     case "resync":
       // The server's per-client send buffer overflowed (this browser fell too

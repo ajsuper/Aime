@@ -26,7 +26,9 @@ import zoneinfo
 from dataclasses import dataclass, field
 from typing import Callable, Literal
 
-from provider_backend import AgentBackend, BackendEvent, SessionInfo
+from provider_backend import (
+    AgentBackend, BackendEvent, SessionInfo, session_started_at,
+)
 
 from .tool_gateway import ToolGateway
 from .commitments import CommitmentService
@@ -367,6 +369,8 @@ class ConversationController:
                 "session_id": session_id or "",
                 "title": (title or "").strip(),
                 "saved_at": saved_at or "",
+                # Absolute instant so the client renders it in the user's tz.
+                "started_at": session_started_at(session_id or ""),
             },
         ))
 

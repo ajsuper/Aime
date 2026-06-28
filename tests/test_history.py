@@ -6,12 +6,31 @@ import json
 import os
 
 import aime.encryption as _enc
+import datetime
+
 from provider_backend import (
     PROACTIVE_TRIGGER_MARKER,
     SessionInfo,
     read_session_messages,
+    session_started_at,
 )
 import frontends.web_app as web_app
+
+
+# --- session_started_at (absolute instant from the id's local stamp) -------
+
+def test_session_started_at_returns_aware_instant():
+    iso = session_started_at("msgs-20260628-143000-abcd1234")
+    assert iso  # non-empty
+    dt = datetime.datetime.fromisoformat(iso)
+    assert dt.tzinfo is not None          # tz-aware → renderable in any zone
+    assert (dt.year, dt.month, dt.day) == (2026, 6, 28)
+    assert (dt.hour, dt.minute) == (14, 30)
+
+
+def test_session_started_at_bad_id_is_empty():
+    assert session_started_at("not-a-session") == ""
+    assert session_started_at("") == ""
 
 
 def _write_session(tmp_path, dek, session_id, data):
@@ -107,4 +126,12 @@ def test_history_page_carries_title_and_events():
     s1 = page["sessions"][0]
     assert s1["id"] == "s1"
     assert s1["title"] == "title-s1"
+    assert "started_at" in s1          # absolute instant for tz-correct rendering
     assert s1["events"][0]["kind"] == "user_message_shown"
+
+
+def test_history_page_derives_started_at_from_real_id():
+    infos = [SessionInfo(id="msgs-20260628-143000-aa", summary="x",
+                         saved_at="2026-06-28T14:35:00")]
+    page = web_app._build_history_page(infos, "", 5, _loader)
+    assert page["sessions"][0]["started_at"]   # non-empty, tz-aware instant

@@ -3714,6 +3714,7 @@ def _build_history_page(infos, before, limit, load_messages):
             return {"sessions": [], "has_more": False}
     page = infos[start:start + limit]
     has_more = len(infos) > start + limit
+    from provider_backend import session_started_at
     sessions = []
     for info in page:
         msgs = load_messages(info.id) or []
@@ -3721,6 +3722,8 @@ def _build_history_page(infos, before, limit, load_messages):
             "id": info.id,
             "title": info.summary or "",
             "saved_at": info.saved_at or "",
+            # Absolute instant so the client renders the divider in the user's tz.
+            "started_at": session_started_at(info.id),
             "events": _session_render_events(msgs),
         })
     # Oldest-first so the client can prepend the whole page as one chronological
