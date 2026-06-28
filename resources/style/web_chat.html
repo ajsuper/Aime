@@ -473,6 +473,21 @@
                          transition: opacity 0.45s ease; }
     .msg.notice.loaded::before { display: none; }
     .msg.notice.loaded.fading { opacity: 0; }
+    /* Session divider — a subtle centered rule that labels the session beneath
+       it, so the continuous thread still shows where one backend session ends and
+       the next begins (a cue that the model doesn't carry everything above it). */
+    .session-divider { display: flex; align-items: center; gap: 0.6rem;
+                       margin: 1.1rem 0 0.6rem; padding-left: 0;
+                       color: var(--muted); font-size: 0.72rem;
+                       letter-spacing: 0.03em; text-transform: uppercase; }
+    .session-divider::before, .session-divider::after {
+                       content: ""; flex: 1; height: 1px;
+                       background: var(--border); opacity: 0.7; }
+    .session-divider span { white-space: nowrap; max-width: 60%;
+                       overflow: hidden; text-overflow: ellipsis; }
+    /* The "loading earlier…" spinner row at the very top while paginating. */
+    .history-loading { text-align: center; color: var(--muted);
+                       font-size: 0.78rem; padding: 0.6rem 0; }
     /* Verbose-mode tool entries: a <details> disclosure. We hide the notice
        bullet and the native marker, and supply our own caret that rotates
        open. Expanding reveals the full tool input/result in a scrollable pre. */
@@ -2547,12 +2562,11 @@
         <span class="logo-bar" aria-hidden="true"></span>
       </button>
       <div class="rail-sep" aria-hidden="true"></div>
-      <button class="rail-btn pane-btn" data-target="chats" title="Chats" aria-label="Chats">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
-             stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
-        </svg>
-      </button>
+      <!-- The Chats (Conversations) pane button was removed: Aime is one
+           continuous thread, so there's no conversation list to switch between.
+           Temporary chats are entered from the composer toggle; clearing history
+           lives in account settings; agent runs live in the Agents pane. -->
+
       <button class="rail-btn pane-btn" data-target="calendar" title="Calendar" aria-label="Calendar">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
              stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -2597,13 +2611,6 @@
           </svg>
         </button>
       </div>
-      <!-- Chats pane -->
-      <div class="pane" data-pane="chats">
-        <div class="scroll" id="chats-list">
-          <div class="empty">loading…</div>
-        </div>
-      </div>
-
       <!-- Calendar pane -->
       <div class="pane" data-pane="calendar">
         <div class="cal-toolbar">
@@ -3611,6 +3618,8 @@ function scrollToBottom(force) {
 log.addEventListener("scroll", () => {
   chat.setFollowing(isAtBottom());
   updateScrollBtn();
+  // Near the top → page in older sessions (one continuous scroll-back).
+  if (log.scrollTop < 240) loadOlderHistory();
 });
 
 scrollBottomBtn.addEventListener("click", () => scrollToBottom(true));
@@ -4286,6 +4295,140 @@ function appendNotice(text, severity) {
   logInner.appendChild(div);
   scrollToBottom();
   return div;
+}
+
+// --- Session dividers & scroll-back history --------------------------------
+// The thread is one continuous scroll, but the backend keeps it as cost-bounded
+// sessions. A labeled divider marks each boundary (so the user can see where the
+// model's live memory starts), and scrolling to the top pages older sessions in
+// from /history — prepended above, with the scroll position preserved.
+
+let historyHasMore = true;     // are there older sessions still to page in?
+let historyLoading = false;    // a /history fetch is in flight
+let historyRow = null;         // the transient "loading earlier…" row at the top
+
+function resetHistoryState() {
+  historyHasMore = true;
+  historyLoading = false;
+  if (historyRow) { historyRow.remove(); historyRow = null; }
+}
+
+// Divider copy: the session's title (Haiku summary) when it has one, else a
+// timestamp — so a just-started rollover session still reads as a clear break.
+function historyLabel(p) {
+  const title = ((p && p.title) || "").trim();
+  if (title) return title;
+  const when = p && p.saved_at;
+  if (when) {
+    const d = new Date(when);
+    if (!isNaN(d.getTime())) {
+      return d.toLocaleString([], {
+        month: "short", day: "numeric", hour: "numeric", minute: "2-digit",
+      });
+    }
+  }
+  return "New chat";
+}
+
+function buildSessionDivider(p) {
+  const div = document.createElement("div");
+  div.className = "session-divider";
+  if (p && p.session_id) div.dataset.sessionId = p.session_id;
+  const label = document.createElement("span");
+  label.textContent = historyLabel(p);
+  div.appendChild(label);
+  return div;
+}
+
+// Like appendMessage, but returns a detached node (no append, no "fresh" rainbow
+// animation — historical messages shouldn't re-animate as if newly arrived).
+function makeMessageNode(cls, who, text) {
+  const div = document.createElement("div");
+  div.className = "msg " + cls;
+  const w = document.createElement("span");
+  w.className = "who";
+  w.textContent = who + "  ";
+  div.appendChild(w);
+  const content = document.createElement("span");
+  content.className = "content";
+  if (text) content.appendChild(document.createTextNode(text));
+  div.appendChild(content);
+  div._content = content;
+  return div;
+}
+
+// Build one historical event node (or null to skip). Mirrors the live render for
+// user/assistant bubbles; tool calls show only for Verbose, as in the live view.
+function buildHistoryNode(ev) {
+  if (ev.kind === "user_message_shown") {
+    const {text: cleanedText, files} = extractAttachedFiles(ev.text || "");
+    const attachments = (ev.attachments || []).concat(files);
+    const node = makeMessageNode("user", "you", cleanedText);
+    const row = renderAttachmentRow(attachments);
+    if (row) node.insertBefore(row, node._content);
+    if (!cleanedText && attachments.length) node.classList.add("no-text");
+    return node;
+  }
+  if (ev.kind === "assistant_html") {
+    const node = makeMessageNode("aime", "aime", "");
+    node._content.innerHTML = ev.text || "";
+    resolveGraphicTags(node._content);
+    return node;
+  }
+  if (ev.kind === "tool_call" && verbosity === "verbose") {
+    const node = document.createElement("div");
+    node.className = "msg notice info";
+    node.textContent = "· " + (ev.tool_name || "tool");
+    return node;
+  }
+  return null;
+}
+
+// One page of older sessions (oldest-first), each a divider + its messages.
+function buildHistoryFragment(sessions) {
+  const frag = document.createDocumentFragment();
+  (sessions || []).forEach(s => {
+    frag.appendChild(buildSessionDivider(
+      {session_id: s.id, title: s.title, saved_at: s.saved_at}));
+    (s.events || []).forEach(ev => {
+      const node = buildHistoryNode(ev);
+      if (node) frag.appendChild(node);
+    });
+  });
+  return frag;
+}
+
+async function loadOlderHistory() {
+  if (historyLoading || !historyHasMore || chat.replaying()) return;
+  // Page from the oldest session currently shown (its divider is the topmost).
+  const firstDivider = logInner.querySelector(".session-divider");
+  const cursor = firstDivider ? (firstDivider.dataset.sessionId || "") : "";
+  if (!cursor) return;   // nothing anchored yet — wait for the snapshot
+  historyLoading = true;
+  historyRow = document.createElement("div");
+  historyRow.className = "history-loading";
+  historyRow.textContent = "loading earlier…";
+  logInner.insertBefore(historyRow, logInner.firstChild);
+  try {
+    const r = await fetch(
+      "/history?before=" + encodeURIComponent(cursor) + "&limit=12");
+    const data = await r.json();
+    if (historyRow) { historyRow.remove(); historyRow = null; }
+    const sessions = data.sessions || [];
+    historyHasMore = !!data.has_more;
+    if (!sessions.length) return;
+    // Preserve the user's reading position across the prepend: pin the content
+    // they were looking at by re-adding the height we inserted above it.
+    const prevHeight = log.scrollHeight;
+    const prevTop = log.scrollTop;
+    logInner.insertBefore(buildHistoryFragment(sessions), logInner.firstChild);
+    log.scrollTop = prevTop + (log.scrollHeight - prevHeight);
+  } catch (e) {
+    if (historyRow) { historyRow.remove(); historyRow = null; }
+    // Leave historyHasMore as-is so a later scroll retries.
+  } finally {
+    historyLoading = false;
+  }
 }
 
 // --- Web-search source bubble ---------------------------------------------
@@ -5345,6 +5488,7 @@ function clearTranscriptView() {
   if (typewriter.rafId != null) cancelAnimationFrame(typewriter.rafId);
   typewriter.bubble = null;
   typewriter.rafId = null;
+  resetHistoryState();
 }
 
 // The browser's EventSource silently auto-reconnects after a *clean* drop
@@ -5623,6 +5767,14 @@ function onStreamMessage(e) {
       // place so the new sources appear immediately.
       mergeTurnSources(e.payload && e.payload.sources);
       if (turnSourceBubble) renderSourceBubble(null);
+      break;
+    case "session_divider":
+      // Boundary between two backend sessions in the continuous thread. Appended
+      // live (a fresh idle-rollover session) or replayed at the top of the
+      // resumed session — a subtle labeled rule so the user can see where the
+      // model's live memory actually starts.
+      logInner.appendChild(buildSessionDivider(e.payload || {}));
+      scrollToBottom();
       break;
     case "tool_result":
       if (verbosity === "verbose") {
@@ -6610,6 +6762,10 @@ function closeSide() {
 const chatsList = document.getElementById("chats-list");
 
 async function loadChats(silent) {
+  // The Conversations pane was removed (Aime is one continuous thread). This
+  // function is still called by chat.reset() and the settings "delete all"
+  // handler; with no list element to populate it's a safe no-op.
+  if (!chatsList) return;
   if (!silent) chatsList.innerHTML = '<div class="empty">loading…</div>';
   try {
     const r = await fetch("/sessions");

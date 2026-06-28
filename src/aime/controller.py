@@ -95,6 +95,11 @@ CoreEventKind = Literal[
                                 # {"sources": [{"title", "url"}, ...]} in
                                 # `payload` so the frontend can render a source
                                 # bubble under the model's reply
+    "session_divider",          # boundary between two backend sessions in the
+                                # continuous transcript; carries
+                                # {session_id, title, saved_at} in `payload` so
+                                # the frontend can label the session above it and
+                                # use the id as the scroll-back cursor
 ]
 
 
@@ -348,6 +353,21 @@ class ConversationController:
     def _emit(self, event: CoreEvent) -> None:
         for sub in self._subscribers:
             sub(event)
+
+    def _emit_session_divider(
+        self, session_id: str | None, title: str = "", saved_at: str = "",
+    ) -> None:
+        """Mark a session boundary in the continuous transcript. The frontend
+        labels the session beneath it (so the user sees the model started fresh
+        here) and uses the id as the scroll-back cursor for /history."""
+        self._emit(CoreEvent(
+            kind="session_divider",
+            payload={
+                "session_id": session_id or "",
+                "title": (title or "").strip(),
+                "saved_at": saved_at or "",
+            },
+        ))
 
     def _capture(self, exc: Exception, *, source: str) -> dict | None:
         """Hand a controller-level exception to the diagnostics sink (when
@@ -778,7 +798,16 @@ class ConversationController:
             self._swap_to_fresh_session()
             self._spawn_worker(self.run_stream_loop)
             # No session_restart / splash: the frontend keeps the existing
-            # transcript so the thread reads as one continuous conversation.
+            # transcript so the thread reads as one continuous conversation — but
+            # a subtle divider marks where this fresh (cost-bounded) session began,
+            # so the user can see the model isn't carrying everything above it.
+            # No title yet (it's generated from the first message); the frontend
+            # falls back to the timestamp.
+            self._emit_session_divider(
+                getattr(self._backend, "session_id", None),
+                "",
+                datetime.datetime.now().isoformat(timespec="seconds"),
+            )
             self._maybe_start_onboarding()
 
     def load(self, session_id: str) -> None:
@@ -803,6 +832,15 @@ class ConversationController:
     def _load_after_swap(self, session_id: str, *, announce: bool = True) -> None:
         self._reset_internal_state()
         self._emit(CoreEvent(kind="session_restart", restart_reason="load"))
+        # Label the session at the top of the view (the scroll-back anchor): its
+        # id is the cursor the frontend pages /history from, its title/saved_at
+        # the divider copy.
+        title, saved_at = "", ""
+        for info in self._backend.list_sessions():
+            if info.id == session_id:
+                title, saved_at = (info.summary or "").strip(), info.saved_at
+                break
+        self._emit_session_divider(session_id, title, saved_at)
         # Replay deferred to keep the import graph shallow — replay imports
         # from controller for the CoreEvent type.
         from .replay import replay_messages

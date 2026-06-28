@@ -3669,6 +3669,90 @@ def sessions():
     return jsonify({"sessions": items})
 
 
+def _session_render_events(messages: list[dict]) -> list[dict]:
+    """Replay a stored message list into render-ready payloads for the scroll-back
+    view. Reuses ``replay_messages`` (so hidden model-only prefixes are stripped
+    and the proactive trigger turns are skipped) and pre-renders assistant markup
+    to HTML, exactly like the live SSE path — so the frontend renders history with
+    the same bubbles it uses for live messages."""
+    from aime.replay import replay_messages
+    out: list[dict] = []
+    for ev in replay_messages(messages):
+        if ev.kind == "user_message_shown":
+            out.append({
+                "kind": "user_message_shown",
+                "text": ev.text,
+                "attachments": ev.attachments,
+            })
+        elif ev.kind == "assistant_text":
+            out.append({
+                "kind": "assistant_html",
+                "text": _render_markup_to_html(ev.text, final=True),
+            })
+        elif ev.kind == "tool_call":
+            out.append({"kind": "tool_call", "tool_name": ev.tool_name})
+        # Notices (e.g. recovery) and other live-only events are dropped from the
+        # historical view — it's a quiet read-back, not a re-run.
+    return out
+
+
+def _build_history_page(infos, before, limit, load_messages):
+    """Pure pagination + assembly for /history, split out so it's testable
+    without Flask. ``infos`` is the newest-first SessionInfo list; ``before`` is
+    the oldest session id currently shown (the cursor) or "" for the newest page;
+    ``load_messages`` maps a session id to its stored message list. Returns
+    ``{"sessions": [...oldest-first...], "has_more": bool}``."""
+    start = 0
+    if before:
+        for i, info in enumerate(infos):
+            if info.id == before:
+                start = i + 1
+                break
+        else:
+            # Cursor not found (e.g. the session was deleted): nothing reliable to
+            # page from, so report the end rather than risk duplicating content.
+            return {"sessions": [], "has_more": False}
+    page = infos[start:start + limit]
+    has_more = len(infos) > start + limit
+    sessions = []
+    for info in page:
+        msgs = load_messages(info.id) or []
+        sessions.append({
+            "id": info.id,
+            "title": info.summary or "",
+            "saved_at": info.saved_at or "",
+            "events": _session_render_events(msgs),
+        })
+    # Oldest-first so the client can prepend the whole page as one chronological
+    # block above what's already shown.
+    sessions.reverse()
+    return {"sessions": sessions, "has_more": has_more}
+
+
+@app.route("/history")
+@login_required
+def history():
+    """Scroll-back read model: the sessions immediately older than ``before``
+    (the oldest session currently shown), rendered like the live transcript so the
+    frontend can prepend them as you scroll up — one continuous thread, with a
+    labeled divider per session."""
+    before = request.args.get("before") or ""
+    try:
+        limit = int(request.args.get("limit") or 12)
+    except (TypeError, ValueError):
+        limit = 12
+    limit = max(1, min(limit, 30))
+    infos = _context_for(g.user_id).controller.list_sessions()  # newest-first
+    dek = _auth_backend.get_dek(g.user_id)
+    conv_dir = _conversations_dir(g.user_id)
+    from provider_backend import read_session_messages
+    page = _build_history_page(
+        infos, before, limit,
+        lambda sid: read_session_messages(conv_dir, dek, sid),
+    )
+    return jsonify(page)
+
+
 @app.route("/sessions/<session_id>", methods=["DELETE"])
 @login_required
 def delete_session(session_id: str):

@@ -84,6 +84,11 @@ def test_idle_gap_rolls_to_fresh_session_silently(monkeypatch):
     assert not any(
         e.kind == "notice" and e.severity == "new_session" for e in events
     )
+    # ...but a subtle session divider marks where the fresh session begins, and
+    # it lands above the user's message.
+    kinds = _kinds(events)
+    assert "session_divider" in kinds
+    assert kinds.index("session_divider") < kinds.index("user_message_shown")
 
 
 def test_no_rollover_within_idle_window(monkeypatch):

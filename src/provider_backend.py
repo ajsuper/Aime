@@ -311,6 +311,24 @@ import aime.dateformat as dateformat
 from aime import graphics as _graphics
 
 
+def read_session_messages(
+    conversations_dir: str, dek: bytes, session_id: str,
+) -> list[dict] | None:
+    """Decrypt and return a stored session's message list, read-only and without
+    touching any live backend — used by the /history scroll-back read model.
+    Returns None when the file is missing or unreadable."""
+    path = os.path.join(conversations_dir, f"{session_id}{_CONV_SUFFIX}")
+    try:
+        with open(path, "rb") as f:
+            blob = f.read()
+        plaintext = _enc.decrypt_blob(dek, blob, aad=session_id.encode("utf-8"))
+        data = json.loads(plaintext)
+    except (OSError, ValueError, InvalidTag):
+        return None
+    msgs = data.get("messages")
+    return msgs if isinstance(msgs, list) else []
+
+
 def append_proactive_message_offline(
     conversations_dir: str, dek: bytes, text: str,
 ) -> bool:

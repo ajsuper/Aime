@@ -181,6 +181,19 @@ def test_proactive_records_inline_when_not_temporary():
     assert backend.appended == ["Heads up"]
 
 
+def test_resume_emits_session_divider_with_cursor():
+    # Restoring the main thread (here via exit) labels it with a divider carrying
+    # the session id — the scroll-back cursor the frontend pages /history from.
+    c, backend, events = _controller()
+    c.enter_temporary_chat()
+    events.clear()
+    c.exit_temporary_chat()
+    dividers = [e for e in events if e.kind == "session_divider"]
+    assert dividers
+    assert dividers[0].payload["session_id"] == "msgs-main-0001"
+    assert dividers[0].payload["title"] == "main"
+
+
 def test_no_idle_rollover_in_temporary(monkeypatch):
     import time
     monkeypatch.setattr(controller_mod, "IDLE_ROLLOVER_SECONDS", 3600)
