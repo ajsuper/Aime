@@ -4421,10 +4421,17 @@ async function loadOlderHistory() {
   const cursor = firstDivider ? (firstDivider.dataset.sessionId || "") : "";
   if (!cursor) return;   // nothing anchored yet — wait for the snapshot
   historyLoading = true;
-  historyRow = document.createElement("div");
-  historyRow.className = "history-loading";
-  historyRow.textContent = "loading earlier…";
-  logInner.insertBefore(historyRow, logInner.firstChild);
+  // Are we pinned to the latest message? If so, older sessions load *above and
+  // out of view* and we keep the user on the latest message — loading must never
+  // move their position. Only when they've scrolled up to read do we show a
+  // "loading earlier…" cue and preserve their exact reading offset.
+  const pinnedToBottom = isAtBottom();
+  if (!pinnedToBottom) {
+    historyRow = document.createElement("div");
+    historyRow.className = "history-loading";
+    historyRow.textContent = "loading earlier…";
+    logInner.insertBefore(historyRow, logInner.firstChild);
+  }
   try {
     const r = await fetch(
       "/history?before=" + encodeURIComponent(cursor) + "&limit=12");
@@ -4433,19 +4440,22 @@ async function loadOlderHistory() {
     const sessions = data.sessions || [];
     historyHasMore = !!data.has_more;
     if (!sessions.length) return;
-    // Preserve the user's reading position across the prepend: pin the content
-    // they were looking at by re-adding the height we inserted above it.
     const prevHeight = log.scrollHeight;
     const prevTop = log.scrollTop;
     logInner.insertBefore(buildHistoryFragment(sessions), logInner.firstChild);
-    log.scrollTop = prevTop + (log.scrollHeight - prevHeight);
+    if (pinnedToBottom) {
+      log.scrollTop = log.scrollHeight;        // stay on the latest message
+    } else {
+      // Hold the user's reading position: re-add the height inserted above them.
+      log.scrollTop = prevTop + (log.scrollHeight - prevHeight);
+    }
   } catch (e) {
     if (historyRow) { historyRow.remove(); historyRow = null; }
     // Leave historyHasMore as-is so a later scroll retries.
   } finally {
     historyLoading = false;
     // If the viewport still isn't scrollable, keep pulling pages (after layout)
-    // until it overflows or history runs out.
+    // until it overflows or history runs out — invisibly, since we stay pinned.
     requestAnimationFrame(maybeFillViewport);
   }
 }
@@ -5721,10 +5731,16 @@ function onStreamMessage(e) {
       // first new message back as a queued draft. Also drops a lingering
       // "Working…" line left by replayed tool calls (chat.reconcile).
       chat.reconcile(e.busy === true);
-      // The snapshot is fully rendered and we're out of replay mode. If the
-      // current session is short and doesn't fill the screen, pull older history
-      // so scroll-back is reachable (and the thread reads as continuous).
-      requestAnimationFrame(maybeFillViewport);
+      // The snapshot (the most recent conversation) is fully rendered. Land
+      // firmly on the latest message, then background-fill older sessions above
+      // while staying pinned there — so the user always opens on the newest
+      // message and never sees the older history scroll in.
+      requestAnimationFrame(() => {
+        log.scrollTop = log.scrollHeight;
+        chat.setFollowing(true);
+        updateScrollBtn();
+        maybeFillViewport();
+      });
       break;
     case "resync":
       // The server's per-client send buffer overflowed (this browser fell too
