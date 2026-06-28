@@ -4313,21 +4313,26 @@ function resetHistoryState() {
   if (historyRow) { historyRow.remove(); historyRow = null; }
 }
 
-// Divider copy: the session's title (Haiku summary) when it has one, else a
-// timestamp — so a just-started rollover session still reads as a clear break.
+// Divider copy: a plain date + time stamp for the session — a clear, reliable
+// separation clue (deliberately not the Haiku title). Taken from the session
+// id's embedded start time (msgs-YYYYMMDD-HHMMSS-…), falling back to saved_at.
 function historyLabel(p) {
-  const title = ((p && p.title) || "").trim();
-  if (title) return title;
-  const when = p && p.saved_at;
-  if (when) {
-    const d = new Date(when);
-    if (!isNaN(d.getTime())) {
-      return d.toLocaleString([], {
-        month: "short", day: "numeric", hour: "numeric", minute: "2-digit",
-      });
-    }
+  let d = null;
+  const sid = (p && p.session_id) || "";
+  const m = sid.match(/^msgs-(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})/);
+  if (m) {
+    d = new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]);
+  } else if (p && p.saved_at) {
+    const t = new Date(p.saved_at);
+    if (!isNaN(t.getTime())) d = t;
   }
-  return "New chat";
+  if (d && !isNaN(d.getTime())) {
+    return d.toLocaleString([], {
+      month: "short", day: "numeric", year: "numeric",
+      hour: "numeric", minute: "2-digit",
+    });
+  }
+  return "Earlier";
 }
 
 function buildSessionDivider(p) {
@@ -4398,6 +4403,17 @@ function buildHistoryFragment(sessions) {
   return frag;
 }
 
+// If the transcript doesn't overflow (nothing to scroll) but older sessions
+// exist, pull a page so there's something to scroll into — otherwise a short
+// current conversation leaves the user with no way to trigger scroll-back at all.
+// Self-limiting: it stops as soon as the content overflows or history runs out.
+function maybeFillViewport() {
+  if (historyHasMore && !historyLoading && !chat.replaying() &&
+      log.scrollHeight - log.clientHeight < 40) {
+    loadOlderHistory();
+  }
+}
+
 async function loadOlderHistory() {
   if (historyLoading || !historyHasMore || chat.replaying()) return;
   // Page from the oldest session currently shown (its divider is the topmost).
@@ -4428,6 +4444,9 @@ async function loadOlderHistory() {
     // Leave historyHasMore as-is so a later scroll retries.
   } finally {
     historyLoading = false;
+    // If the viewport still isn't scrollable, keep pulling pages (after layout)
+    // until it overflows or history runs out.
+    requestAnimationFrame(maybeFillViewport);
   }
 }
 
@@ -5702,6 +5721,10 @@ function onStreamMessage(e) {
       // first new message back as a queued draft. Also drops a lingering
       // "Working…" line left by replayed tool calls (chat.reconcile).
       chat.reconcile(e.busy === true);
+      // The snapshot is fully rendered and we're out of replay mode. If the
+      // current session is short and doesn't fill the screen, pull older history
+      // so scroll-back is reachable (and the thread reads as continuous).
+      requestAnimationFrame(maybeFillViewport);
       break;
     case "resync":
       // The server's per-client send buffer overflowed (this browser fell too
@@ -5771,21 +5794,14 @@ function onStreamMessage(e) {
     case "session_divider": {
       // Boundary between two backend sessions in the continuous thread. Appended
       // live (a fresh idle-rollover session) or replayed at the top of the
-      // resumed session — a subtle labeled rule so the user can see where the
-      // model's live memory actually starts. A repeat for the same session id is
-      // a title backfill (a rollover divider started as a timestamp, then its
-      // Haiku title landed): update the existing label in place rather than
-      // appending a duplicate.
+      // resumed session — a subtle date/time rule so the user can see where the
+      // model's live memory actually starts. Deduped by session id (the label is
+      // a stable timestamp, so a repeat needs no update).
       const p = e.payload || {};
       const sid = p.session_id || "";
       const existing = sid ? logInner.querySelector(
         '.session-divider[data-session-id="' + CSS.escape(sid) + '"]') : null;
-      if (existing) {
-        if ((p.title || "").trim()) {
-          const span = existing.querySelector("span");
-          if (span) span.textContent = historyLabel(p);
-        }
-      } else {
+      if (!existing) {
         logInner.appendChild(buildSessionDivider(p));
         scrollToBottom();
       }

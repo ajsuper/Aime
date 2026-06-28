@@ -137,28 +137,6 @@ def test_seed_last_activity_from_iso(monkeypatch):
 
 # --- inline proactive recording -------------------------------------------
 
-def test_title_backfill_reemits_divider_for_known_session():
-    c, backend, events = _controller()
-    # Pretend we drew a rollover divider for this session (timestamp label).
-    c._emit_session_divider("msgs-roll-1", "", "2026-06-27T12:00:00")
-    events.clear()
-    # The Haiku title lands → backfill re-emits the divider with the title.
-    c._handle_title_generated("msgs-roll-1", "Weekend plans")
-    dividers = [e for e in events if e.kind == "session_divider"]
-    assert len(dividers) == 1
-    assert dividers[0].payload["session_id"] == "msgs-roll-1"
-    assert dividers[0].payload["title"] == "Weekend plans"
-
-
-def test_title_backfill_ignored_for_session_without_divider():
-    c, backend, events = _controller()
-    events.clear()
-    # No divider was drawn for this session (e.g. the first-ever chat) → no stray
-    # divider should appear mid-stream when its title generates.
-    c._handle_title_generated("msgs-unknown", "Some title")
-    assert not [e for e in events if e.kind == "session_divider"]
-
-
 def test_record_proactive_when_idle_appends_and_emits():
     c, backend, events = _controller()
     events.clear()
