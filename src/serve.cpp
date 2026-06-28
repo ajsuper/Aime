@@ -408,10 +408,21 @@ static bool isValidStatus(const std::string& status) {
 //
 // `nowDate`/`nowTime` come from the caller in the *user's* local time (the C++
 // side only knows UTC), so the boundary matches what the user sees as "now".
-// All-day events (blank time) only flip once their whole day has elapsed;
-// timed events flip the minute they're past. last_modified is intentionally
-// left untouched: this is a system reconciliation, not a user edit, and
-// bumping it would spam the frontend's "edited since you last looked" tagging.
+//
+// "Past" is judged by the event's END, never its start, so an in-progress event
+// is never prematurely marked unconfirmed:
+//   * end_date + end_time  → past once now is beyond that exact instant;
+//   * end_date, no end_time → past once the whole end day has elapsed;
+//   * no end (a single-day all-day item OR a point event with just a start
+//     time) → past only once its own day is fully behind us — never mid-day.
+//
+// This is also self-healing: an event previously swept to `unknown` whose end
+// turns out NOT to be past (e.g. it was flipped under the old start-based rule,
+// or its end was pushed later) is flipped back to `scheduled`. Only these two
+// system-derived transitions happen here — completed / canceled are real
+// outcomes and are never touched. last_modified is intentionally left alone:
+// this is a system reconciliation, not a user edit, and bumping it would spam
+// the frontend's "edited since you last looked" tagging.
 static void reconcileStalePastEvents(sqlite3* database,
                                      const std::string& nowDate,
                                      const std::string& nowTime) {
@@ -419,11 +430,12 @@ static void reconcileStalePastEvents(sqlite3* database,
     const int nowDatePacked = packDate(parseDate(nowDate));
     const int nowTimePacked = packTime(parseTime(nowTime));
 
-    std::vector<int> staleIds;
+    std::vector<int> toUnknown;    // scheduled, now past their end
+    std::vector<int> toScheduled;  // unknown, but not actually past → heal
     sqlite3_stmt* sel = nullptr;
     const std::string selSql =
-        "SELECT ID, EVENT_DATE, EVENT_TIME FROM EVENT "
-        "WHERE EVENT_STATUS='scheduled' AND EVENT_ARCHIVED='FALSE'";
+        "SELECT ID, EVENT_DATE, EVENT_END_DATE, EVENT_END_TIME, EVENT_STATUS FROM EVENT "
+        "WHERE EVENT_STATUS IN ('scheduled','unknown') AND EVENT_ARCHIVED='FALSE'";
     if (sqlite3_prepare_v2(database, selSql.c_str(), -1, &sel, nullptr) != SQLITE_OK) {
         std::cout << "reconcileStalePastEvents select failed: "
                   << sqlite3_errmsg(database) << std::endl;
@@ -432,36 +444,55 @@ static void reconcileStalePastEvents(sqlite3* database,
     while (sqlite3_step(sel) == SQLITE_ROW) {
         const int id = sqlite3_column_int(sel, 0);
         const std::string dateStr = columnTextOrEmpty(sel, 1);
-        const std::string timeStr = columnTextOrEmpty(sel, 2);
+        const std::string endDateStr = columnTextOrEmpty(sel, 2);
+        const std::string endTimeStr = columnTextOrEmpty(sel, 3);
+        const std::string status = columnTextOrEmpty(sel, 4);
         const int datePacked = packDate(parseDate(dateStr));
 
         bool isPast;
-        if (timeStr.empty()) {
-            // All-day: past only once the whole day is behind us.
-            isPast = datePacked < nowDatePacked;
+        if (!endDateStr.empty()) {
+            const int endDatePacked = packDate(parseDate(endDateStr));
+            if (!endTimeStr.empty()) {
+                // Precise end: past once now has moved beyond end date+time.
+                isPast = endDatePacked < nowDatePacked ||
+                         (endDatePacked == nowDatePacked &&
+                          packTime(parseTime(endTimeStr)) < nowTimePacked);
+            } else {
+                // End date but no end time: past once the end day is behind us.
+                isPast = endDatePacked < nowDatePacked;
+            }
         } else {
-            isPast = datePacked < nowDatePacked ||
-                     (datePacked == nowDatePacked &&
-                      packTime(parseTime(timeStr)) < nowTimePacked);
+            // No recorded end (single-day all-day or point event): past only
+            // once the whole day has elapsed, regardless of any start time.
+            isPast = datePacked < nowDatePacked;
         }
-        if (isPast) staleIds.push_back(id);
+
+        if (status == "scheduled" && isPast) toUnknown.push_back(id);
+        else if (status == "unknown" && !isPast) toScheduled.push_back(id);
     }
     sqlite3_finalize(sel);
-    if (staleIds.empty()) return;
+    if (toUnknown.empty() && toScheduled.empty()) return;
 
-    sqlite3_stmt* upd = nullptr;
-    const std::string updSql = "UPDATE EVENT SET EVENT_STATUS='unknown' WHERE ID=?";
-    if (sqlite3_prepare_v2(database, updSql.c_str(), -1, &upd, nullptr) != SQLITE_OK) {
-        std::cout << "reconcileStalePastEvents update failed: "
-                  << sqlite3_errmsg(database) << std::endl;
-        return;
-    }
-    for (const int id : staleIds) {
-        sqlite3_bind_int(upd, 1, id);
-        sqlite3_step(upd);
-        sqlite3_reset(upd);
-    }
-    sqlite3_finalize(upd);
+    auto applyStatus = [&](const std::vector<int>& ids, const char* newStatus) {
+        if (ids.empty()) return;
+        sqlite3_stmt* upd = nullptr;
+        const std::string updSql =
+            std::string("UPDATE EVENT SET EVENT_STATUS=? WHERE ID=?");
+        if (sqlite3_prepare_v2(database, updSql.c_str(), -1, &upd, nullptr) != SQLITE_OK) {
+            std::cout << "reconcileStalePastEvents update failed: "
+                      << sqlite3_errmsg(database) << std::endl;
+            return;
+        }
+        for (const int id : ids) {
+            sqlite3_bind_text(upd, 1, newStatus, -1, SQLITE_STATIC);
+            sqlite3_bind_int(upd, 2, id);
+            sqlite3_step(upd);
+            sqlite3_reset(upd);
+        }
+        sqlite3_finalize(upd);
+    };
+    applyStatus(toUnknown, "unknown");
+    applyStatus(toScheduled, "scheduled");
 }
 
 void addEvent(sqlite3* database, CalenderEvent& event) {
