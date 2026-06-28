@@ -640,10 +640,31 @@
       100% { opacity: 0;    transform: scale(2); }
     }
 
+    /* (E) An unanswered Aime message the user hasn't engaged with breathes a soft
+       pastel-rainbow halo to draw the eye back to it. Applied by JS (.attention)
+       once the message has lingered a few minutes or the user starts a reply;
+       cleared when they respond or a newer message arrives. Same z-index:-1 +
+       isolation pattern as the user-bubble glint, so the blurred glow sits behind
+       the text without leaking past the message. */
+    .msg.aime.attention { isolation: isolate; }
+    .msg.aime.attention::after {
+      content: ""; position: absolute; inset: -3px -7px; z-index: -1;
+      border-radius: 14px; pointer-events: none;
+      background: var(--rainbow, var(--accent));
+      filter: blur(8px);
+      animation: aime-breathe 2.8s ease-in-out infinite;
+    }
+    @keyframes aime-breathe {
+      0%, 100% { opacity: 0;    transform: scale(0.99); }
+      50%      { opacity: 0.34; transform: scale(1);    }
+    }
+
     @media (prefers-reduced-motion: reduce) {
       form.sent::after, .msg.aime.fresh::before, .msg.user.fresh::before,
       .composer-toggle.stt-pulse .composer-toggle-track,
       .attach-btn.burst::after { animation: none; }
+      /* Keep a static, subtler halo so the message is still distinguishable. */
+      .msg.aime.attention::after { animation: none; opacity: 0.22; }
     }
     /* Small CSS-only tooltip: anchor with `data-tip="..."` and `tip-anchor`.
        A pill appears above the element on hover/focus, after a short delay
@@ -764,22 +785,29 @@
     /* Reading the past is read-only: keep the bottom bar, but nothing is
        pressable — the composer controls are swapped for a read-only message.
        Returning to Today is via the banner button (or clicking Today). */
-    #readonly-msg { display: none; align-items: center; justify-content: center;
-                    gap: 0.5rem; padding: 0.85rem 0.75rem; color: var(--muted);
-                    font-size: 0.88rem; text-align: center; }
+    #readonly-msg { display: none; width: 100%; max-width: 960px; margin: 0 auto;
+                    box-sizing: border-box; align-items: center;
+                    justify-content: center; gap: 0.5rem; padding: 0.85rem 0.75rem;
+                    color: var(--muted); font-size: 0.88rem; text-align: center; }
     #readonly-msg svg { width: 16px; height: 16px; flex-shrink: 0; }
     body.viewing-past #f { pointer-events: none; }
     body.viewing-past #f > #scroll-bottom-btn,
     body.viewing-past #f > .composer-row { display: none; }
     body.viewing-past #readonly-msg { display: flex; }
     /* Day rows in the History pane. */
-    .day-item { padding: 0.6rem 0.75rem; cursor: pointer;
-                border-radius: 14px; transition: background 0.12s; }
+    /* Day rows: a transparent border on every row keeps inactive/active the same
+       size (no jump), and the side margin gives the selected pill room to breathe
+       inside the pane. */
+    .day-item { padding: 0.55rem 0.7rem; margin: 2px 8px; cursor: pointer;
+                border: 1px solid transparent; border-radius: 14px;
+                transition: background 0.12s, border-color 0.12s; }
     .day-item:hover { background: var(--bg-elev); }
-    /* Selected day reads as a filled bubble (not a left bar). */
-    .day-item.active { background: var(--bg-elev);
-                       background: color-mix(in srgb, var(--accent) 22%, var(--bg-elev)); }
-    .day-item.active:hover { background: color-mix(in srgb, var(--accent) 30%, var(--bg-elev)); }
+    /* Selected day = an accent-outlined pill filled with a heavily greyed-out
+       (mostly neutral) tint of the accent. */
+    .day-item.active, .day-item.active:hover {
+      border-color: var(--accent);
+      background: var(--bg-elev);
+      background: color-mix(in srgb, var(--accent) 12%, var(--bg-elev)); }
     .day-label { color: var(--text); font-size: 0.92rem; display: flex;
                  align-items: center; gap: 0.5rem; }
     .day-live { font-size: 0.62rem; text-transform: uppercase; letter-spacing: 0.04em;
