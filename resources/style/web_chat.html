@@ -3622,26 +3622,29 @@ log.addEventListener("scroll", () => {
   if (log.scrollTop < 240) loadOlderHistory();
 });
 
-// Land on the newest message and *hold* there through late layout — rendered
-// markdown, graphics, and images can grow the transcript over several frames
-// after first paint, so a single scroll lands short. We re-pin across a handful
-// of frames + short delays, but back off the instant the user scrolls up
-// (following=false) so it never fights them.
-function scrollToLatest() {
-  log.scrollTop = log.scrollHeight;
+// Jump straight to the newest message and follow it. Instant (never animated):
+// every programmatic scroll bypasses #log's CSS `scroll-behavior: smooth`, which
+// is reserved for the user's jump-to-bottom button (scrollToBottom(true)) — using
+// a raw scrollTop assignment here is what made reloads "fly through" and land
+// mid-transcript.
+function jumpToBottom() {
   chat.setFollowing(true);
+  log.scrollTo({ top: log.scrollHeight, behavior: "instant" });
   updateScrollBtn();
-  const repin = () => {
-    if (!chat.state.following) return;   // user scrolled up — leave them be
-    log.scrollTop = log.scrollHeight;
-    updateScrollBtn();
-  };
-  requestAnimationFrame(repin);
-  requestAnimationFrame(() => requestAnimationFrame(repin));
-  setTimeout(repin, 80);
-  setTimeout(repin, 250);
-  setTimeout(repin, 600);
 }
+
+// The single mechanism that *holds* the bottom: while following, any growth of
+// the transcript re-pins instantly. One observer covers all the cases the old
+// code hacked at separately — streaming text, late layout (rendered markdown /
+// graphics / images that grow a few frames after first paint), and older-history
+// prepends. It fires before paint, so the correction is never visible; it no-ops
+// the moment the user scrolls up (following=false), so it never fights them.
+new ResizeObserver(() => {
+  if (chat.state.following) {
+    log.scrollTo({ top: log.scrollHeight, behavior: "instant" });
+    updateScrollBtn();
+  }
+}).observe(logInner);
 
 scrollBottomBtn.addEventListener("click", () => scrollToBottom(true));
 const input = document.getElementById("i");
@@ -4447,12 +4450,13 @@ async function loadOlderHistory() {
   const cursor = firstDivider ? (firstDivider.dataset.sessionId || "") : "";
   if (!cursor) return;   // nothing anchored yet — wait for the snapshot
   historyLoading = true;
-  // Are we pinned to the latest message? If so, older sessions load *above and
-  // out of view* and we keep the user on the latest message — loading must never
-  // move their position. Only when they've scrolled up to read do we show a
-  // "loading earlier…" cue and preserve their exact reading offset.
-  const pinnedToBottom = isAtBottom();
-  if (!pinnedToBottom) {
+  // Decide from the *intent* (`following`), not a live measurement that an
+  // in-flight scroll could fool: if the user is on the latest message, older
+  // sessions load above and out of view and the ResizeObserver keeps them pinned
+  // to the bottom — loading never moves their view. If they've scrolled up to
+  // read, show a "loading earlier…" cue and hold their exact reading offset.
+  const holdPosition = !chat.state.following;
+  if (holdPosition) {
     historyRow = document.createElement("div");
     historyRow.className = "history-loading";
     historyRow.textContent = "loading earlier…";
@@ -4469,12 +4473,15 @@ async function loadOlderHistory() {
     const prevHeight = log.scrollHeight;
     const prevTop = log.scrollTop;
     logInner.insertBefore(buildHistoryFragment(sessions), logInner.firstChild);
-    if (pinnedToBottom) {
-      log.scrollTop = log.scrollHeight;        // stay on the latest message
-    } else {
-      // Hold the user's reading position: re-add the height inserted above them.
-      log.scrollTop = prevTop + (log.scrollHeight - prevHeight);
+    if (holdPosition) {
+      // Instant jump (the smooth CSS would otherwise animate this) so the content
+      // under the user's eyes doesn't shift by the height inserted above it.
+      log.scrollTo({
+        top: prevTop + (log.scrollHeight - prevHeight), behavior: "instant",
+      });
     }
+    // The following case needs nothing here — the ResizeObserver re-pins to the
+    // bottom before paint.
   } catch (e) {
     if (historyRow) { historyRow.remove(); historyRow = null; }
     // Leave historyHasMore as-is so a later scroll retries.
@@ -5757,11 +5764,11 @@ function onStreamMessage(e) {
       // first new message back as a queued draft. Also drops a lingering
       // "Working…" line left by replayed tool calls (chat.reconcile).
       chat.reconcile(e.busy === true);
-      // The snapshot (the most recent conversation) is fully rendered. Land
-      // firmly on the latest message, then background-fill older sessions above
-      // while staying pinned there — so the user always opens on the newest
-      // message and never sees the older history scroll in.
-      scrollToLatest();
+      // The snapshot (the most recent conversation) is fully rendered. Land on
+      // the latest message; the ResizeObserver then holds it there through any
+      // late layout. Background-fill older sessions above (out of view, since we
+      // stay pinned) so scroll-back is reachable on a short conversation.
+      jumpToBottom();
       requestAnimationFrame(maybeFillViewport);
       break;
     case "resync":
