@@ -161,3 +161,33 @@ def test_replay_skips_proactive_trigger_turn():
     assert "user_message_shown" not in kinds
     assert kinds == ["assistant_text"]
     assert events[0].text == "Gig at 5:30!"
+
+
+# --- replay strips hidden model-only prefixes from user bubbles -----------
+
+def test_replay_strips_active_events_prefix():
+    from aime.replay import replay_messages
+    stored = ("<active_events>\n- Gig (now)\n</active_events>\n"
+              "what's on my plate today?")
+    events = list(replay_messages(
+        [{"role": "user", "content": [{"type": "text", "text": stored}]}]))
+    assert len(events) == 1
+    assert events[0].kind == "user_message_shown"
+    assert events[0].text == "what's on my plate today?"
+
+
+def test_replay_strips_stacked_stale_and_active_prefixes():
+    from aime.replay import replay_messages
+    stored = ("<active_events>\n- Gig\n</active_events>\n"
+              "<stale>e23 boxing match</stale>\n"
+              "move it to 6")
+    events = list(replay_messages(
+        [{"role": "user", "content": [{"type": "text", "text": stored}]}]))
+    assert events[0].text == "move it to 6"
+
+
+def test_replay_leaves_plain_user_text_untouched():
+    from aime.replay import replay_messages
+    events = list(replay_messages(
+        [{"role": "user", "content": [{"type": "text", "text": "just hello"}]}]))
+    assert events[0].text == "just hello"

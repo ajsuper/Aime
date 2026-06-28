@@ -154,3 +154,60 @@ def test_record_proactive_empty_is_noop():
     c, backend, events = _controller()
     assert c.record_proactive_message("  ") is False
     assert backend.appended == []
+
+
+# --- interactive SendMessage flushes inline on turn end -------------------
+
+def test_sendmessage_flushes_inline_on_turn_end():
+    c, backend, events = _controller()
+    # A wired messenger so _deliver_message reports success.
+    sent = []
+    c._messenger = type("M", (), {"send": lambda self, to, text, subject=None: sent.append(text)})()
+    c._message_recipient = "tg:123"
+
+    c.dispatch_input("text me a reminder")     # claims the turn
+    # Model calls SendMessage mid-turn.
+    c._handle_backend_event(BackendEvent(
+        kind="assistant_use_tool", tool_name="SendMessage",
+        tool_input={"text": "Reminder: gig at 5:30!"},
+        tool_use_id="tu_1", expects_response=True,
+    ))
+    # Delivered out of band, but not yet appended to history (mid-turn).
+    assert sent == ["Reminder: gig at 5:30!"]
+    assert backend.appended == []
+
+    # Turn ends → the sent text flushes as an inline assistant bubble.
+    c._handle_backend_event(BackendEvent(kind="turn_end", stop_reason="end_turn"))
+    assert backend.appended == ["Reminder: gig at 5:30!"]
+    assert any(
+        e.kind == "assistant_text" and e.text == "Reminder: gig at 5:30!"
+        for e in events
+    )
+
+
+def test_deliver_inline_proactive_when_idle_records_now():
+    c, backend, events = _controller()
+    assert c.deliver_inline_proactive("Heads up: 6pm") is True
+    assert backend.appended == ["Heads up: 6pm"]
+
+
+def test_deliver_inline_proactive_when_busy_defers_to_turn_end():
+    c, backend, events = _controller()
+    c.dispatch_input("hold on")          # claims the turn (busy)
+    assert c.deliver_inline_proactive("Reminder fired") is True
+    assert backend.appended == []        # not recorded mid-turn
+    # Flushes once the turn ends.
+    c._handle_backend_event(BackendEvent(kind="turn_end", stop_reason="end_turn"))
+    assert backend.appended == ["Reminder fired"]
+
+
+def test_sendmessage_not_flushed_when_delivery_fails():
+    c, backend, events = _controller()
+    # No messenger wired → delivery fails → nothing to echo inline.
+    c.dispatch_input("text me")
+    c._handle_backend_event(BackendEvent(
+        kind="assistant_use_tool", tool_name="SendMessage",
+        tool_input={"text": "hello"}, tool_use_id="tu_1", expects_response=True,
+    ))
+    c._handle_backend_event(BackendEvent(kind="turn_end", stop_reason="end_turn"))
+    assert backend.appended == []

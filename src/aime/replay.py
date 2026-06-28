@@ -8,11 +8,37 @@ with no matching `tool_result` (the original tool result was a user-role
 block, not a separate display event).
 """
 
+import re
 from typing import Iterator
 
 from provider_backend import RECOVERY_MARKER, PROACTIVE_TRIGGER_MARKER
 
 from .controller import CoreEvent
+
+
+# Hidden out-of-band context the controller prepends to a user message before
+# sending it to the model (current active events, records that changed mid-turn,
+# the volatile clock). It's for the model, never the user — strip it from the
+# replayed bubble so a resumed/loaded thread shows only what the user actually
+# typed, not the raw <active_events>/<stale>/<clock> tags.
+_HIDDEN_PREFIX_RE = re.compile(
+    r"\A\s*(?:"
+    r"<active_events>.*?</active_events>"
+    r"|<stale>.*?</stale>"
+    r"|<clock\b[^>]*>.*?</clock>"
+    r")\s*",
+    re.DOTALL,
+)
+
+
+def _strip_hidden_prefix(text: str) -> str:
+    """Remove any run of leading hidden-context blocks from a stored user
+    message, leaving just the user's own words."""
+    prev = None
+    while prev != text:
+        prev = text
+        text = _HIDDEN_PREFIX_RE.sub("", text, count=1)
+    return text
 
 
 def replay_messages(messages: list[dict]) -> Iterator[CoreEvent]:
@@ -54,6 +80,9 @@ def replay_messages(messages: list[dict]) -> Iterator[CoreEvent]:
                     marker = "[End System Info]"
                     if marker in text:
                         text = text.split(marker, 1)[1].strip()
+                    # Drop the hidden model-only prefix (active events / stale /
+                    # clock) so the replayed bubble shows only the user's words.
+                    text = _strip_hidden_prefix(text)
                     if text:
                         text_parts.append(text)
                 elif btype == "image":

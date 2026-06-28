@@ -302,6 +302,12 @@ class ConversationController:
         self._idle_event = threading.Event()
         self._idle_event.set()
         self._pending_user_messages: list[tuple] = []
+        # Text the model sent the user via the SendMessage tool *during* a turn.
+        # We can't append it to history mid-turn (it would corrupt the in-flight
+        # assistant/tool_result ordering), so it's stashed here and flushed as an
+        # inline assistant turn when the turn ends — so an interactive send shows
+        # in the thread just like a scheduler/agent one. Guarded by _state_lock.
+        self._pending_proactive: list[str] = []
         # Two locks keep input dispatch race-free across the waitress request
         # threads and the stream-worker thread:
         #   * _dispatch_lock (reentrant) serializes a whole dispatch_input /
@@ -779,6 +785,8 @@ class ConversationController:
             self._is_idle = True
             self._idle_event.set()
             self._pending_user_messages = []
+            # Stashed inline echoes belong to the conversation we're leaving.
+            self._pending_proactive = []
 
     # --- queries used by frontends (e.g. autocomplete) ---
 
@@ -883,6 +891,10 @@ class ConversationController:
                     self._dispatch_user_message(
                         text, images=images, hidden_prefix=hidden_prefix)
                 else:
+                    # Now genuinely idle: flush any SendMessage texts the model
+                    # sent mid-turn as inline assistant turns, so they show in the
+                    # thread (and the model has them as context on the next reply).
+                    self._flush_pending_proactive()
                     self._emit(CoreEvent(kind="ready"))
         elif kind == "session_terminated":
             self._emit(CoreEvent(kind="session_terminated"))
@@ -948,6 +960,47 @@ class ConversationController:
             return False
         self._emit(CoreEvent(kind="assistant_text", text=body))
         return True
+
+    def deliver_inline_proactive(self, text: str) -> bool:
+        """Thread an out-of-band message (scheduler reminder, agent notification)
+        into *this* live session as an inline assistant turn. If idle, record and
+        surface it now; if a turn is in flight, stash it to flush on turn_end —
+        never write mid-turn, which the turn's own persist would clobber. Returns
+        True when the live session has taken ownership (recorded or queued), so the
+        caller knows not to also write it to disk."""
+        body = (text or "").strip()
+        if not body:
+            return False
+        with self._state_lock:
+            if not self._is_idle:
+                self._pending_proactive.append(body)
+                return True
+        if self.record_proactive_message(body):
+            return True
+        # Lost the idle race between the check and the record — stash it so the
+        # next turn_end flushes it rather than dropping (or racing) the write.
+        with self._state_lock:
+            self._pending_proactive.append(body)
+        return True
+
+    def _flush_pending_proactive(self) -> None:
+        """Record any SendMessage texts stashed during the just-ended turn as
+        inline assistant turns. Called from the turn_end idle transition, where
+        appending to history is safe again. Best-effort per message."""
+        with self._state_lock:
+            pending = self._pending_proactive
+            self._pending_proactive = []
+        for text in pending:
+            try:
+                if not self.record_proactive_message(text):
+                    # A racing /send claimed the turn between the idle flip and
+                    # here; re-stash so the next turn_end flushes it rather than
+                    # dropping the inline echo (the phone already has it).
+                    with self._state_lock:
+                        self._pending_proactive.append(text)
+            except Exception as exc:
+                self._emit_error(exc, source="proactive_flush",
+                                 label="inline message failed")
 
     def _handle_tool_use(self, event: BackendEvent) -> None:
         tool_name = event.tool_name or "tool"
@@ -1064,9 +1117,18 @@ class ConversationController:
         # wired in it returns a friendly result so the model can fall back to
         # telling the user in chat instead.
         if tool_name == "SendMessage":
-            ok, note = self._deliver_message(
-                tool_input.get("text") or "", tool_input.get("subject"),
-            )
+            sent_text = tool_input.get("text") or ""
+            ok, note = self._deliver_message(sent_text, tool_input.get("subject"))
+            # Show the sent text inline in this chat too, so an interactive send
+            # reads like a message Aime posted in-thread (not just a silent push
+            # to the phone). It can't be appended to history now — we're mid-turn,
+            # suspended at the tool_use yield — so stash it and flush it as an
+            # assistant turn when the turn ends (see the turn_end handler). Only
+            # for the interactive user's own controller; a background agent has no
+            # live chat to post into, and routes its message via the run instead.
+            if ok and sent_text.strip() and not self._headless:
+                with self._state_lock:
+                    self._pending_proactive.append(sent_text.strip())
             self._emit(CoreEvent(
                 kind="tool_result",
                 tool_name=tool_name,
