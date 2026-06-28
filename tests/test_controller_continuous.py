@@ -107,12 +107,23 @@ def test_no_rollover_when_session_empty(monkeypatch):
     assert backend.reset_calls == 0
 
 
-def test_rollover_disabled_when_threshold_zero(monkeypatch):
+def test_idle_rollover_disabled_when_threshold_zero(monkeypatch):
     monkeypatch.setattr(controller_mod, "IDLE_ROLLOVER_SECONDS", 0)
     c, backend, events = _controller(messages=[{"role": "user", "content": []}])
-    c._last_activity = time.time() - 999999
+    c._last_activity = time.time() - 100      # recent, same local day
     c.dispatch_input("hello")
-    assert backend.reset_calls == 0
+    assert backend.reset_calls == 0           # idle rollover off, same day → no roll
+
+
+def test_day_change_rolls_even_with_idle_disabled(monkeypatch):
+    # A new local day always starts a fresh session so history groups by day,
+    # independent of the idle threshold.
+    monkeypatch.setattr(controller_mod, "IDLE_ROLLOVER_SECONDS", 0)
+    c, backend, events = _controller(messages=[{"role": "user", "content": []}])
+    c._last_activity = time.time() - 2 * 86400   # ~2 days ago → different day
+    c.dispatch_input("good morning")
+    assert backend.reset_calls == 1
+    assert "session_divider" in _kinds(events)
 
 
 def test_explicit_reset_still_announces(monkeypatch):

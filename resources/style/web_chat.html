@@ -746,6 +746,36 @@
     body.temp-mode #temp-banner { display: flex; }
     /* A faint accent rail on the composer reinforces that you're off the record. */
     body.temp-mode #f { box-shadow: inset 0 2px 0 0 var(--accent); }
+    /* Past-day read-only banner — same shape as the temp banner. */
+    #past-day-banner { display: none; align-items: center; gap: 0.5rem;
+                       margin: 0.5rem 0.75rem 0; padding: 0.5rem 0.75rem;
+                       border: 1px solid var(--border); border-radius: var(--r-sm);
+                       background: var(--bg-elev); color: var(--muted);
+                       font-size: 0.85rem; }
+    #past-day-banner svg { width: 16px; height: 16px; flex-shrink: 0; }
+    #past-day-banner span { flex: 1; }
+    #past-day-banner strong { color: var(--text); }
+    #past-day-banner button { background: transparent; border: 1px solid var(--border);
+                              border-radius: var(--r-sm); color: var(--text);
+                              padding: 0.2rem 0.6rem; cursor: pointer; font: inherit;
+                              font-size: 0.8rem; }
+    #past-day-banner button:hover { border-color: var(--accent); color: var(--accent); }
+    body.viewing-past #past-day-banner { display: flex; }
+    /* Reading the past is read-only: hide the composer; the banner button (or a
+       day click) returns to the live Today. */
+    body.viewing-past #f { display: none; }
+    /* Day rows in the History pane. */
+    .day-item { padding: 0.6rem 0.5rem 0.6rem 1rem; cursor: pointer;
+                border-radius: var(--r-sm); transition: background 0.12s; }
+    .day-item:hover { background: var(--bg-elev); }
+    .day-item.active { background: var(--bg-elev);
+                       box-shadow: inset 2px 0 0 0 var(--accent); }
+    .day-label { color: var(--text); font-size: 0.92rem; display: flex;
+                 align-items: center; gap: 0.5rem; }
+    .day-live { font-size: 0.62rem; text-transform: uppercase; letter-spacing: 0.04em;
+                color: var(--accent); border: 1px solid var(--accent);
+                border-radius: 999px; padding: 0.02rem 0.4rem; }
+    .day-meta { color: var(--muted); font-size: 0.74rem; margin-top: 0.15rem; }
     /* Feedback modal internals. */
     .feedback-intro { color: var(--muted); font-size: 0.88rem; margin: 0;
                       line-height: 1.4; }
@@ -2562,11 +2592,18 @@
         <span class="logo-bar" aria-hidden="true"></span>
       </button>
       <div class="rail-sep" aria-hidden="true"></div>
-      <!-- The Chats (Conversations) pane button was removed: Aime is one
-           continuous thread, so there's no conversation list to switch between.
-           Temporary chats are entered from the composer toggle; clearing history
-           lives in account settings; agent runs live in the Agents pane. -->
-
+      <!-- History pane: daily transcripts. You open into a live "Today"; this
+           lists past days (and Today) so you can read back. Days are automatic
+           buckets the user never manages — not the old user-created conversation
+           switcher. -->
+      <button class="rail-btn pane-btn" data-target="chats" title="History" aria-label="History">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3 3v5h5"/>
+          <path d="M3.05 13A9 9 0 1 0 6 5.3L3 8"/>
+          <path d="M12 7v5l4 2"/>
+        </svg>
+      </button>
       <button class="rail-btn pane-btn" data-target="calendar" title="Calendar" aria-label="Calendar">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
              stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -2611,6 +2648,13 @@
           </svg>
         </button>
       </div>
+      <!-- History pane: daily transcripts (Today + past days). -->
+      <div class="pane" data-pane="chats">
+        <div class="scroll" id="days-list">
+          <div class="empty">loading…</div>
+        </div>
+      </div>
+
       <!-- Calendar pane -->
       <div class="pane" data-pane="calendar">
         <div class="cal-toolbar">
@@ -2736,6 +2780,17 @@
         </svg>
         <span>Temporary chat — this conversation won't be saved.</span>
         <button type="button" id="temp-exit-btn">Exit</button>
+      </div>
+      <!-- Shown only while reading a past day (body.viewing-past). CSS-driven. -->
+      <div id="past-day-banner" aria-live="polite">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3 3v5h5"/>
+          <path d="M3.05 13A9 9 0 1 0 6 5.3L3 8"/>
+          <path d="M12 7v5l4 2"/>
+        </svg>
+        <span>Viewing <strong id="past-day-label"></strong> — read only.</span>
+        <button type="button" id="past-day-today-btn">Back to Today</button>
       </div>
       <div id="log"><div id="log-inner"></div><div id="empty-hint">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
@@ -4111,7 +4166,7 @@ const chat = {
     // would wrongly disable the typewriter for the new conversation's replies.
     clearTranscriptView();
     updateScrollBtn();
-    loadChats();
+    loadDays(true);
     // A message typed during the switch was held (busy() is true while
     // switching) so it couldn't race the /reset|/load on the backend. The new
     // session is ready now, so dispatch it here rather than dropping it.
@@ -4330,6 +4385,9 @@ function appendNotice(text, severity) {
 let historyHasMore = true;     // are there older sessions still to page in?
 let historyLoading = false;    // a /history fetch is in flight
 let historyRow = null;         // the transient "loading earlier…" row at the top
+let liveDayKey = null;         // the local day of the live (Today) session — the
+                               // scroll-back stays within it; older days use the pane
+let viewingDay = null;         // a past day being read read-only (null = live Today)
 
 function resetHistoryState() {
   historyHasMore = true;
@@ -4367,6 +4425,7 @@ function buildSessionDivider(p) {
   const div = document.createElement("div");
   div.className = "session-divider";
   if (p && p.session_id) div.dataset.sessionId = p.session_id;
+  if (p && p.started_at) div.dataset.startedAt = p.started_at;
   const label = document.createElement("span");
   label.textContent = historyLabel(p);
   div.appendChild(label);
@@ -4437,14 +4496,16 @@ function buildHistoryFragment(sessions) {
 // current conversation leaves the user with no way to trigger scroll-back at all.
 // Self-limiting: it stops as soon as the content overflows or history runs out.
 function maybeFillViewport() {
-  if (historyHasMore && !historyLoading && !chat.replaying() &&
+  if (historyHasMore && !historyLoading && !chat.replaying() && !viewingDay &&
       log.scrollHeight - log.clientHeight < 40) {
     loadOlderHistory();
   }
 }
 
 async function loadOlderHistory() {
-  if (historyLoading || !historyHasMore || chat.replaying()) return;
+  // Scroll-back is a Today affordance only. A past day is a fixed, read-only
+  // snapshot — never page other days into it.
+  if (historyLoading || !historyHasMore || chat.replaying() || viewingDay) return;
   // Page from the oldest session currently shown (its divider is the topmost).
   const firstDivider = logInner.querySelector(".session-divider");
   const cursor = firstDivider ? (firstDivider.dataset.sessionId || "") : "";
@@ -4467,8 +4528,17 @@ async function loadOlderHistory() {
       "/history?before=" + encodeURIComponent(cursor) + "&limit=12");
     const data = await r.json();
     if (historyRow) { historyRow.remove(); historyRow = null; }
-    const sessions = data.sessions || [];
-    historyHasMore = !!data.has_more;
+    let sessions = data.sessions || [];
+    // Scroll-back stays within the live day — older days are reached from the
+    // History pane, not by scrolling. Stop as soon as a page crosses midnight.
+    let crossedDay = false;
+    if (liveDayKey) {
+      const n = sessions.length;
+      sessions = sessions.filter(s =>
+        s.started_at && localDayKey(new Date(s.started_at)) === liveDayKey);
+      crossedDay = sessions.length < n;
+    }
+    historyHasMore = !!data.has_more && !crossedDay;
     if (!sessions.length) return;
     const prevHeight = log.scrollHeight;
     const prevTop = log.scrollTop;
@@ -5636,6 +5706,9 @@ const Link = {
     this.lastMsgAt = Date.now();
     const e = JSON.parse(ev.data);
     if (e.kind === "ping") return;   // heartbeat — purely a liveness signal
+    // While reading a past day, ignore live transcript events. They stay in the
+    // server snapshot and replay when we return to Today (which reconnects).
+    if (viewingDay) return;
     onStreamMessage(e);
   },
 
@@ -5764,12 +5837,24 @@ function onStreamMessage(e) {
       // first new message back as a queued draft. Also drops a lingering
       // "Working…" line left by replayed tool calls (chat.reconcile).
       chat.reconcile(e.busy === true);
-      // The snapshot (the most recent conversation) is fully rendered. Land on
-      // the latest message; the ResizeObserver then holds it there through any
-      // late layout. Background-fill older sessions above (out of view, since we
-      // stay pinned) so scroll-back is reachable on a short conversation.
+      // Capture the live day (the resumed session's day): today's scroll-back
+      // stays within it; older days are reached from the History pane.
+      {
+        const liveDiv = logInner.querySelector(".session-divider");
+        liveDayKey = (liveDiv && liveDiv.dataset.startedAt)
+          ? localDayKey(new Date(liveDiv.dataset.startedAt))
+          : localDayKey(new Date());
+      }
+      // The snapshot (today, live) is fully rendered. Land on the latest message;
+      // the ResizeObserver then holds it there through any late layout.
+      // Background-fill earlier-today sessions above (out of view, since we stay
+      // pinned) so within-day scroll-back is reachable on a short conversation.
       jumpToBottom();
       requestAnimationFrame(maybeFillViewport);
+      // Refresh the History pane if it's open (a new day may have appeared).
+      if (typeof activePaneName !== "undefined" && activePaneName === "chats") {
+        loadDays(true);
+      }
       break;
     case "resync":
       // The server's per-client send buffer overflowed (this browser fell too
@@ -6180,6 +6265,11 @@ document.getElementById("temp-toggle-btn").addEventListener("click", () => {
 });
 const tempExitBtn = document.getElementById("temp-exit-btn");
 if (tempExitBtn) tempExitBtn.addEventListener("click", () => chat.exitTemp());
+
+// Past-day (read-only) banner: its label and the "Back to Today" button.
+const pastDayLabel = document.getElementById("past-day-label");
+const pastDayTodayBtn = document.getElementById("past-day-today-btn");
+if (pastDayTodayBtn) pastDayTodayBtn.addEventListener("click", () => returnToToday());
 
 document.getElementById("feedback-btn")
   .addEventListener("click", () => openFeedback("feedback", null));
@@ -6657,7 +6747,7 @@ window.addEventListener("paste", (e) => {
 
 const sideColEl = document.getElementById("side-col");
 const sideTitleEl = document.getElementById("side-title");
-const PANE_TITLES = { chats: "Conversations", calendar: "Calendar",
+const PANE_TITLES = { chats: "History", calendar: "Calendar",
                       topics: "Topics", agents: "Agents" };
 let activePaneName = null;
 
@@ -6677,7 +6767,7 @@ document.getElementById("side-close").addEventListener("click", closeSide);
 // by the explicit refresh button (loud), the auto-refresh hooks (silent),
 // and the visibility-change fallback (silent).
 function refreshActivePane(silent) {
-  if (activePaneName === "chats") loadChats(silent);
+  if (activePaneName === "chats") loadDays(silent);
   else if (activePaneName === "calendar") renderCalendar(silent);
   else if (activePaneName === "topics") { loadTopics(silent); refreshOpenTopic(); }
   else if (activePaneName === "agents") loadAgentsPane(silent);
@@ -6809,7 +6899,7 @@ function activatePane(name) {
     t.classList.toggle("active", t.dataset.target === name));
   document.querySelectorAll(".pane").forEach(p =>
     p.classList.toggle("active", p.dataset.pane === name));
-  if (name === "chats") loadChats();
+  if (name === "chats") loadDays();
   else if (name === "calendar") renderCalendar();
   else if (name === "topics") loadTopics();
   else if (name === "agents") loadAgentsPane();
@@ -6833,133 +6923,17 @@ function closeSide() {
   }
 }
 
-// -- Chats --------------------------------------------------------------
-
-const chatsList = document.getElementById("chats-list");
-
-async function loadChats(silent) {
-  // The Conversations pane was removed (Aime is one continuous thread). This
-  // function is still called by chat.reset() and the settings "delete all"
-  // handler; with no list element to populate it's a safe no-op.
-  if (!chatsList) return;
-  if (!silent) chatsList.innerHTML = '<div class="empty">loading…</div>';
-  try {
-    const r = await fetch("/sessions");
-    const data = await r.json();
-    const sessions = data.sessions || [];
-    chatsList.innerHTML = "";
-    if (!sessions.length) {
-      const empty = document.createElement("div");
-      empty.className = "empty";
-      empty.textContent = "no saved conversations";
-      chatsList.appendChild(empty);
-    }
-    sessions.forEach(s => {
-      const item = document.createElement("div");
-      item.className = "session-item";
-      const summary = document.createElement("div");
-      summary.className = "summary";
-      summary.textContent = s.summary || "(untitled conversation)";
-      const meta = document.createElement("div");
-      meta.className = "meta";
-      meta.textContent = s.saved_at || s.id;
-      const del = document.createElement("button");
-      del.className = "del-btn";
-      del.title = "Delete conversation";
-      del.setAttribute("aria-label", "Delete conversation");
-      del.innerHTML =
-        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
-        'stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
-        '<path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>' +
-        '<path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>' +
-        '<line x1="10" y1="11" x2="10" y2="17"/>' +
-        '<line x1="14" y1="11" x2="14" y2="17"/></svg>';
-      del.addEventListener("click", (e) => {
-        e.stopPropagation();
-        const label = s.summary || "this conversation";
-        confirmAction({
-          title: "Delete conversation?",
-          message: `"${label}" will be permanently removed.`,
-          confirmLabel: "Delete",
-          onConfirm: () => deleteSession(s.id),
-        });
-      });
-      item.appendChild(summary);
-      item.appendChild(meta);
-      item.appendChild(del);
-
-      const openSession = () => {
-        chat.loadChat(s.id);
-        // Mobile: drop back to the conversation after picking one.
-        if (mobileMQ.matches) closeSide();
-      };
-      // On mobile the panel often opens while the on-screen keyboard is still
-      // retracting; the viewport reflows mid-tap and the browser cancels the
-      // synthetic `click`, so the first tap appears to do nothing. `touchend`
-      // fires regardless of reflow — handle the tap there (when it didn't
-      // turn into a scroll) and suppress the now-redundant ghost click.
-      let touchStartY = null, touchMoved = false;
-      item.addEventListener("touchstart", (e) => {
-        touchStartY = e.touches[0].clientY;
-        touchMoved = false;
-      }, {passive: true});
-      item.addEventListener("touchmove", (e) => {
-        if (touchStartY !== null &&
-            Math.abs(e.touches[0].clientY - touchStartY) > 10) {
-          touchMoved = true;
-        }
-      }, {passive: true});
-      item.addEventListener("touchend", (e) => {
-        // Let taps on the delete button run their own handler.
-        if (touchMoved || e.target.closest(".del-btn")) return;
-        e.preventDefault();  // cancel the ghost click so it doesn't double-fire
-        openSession();
-      });
-      item.addEventListener("click", openSession);
-      chatsList.appendChild(item);
-    });
-    // Verbose users also see background-agent runs, folded into this same
-    // menu beneath their conversations. Other tiers never fetch them.
-    if (verbosity === "verbose") await loadAgentRuns();
-  } catch (e) {
-    // Keep the prior list visible on a silent refresh failure rather than
-    // flashing an error over content the user is reading.
-    if (!silent) chatsList.innerHTML = '<div class="empty">error: ' + e + '</div>';
-  }
-}
-
-// -- Background-agent runs (Verbose only) -------------------------------
-// A read-only audit trail of what each headless agent did, folded into the
-// Conversations menu for the Verbose tier. Runs aren't conversations, so a
-// click opens the run's transcript in a modal rather than loading it as chat.
+// -- Background-agent run rows ------------------------------------------
+// Status labels + a row builder for an agent run, used by the Agents pane to
+// list each agent's runs (clicking opens the run's transcript in a modal).
 
 const AGENT_STATUS_LABELS = {
   completed: "done", error: "error", no_result: "no result",
   max_turns: "incomplete",
 };
 
-async function loadAgentRuns() {
-  let runs = [];
-  try {
-    const r = await fetch("/agent-runs");
-    const data = await r.json();
-    runs = data.runs || [];
-  } catch (e) {
-    return;  // a runs-fetch failure must never blank the conversations list
-  }
-  if (!runs.length) return;  // nothing yet — don't clutter the menu
-
-  const header = document.createElement("div");
-  header.className = "side-section-head";
-  header.textContent = "Background agents";
-  chatsList.appendChild(header);
-
-  runs.forEach(run => chatsList.appendChild(buildRunItem(run)));
-}
-
 // One row in a runs list: agent name + a status pill, clickable to open the
-// run's transcript. Shared by the Verbose conversations section and the
-// agents pane.
+// run's transcript.
 function buildRunItem(run) {
   const item = document.createElement("div");
   item.className = "session-item agent-run-item";
@@ -6973,6 +6947,121 @@ function buildRunItem(run) {
   if (badge.textContent) item.appendChild(badge);
   item.addEventListener("click", () => openAgentRun(run.run_id));
   return item;
+}
+
+// -- Daily history pane -------------------------------------------------
+// You open into a live "Today"; this pane lists the days (Today + past) so you
+// can read back. Days are automatic buckets grouped from /days — not the old
+// user-created conversation switcher. Clicking a past day shows it read-only;
+// clicking Today returns to the live thread.
+
+const daysList = document.getElementById("days-list");
+
+// "YYYY-MM-DD" for a Date in the browser's local zone (matches how the server
+// groups, since it uses the user's stored tz which the browser reports).
+function localDayKey(d) {
+  return d.getFullYear() + "-" +
+    String(d.getMonth() + 1).padStart(2, "0") + "-" +
+    String(d.getDate()).padStart(2, "0");
+}
+
+// Friendly label for a day bucket: Today / Yesterday / weekday (this week) / date.
+function dayLabel(dateStr) {
+  const p = (dateStr || "").split("-");
+  if (p.length !== 3) return dateStr || "";
+  const d = new Date(+p[0], +p[1] - 1, +p[2]);
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const diff = Math.round((today - d) / 86400000);
+  if (diff === 0) return "Today";
+  if (diff === 1) return "Yesterday";
+  if (diff > 1 && diff < 7) return d.toLocaleDateString([], {weekday: "long"});
+  return d.toLocaleDateString([], {month: "short", day: "numeric", year: "numeric"});
+}
+
+async function loadDays(silent) {
+  if (!daysList) return;
+  if (!silent) daysList.innerHTML = '<div class="empty">loading…</div>';
+  try {
+    const r = await fetch("/days");
+    const data = await r.json();
+    const days = data.days || [];
+    const todayKey = localDayKey(new Date());
+    daysList.innerHTML = "";
+    if (!days.length) {
+      daysList.innerHTML = '<div class="empty">no history yet</div>';
+      return;
+    }
+    days.forEach(day => {
+      const item = document.createElement("div");
+      item.className = "day-item";
+      // Active = the day currently shown (live Today, or the past day being read).
+      const isLiveToday = day.date === todayKey && !viewingDay;
+      if (isLiveToday || day.date === viewingDay) item.classList.add("active");
+      const label = document.createElement("div");
+      label.className = "day-label";
+      label.textContent = dayLabel(day.date);
+      if (day.date === todayKey) {
+        const live = document.createElement("span");
+        live.className = "day-live"; live.textContent = "live";
+        label.appendChild(live);
+      }
+      const meta = document.createElement("div");
+      meta.className = "day-meta";
+      meta.textContent = day.count + (day.count === 1 ? " session" : " sessions");
+      item.appendChild(label);
+      item.appendChild(meta);
+      item.addEventListener("click", () => {
+        if (day.date === todayKey) returnToToday();
+        else openDayView(day.date);
+        if (mobileMQ.matches) closeSide();
+      });
+      daysList.appendChild(item);
+    });
+  } catch (e) {
+    if (!silent) daysList.innerHTML = '<div class="empty">error: ' + e + '</div>';
+  }
+}
+
+// Build DOM for a list of render events (session_divider + message bubbles),
+// reusing the same builders the live/scroll-back path uses.
+function renderEventList(events) {
+  const frag = document.createDocumentFragment();
+  (events || []).forEach(ev => {
+    const node = ev.kind === "session_divider"
+      ? buildSessionDivider(ev.payload || {})
+      : buildHistoryNode(ev);
+    if (node) frag.appendChild(node);
+  });
+  return frag;
+}
+
+// Show a past day read-only. The live session is untouched; incoming live events
+// are ignored while viewing (Link.reconnect on return replays the live Today).
+async function openDayView(date) {
+  let data;
+  try {
+    const r = await fetch("/day/" + encodeURIComponent(date));
+    data = await r.json();
+  } catch (e) { return; }
+  viewingDay = date;
+  document.body.classList.add("viewing-past");
+  if (pastDayLabel) pastDayLabel.textContent = dayLabel(date);
+  chat.setFollowing(false);          // a past day opens at its start, not pinned
+  clearTranscriptView();
+  logInner.appendChild(renderEventList(data.events || []));
+  log.scrollTo({ top: 0, behavior: "instant" });
+  updateScrollBtn();
+  loadDays(true);                    // refresh the pane highlight
+}
+
+// Return from a past day to the live Today: reconnect replays the live snapshot,
+// history_done re-pins to the newest message.
+function returnToToday() {
+  if (!viewingDay) { jumpToBottom(); return; }   // already live — just go latest
+  viewingDay = null;
+  document.body.classList.remove("viewing-past");
+  Link.reconnect();
+  loadDays(true);
 }
 
 // -- Agents pane --------------------------------------------------------
@@ -10535,11 +10624,11 @@ function applyDetail() {
     }
   }
 
-  // Agent runs are a verbose-only addition to the Conversations menu, so
-  // re-render it when verbosity actually changes while it's open.
+  // Keep the open History pane in sync when verbosity changes (it gates tool
+  // rows in any read-back day view).
   if (_detailReady && verbosity !== prevVerbosity &&
       typeof activePaneName !== "undefined" && activePaneName === "chats") {
-    loadChats(true);
+    loadDays(true);
   }
 }
 
@@ -11798,7 +11887,7 @@ async function doImport(file) {
 async function deleteSession(id) {
   try {
     await fetch("/sessions/" + encodeURIComponent(id), {method: "DELETE"});
-    loadChats();
+    loadDays();
   } catch (e) {
     appendNotice("failed to delete conversation: " + e, "error");
   }
@@ -11807,7 +11896,7 @@ async function deleteSession(id) {
 async function deleteAllSessions() {
   try {
     await fetch("/sessions", {method: "DELETE"});
-    loadChats();
+    loadDays();
   } catch (e) {
     appendNotice("failed to delete conversations: " + e, "error");
   }
@@ -11852,8 +11941,8 @@ document.getElementById("account-delete-btn").addEventListener("click", () => {
   });
 });
 
-// Side panel starts closed; chats reload happens when the user opens it (or
-// after a session_restart that calls loadChats explicitly).
+// Side panel starts closed; the History pane reloads when the user opens it (or
+// after a session_restart that calls loadDays explicitly).
 </script>
 </body>
 </html>

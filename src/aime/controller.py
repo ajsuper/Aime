@@ -540,11 +540,11 @@ class ConversationController:
         check-then-act that a concurrent turn_end could slip between. A queued
         message is dispatched when the current turn ends (see the turn_end
         handler), not discarded."""
-        # A returning user (quiet past the idle threshold) silently rolls onto a
-        # fresh session before this message is accepted, so their live context
-        # stays cheap without any visible conversation break. No-op mid-turn or
-        # on an already-fresh session.
-        self._maybe_roll_idle_session()
+        # A returning user (quiet past the idle threshold, or arriving on a new
+        # day) silently rolls onto a fresh session before this message is accepted,
+        # so their live context stays cheap and each session sits in one local day.
+        # No-op mid-turn or on an already-fresh session.
+        self._maybe_roll_session()
         with self._state_lock:
             if not self._is_idle:
                 self._pending_user_messages.append((text, images, hidden_prefix))
@@ -780,23 +780,41 @@ class ConversationController:
         self._backend.reset()
         self._reset_internal_state()
 
-    def _maybe_roll_idle_session(self) -> None:
+    def _local_date(self, epoch: float) -> datetime.date:
+        """The calendar date of an epoch time in the user's timezone (server-local
+        when no client zone is known). Used to detect a day boundary for rollover
+        and to keep each session inside a single local day."""
+        if self._client_tz:
+            try:
+                return datetime.datetime.fromtimestamp(
+                    epoch, zoneinfo.ZoneInfo(self._client_tz)
+                ).date()
+            except Exception:
+                pass
+        return datetime.datetime.fromtimestamp(epoch).date()
+
+    def _maybe_roll_session(self) -> None:
         """Before accepting a fresh user turn, silently roll onto a new backend
-        session if the thread has been quiet past IDLE_ROLLOVER_SECONDS. Invisible
-        to the user: no transcript clear, no splash — the continuous thread just
-        keeps scrolling while the model's live context resets to a cheap, empty
-        session. Skipped in headless agent runs and when the session is already
-        empty (nothing to bound) or rollover is disabled."""
-        if self._headless or IDLE_ROLLOVER_SECONDS <= 0:
+        session when either (a) the thread has been quiet past IDLE_ROLLOVER_SECONDS
+        (a cost-bounded boundary), or (b) the user's local day has changed since the
+        last activity — so a session never spans midnight and history groups cleanly
+        by day. Invisible to the user: no transcript clear, no splash; just a subtle
+        divider marks where the fresh, cheap session began. Skipped in headless agent
+        runs, temporary chats, and on an already-empty session."""
+        if self._headless or self._temporary:
             return
-        if self._temporary:
-            return  # a temporary chat is already ephemeral — never roll it
         with self._dispatch_lock:
             with self._state_lock:
                 if not self._is_idle:
                     return  # mid-turn: this message will queue, don't roll
-                idle_for = time.time() - self._last_activity
-            if idle_for < IDLE_ROLLOVER_SECONDS:
+                last = self._last_activity
+            now = time.time()
+            idle_rolled = (
+                IDLE_ROLLOVER_SECONDS > 0
+                and now - last >= IDLE_ROLLOVER_SECONDS
+            )
+            day_rolled = self._local_date(last) != self._local_date(now)
+            if not (idle_rolled or day_rolled):
                 return
             if not self._backend.messages_snapshot():
                 return  # already on a fresh/empty session

@@ -21,6 +21,7 @@ import base64
 import zipfile
 import tempfile
 import datetime
+import zoneinfo
 import threading
 import time
 from functools import wraps
@@ -3662,11 +3663,38 @@ def stream():
 @app.route("/sessions")
 @login_required
 def sessions():
+    from provider_backend import session_started_at
     items = [
-        {"id": s.id, "summary": s.summary, "saved_at": s.saved_at}
+        {"id": s.id, "summary": s.summary, "saved_at": s.saved_at,
+         "started_at": session_started_at(s.id)}
         for s in _context_for(g.user_id).controller.list_sessions()
     ]
     return jsonify({"sessions": items})
+
+
+def _user_tz(user_id: int) -> str:
+    rec = _auth_backend.lookup(user_id)
+    return (rec.tz if rec else "") or ""
+
+
+def _session_local_day(session_id: str, tz_name: str) -> str:
+    """The user-local calendar day (YYYY-MM-DD) a session belongs to, from its
+    start instant. Day-boundary rollover keeps a session within one local day, so
+    this groups history into clean daily buckets."""
+    from provider_backend import session_started_at
+    iso = session_started_at(session_id)
+    if not iso:
+        return ""
+    try:
+        dt = datetime.datetime.fromisoformat(iso)
+    except ValueError:
+        return ""
+    if tz_name:
+        try:
+            dt = dt.astimezone(zoneinfo.ZoneInfo(tz_name))
+        except Exception:
+            pass
+    return dt.date().isoformat()
 
 
 def _session_render_events(messages: list[dict]) -> list[dict]:
@@ -3754,6 +3782,66 @@ def history():
         lambda sid: read_session_messages(conv_dir, dek, sid),
     )
     return jsonify(page)
+
+
+def _group_days(infos, day_of):
+    """Group newest-first SessionInfos into per-day buckets, newest day first.
+    ``day_of(session_id)`` returns the YYYY-MM-DD the session belongs to. Pure, so
+    it's testable without Flask. Each bucket carries the day, a session count, and
+    the day's most recent saved_at (the first one seen, since infos are newest)."""
+    order: list[str] = []
+    by_day: dict[str, dict] = {}
+    for info in infos:
+        day = day_of(info.id)
+        if not day:
+            continue
+        bucket = by_day.get(day)
+        if bucket is None:
+            by_day[day] = {"date": day, "count": 1, "last_activity": info.saved_at or ""}
+            order.append(day)
+        else:
+            bucket["count"] += 1
+    return [by_day[d] for d in order]
+
+
+@app.route("/days")
+@login_required
+def days():
+    """The daily buckets for the history pane — newest day first. Sessions are
+    grouped by the user's local day (kept whole by the day-boundary rollover)."""
+    tz = _user_tz(g.user_id)
+    infos = _context_for(g.user_id).controller.list_sessions()  # newest-first
+    return jsonify({"days": _group_days(infos, lambda sid: _session_local_day(sid, tz))})
+
+
+@app.route("/day/<date>")
+@login_required
+def day_view(date: str):
+    """A whole day's transcript: every session on ``date`` (user-local), oldest
+    first, rendered into the same event payloads the live view uses, with a labeled
+    divider before each session. Read-only — viewing the past doesn't touch the
+    live session."""
+    tz = _user_tz(g.user_id)
+    infos = _context_for(g.user_id).controller.list_sessions()  # newest-first
+    day_sessions = [i for i in infos if _session_local_day(i.id, tz) == date]
+    day_sessions.reverse()  # oldest-first for chronological rendering
+    dek = _auth_backend.get_dek(g.user_id)
+    conv_dir = _conversations_dir(g.user_id)
+    from provider_backend import read_session_messages, session_started_at
+    events: list[dict] = []
+    for info in day_sessions:
+        events.append({
+            "kind": "session_divider",
+            "payload": {
+                "session_id": info.id,
+                "title": info.summary or "",
+                "saved_at": info.saved_at or "",
+                "started_at": session_started_at(info.id),
+            },
+        })
+        msgs = read_session_messages(conv_dir, dek, info.id) or []
+        events.extend(_session_render_events(msgs))
+    return jsonify({"date": date, "events": events})
 
 
 @app.route("/sessions/<session_id>", methods=["DELETE"])
