@@ -209,9 +209,9 @@ def test_record_proactive_when_idle_appends_and_emits():
     events.clear()
     assert c.record_proactive_message("Reminder: gig at 5:30!") is True
     assert backend.appended == ["Reminder: gig at 5:30!"]
-    # Surfaced live to the frontend as an Aime bubble.
-    assistant = [e for e in events if e.kind == "assistant_text"]
-    assert assistant and assistant[-1].text == "Reminder: gig at 5:30!"
+    # Surfaced live to the frontend as a dedicated proactive_message bubble.
+    proactive = [e for e in events if e.kind == "proactive_message"]
+    assert proactive and proactive[-1].text == "Reminder: gig at 5:30!"
 
 
 def test_record_proactive_skipped_mid_turn():
@@ -248,11 +248,11 @@ def test_sendmessage_flushes_inline_on_turn_end():
     assert sent == ["Reminder: gig at 5:30!"]
     assert backend.appended == []
 
-    # Turn ends → the sent text flushes as an inline assistant bubble.
+    # Turn ends → the sent text flushes as an inline proactive_message bubble.
     c._handle_backend_event(BackendEvent(kind="turn_end", stop_reason="end_turn"))
     assert backend.appended == ["Reminder: gig at 5:30!"]
     assert any(
-        e.kind == "assistant_text" and e.text == "Reminder: gig at 5:30!"
+        e.kind == "proactive_message" and e.text == "Reminder: gig at 5:30!"
         for e in events
     )
 

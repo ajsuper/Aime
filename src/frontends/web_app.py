@@ -1008,6 +1008,10 @@ class UserContext:
             "from_replay": event.from_replay,
             "attachments": event.attachments,
         }
+        # A proactive message carries raw markup; pre-render it to HTML so the
+        # frontend can drop it straight into a bubble (no client-side markup pass).
+        if event.kind == "proactive_message":
+            payload["text"] = _render_markup_to_html(event.text or "", final=True)
         # Structured payload for events that carry one (e.g. `graphic`, which
         # holds {format, summary, source} for the frontend to render).
         if event.payload is not None:
@@ -3920,9 +3924,11 @@ def _record_proactive_in_user_thread(user_id: int, text: str) -> None:
     try:
         ctx = _user_contexts.get(user_id)
         if ctx is not None and ctx.controller.deliver_inline_proactive(body):
-            # A live (non-temporary) session owns it: recorded now if idle, or
-            # queued to flush on turn_end if busy (so the turn's own persist can't
-            # clobber a direct file write). Don't also write to disk.
+            # A live (non-temporary) session owns it: recorded now if idle (and
+            # pushed to the open chat as a proactive_message), or queued to flush
+            # on turn_end if busy. Don't also write to disk.
+            app.logger.info(
+                "proactive: threaded live for user %s (%d chars)", user_id, len(body))
             return
         # No live session for this user, OR they're in a Temporary Chat: persist
         # into *today's* session file directly so the message threads into Today,
@@ -3932,6 +3938,8 @@ def _record_proactive_in_user_thread(user_id: int, text: str) -> None:
             _conversations_dir(user_id), _auth_backend.get_dek(user_id), body,
             _user_tz(user_id),
         )
+        app.logger.info(
+            "proactive: wrote offline for user %s (ctx=%s)", user_id, ctx is not None)
         # If they're sitting in a temporary chat, let them know a message landed
         # in their main thread (the phone already got it too).
         if ctx is not None and ctx.controller.is_temporary:
@@ -3946,26 +3954,33 @@ def _record_proactive_in_user_thread(user_id: int, text: str) -> None:
         )
 
 
-def _scheduler_send_message(user_id: int, text: str) -> None:
-    """Scheduler action: deliver a reminder to the user's stored contact over the
-    configured channel, and record it inline in their conversation so it reads as
-    a text Aime sent in-thread. Best-effort — messaging off, no contact connected,
-    or a transport hiccup all degrade to a quiet skip rather than a hard failure."""
-    from aime import messaging as _aime_messaging
-    messenger = _aime_messaging.get_messenger()
+def _pipeline_send(user_id: int, text: str, subject: str | None = None) -> None:
+    """The single outbound chokepoint. Every out-of-band message Aime sends the
+    user routes through here so the messaging pipeline and the chat transcript can
+    never diverge: it (1) delivers out of band over the configured channel
+    (Telegram/email), and (2) threads the same text into the user's transcript —
+    recorded so the model sees it, and shown live in the UI as an Aime bubble.
+    Best-effort throughout; a failure in either half never blocks the other."""
+    body = (text or "").strip()
+    if not body:
+        return
     rec = _auth_backend.lookup(user_id)
     contact = rec.messaging_contact if rec else None
-    # Out-of-band delivery to the user's phone/email, exactly as before.
+    from aime import messaging as _aime_messaging
+    messenger = _aime_messaging.get_messenger()
     if messenger is not None and contact:
         try:
-            messenger.send(contact, text)
+            messenger.send(contact, body, subject=subject)
         except _aime_messaging.MessageSendError as exc:
-            app.logger.warning(
-                "scheduled reminder to user %s failed: %s", user_id, exc
-            )
-    # Inline record so the reminder shows in the thread and stays replyable, even
-    # when no messaging channel/contact is wired up (the chat becomes the surface).
-    _record_proactive_in_user_thread(user_id, text)
+            app.logger.warning("pipeline send to user %s failed: %s", user_id, exc)
+    # Thread into the transcript + live UI, even when no channel/contact is wired
+    # up (the chat becomes the surface).
+    _record_proactive_in_user_thread(user_id, body)
+
+
+def _scheduler_send_message(user_id: int, text: str) -> None:
+    """Scheduler action: a reminder. Routes through the single outbound pipeline."""
+    _pipeline_send(user_id, text)
 
 
 def _scheduler_upcoming_events(user_id: int) -> list:
@@ -4931,13 +4946,9 @@ def _notify_share(user_id: int, message_text: str) -> None:
             ctx.notify_share_update()
         except Exception:
             pass
+    # Out of band + into the transcript, via the single pipeline chokepoint.
     try:
-        rec = _auth_backend.lookup(user_id)
-        if rec and rec.messaging_contact:
-            from aime import messaging as _aime_messaging
-            messenger = _aime_messaging.get_messenger()
-            if messenger is not None:
-                messenger.send(rec.messaging_contact, message_text)
+        _pipeline_send(user_id, message_text)
     except Exception:
         pass
 

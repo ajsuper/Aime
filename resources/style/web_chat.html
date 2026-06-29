@@ -5928,6 +5928,20 @@ function onStreamMessage(e) {
       if (!e.from_replay) armAimeAttention();
       break;
     }
+    case "proactive_message": {
+      // A message Aime sent the user out of band (scheduler reminder, agent
+      // notification, SendMessage), pre-rendered to HTML server-side. Rendered as
+      // a self-contained Aime bubble, INSTANTLY — no ensureAssistant /
+      // pendingHtmlTarget / typewriter / turn-state dependence. This is the path
+      // that guarantees pipeline messages always appear in the chat.
+      clearThinking();
+      const bubble = appendMessage("aime", "aime", "");
+      bubble._content.innerHTML = e.text || "";
+      resolveGraphicTags(bubble._content);
+      scrollToBottom();
+      if (!e.from_replay) armAimeAttention();
+      break;
+    }
     case "history_done":
       // Switch out of replay mode and reconcile the busy gate to the server's
       // authoritative turn state. Replayed history contains user_message_shown

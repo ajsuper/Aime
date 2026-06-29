@@ -102,6 +102,11 @@ CoreEventKind = Literal[
                                 # {session_id, title, saved_at} in `payload` so
                                 # the frontend can label the session above it and
                                 # use the id as the scroll-back cursor
+    "proactive_message",        # a message Aime sent the user out of band (a
+                                # scheduler reminder, an agent notification, a
+                                # SendMessage). Rendered as a self-contained Aime
+                                # bubble, instantly — no turn / typewriter state —
+                                # so it always appears in the chat
 ]
 
 
@@ -1132,7 +1137,10 @@ class ConversationController:
                 return False
         if not self._backend.append_assistant_message(body):
             return False
-        self._emit(CoreEvent(kind="assistant_text", text=body))
+        # A dedicated event (not assistant_text): the frontend renders it as a
+        # standalone Aime bubble instantly, with no dependence on turn/typewriter
+        # state — which is what kept proactive messages from showing in the chat.
+        self._emit(CoreEvent(kind="proactive_message", text=body))
         return True
 
     def deliver_inline_proactive(self, text: str) -> bool:
