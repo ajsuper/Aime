@@ -4113,7 +4113,7 @@ def _launch_agent_run(
 
     def _run() -> None:
         try:
-            result = BackgroundAgentRunner().run(
+            BackgroundAgentRunner().run(
                 spec,
                 user_id=user_id,
                 dek=dek,
@@ -4121,6 +4121,13 @@ def _launch_agent_run(
                 usage_label=username,
                 client_tz=client_tz,
                 messaging_contact=messaging_contact,
+                # Every message this run sends — a SendMessage tool call *or* its
+                # SubmitResult message_to_user — flows through the controller's
+                # _deliver_message, which calls this sink to thread the same text
+                # into the owning user's transcript + live UI. So agent messages
+                # appear in the chat exactly like interactive ones (the gap that
+                # made agent/reminder messages reach Telegram but not the UI).
+                message_sink=lambda t: _record_proactive_in_user_thread(user_id, t),
                 api_url=aime_config.API_URL,
                 agent_id=agent_id,
                 # Debit this run's real cost against the user's budget (None when
@@ -4130,11 +4137,6 @@ def _launch_agent_run(
                 # bucket so an agent can't be a free, uncapped channel.
                 quota=ctx.quota_meter,
             )
-            # If the worker chose to notify the user, thread that note into their
-            # conversation too (it was already delivered out of band during the
-            # run) so it reads as a text Aime sent and stays replyable in context.
-            if result is not None and result.message_to_user:
-                _record_proactive_in_user_thread(user_id, result.message_to_user)
         except Exception:
             # The runner already converts its own failures into a persisted
             # error run; a failure here means it never got that far. Nothing

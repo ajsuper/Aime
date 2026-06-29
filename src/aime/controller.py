@@ -229,6 +229,7 @@ class ConversationController:
         headless: bool = False,
         messenger=None,
         message_recipient: str | None = None,
+        message_sink=None,
         reminder_service=None,
         record_sync=None,
         graphic_store_provider=None,
@@ -285,6 +286,13 @@ class ConversationController:
         # tool returns a friendly "not set up" result and the field is ignored.
         self._messenger = messenger
         self._message_recipient = (message_recipient or "").strip() or None
+        # Optional callback fired with the text of every message actually sent
+        # through the pipeline (see _deliver_message). Lets a background-agent run
+        # thread its outbound messages (SendMessage *and* SubmitResult) into the
+        # owning user's transcript — the single place every send is captured, so
+        # agent and interactive sends behave identically. None on the interactive
+        # user's own controller, which records into its own session instead.
+        self._message_sink = message_sink
         # Headless mode drives a background-agent run rather than an interactive
         # chat: start() skips the onboarding bootstrap and instead arms the
         # SubmitResult terminal tool, and the SubmitResult call is surfaced as
@@ -1103,7 +1111,12 @@ class ConversationController:
         """Send an outbound text to the user via the wired messenger. Returns
         (ok, human_note). Never raises — a missing messenger/recipient or a
         transport failure comes back as (False, friendly reason) so callers can
-        report it to the model or surface it in the UI without crashing a run."""
+        report it to the model or surface it in the UI without crashing a run.
+
+        This is the single pipeline chokepoint: every message Aime sends — the
+        interactive SendMessage tool, a background agent's SendMessage *or* its
+        SubmitResult message_to_user — flows through here, so on success we also
+        thread the same text into the transcript (model context + live UI)."""
         body = (text or "").strip()
         if not body:
             return False, "no message text to send"
@@ -1115,7 +1128,26 @@ class ConversationController:
             self._messenger.send(self._message_recipient, body, subject=subject)
         except Exception as exc:
             return False, str(exc)
+        self._record_sent_message(body)
         return True, "message sent to the user"
+
+    def _record_sent_message(self, body: str) -> None:
+        """Thread a just-sent message into the transcript. A background-agent run
+        routes it to the owning user's transcript via the injected sink; the
+        interactive user's own controller stashes it (we're suspended mid-turn at
+        the tool_use yield, so a direct append would corrupt history) and flushes
+        it as an inline proactive bubble on turn_end."""
+        if self._message_sink is not None:
+            try:
+                self._message_sink(body)
+            except Exception as exc:
+                self._emit_error(exc, source="message_sink",
+                                 label="inline message failed")
+            return
+        if self._headless:
+            return  # headless run with no sink wired — nothing to thread into
+        with self._state_lock:
+            self._pending_proactive.append(body)
 
     def record_proactive_message(self, text: str) -> bool:
         """Make an out-of-band message that was sent to the user (a scheduler
@@ -1304,18 +1336,11 @@ class ConversationController:
         # wired in it returns a friendly result so the model can fall back to
         # telling the user in chat instead.
         if tool_name == "SendMessage":
-            sent_text = tool_input.get("text") or ""
-            ok, note = self._deliver_message(sent_text, tool_input.get("subject"))
-            # Show the sent text inline in this chat too, so an interactive send
-            # reads like a message Aime posted in-thread (not just a silent push
-            # to the phone). It can't be appended to history now — we're mid-turn,
-            # suspended at the tool_use yield — so stash it and flush it as an
-            # assistant turn when the turn ends (see the turn_end handler). Only
-            # for the interactive user's own controller; a background agent has no
-            # live chat to post into, and routes its message via the run instead.
-            if ok and sent_text.strip() and not self._headless:
-                with self._state_lock:
-                    self._pending_proactive.append(sent_text.strip())
+            # Threading the sent text into the transcript is handled centrally in
+            # _deliver_message (the single pipeline chokepoint), so interactive and
+            # agent sends behave identically.
+            ok, note = self._deliver_message(
+                tool_input.get("text") or "", tool_input.get("subject"))
             self._emit(CoreEvent(
                 kind="tool_result",
                 tool_name=tool_name,

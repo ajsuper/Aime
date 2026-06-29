@@ -228,6 +228,49 @@ def test_record_proactive_empty_is_noop():
     assert backend.appended == []
 
 
+# --- every pipeline send threads into the transcript (one chokepoint) ------
+
+def _wire_messenger(c, sent):
+    c._messenger = type("M", (), {
+        "send": lambda self, to, text, subject=None: sent.append(text)})()
+    c._message_recipient = "tg:123"
+
+
+def test_agent_send_routes_through_message_sink():
+    # A background-agent controller routes every send to the owning user's
+    # transcript via the injected sink (this is the path that was missing — agent
+    # SendMessage reached Telegram but never the chat).
+    c, backend, events = _controller()
+    sent, recorded = [], []
+    _wire_messenger(c, sent)
+    c._headless = True
+    c._message_sink = recorded.append
+    ok, _ = c._deliver_message("Briefing ready!")
+    assert ok and sent == ["Briefing ready!"]
+    assert recorded == ["Briefing ready!"]      # threaded to the user
+
+
+def test_interactive_send_stashes_for_flush():
+    # The interactive user's own controller (no sink) stashes the send to flush
+    # as an inline bubble on turn_end.
+    c, backend, events = _controller()
+    sent = []
+    _wire_messenger(c, sent)
+    c._deliver_message("Texting you this")
+    assert c._pending_proactive == ["Texting you this"]
+
+
+def test_headless_without_sink_records_nothing():
+    c, backend, events = _controller()
+    sent = []
+    _wire_messenger(c, sent)
+    c._headless = True
+    c._message_sink = None
+    c._deliver_message("nowhere to go")
+    assert sent == ["nowhere to go"]            # still delivered out of band
+    assert c._pending_proactive == []           # but not threaded anywhere
+
+
 # --- interactive SendMessage flushes inline on turn end -------------------
 
 def test_sendmessage_flushes_inline_on_turn_end():

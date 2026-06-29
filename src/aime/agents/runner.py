@@ -74,6 +74,7 @@ class BackgroundAgentRunner:
         usage_label: str | None = None,
         client_tz: str | None = None,
         messaging_contact: str | None = None,
+        message_sink=None,
         api_url: str = config.API_URL,
         agent_id: str | None = None,
         quota=None,
@@ -103,7 +104,8 @@ class BackgroundAgentRunner:
         backend, controller, collector = self._build(
             spec, user_id=user_id, dek=dek, runs_dir=runs_dir,
             usage_label=usage_label, api_url=api_url, client_tz=client_tz,
-            messaging_contact=messaging_contact, quota=quota,
+            messaging_contact=messaging_contact, message_sink=message_sink,
+            quota=quota,
         )
 
         status = ""
@@ -148,7 +150,7 @@ class BackgroundAgentRunner:
 
     def _build(
         self, spec, *, user_id, dek, runs_dir, usage_label, api_url, client_tz,
-        messaging_contact=None, quota=None,
+        messaging_contact=None, message_sink=None, quota=None,
     ):
         web_search_agent = None
         web_search_schema = None
@@ -215,6 +217,9 @@ class BackgroundAgentRunner:
             headless=True,
             messenger=messenger,
             message_recipient=messaging_contact,
+            # Every message this run sends (SendMessage *or* SubmitResult) is
+            # threaded into the owning user's transcript + live UI via this sink.
+            message_sink=message_sink,
         )
         if client_tz:
             controller.set_client_timezone(client_tz)
