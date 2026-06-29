@@ -794,13 +794,17 @@ class ConversationController:
         return datetime.datetime.fromtimestamp(epoch).date()
 
     def _maybe_roll_session(self) -> None:
-        """Before accepting a fresh user turn, silently roll onto a new backend
-        session when either (a) the thread has been quiet past IDLE_ROLLOVER_SECONDS
-        (a cost-bounded boundary), or (b) the user's local day has changed since the
-        last activity — so a session never spans midnight and history groups cleanly
-        by day. Invisible to the user: no transcript clear, no splash; just a subtle
-        divider marks where the fresh, cheap session began. Skipped in headless agent
-        runs, temporary chats, and on an already-empty session."""
+        """Before accepting a fresh user turn, roll onto a new backend session when
+        either (a) the thread has been quiet past IDLE_ROLLOVER_SECONDS (a cost
+        boundary), or (b) the user's local day has changed since the last activity.
+
+        The two rolls differ in how they're presented:
+          * idle roll (same day) — silent: the transcript stays continuous within
+            the day, with just a subtle divider marking the fresh, cheap session.
+          * day roll — clears the transcript to a fresh "Today", so yesterday's
+            messages don't bleed into today (they live in the History pane).
+
+        Skipped in headless runs, temporary chats, and on an already-empty session."""
         if self._headless or self._temporary:
             return
         with self._dispatch_lock:
@@ -820,12 +824,12 @@ class ConversationController:
                 return  # already on a fresh/empty session
             self._swap_to_fresh_session()
             self._spawn_worker(self.run_stream_loop)
-            # No session_restart / splash: the frontend keeps the existing
-            # transcript so the thread reads as one continuous conversation — but
-            # a subtle divider marks where this fresh (cost-bounded) session began,
-            # so the user can see the model isn't carrying everything above it.
-            # No title yet (it's generated from the first message); the frontend
-            # falls back to the timestamp.
+            if day_rolled:
+                # New day → wipe the view to a fresh Today (no "New conversation"
+                # splash — that's only for an explicit reset).
+                self._emit(CoreEvent(kind="session_restart", restart_reason="reset"))
+            # A subtle, timestamped divider marks the fresh session (title fills in
+            # from the first message). After a day roll it labels the top of Today.
             self._emit_session_divider(
                 getattr(self._backend, "session_id", None),
                 "",
@@ -895,12 +899,12 @@ class ConversationController:
         self._spawn_worker(self.run_stream_loop)
 
     def resume_latest_session(self) -> bool:
-        """Continue the user's most recent conversation at startup instead of
-        opening a blank one, so the thread reads as one continuous history across
-        restarts and any message recorded while they were away (a proactive
-        reminder) is visible. Replays that session silently (no banner) and seeds
-        the idle-rollover clock from its age, so a long-dormant thread still rolls
-        onto a fresh session on the user's next message. Returns True if resumed.
+        """Open into a live "Today" at startup: resume the most recent session *only
+        if it belongs to the current local day*, so today continues where it left off
+        and any proactive message recorded while away is visible. A previous day's
+        thread is left for the History pane — it must not appear in Today. Returns
+        True if a (today's) session was resumed, False to stay on a fresh, empty
+        Today.
 
         Called once at startup, after start(); the backend's epoch logic retires
         the empty-session worker start() spawned (same swap dance as load())."""
@@ -911,6 +915,8 @@ class ConversationController:
             if not sessions:
                 return False
             latest = sessions[0]  # list_sessions is newest-first
+            if not self._is_today(latest.id):
+                return False      # latest is a past day → start fresh on Today
             self.stop_model()
             try:
                 self._backend.load_session(latest.id)
@@ -919,6 +925,19 @@ class ConversationController:
             self.seed_last_activity(latest.saved_at)
             self._load_after_swap(latest.id, announce=False)
             return True
+
+    def _is_today(self, session_id: str) -> bool:
+        """True if a session started on the user's current local day. Unknown /
+        unparseable timestamps default to True (resume) — the safe, non-losing
+        choice. Uses the absolute instant from the id so it's tz-correct."""
+        iso = session_started_at(session_id)
+        if not iso:
+            return True
+        try:
+            epoch = datetime.datetime.fromisoformat(iso).timestamp()
+        except (ValueError, TypeError):
+            return True
+        return self._local_date(epoch) == self._local_date(time.time())
 
     def seed_last_activity(self, saved_at: str) -> None:
         """Seed the idle-rollover clock from a persisted ISO ``saved_at`` so a

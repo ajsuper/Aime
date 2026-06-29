@@ -4474,8 +4474,6 @@ function appendNotice(text, severity) {
 let historyHasMore = true;     // are there older sessions still to page in?
 let historyLoading = false;    // a /history fetch is in flight
 let historyRow = null;         // the transient "loading earlier…" row at the top
-let liveDayKey = null;         // the local day of the live (Today) session — the
-                               // scroll-back stays within it; older days use the pane
 let viewingDay = null;         // a past day being read read-only (null = live Today)
 
 function resetHistoryState() {
@@ -4618,15 +4616,14 @@ async function loadOlderHistory() {
     const data = await r.json();
     if (historyRow) { historyRow.remove(); historyRow = null; }
     let sessions = data.sessions || [];
-    // Scroll-back stays within the live day — older days are reached from the
-    // History pane, not by scrolling. Stop as soon as a page crosses midnight.
-    let crossedDay = false;
-    if (liveDayKey) {
-      const n = sessions.length;
-      sessions = sessions.filter(s =>
-        s.started_at && localDayKey(new Date(s.started_at)) === liveDayKey);
-      crossedDay = sessions.length < n;
-    }
+    // "Today" scroll-back stays within the current calendar day — older days are
+    // reached from the History pane, not by scrolling. Stop the moment a page
+    // crosses midnight into a previous day.
+    const today = localDayKey(new Date());
+    const n = sessions.length;
+    sessions = sessions.filter(s =>
+      s.started_at && localDayKey(new Date(s.started_at)) === today);
+    const crossedDay = sessions.length < n;
     historyHasMore = !!data.has_more && !crossedDay;
     if (!sessions.length) return;
     const prevHeight = log.scrollHeight;
@@ -5933,14 +5930,6 @@ function onStreamMessage(e) {
       // first new message back as a queued draft. Also drops a lingering
       // "Working…" line left by replayed tool calls (chat.reconcile).
       chat.reconcile(e.busy === true);
-      // Capture the live day (the resumed session's day): today's scroll-back
-      // stays within it; older days are reached from the History pane.
-      {
-        const liveDiv = logInner.querySelector(".session-divider");
-        liveDayKey = (liveDiv && liveDiv.dataset.startedAt)
-          ? localDayKey(new Date(liveDiv.dataset.startedAt))
-          : localDayKey(new Date());
-      }
       // The snapshot (today, live) is fully rendered. Land on the latest message;
       // the ResizeObserver then holds it there through any late layout.
       // Background-fill earlier-today sessions above (out of view, since we stay

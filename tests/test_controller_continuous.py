@@ -8,10 +8,11 @@ threads an out-of-band send into the live session as an assistant turn so it
 shows in the chat and the reply has context.
 """
 
+import datetime
 import time
 
 import aime.controller as controller_mod
-from provider_backend import BackendEvent
+from provider_backend import BackendEvent, SessionInfo
 from aime.controller import ConversationController
 
 
@@ -115,15 +116,70 @@ def test_idle_rollover_disabled_when_threshold_zero(monkeypatch):
     assert backend.reset_calls == 0           # idle rollover off, same day → no roll
 
 
-def test_day_change_rolls_even_with_idle_disabled(monkeypatch):
+def test_day_change_rolls_and_clears_to_fresh_today(monkeypatch):
     # A new local day always starts a fresh session so history groups by day,
-    # independent of the idle threshold.
+    # independent of the idle threshold — AND it clears the view (session_restart)
+    # so yesterday's messages don't bleed into Today.
     monkeypatch.setattr(controller_mod, "IDLE_ROLLOVER_SECONDS", 0)
     c, backend, events = _controller(messages=[{"role": "user", "content": []}])
     c._last_activity = time.time() - 2 * 86400   # ~2 days ago → different day
     c.dispatch_input("good morning")
     assert backend.reset_calls == 1
-    assert "session_divider" in _kinds(events)
+    kinds = _kinds(events)
+    assert "session_restart" in kinds            # fresh Today
+    assert "session_divider" in kinds
+    # The clear lands before the user's message renders.
+    assert kinds.index("session_restart") < kinds.index("user_message_shown")
+
+
+class _ResumeBackend:
+    """Minimal backend for exercising resume_latest_session's day check."""
+    conversations_dir = None
+
+    def __init__(self, latest_id):
+        self.session_id = "fresh"
+        self._latest = latest_id
+        self.loaded = []
+        self._messages = []
+
+    def list_sessions(self):
+        return [SessionInfo(id=self._latest, summary="", saved_at="2026-01-01T00:00:00")]
+
+    def load_session(self, sid):
+        self.loaded.append(sid)
+        self.session_id = sid
+
+    def messages_snapshot(self):
+        return list(self._messages)
+
+    def interrupt_turn(self):
+        pass
+
+    def reset(self):
+        pass
+
+
+def _resume_controller(latest_id):
+    backend = _ResumeBackend(latest_id)
+    c = ConversationController(
+        backend=backend, tool_gateway=object(), worker_spawner=lambda fn: None,
+    )
+    c._maybe_start_onboarding = lambda: None
+    return c, backend
+
+
+def test_resume_loads_todays_session():
+    today_id = "msgs-" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S") + "-aaaaaaaa"
+    c, backend = _resume_controller(today_id)
+    assert c.resume_latest_session() is True
+    assert backend.loaded == [today_id]
+
+
+def test_resume_skips_a_previous_days_session():
+    # A past-day session belongs in the History pane, not the live Today.
+    c, backend = _resume_controller("msgs-20200101-120000-bbbbbbbb")
+    assert c.resume_latest_session() is False
+    assert backend.loaded == []          # stays on the fresh, empty Today
 
 
 def test_explicit_reset_still_announces(monkeypatch):
