@@ -5901,11 +5901,17 @@ function onStreamMessage(e) {
     case "assistant_html": {
       clearThinking();
       if (!e.from_replay) chat.markResponded();
-      // Final/full render. On history replay we have no streaming bubble — make
-      // one and skip the typewriter entirely (replay should appear instantly).
+      // Final/full render. The typewriter only runs for a *live reply to an
+      // active turn* (turn === "busy"). Replay (from_replay) and out-of-band
+      // messages — an inline proactive reminder pushed while the chat is idle —
+      // render instantly: a standalone message with no streaming turn behind it
+      // must not depend on the typewriter's mid-turn state (that's exactly why
+      // proactive messages weren't appearing in the chat).
+      const liveTurn = !chat.replaying() && !e.from_replay
+        && chat.state.turn === "busy";
       let target = pendingHtmlTarget || currentAssistant;
       if (!target) target = appendMessage("aime", "aime", "");
-      if (!chat.replaying() && !e.from_replay) {
+      if (liveTurn) {
         typewriterUpdate(target, e.text, /*finalize=*/true);
       } else {
         target._content.innerHTML = e.text;
