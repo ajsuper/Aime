@@ -361,22 +361,22 @@
     }
     .msg .who { display: none; }
     .msg.aime, .msg.notice { padding-left: 1.25rem; position: relative; }
+    /* Every Aime message carries its own left rainbow bar — including back-to-back
+       bubbles, so a burst of replies (or pushed messages) reads as distinct turns
+       rather than one wall of text. */
     .msg.aime::before {
       content: ""; position: absolute; left: 0; top: 0.3rem; bottom: 0.3rem;
       width: 3px; border-radius: 2px;
       background: var(--rainbow-v,
         linear-gradient(180deg, var(--accent) 0%, var(--accent-hover) 100%));
-      /* Recency: the bar is vivid while its message is fresh, then settles
-         to a calm, much dimmer rainbow once `.fresh` is dropped by
-         appendMessage. The settle is a slow fade, not a snap. */
-      opacity: 0.28;
-      filter: saturate(0.5);
+      /* Recency: the bar is vivid while the message is new, then settles to a
+         calm, much dimmer rainbow once the user has actually seen it (`.seen`,
+         added by the viewport observer). The settle is a slow fade, not a snap. */
+      opacity: 1;
+      filter: saturate(1);
       transition: opacity 2.4s ease, filter 2.4s ease;
     }
-    /* Avatar only on the first assistant block of a run — when two aime
-       bubbles are adjacent siblings (no tool call / user msg between them),
-       suppress the avatar on the follow-up. */
-    .msg.aime + .msg.aime::before { display: none; }
+    .msg.aime.seen::before { opacity: 0.28; filter: saturate(0.5); }
     .msg.user { align-self: flex-end; max-width: 80%;
                 background: var(--user-bubble); color: var(--user-bubble-text, white);
                 padding: 0.65rem 1rem; border-radius: 18px 18px 4px 18px;
@@ -594,12 +594,9 @@
       100% { opacity: 0; transform: translateX(100%); }
     }
 
-    /* (B) Aime responds — the bar draws itself in, vivid; it stays bright
-       while `.fresh`, then the base rule above fades it to the dim state. */
-    .msg.aime.fresh::before {
-      opacity: 1; filter: saturate(1);
-      animation: rb-wipe 0.55s ease-out;
-    }
+    /* (B) Aime responds — the bar draws itself in. It stays vivid (the base
+       rule) until the message is seen, then settles to the dim `.seen` state. */
+    .msg.aime.fresh::before { animation: rb-wipe 0.55s ease-out; }
     @keyframes rb-wipe {
       from { clip-path: inset(0 0 100% 0); }
       to   { clip-path: inset(0 0 0 0); }
@@ -640,31 +637,38 @@
       100% { opacity: 0;    transform: scale(2); }
     }
 
-    /* (E) An unanswered Aime message the user hasn't engaged with breathes a soft
-       pastel-rainbow halo to draw the eye back to it. Applied by JS (.attention)
-       once the message has lingered a few minutes or the user starts a reply;
-       cleared when they respond or a newer message arrives. Same z-index:-1 +
-       isolation pattern as the user-bubble glint, so the blurred glow sits behind
-       the text without leaking past the message. */
-    .msg.aime.attention { isolation: isolate; }
-    .msg.aime.attention::after {
-      content: ""; position: absolute; inset: -3px -7px; z-index: -1;
-      border-radius: 14px; pointer-events: none;
-      background: var(--rainbow, var(--accent));
-      filter: blur(8px);
-      animation: aime-breathe 2.8s ease-in-out infinite;
-    }
-    @keyframes aime-breathe {
-      0%, 100% { opacity: 0;    transform: scale(0.99); }
-      50%      { opacity: 0.34; transform: scale(1);    }
+    /* (E) "New" markers for messages Aime pushed out of band (reminders, agent
+       notifications, SendMessage) that the user hasn't had a moment with yet.
+       Two crisp, on-brand cues — no blur, no breathing:
+         · a "New" divider rule (the pastel rainbow, hard stops) marking where
+           the unread run begins, and
+         · a small "New" pill on each unread proactive message.
+       Both clear once the message has been seen (`.unread` is dropped by JS). */
+    .new-divider { display: flex; align-items: center; gap: 0.6rem;
+                   margin: 0.5rem 0 0.1rem; color: var(--cta, var(--accent));
+                   font-size: 0.7rem; font-weight: 700; letter-spacing: 0.08em;
+                   text-transform: uppercase; }
+    .new-divider::before, .new-divider::after {
+                   content: ""; flex: 1; height: 2px; border-radius: 2px;
+                   background: var(--rainbow, var(--accent)); opacity: 0.85; }
+    .new-divider span { white-space: nowrap; }
+
+    /* The pill sits above the text (the message gets a little headroom while
+       unread), anchored just right of the rainbow bar. */
+    .msg.aime.proactive.unread { padding-top: 1.45rem; }
+    .msg.aime.proactive.unread::after {
+      content: "New"; position: absolute; top: 0; left: 1.25rem;
+      font-size: 0.62rem; font-weight: 700; letter-spacing: 0.07em;
+      text-transform: uppercase; color: var(--cta, var(--accent));
+      padding: 0.12rem 0.5rem 0.16rem; border-radius: 999px;
+      background: var(--bg-elev); border: 1px solid var(--border);
+      box-shadow: var(--shadow-1, 0 1px 3px rgba(0,0,0,0.18));
     }
 
     @media (prefers-reduced-motion: reduce) {
       form.sent::after, .msg.aime.fresh::before, .msg.user.fresh::before,
       .composer-toggle.stt-pulse .composer-toggle-track,
       .attach-btn.burst::after { animation: none; }
-      /* Keep a static, subtler halo so the message is still distinguishable. */
-      .msg.aime.attention::after { animation: none; opacity: 0.22; }
     }
     /* Small CSS-only tooltip: anchor with `data-tip="..."` and `tip-anchor`.
        A pill appears above the element on hover/focus, after a short delay
@@ -3756,45 +3760,93 @@ const inputWrap = input.closest(".input-wrap");
 const voiceToggle = document.getElementById("voice-toggle");
 const voiceToggleInput = document.getElementById("voice-toggle-input");
 
-// --- "Attention" glow on an unanswered Aime message ------------------------
-// An Aime message that Aime spoke *last* (the user hasn't replied) breathes a
-// rainbow halo once it's either lingered a few minutes or the user starts a
-// reply — drawing the eye back to a message they may have missed. Only one is
-// ever flagged; it clears when they respond or a newer Aime message lands.
-let attentionMsg = null;
-let attentionTimer = null;
-const ATTENTION_DELAY_MS = 150000;   // ~2.5 min on screen → start glowing
+// --- Seen / unread tracking ------------------------------------------------
+// Every Aime message's left rainbow bar is vivid while the message is new and
+// settles to a calm dim once the user has actually seen it — scrolled into view
+// with the tab focused. Proactive messages (ones Aime pushed out of band) also
+// carry a "New" pill and sit beneath a "New" divider until the user has had a
+// moment with them. No blur, no breathing: the rainbow stays crisp throughout.
+const READ_DWELL_MS = 4000;   // an unread proactive msg in view this long = read
 
-function clearAimeAttention() {
-  if (attentionTimer) { clearTimeout(attentionTimer); attentionTimer = null; }
-  if (attentionMsg) { attentionMsg.classList.remove("attention"); attentionMsg = null; }
+// Observe against the chat scroller (#log), not the page, so "in view" means
+// "actually scrolled to" within the thread.
+const seenObserver = new IntersectionObserver((entries) => {
+  for (const e of entries) {
+    e.target._inView = e.isIntersecting;
+    // Left the viewport before the read-dwell elapsed — cancel its timer.
+    if (!e.isIntersecting && e.target._readTimer) {
+      clearTimeout(e.target._readTimer); e.target._readTimer = null;
+    }
+  }
+  flushSeen();
+}, { root: log, threshold: 0.55 });
+
+function observeForSeen(node) {
+  if (node && !node._seenTracked) { node._seenTracked = true; seenObserver.observe(node); }
 }
 
-// Re-evaluate which message (if any) is the attention candidate: the latest
-// message, but only when Aime spoke last (an unanswered reply). Resets the
-// linger timer for a fresh candidate; the glow itself is applied on timeout or
-// when the user starts typing (flagAimeAttentionNow).
-function armAimeAttention() {
-  const msgs = logInner.querySelectorAll(".msg.aime, .msg.user");
-  const last = msgs.length ? msgs[msgs.length - 1] : null;
-  const candidate = (last && last.classList.contains("aime")) ? last : null;
-  if (candidate === attentionMsg) return;   // unchanged — keep its timer running
-  clearAimeAttention();
-  if (!candidate) return;
-  attentionMsg = candidate;
-  attentionTimer = setTimeout(() => {
-    if (attentionMsg) attentionMsg.classList.add("attention");
-  }, ATTENTION_DELAY_MS);
+// Dim the bar of anything in view (mark `.seen`), and arm the read-dwell for
+// unread proactive messages. Skipped while the tab is hidden and re-run on
+// visibilitychange, so a message that arrived in the background is only counted
+// as read once the user is genuinely looking at it.
+function flushSeen() {
+  if (document.visibilityState !== "visible") return;
+  logInner.querySelectorAll(".msg.aime").forEach((node) => {
+    if (!node._inView) return;
+    node.classList.add("seen");
+    if (node.classList.contains("unread")) {
+      if (!node._readTimer) {
+        node._readTimer = setTimeout(() => {
+          node._readTimer = null; markProactiveRead(node);
+        }, READ_DWELL_MS);
+      }
+    } else if (node._seenTracked) {
+      seenObserver.unobserve(node); node._seenTracked = false;
+    }
+  });
 }
 
-// The user started composing a reply → highlight what they're answering now,
-// without waiting out the linger timer.
-function flagAimeAttentionNow() {
-  if (attentionMsg) attentionMsg.classList.add("attention");
+// Drop a proactive message's "new" state (pill + its claim on the divider).
+function markProactiveRead(node) {
+  if (!node.classList.contains("unread")) return;
+  node.classList.remove("unread");
+  if (node._readTimer) { clearTimeout(node._readTimer); node._readTimer = null; }
+  if (node._seenTracked && node.classList.contains("seen")) {
+    seenObserver.unobserve(node); node._seenTracked = false;
+  }
+  updateNewDivider();
 }
+
+// The user engaged (started a reply) — every pending "New" marker clears at once.
+function clearAllUnread() {
+  logInner.querySelectorAll(".msg.aime.unread").forEach(markProactiveRead);
+}
+
+// A single "New" divider, repositioned just above the earliest still-unread
+// proactive message; removed entirely once nothing is unread.
+let newDivider = null;
+function updateNewDivider() {
+  const firstUnread = logInner.querySelector(".msg.aime.unread");
+  if (!firstUnread) {
+    if (newDivider) { newDivider.remove(); newDivider = null; }
+    return;
+  }
+  if (!newDivider) {
+    newDivider = document.createElement("div");
+    newDivider.className = "new-divider";
+    const s = document.createElement("span");
+    s.textContent = "New";
+    newDivider.appendChild(s);
+  }
+  if (firstUnread.previousElementSibling !== newDivider) {
+    logInner.insertBefore(newDivider, firstUnread);
+  }
+}
+
+document.addEventListener("visibilitychange", flushSeen);
 
 input.addEventListener("input", () => {
-  if (input.value) flagAimeAttentionNow();
+  if (input.value) clearAllUnread();
 });
 
 // Voice mode is enabled by the dedicated toggle in the composer toolbar.
@@ -4550,6 +4602,7 @@ function buildHistoryNode(ev) {
   }
   if (ev.kind === "assistant_html") {
     const node = makeMessageNode("aime", "aime", "");
+    node.classList.add("seen");   // paged-in history is already-read: dim bar
     node._content.innerHTML = ev.text || "";
     resolveGraphicTags(node._content);
     return node;
@@ -5707,7 +5760,10 @@ function clearTranscriptView() {
   typewriter.bubble = null;
   typewriter.rafId = null;
   resetHistoryState();
-  clearAimeAttention();
+  // The transcript was just wiped — drop the divider handle and stop observing
+  // the now-detached message nodes (fresh nodes re-observe as they're built).
+  newDivider = null;
+  seenObserver.disconnect();
 }
 
 // The browser's EventSource silently auto-reconnects after a *clean* drop
@@ -5832,8 +5888,8 @@ function onStreamMessage(e) {
       const row = renderAttachmentRow(attachments);
       if (row) msg.insertBefore(row, msg._content);
       if (!cleanedText && attachments.length) msg.classList.add("no-text");
-      // The user has replied — the prior Aime message is answered; drop its glow.
-      clearAimeAttention();
+      // The user has replied — they've clearly engaged; clear any "New" markers.
+      clearAllUnread();
       // Only a *live* user message starts a turn. Replayed history (loading
       // or switching conversations) must not flip the busy gate — otherwise
       // the first message in the loaded conversation gets held as a queued
@@ -5922,10 +5978,10 @@ function onStreamMessage(e) {
       pendingHtmlTarget = null;
       currentAssistant = null;
       scrollToBottom();
-      // Aime spoke (a live reply or an inline proactive message) — this becomes
-      // the unanswered message we may glow. Replayed history doesn't re-arm here;
-      // history_done does that once for the resumed thread.
-      if (!e.from_replay) armAimeAttention();
+      // Bar recency: a live reply settles vivid→dim once it's been seen.
+      // Replayed history is already-read, so it starts dim.
+      if (e.from_replay) target.classList.add("seen");
+      else observeForSeen(target);
       break;
     }
     case "proactive_message": {
@@ -5936,10 +5992,19 @@ function onStreamMessage(e) {
       // that guarantees pipeline messages always appear in the chat.
       clearThinking();
       const bubble = appendMessage("aime", "aime", "");
+      bubble.classList.add("proactive");
       bubble._content.innerHTML = e.text || "";
       resolveGraphicTags(bubble._content);
       scrollToBottom();
-      if (!e.from_replay) armAimeAttention();
+      if (e.from_replay) {
+        bubble.classList.add("seen");   // already-read history
+      } else {
+        // Out of band and unseen: flag it "New" (pill + divider) until the user
+        // has had a moment with it, and track it for the bar's seen-settle.
+        bubble.classList.add("unread");
+        observeForSeen(bubble);
+        updateNewDivider();
+      }
       break;
     }
     case "history_done":
@@ -5956,9 +6021,6 @@ function onStreamMessage(e) {
       // pinned) so within-day scroll-back is reachable on a short conversation.
       jumpToBottom();
       requestAnimationFrame(maybeFillViewport);
-      // A returning user: if Aime spoke last, arm the attention glow so a missed
-      // message draws the eye after it lingers (or the moment they start typing).
-      armAimeAttention();
       // Refresh the History pane if it's open (a new day may have appeared).
       if (typeof activePaneName !== "undefined" && activePaneName === "chats") {
         loadDays(true);
