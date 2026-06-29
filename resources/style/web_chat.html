@@ -361,12 +361,19 @@
     }
     .msg .who { display: none; }
     .msg.aime, .msg.notice { padding-left: 1.25rem; position: relative; }
-    /* Every Aime message carries its own left rainbow bar — including back-to-back
-       bubbles, so a burst of replies (or pushed messages) reads as distinct turns
-       rather than one wall of text. */
+    /* Each Aime message is a full-width card on a subtle grey wash — so it's clear
+       where a message starts and ends — flush-left against its own rainbow spine
+       and rounded on the right. Back-to-back bubbles each get their own card, so a
+       burst of replies (or pushed messages) reads as distinct turns. */
+    .msg.aime {
+      background: rgba(128, 128, 128, 0.06);
+      border-radius: 0 10px 10px 0;
+      padding: 0.55rem 1rem 0.55rem 1.1rem;
+    }
+    /* The rainbow spine: the message's left edge, full text height. */
     .msg.aime::before {
-      content: ""; position: absolute; left: 0; top: 0.3rem; bottom: 0.3rem;
-      width: 3px; border-radius: 2px;
+      content: ""; position: absolute; left: 0; top: 0; bottom: 0;
+      width: 3px; border-radius: 0;
       background: var(--rainbow-v,
         linear-gradient(180deg, var(--accent) 0%, var(--accent-hover) 100%));
       /* Recency: the bar is vivid while the message is new, then settles to a
@@ -637,37 +644,37 @@
       100% { opacity: 0;    transform: scale(2); }
     }
 
-    /* (E) "New" markers for messages Aime pushed out of band (reminders, agent
-       notifications, SendMessage) that the user hasn't had a moment with yet.
-       Two crisp, on-brand cues — no blur, no breathing:
-         · a "New" divider rule (the pastel rainbow, hard stops) marking where
-           the unread run begins, and
-         · a small "New" pill on each unread proactive message.
-       Both clear once the message has been seen (`.unread` is dropped by JS). */
+    /* (E) The "New" divider — a pastel-rainbow rule (hard stops, no blur) marking
+       where messages Aime pushed out of band begin, with a quiet grey label. The
+       two halves grow outward from the centre when it appears and retract back to
+       the centre when it leaves (JS adds `.closing` and removes on animationend).
+       Cleared once the unread run has been seen (`.unread` dropped by JS). */
     .new-divider { display: flex; align-items: center; gap: 0.6rem;
-                   margin: 0.5rem 0 0.1rem; color: var(--cta, var(--accent));
+                   margin: 0.5rem 0 0.1rem; color: var(--muted);
                    font-size: 0.7rem; font-weight: 700; letter-spacing: 0.08em;
                    text-transform: uppercase; }
     .new-divider::before, .new-divider::after {
                    content: ""; flex: 1; height: 2px; border-radius: 2px;
                    background: var(--rainbow, var(--accent)); opacity: 0.85; }
+    .new-divider::before { transform-origin: right center; }
+    .new-divider::after  { transform-origin: left center; }
+    .new-divider:not(.closing)::before,
+    .new-divider:not(.closing)::after {
+                   animation: nd-expand 0.42s cubic-bezier(0.22,0.85,0.3,1) both; }
+    .new-divider:not(.closing) span { animation: nd-label-in 0.42s ease both; }
+    .new-divider.closing::before, .new-divider.closing::after {
+                   animation: nd-retract 0.32s ease-in both; }
+    .new-divider.closing span { animation: nd-label-out 0.28s ease both; }
     .new-divider span { white-space: nowrap; }
-
-    /* The pill sits above the text (the message gets a little headroom while
-       unread), anchored just right of the rainbow bar. */
-    .msg.aime.proactive.unread { padding-top: 1.45rem; }
-    .msg.aime.proactive.unread::after {
-      content: "New"; position: absolute; top: 0; left: 1.25rem;
-      font-size: 0.62rem; font-weight: 700; letter-spacing: 0.07em;
-      text-transform: uppercase; color: var(--cta, var(--accent));
-      padding: 0.12rem 0.5rem 0.16rem; border-radius: 999px;
-      background: var(--bg-elev); border: 1px solid var(--border);
-      box-shadow: var(--shadow-1, 0 1px 3px rgba(0,0,0,0.18));
-    }
+    @keyframes nd-expand    { from { transform: scaleX(0); } to { transform: scaleX(1); } }
+    @keyframes nd-retract   { from { transform: scaleX(1); } to { transform: scaleX(0); } }
+    @keyframes nd-label-in  { from { opacity: 0; } to { opacity: 1; } }
+    @keyframes nd-label-out { from { opacity: 1; } to { opacity: 0; } }
 
     @media (prefers-reduced-motion: reduce) {
       form.sent::after, .msg.aime.fresh::before, .msg.user.fresh::before,
       .composer-toggle.stt-pulse .composer-toggle-track,
+      .new-divider::before, .new-divider::after, .new-divider span,
       .attach-btn.burst::after { animation: none; }
     }
     /* Small CSS-only tooltip: anchor with `data-tip="..."` and `tip-anchor`.
@@ -3764,8 +3771,8 @@ const voiceToggleInput = document.getElementById("voice-toggle-input");
 // Every Aime message's left rainbow bar is vivid while the message is new and
 // settles to a calm dim once the user has actually seen it — scrolled into view
 // with the tab focused. Proactive messages (ones Aime pushed out of band) also
-// carry a "New" pill and sit beneath a "New" divider until the user has had a
-// moment with them. No blur, no breathing: the rainbow stays crisp throughout.
+// sit beneath a "New" divider until the user has had a moment with them.
+// No blur, no breathing: the rainbow stays crisp throughout.
 const READ_DWELL_MS = 4000;   // an unread proactive msg in view this long = read
 
 // Observe against the chat scroller (#log), not the page, so "in view" means
@@ -3828,7 +3835,18 @@ let newDivider = null;
 function updateNewDivider() {
   const firstUnread = logInner.querySelector(".msg.aime.unread");
   if (!firstUnread) {
-    if (newDivider) { newDivider.remove(); newDivider = null; }
+    // Nothing unread left — retract the rule back to its centre, then drop it.
+    if (newDivider && !newDivider.classList.contains("closing")) {
+      const d = newDivider;
+      d.classList.add("closing");
+      const done = () => {
+        if (!d.classList.contains("closing")) return;   // revived mid-retract
+        d.remove();
+        if (newDivider === d) newDivider = null;
+      };
+      d.addEventListener("animationend", done, { once: true });
+      setTimeout(done, 600);   // fallback (reduced-motion: no animationend fires)
+    }
     return;
   }
   if (!newDivider) {
@@ -3837,6 +3855,8 @@ function updateNewDivider() {
     const s = document.createElement("span");
     s.textContent = "New";
     newDivider.appendChild(s);
+  } else {
+    newDivider.classList.remove("closing");   // a new unread arrived mid-retract
   }
   if (firstUnread.previousElementSibling !== newDivider) {
     logInner.insertBefore(newDivider, firstUnread);
