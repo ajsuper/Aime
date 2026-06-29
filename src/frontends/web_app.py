@@ -3925,11 +3925,12 @@ def _record_proactive_in_user_thread(user_id: int, text: str) -> None:
             # clobber a direct file write). Don't also write to disk.
             return
         # No live session for this user, OR they're in a Temporary Chat: persist
-        # into the main session file directly so the message threads into the main
-        # conversation, present on next load / on exiting temp mode.
+        # into *today's* session file directly so the message threads into Today,
+        # present on next load / on exiting temp mode.
         from provider_backend import append_proactive_message_offline
         append_proactive_message_offline(
             _conversations_dir(user_id), _auth_backend.get_dek(user_id), body,
+            _user_tz(user_id),
         )
         # If they're sitting in a temporary chat, let them know a message landed
         # in their main thread (the phone already got it too).

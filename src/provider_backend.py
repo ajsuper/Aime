@@ -346,16 +346,18 @@ def read_session_messages(
 
 
 def append_proactive_message_offline(
-    conversations_dir: str, dek: bytes, text: str,
+    conversations_dir: str, dek: bytes, text: str, tz_name: str = "",
 ) -> bool:
-    """Append an out-of-band assistant message to a user's most recent persisted
-    session *without* a live backend in memory — used when the user is offline so
-    a scheduler reminder still threads into their conversation and is visible the
-    next time they open it. Mirrors ``append_assistant_message`` /
-    ``_persist`` exactly (same hidden-trigger guard, same encryption + atomic
-    write, AAD = session id) so the live and offline paths produce identical
-    files. Creates a fresh session to hold the message if the user has none.
-    Returns True if written.
+    """Append an out-of-band assistant message to a user's *current-day* session
+    *without* a live backend in memory — used when the user is offline so a
+    scheduler reminder still threads into their conversation and is visible the
+    next time they open Today. Mirrors ``append_assistant_message`` / ``_persist``
+    exactly (same hidden-trigger guard, same encryption + atomic write, AAD =
+    session id) so the live and offline paths produce identical files.
+
+    Targets today's session (in the user's ``tz_name``) so the message lands in
+    Today, not a past day's bucket — creating a fresh today session if the most
+    recent one is from a previous day (or there are none). Returns True if written.
 
     Best-effort: the caller uses this only when no in-memory session is loaded,
     so there is no live writer to race; a decrypt/parse failure on any one file
@@ -363,6 +365,24 @@ def append_proactive_message_offline(
     body = (text or "").strip()
     if not body:
         return False
+    tz = None
+    if tz_name:
+        try:
+            tz = zoneinfo.ZoneInfo(tz_name)
+        except Exception:
+            tz = None
+    today = (datetime.datetime.now(tz) if tz else datetime.datetime.now()).date()
+
+    def _session_day(session_id: str):
+        iso = session_started_at(session_id)
+        if not iso:
+            return None
+        try:
+            dt = datetime.datetime.fromisoformat(iso)
+        except ValueError:
+            return None
+        return (dt.astimezone(tz) if tz else dt.astimezone()).date()
+
     try:
         names = [
             n for n in os.listdir(conversations_dir) if n.endswith(_CONV_SUFFIX)
@@ -386,6 +406,11 @@ def append_proactive_message_offline(
             best_saved = saved
             target_id = data.get("id") or session_id
             target_data = data
+    # Only append to the latest session if it's *today's* — otherwise the message
+    # would land in a past day. Start a fresh today session instead.
+    if target_id is not None and _session_day(target_id) != today:
+        target_id = None
+        target_data = None
     if target_id is None or target_data is None:
         stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         target_id = f"msgs-{stamp}-" + hashlib.sha1(os.urandom(8)).hexdigest()[:8]

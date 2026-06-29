@@ -121,30 +121,43 @@ def test_offline_append_creates_session_when_none(tmp_path, dek):
     assert data["messages"][-1]["content"][0]["text"] == "Hello there"
 
 
-def test_offline_append_targets_latest_session(tmp_path, dek):
-    # Two sessions; the proactive message must land in the newer one.
-    older = {"id": "msgs-20200101-000000-aaaaaaaa", "summary": "old",
-             "saved_at": "2020-01-01T00:00:00",
-             "messages": [{"role": "user", "content": [{"type": "text", "text": "old"}]}]}
-    newer = {"id": "msgs-20260101-000000-bbbbbbbb", "summary": "new",
-             "saved_at": "2026-01-01T00:00:00",
-             "messages": [{"role": "user", "content": [{"type": "text", "text": "new"}]},
-                          {"role": "assistant", "content": [{"type": "text", "text": "ok"}]}]}
-    for data in (older, newer):
-        sid = data["id"]
-        blob = _enc.encrypt_blob(dek, json.dumps(data).encode("utf-8"), aad=sid.encode("utf-8"))
-        with open(os.path.join(tmp_path, f"{sid}.json.enc"), "wb") as f:
-            f.write(blob)
+def _write_raw_session(tmp_path, dek, sid, data):
+    blob = _enc.encrypt_blob(dek, json.dumps(data).encode("utf-8"), aad=sid.encode("utf-8"))
+    with open(os.path.join(tmp_path, f"{sid}.json.enc"), "wb") as f:
+        f.write(blob)
 
-    append_proactive_message_offline(str(tmp_path), dek, "Newer note")
 
-    newer_data = _decrypt_session(
-        os.path.join(tmp_path, f"{newer['id']}.json.enc"), dek, newer["id"])
-    older_data = _decrypt_session(
-        os.path.join(tmp_path, f"{older['id']}.json.enc"), dek, older["id"])
-    # Newer gained a trigger + assistant turn; older is untouched.
-    assert newer_data["messages"][-1]["content"][0]["text"] == "Newer note"
-    assert len(older_data["messages"]) == 1
+def test_offline_append_targets_todays_session(tmp_path, dek):
+    import datetime
+    today_id = "msgs-" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S") + "-cccccccc"
+    _write_raw_session(tmp_path, dek, today_id, {
+        "id": today_id, "summary": "today", "saved_at": "2020-01-01T00:00:00",
+        "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]},
+                     {"role": "assistant", "content": [{"type": "text", "text": "yo"}]}],
+    })
+    append_proactive_message_offline(str(tmp_path), dek, "Reminder!")
+    data = _decrypt_session(os.path.join(tmp_path, f"{today_id}.json.enc"), dek, today_id)
+    assert data["messages"][-1]["content"][0]["text"] == "Reminder!"
+
+
+def test_offline_append_starts_fresh_when_latest_is_past_day(tmp_path, dek):
+    # The most recent session is from a past day → the message must NOT land
+    # there (it would hide in a past-day bucket); a fresh today session is made.
+    past_id = "msgs-20200101-000000-aaaaaaaa"
+    _write_raw_session(tmp_path, dek, past_id, {
+        "id": past_id, "summary": "old", "saved_at": "2020-01-01T00:00:00",
+        "messages": [{"role": "user", "content": [{"type": "text", "text": "old"}]}],
+    })
+    append_proactive_message_offline(str(tmp_path), dek, "Today's reminder")
+
+    past = _decrypt_session(os.path.join(tmp_path, f"{past_id}.json.enc"), dek, past_id)
+    assert len(past["messages"]) == 1          # past day untouched
+    files = [n for n in os.listdir(tmp_path) if n.endswith(".json.enc")]
+    assert len(files) == 2                      # a new today session was created
+    new_file = next(n for n in files if not n.startswith(past_id))
+    sid = new_file[: -len(".json.enc")]
+    data = _decrypt_session(os.path.join(tmp_path, new_file), dek, sid)
+    assert data["messages"][-1]["content"][0]["text"] == "Today's reminder"
 
 
 # --- replay hides the hidden trigger turn ---------------------------------
