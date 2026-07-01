@@ -353,6 +353,24 @@ def test_deliver_inline_proactive_when_idle_records_now():
     assert backend.appended == ["Heads up: 6pm"]
 
 
+def test_deliver_inline_proactive_rolls_stale_day_into_today(monkeypatch):
+    # An out-of-band task/reminder arriving against a live session still holding a
+    # *previous day's* thread must roll onto a fresh Today first — otherwise it
+    # would thread into yesterday and be stranded in History when the user next
+    # opens a fresh Today. (The bug: agent/task messages "went nowhere" when there
+    # was no conversation for today.)
+    monkeypatch.setattr(controller_mod, "IDLE_ROLLOVER_SECONDS", 3600)
+    monkeypatch.setattr(controller_mod, "DAY_ROLL_MIN_GAP_SECONDS", 1800)
+    c, backend, events = _controller(messages=[{"role": "user", "content": []}])
+    c._last_activity = time.time() - 2 * 86400   # yesterday's thread, real gap
+    assert c.deliver_inline_proactive("Your morning briefing is ready.") is True
+    assert backend.reset_calls == 1                       # rolled to fresh Today
+    assert "session_restart" in _kinds(events)            # view cleared to Today
+    # The message landed in the fresh session, not the stale one.
+    assert backend.appended == ["Your morning briefing is ready."]
+    assert any(e.kind == "proactive_message" for e in events)
+
+
 def test_deliver_inline_proactive_when_busy_defers_to_turn_end():
     c, backend, events = _controller()
     c.dispatch_input("hold on")          # claims the turn (busy)

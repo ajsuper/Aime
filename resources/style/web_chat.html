@@ -473,13 +473,6 @@
     @media (prefers-reduced-motion: reduce) {
       .thinking-dots span { animation: none; opacity: 0.6; }
     }
-    /* The "loaded conversation" line: centered, no bullet dot, and fades out
-       once the user sends a message so the transcript reads as one
-       continuous conversation. */
-    .msg.notice.loaded { text-align: center; padding-left: 0;
-                         transition: opacity 0.45s ease; }
-    .msg.notice.loaded::before { display: none; }
-    .msg.notice.loaded.fading { opacity: 0; }
     /* Session divider — a subtle centered rule that labels the session beneath
        it, so the continuous thread still shows where one backend session ends and
        the next begins (a cue that the model doesn't carry everything above it). */
@@ -2669,7 +2662,7 @@
         </svg>
       </button>
       <button class="rail-btn pane-btn" data-target="agents"
-              title="Agents" aria-label="Agents">
+              title="Tasks" aria-label="Tasks">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
              stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <rect x="4" y="8" width="16" height="12" rx="2"/>
@@ -2800,10 +2793,10 @@
            per-user. -->
       <div class="pane" data-pane="agents">
         <div class="agents-toolbar">
-          <button id="agent-new-btn" class="primary">+ New agent</button>
+          <button id="agent-new-btn" class="primary">+ New task</button>
         </div>
         <div class="scroll" id="agents-pane-scroll">
-          <div class="side-section-head">Your agents</div>
+          <div class="side-section-head">Your tasks</div>
           <div id="saved-agents-list">
             <div class="empty">loading…</div>
           </div>
@@ -3084,7 +3077,7 @@
        aria-modal="true" aria-labelledby="agent-run-title" hidden>
     <div id="agent-run-modal" class="modal-card">
       <div class="modal-head">
-        <span class="title" id="agent-run-title">Agent run</span>
+        <span class="title" id="agent-run-title">Task run</span>
         <button class="modal-close" id="agent-run-close" title="Close"
                 aria-label="Close">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
@@ -3102,7 +3095,7 @@
        aria-modal="true" aria-labelledby="agent-edit-title" hidden>
     <div id="agent-edit-modal" class="modal-card">
       <div class="modal-head">
-        <span class="title" id="agent-edit-title">New agent</span>
+        <span class="title" id="agent-edit-title">New task</span>
         <button class="modal-close" id="agent-edit-close" title="Close"
                 aria-label="Close">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
@@ -3117,10 +3110,10 @@
                placeholder="e.g. Weekly calendar audit">
         <label class="agents-label" for="agent-desc">Description <span class="agents-optional">(optional)</span></label>
         <input id="agent-desc" type="text" spellcheck="false" maxlength="160"
-               placeholder="A short note about what this agent does">
+               placeholder="A short note about what this task does">
         <label class="agents-label" for="agent-edit-instructions">Instructions</label>
         <textarea id="agent-edit-instructions" rows="6" spellcheck="false"
-                  placeholder="Describe the task for the agent to carry out against your data…"></textarea>
+                  placeholder="Describe what you'd like Aime to do against your data…"></textarea>
         <label class="agents-label">Permissions</label>
         <div class="agent-perms">
           <label class="sched-switch">
@@ -3145,14 +3138,14 @@
           </label>
         </div>
         <p class="agents-hint" id="agent-perm-send-message-hint">
-          To actually get a message, tell the agent in its instructions to send
+          To actually get a message, tell Aime in the instructions to send
           you one — this permission only lets it.
         </p>
         <label class="agents-label">Schedule</label>
         <label class="sched-switch">
           <input type="checkbox" id="agent-sched-enabled">
           <span class="sched-slider"></span>
-          <span class="sched-switch-label">Run this agent automatically</span>
+          <span class="sched-switch-label">Run this task automatically</span>
         </label>
         <div id="agent-sched-config" class="sched-config" hidden>
           <div class="seg" id="agent-sched-freq" role="group" aria-label="Frequency">
@@ -3176,7 +3169,7 @@
         <p class="agents-hint error" id="agent-edit-hint" hidden></p>
         <div class="agent-edit-actions">
           <button id="agent-edit-cancel" class="ghost">Cancel</button>
-          <button id="agent-edit-save" class="primary">Save agent</button>
+          <button id="agent-edit-save" class="primary">Save task</button>
         </div>
       </div>
     </div>
@@ -5593,10 +5586,8 @@ function appendToolNotice(summaryText, severity, detailText) {
   return det;
 }
 
-// The "Loaded conversation…" line and the new-conversation welcome splash —
-// kept so both can be faded out the moment the user sends a message (see the
-// user_message_shown handler).
-let loadedNotice = null;
+// The new-conversation welcome splash — kept so it can be faded out the moment
+// the user sends a message (see the user_message_shown handler).
 let newSessionSplash = null;
 
 // Build the centered Aime-logo welcome shown when a new conversation starts.
@@ -5822,7 +5813,6 @@ function clearTranscriptView() {
   logInner.innerHTML = "";
   workingIndicator = null;
   thinkingIndicator = null;
-  loadedNotice = null;
   newSessionSplash = null;
   currentAssistant = null;
   pendingHtmlTarget = null;
@@ -6001,16 +5991,14 @@ function onStreamMessage(e) {
       // draft instead of being sent.
       if (!e.from_replay) {
         chat.beginTurn();
-        // Fade out the "Loaded conversation…" line / new-conversation splash
-        // — once the user has sent a message the transcript should read as
-        // one continuous chat.
-        for (const el of [loadedNotice, newSessionSplash]) {
-          if (!el) continue;
+        // Fade out the new-conversation welcome splash once the user has sent a
+        // message — the transcript should then read as one continuous chat.
+        if (newSessionSplash) {
+          const el = newSessionSplash;
           el.classList.add("fading");
           el.addEventListener("transitionend", () => el.remove(), {once: true});
           setTimeout(() => el.remove(), 700);  // fallback if no transition
         }
-        loadedNotice = null;
         newSessionSplash = null;
         // Snap to the message even if the user had scrolled up.
         scrollToBottom(true);
@@ -6298,12 +6286,6 @@ function onStreamMessage(e) {
       }
       if (e.severity === "temporary_end") {
         setTempMode(false);
-        break;
-      }
-      // The "Loaded conversation…" line — centered, and tracked so it can
-      // fade out once the user sends their first message.
-      if (e.severity === "loaded") {
-        loadedNotice = appendNotice(e.text, "loaded");
         break;
       }
       // New conversation: a centered Aime-logo welcome splash instead of a
@@ -7027,7 +7009,7 @@ window.addEventListener("paste", (e) => {
 const sideColEl = document.getElementById("side-col");
 const sideTitleEl = document.getElementById("side-title");
 const PANE_TITLES = { chats: "History", calendar: "Calendar",
-                      topics: "Topics", agents: "Agents" };
+                      topics: "Topics", agents: "Tasks" };
 let activePaneName = null;
 
 document.querySelectorAll(".pane-btn").forEach(btn => {
@@ -7408,7 +7390,7 @@ function renderSavedAgents(agents) {
   savedAgentsListEl.innerHTML = "";
   if (!agents.length) {
     savedAgentsListEl.innerHTML =
-      '<div class="empty">No agents yet — create one to get started.</div>';
+      '<div class="empty">No tasks yet — create one to get started.</div>';
     return;
   }
   agents.forEach(a => savedAgentsListEl.appendChild(buildAgentCard(a)));
@@ -7431,7 +7413,7 @@ function buildActiveRunItem(active) {
   item.className = "session-item agent-run-item is-active";
   const summary = document.createElement("div");
   summary.className = "summary";
-  summary.textContent = active.agent_name || "agent";
+  summary.textContent = active.agent_name || "task";
   const badge = document.createElement("span");
   badge.className = "agent-status running";
   badge.innerHTML = '<span class="run-spinner"></span>running';
@@ -7578,16 +7560,16 @@ async function runSavedAgent(agent, btn) {
     if (!data.ok) throw new Error(data.message || data.error || "failed to start");
     loadAgentsPane(true);  // pull in the running state right away
   } catch (e) {
-    alert("Couldn't run this agent — " + (e.message || e));
+    alert("Couldn't run this task — " + (e.message || e));
     if (btn) { btn.disabled = false; btn.textContent = "Run"; }
   }
 }
 
 function deleteSavedAgent(agent) {
   confirmAction({
-    title: "Delete agent",
+    title: "Delete task",
     message: "Delete “" + (agent.name || agent.agent_id) + "”? Its past run "
-           + "records are kept; only the saved agent is removed.",
+           + "records are kept; only the saved task is removed.",
     confirmLabel: "Delete",
     onConfirm: async () => {
       try {
@@ -7732,7 +7714,7 @@ agentSchedFreqEl.querySelectorAll("button").forEach(b =>
 
 function openAgentEditor(agent) {
   editingAgentId = agent ? agent.agent_id : null;
-  agentEditTitle.textContent = agent ? "Edit agent" : "New agent";
+  agentEditTitle.textContent = agent ? "Edit task" : "New task";
   agentNameEl.value = agent ? (agent.name || "") : "";
   agentDescEl.value = agent ? (agent.description || "") : "";
   agentEditInstructionsEl.value = agent ? (agent.instructions || "") : "";
@@ -7760,7 +7742,7 @@ function setAgentEditHint(text) {
 async function saveAgentEditor() {
   const name = agentNameEl.value.trim();
   const instructions = agentEditInstructionsEl.value.trim();
-  if (!name) { setAgentEditHint("Give your agent a name."); agentNameEl.focus(); return; }
+  if (!name) { setAgentEditHint("Give your task a name."); agentNameEl.focus(); return; }
   if (!instructions) {
     setAgentEditHint("Add instructions describing the task.");
     agentEditInstructionsEl.focus();
@@ -8967,7 +8949,7 @@ function agentMarkdown(text) {
 }
 
 async function openAgentRun(runId) {
-  agentRunTitle.textContent = "Agent run";
+  agentRunTitle.textContent = "Task run";
   agentRunBody.innerHTML = '<div class="empty">loading…</div>';
   agentRunBackdrop.hidden = false;
   try {
@@ -8985,7 +8967,7 @@ async function openAgentRun(runId) {
 }
 
 function renderAgentRun(run) {
-  agentRunTitle.textContent = run.agent_name || "Agent run";
+  agentRunTitle.textContent = run.agent_name || "Task run";
   agentRunBody.innerHTML = "";
 
   // Meta line: status badge + timing + turn count.

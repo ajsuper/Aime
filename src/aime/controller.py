@@ -133,7 +133,7 @@ CoreEventKind = Literal[
 
 
 Severity = Literal[
-    "info", "warning", "error", "success", "recovery", "loaded", "new_session",
+    "info", "warning", "error", "success", "recovery", "new_session",
     # Signal-only severities (no visible banner): tell the frontend that the
     # first-run onboarding flow has started / finished so it can show or hide
     # onboarding-only affordances like the empty-state upload nudge.
@@ -782,7 +782,7 @@ class ConversationController:
             if restored:
                 # Replays the main thread silently and spawns the worker.
                 self.seed_last_activity(self._saved_at_for(main_id))
-                self._load_after_swap(main_id, announce=False)
+                self._load_after_swap(main_id)
             elif not self.resume_latest_session():
                 # No main thread to restore (it was empty/unsaved): land on a
                 # fresh, normal session.
@@ -879,8 +879,17 @@ class ConversationController:
             )
             if not (idle_rolled or day_rolled):
                 return
-            if not self._backend.messages_snapshot():
-                return  # already on a fresh/empty session
+            sid = getattr(self._backend, "session_id", None)
+            if not self._backend.messages_snapshot() and (
+                sid is None or self._is_today(sid)
+            ):
+                # Already on a fresh/empty session dated Today — nothing to roll.
+                # But an *empty yet stale* session (its id minted on a prior day,
+                # left unused across midnight) still rolls: its fresh id re-stamps
+                # to Today, so the next write — a typed message, or an out-of-band
+                # task/reminder — persists under a Today id instead of being
+                # stranded in yesterday's bucket / History.
+                return
             self._swap_to_fresh_session()
             self._spawn_worker(self.run_stream_loop)
             if day_rolled:
@@ -915,7 +924,7 @@ class ConversationController:
                 return
             self._load_after_swap(session_id)
 
-    def _load_after_swap(self, session_id: str, *, announce: bool = True) -> None:
+    def _load_after_swap(self, session_id: str) -> None:
         self._reset_internal_state()
         self._emit(CoreEvent(kind="session_restart", restart_reason="load"))
         # Label the session at the top of the view (the scroll-back anchor): its
@@ -932,29 +941,9 @@ class ConversationController:
         from .replay import replay_messages
         for event in replay_messages(self._backend.messages_snapshot()):
             self._emit(event)
-        # A startup resume (announce=False) is silent: the thread just continues
-        # where it left off, no centered "Loaded conversation" banner — that's a
-        # switching affordance, and there's no longer a switcher.
-        if announce:
-            title = ""
-            for info in self._backend.list_sessions():
-                if info.id == session_id:
-                    title = (info.summary or "").strip()
-                    break
-            if title:
-                preview = title if len(title) <= 40 else title[:40].rstrip() + "..."
-                loaded_text = (
-                    f'Loaded conversation "{preview}". Continue where you left off.'
-                )
-            else:
-                loaded_text = "Loaded conversation. Continue where you left off."
-            # "loaded" severity (not "success") so the frontend can center it and
-            # fade it away once the user sends a message — see web_chat.html.
-            self._emit(CoreEvent(
-                kind="notice",
-                severity="loaded",
-                text=loaded_text,
-            ))
+        # No "Loaded conversation… continue where you left off" banner: the thread
+        # just continues silently. That line was a switching affordance, and
+        # there's no longer a switcher — the chat is one continuous conversation.
         self._spawn_worker(self.run_stream_loop)
 
     def resume_latest_session(self) -> bool:
@@ -982,7 +971,7 @@ class ConversationController:
             except (OSError, ValueError):
                 return False
             self.seed_last_activity(latest.saved_at)
-            self._load_after_swap(latest.id, announce=False)
+            self._load_after_swap(latest.id)
             return True
 
     def _is_today(self, session_id: str) -> bool:
@@ -1239,6 +1228,13 @@ class ConversationController:
         # reminder never lands in (or vanishes with) the throwaway chat.
         if self._temporary:
             return False
+        # Land the message in *Today*. A long-lived context can still be holding a
+        # previous day's session in memory (nothing pokes a rollover while the user
+        # is away), so without this an overnight task/reminder would thread into
+        # yesterday's session and be stranded in History when the user next opens a
+        # fresh Today. Rolling first — exactly as a returning client would — puts it
+        # on a fresh Today (creating one if needed) so it's actually visible.
+        self._maybe_roll_session()
         with self._state_lock:
             if not self._is_idle:
                 self._pending_proactive.append(body)
