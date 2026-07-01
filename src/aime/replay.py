@@ -42,10 +42,16 @@ def _strip_hidden_prefix(text: str) -> str:
 
 
 def replay_messages(messages: list[dict]) -> Iterator[CoreEvent]:
+    # Tracks whether the turn we just passed was the hidden trigger that precedes a
+    # proactive (out-of-band) assistant message, so we can replay that assistant
+    # turn as a `proactive_message` — preserving its identity so the frontend can
+    # decide whether it's still "New" — rather than as an ordinary `assistant_text`.
+    prev_proactive_trigger = False
     for msg in messages:
         role = msg.get("role")
         content = msg.get("content")
         if not isinstance(content, list):
+            prev_proactive_trigger = False
             continue
         if role == "user":
             # A recovery-flattened message holds a condensed transcript meant
@@ -57,15 +63,19 @@ def replay_messages(messages: list[dict]) -> Iterator[CoreEvent]:
                 "",
             )
             if first_text.startswith(RECOVERY_MARKER):
+                prev_proactive_trigger = False
                 yield CoreEvent(
                     kind="notice", severity="recovery", from_replay=True,
                 )
                 continue
             # Hidden trigger turn we slip in ahead of a proactive assistant
             # message (see append_assistant_message). It exists only to keep the
-            # API history valid; the user never sent it, so don't render it.
+            # API history valid; the user never sent it, so don't render it — but
+            # remember it so the assistant turn that follows replays as proactive.
             if first_text.startswith(PROACTIVE_TRIGGER_MARKER):
+                prev_proactive_trigger = True
                 continue
+            prev_proactive_trigger = False
             # A user message can mix one or more text blocks with image blocks.
             # Collapse them into a single user_message_shown event so the
             # frontend can render attachments in the same bubble as the text.
@@ -101,6 +111,21 @@ def replay_messages(messages: list[dict]) -> Iterator[CoreEvent]:
                     from_replay=True,
                 )
         elif role == "assistant":
+            was_proactive = prev_proactive_trigger
+            prev_proactive_trigger = False
+            if was_proactive:
+                # The out-of-band message itself: replay it as a proactive_message
+                # (a single Aime bubble) so the frontend renders it identically to
+                # a live push and can surface it as "New" if unacknowledged.
+                body = "\n\n".join(
+                    b.get("text", "") for b in content
+                    if isinstance(b, dict) and b.get("type") == "text" and b.get("text")
+                )
+                if body:
+                    yield CoreEvent(
+                        kind="proactive_message", text=body, from_replay=True
+                    )
+                continue
             for block in content:
                 if not isinstance(block, dict):
                     continue

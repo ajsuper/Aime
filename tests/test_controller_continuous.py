@@ -155,11 +155,12 @@ def test_crossing_midnight_mid_conversation_does_not_wipe(monkeypatch):
 
 def test_returning_next_day_after_a_gap_rolls(monkeypatch):
     # The same day change, but after a real gap (stepped away), does clear to a
-    # fresh Today — that's the "came back the next morning" case.
+    # fresh Today — that's the "came back the next morning" case. A multi-day gap
+    # keeps this deterministic regardless of the wall-clock time the test runs at.
     monkeypatch.setattr(controller_mod, "IDLE_ROLLOVER_SECONDS", 3600)
     monkeypatch.setattr(controller_mod, "DAY_ROLL_MIN_GAP_SECONDS", 1800)
     c, backend, events = _controller(messages=[{"role": "user", "content": []}])
-    c._last_activity = time.time() - 12 * 3600   # ~overnight → different day + gap
+    c._last_activity = time.time() - 2 * 86400   # >1 day ago → different day + gap
     c.dispatch_input("good morning")
     assert backend.reset_calls == 1
     assert "session_restart" in _kinds(events)

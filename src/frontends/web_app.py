@@ -3735,7 +3735,10 @@ def _session_render_events(messages: list[dict]) -> list[dict]:
                 "text": ev.text,
                 "attachments": ev.attachments,
             })
-        elif ev.kind == "assistant_text":
+        elif ev.kind in ("assistant_text", "proactive_message"):
+            # A past-day read-back is a quiet re-read, so a proactive message
+            # renders as an ordinary Aime bubble here — never flagged "New" (that's
+            # only for the live Today snapshot, which goes through _fanout).
             out.append({
                 "kind": "assistant_html",
                 "text": _render_markup_to_html(ev.text, final=True),

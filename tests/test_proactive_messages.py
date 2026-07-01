@@ -170,10 +170,13 @@ def test_replay_skips_proactive_trigger_turn():
     ]
     events = list(replay_messages(msgs))
     kinds = [e.kind for e in events]
-    # The synthetic user turn never surfaces; only Aime's bubble does.
+    # The synthetic user turn never surfaces; Aime's bubble replays as a
+    # proactive_message (not a plain assistant_text) so the frontend can tell it
+    # was out-of-band and decide whether it's still "New".
     assert "user_message_shown" not in kinds
-    assert kinds == ["assistant_text"]
+    assert kinds == ["proactive_message"]
     assert events[0].text == "Gig at 5:30!"
+    assert events[0].from_replay is True
 
 
 # --- replay strips hidden model-only prefixes from user bubbles -----------

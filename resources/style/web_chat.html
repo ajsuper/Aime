@@ -3773,23 +3773,45 @@ const voiceToggleInput = document.getElementById("voice-toggle-input");
 // with the tab focused. Proactive messages (ones Aime pushed out of band) also
 // sit beneath a "New" divider until the user has had a moment with them.
 // No blur, no breathing: the rainbow stays crisp throughout.
-// Desktop keeps a pushed message's "New" marker sticky — it stays until the user
-// actually interacts with the page (chat pane open), then lingers READ_GRACE_MS
-// so it doesn't vanish the instant they touch something. Mobile can have it
-// hidden, so there it just auto-reads after a dwell in view (READ_DWELL_MS).
-const READ_DWELL_MS = 4000;    // mobile: an unread proactive msg in view this long = read
-const READ_GRACE_MS = 15000;   // desktop: keep "New" up this long after the first interaction
+// A pushed message's "New" marker is sticky: it stays until the user actually
+// interacts with the page (chat pane open), then lingers READ_GRACE_MS more so it
+// doesn't vanish the instant they touch something. There is deliberately no
+// "seen just by being on screen" path — only a real interaction (or a reply)
+// clears it, so the behavior is identical on desktop and mobile.
+const READ_GRACE_MS = 15000;   // keep "New" up this long after the first interaction
+
+// Which proactive messages this device has already acknowledged, so a stream
+// reconnect (which replays the whole history) doesn't re-flag as "New" a message
+// the user already read here. Keyed by a hash of the message's rendered HTML;
+// capped so it can't grow without bound. A message that arrived while we were
+// disconnected was never acknowledged here, so it's absent → it shows as New.
+const PROACTIVE_SEEN_KEY = "aime.proactiveSeen";
+const PROACTIVE_SEEN_CAP = 300;
+function _hashText(s) {
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+  return String(h);
+}
+function _proactiveSeenLoad() {
+  try { return JSON.parse(localStorage.getItem(PROACTIVE_SEEN_KEY)) || []; }
+  catch (_) { return []; }
+}
+function proactiveSeenHas(html) {
+  return _proactiveSeenLoad().includes(_hashText(html || ""));
+}
+function proactiveSeenAdd(html) {
+  const id = _hashText(html || "");
+  const list = _proactiveSeenLoad();
+  if (list.includes(id)) return;
+  list.push(id);
+  if (list.length > PROACTIVE_SEEN_CAP) list.splice(0, list.length - PROACTIVE_SEEN_CAP);
+  try { localStorage.setItem(PROACTIVE_SEEN_KEY, JSON.stringify(list)); } catch (_) {}
+}
 
 // Observe against the chat scroller (#log), not the page, so "in view" means
 // "actually scrolled to" within the thread.
 const seenObserver = new IntersectionObserver((entries) => {
-  for (const e of entries) {
-    e.target._inView = e.isIntersecting;
-    // Left the viewport before the read-dwell elapsed — cancel its timer.
-    if (!e.isIntersecting && e.target._readTimer) {
-      clearTimeout(e.target._readTimer); e.target._readTimer = null;
-    }
-  }
+  for (const e of entries) e.target._inView = e.isIntersecting;
   flushSeen();
 }, { root: log, threshold: 0.55 });
 
@@ -3797,38 +3819,29 @@ function observeForSeen(node) {
   if (node && !node._seenTracked) { node._seenTracked = true; seenObserver.observe(node); }
 }
 
-// Settle the bar of anything in view to a calm dim (`.seen`). An unread proactive
-// message is held vivid until it's actually *read* (so a vivid bar and the "New"
-// divider stay in agreement): mobile reads it after a dwell in view; desktop holds
-// it until the user interacts (see noteInteraction). Skipped while the tab is
-// hidden and re-run on visibilitychange, so a message that arrived in the
-// background isn't counted until the user is genuinely looking at it.
+// Settle the bar of a *read* message in view to a calm dim (`.seen`). An unread
+// proactive message is deliberately left alone here — it stays vivid, under the
+// "New" divider, until the user actually interacts (see noteInteraction). Merely
+// scrolling it into view never clears it. Skipped while the tab is hidden.
 function flushSeen() {
   if (document.visibilityState !== "visible") return;
   logInner.querySelectorAll(".msg.aime").forEach((node) => {
     if (!node._inView) return;
-    if (!node.classList.contains("unread")) {
-      node.classList.add("seen");
-      if (node._seenTracked) { seenObserver.unobserve(node); node._seenTracked = false; }
-      return;
-    }
-    // Unread: mobile auto-reads on a dwell; desktop waits for an interaction.
-    if (mobileMQ.matches && !node._readTimer) {
-      node._readTimer = setTimeout(() => {
-        node._readTimer = null; markProactiveRead(node);
-      }, READ_DWELL_MS);
-    }
+    if (node.classList.contains("unread")) return;   // held vivid until read
+    node.classList.add("seen");
+    if (node._seenTracked) { seenObserver.unobserve(node); node._seenTracked = false; }
   });
 }
 
-// Drop a proactive message's "new" state (its claim on the "New" divider) and
-// settle its bar to the calm dim now that it's read.
+// Drop a proactive message's "new" state (its claim on the "New" divider), settle
+// its bar to the calm dim, and remember on this device that it's been read so a
+// later reconnect (which replays history) doesn't resurface it as New.
 function markProactiveRead(node) {
   if (!node.classList.contains("unread")) return;
   node.classList.remove("unread");
   node.classList.add("seen");
-  if (node._readTimer) { clearTimeout(node._readTimer); node._readTimer = null; }
   if (node._seenTracked) { seenObserver.unobserve(node); node._seenTracked = false; }
+  if (node._content) proactiveSeenAdd(node._content.innerHTML);
   updateNewDivider();
 }
 
@@ -3837,14 +3850,12 @@ function clearAllUnread() {
   logInner.querySelectorAll(".msg.aime.unread").forEach(markProactiveRead);
 }
 
-// Desktop stickiness: the "New" marker persists until the user interacts with the
-// page while the live chat is on screen, then holds READ_GRACE_MS more before
-// clearing — so a pushed message can't be missed by just sitting on the tab, and
-// doesn't disappear the instant the user twitches the mouse. Mobile auto-reads on
-// dwell instead (see flushSeen), so this is a no-op there.
+// Stickiness: the "New" marker persists until the user interacts with the page
+// while the live chat is on screen, then holds READ_GRACE_MS more before clearing
+// — so a pushed message can't be missed by just sitting on the tab, and doesn't
+// disappear the instant the user twitches the mouse. Same on desktop and mobile.
 let readGraceTimer = null;
 function noteInteraction() {
-  if (mobileMQ.matches) return;                             // mobile: dwell-reads instead
   if (viewingDay) return;                                   // reading a past day, not live chat
   if (document.visibilityState !== "visible") return;
   if (readGraceTimer) return;                               // grace already counting down
@@ -5821,9 +5832,12 @@ function clearTranscriptView() {
   typewriter.bubble = null;
   typewriter.rafId = null;
   resetHistoryState();
-  // The transcript was just wiped — drop the divider handle and stop observing
-  // the now-detached message nodes (fresh nodes re-observe as they're built).
+  // The transcript was just wiped — drop the divider handle, cancel any pending
+  // read-grace countdown (its target nodes are gone; left running it could clear
+  // the "New" markers the imminent snapshot rebuild is about to add), and stop
+  // observing the now-detached message nodes (fresh nodes re-observe as built).
   newDivider = null;
+  resetReadGrace();
   seenObserver.disconnect();
 }
 
@@ -6085,17 +6099,21 @@ function onStreamMessage(e) {
       bubble.classList.add("proactive");
       bubble._content.innerHTML = e.text || "";
       resolveGraphicTags(bubble._content);
-      scrollToBottom();
-      if (e.from_replay) {
-        bubble.classList.add("seen");   // already-read history
+      if (!e.from_replay) scrollToBottom();
+      // A replayed proactive message is only "already read" if *this device*
+      // acknowledged it before. One that arrived while we were disconnected was
+      // never acknowledged here, so it replays as New — that's how a missed
+      // message surfaces on reconnect. A live arrival is always New.
+      const alreadyRead = e.from_replay && proactiveSeenHas(bubble._content.innerHTML);
+      if (alreadyRead) {
+        bubble.classList.add("seen");
       } else {
-        // Out of band and unseen: flag it "New" (pill + divider) until the user
-        // has had a moment with it, and track it for the bar's seen-settle. A
-        // fresh arrival resets any in-flight grace countdown so this message is
-        // held sticky until the user's next interaction, not cleared by a stale one.
+        // Out of band and unseen: flag it "New" until the user interacts. A live
+        // arrival also resets any in-flight grace countdown so it's held sticky
+        // until the user's next interaction, not cleared by a stale one.
         bubble.classList.add("unread");
         observeForSeen(bubble);
-        resetReadGrace();
+        if (!e.from_replay) resetReadGrace();
         updateNewDivider();
       }
       break;
