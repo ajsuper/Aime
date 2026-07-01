@@ -3603,10 +3603,29 @@ def interrupt():
     return jsonify({"ok": True})
 
 
+@app.route("/day-check", methods=["POST"])
+@login_required
+def day_check():
+    """Cheap, idempotent rollover poke for a *live* client (one whose stream never
+    dropped, so /stream's open-time check never re-ran). The client fires it when
+    it notices its own local day has advanced — on tab focus or a midnight tick —
+    so a window left open overnight clears to a fresh Today on its own instead of
+    showing yesterday until the next message. The roll, if due, emits
+    session_restart over the existing stream, which is what clears the view."""
+    ctx = _context_for(g.user_id)
+    ctx.controller.maybe_roll_session()
+    return jsonify({"ok": True})
+
+
 @app.route("/stream")
 @login_required
 def stream():
     ctx = _context_for(g.user_id)
+    # Opening (or reconnecting) is itself a "the user came back" signal: roll onto
+    # a fresh Today first if the day turned over while they were away, so the
+    # snapshot we're about to capture already reflects today — they don't have to
+    # send a message to shed yesterday's thread. No-op when no roll is due.
+    ctx.controller.maybe_roll_session()
     q, snapshot = ctx.attach_client()
 
     def gen():

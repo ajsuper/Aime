@@ -132,6 +132,51 @@ def test_day_change_rolls_and_clears_to_fresh_today(monkeypatch):
     assert kinds.index("session_restart") < kinds.index("user_message_shown")
 
 
+def test_crossing_midnight_mid_conversation_does_not_wipe(monkeypatch):
+    # Messaging across midnight (a short gap that happens to straddle the day
+    # boundary) must NOT clear the thread out from under an active conversation.
+    # The day-roll is gated on DAY_ROLL_MIN_GAP_SECONDS for exactly this.
+    monkeypatch.setattr(controller_mod, "IDLE_ROLLOVER_SECONDS", 3600)
+    monkeypatch.setattr(controller_mod, "DAY_ROLL_MIN_GAP_SECONDS", 1800)
+    c, backend, events = _controller(messages=[{"role": "user", "content": []}])
+    # Force a day change with only a small gap: pretend last activity was a
+    # different local day but just five minutes ago.
+    real_local_date = c._local_date
+    monkeypatch.setattr(
+        c, "_local_date",
+        lambda epoch: real_local_date(epoch) if epoch >= c._last_activity
+        else real_local_date(epoch) - datetime.timedelta(days=1),
+    )
+    c._last_activity = time.time() - 300      # 5 min ago → under the min gap
+    c.dispatch_input("still typing past midnight")
+    assert backend.reset_calls == 0                       # thread kept, not wiped
+    assert "session_restart" not in _kinds(events)
+
+
+def test_returning_next_day_after_a_gap_rolls(monkeypatch):
+    # The same day change, but after a real gap (stepped away), does clear to a
+    # fresh Today — that's the "came back the next morning" case.
+    monkeypatch.setattr(controller_mod, "IDLE_ROLLOVER_SECONDS", 3600)
+    monkeypatch.setattr(controller_mod, "DAY_ROLL_MIN_GAP_SECONDS", 1800)
+    c, backend, events = _controller(messages=[{"role": "user", "content": []}])
+    c._last_activity = time.time() - 12 * 3600   # ~overnight → different day + gap
+    c.dispatch_input("good morning")
+    assert backend.reset_calls == 1
+    assert "session_restart" in _kinds(events)
+
+
+def test_maybe_roll_session_rolls_on_open_without_a_message(monkeypatch):
+    # A client merely opening/reconnecting on a new day rolls to Today — the user
+    # shouldn't have to send a message to shed yesterday's thread.
+    monkeypatch.setattr(controller_mod, "IDLE_ROLLOVER_SECONDS", 0)
+    c, backend, events = _controller(messages=[{"role": "user", "content": []}])
+    c._last_activity = time.time() - 2 * 86400   # ~2 days ago → different day
+    c.maybe_roll_session()
+    assert backend.reset_calls == 1
+    assert "session_restart" in _kinds(events)
+    assert "user_message_shown" not in _kinds(events)   # no message was sent
+
+
 class _ResumeBackend:
     """Minimal backend for exercising resume_latest_session's day check."""
     conversations_dir = None

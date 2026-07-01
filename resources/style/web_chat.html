@@ -3773,7 +3773,12 @@ const voiceToggleInput = document.getElementById("voice-toggle-input");
 // with the tab focused. Proactive messages (ones Aime pushed out of band) also
 // sit beneath a "New" divider until the user has had a moment with them.
 // No blur, no breathing: the rainbow stays crisp throughout.
-const READ_DWELL_MS = 4000;   // an unread proactive msg in view this long = read
+// Desktop keeps a pushed message's "New" marker sticky — it stays until the user
+// actually interacts with the page (chat pane open), then lingers READ_GRACE_MS
+// so it doesn't vanish the instant they touch something. Mobile can have it
+// hidden, so there it just auto-reads after a dwell in view (READ_DWELL_MS).
+const READ_DWELL_MS = 4000;    // mobile: an unread proactive msg in view this long = read
+const READ_GRACE_MS = 15000;   // desktop: keep "New" up this long after the first interaction
 
 // Observe against the chat scroller (#log), not the page, so "in view" means
 // "actually scrolled to" within the thread.
@@ -3792,41 +3797,77 @@ function observeForSeen(node) {
   if (node && !node._seenTracked) { node._seenTracked = true; seenObserver.observe(node); }
 }
 
-// Dim the bar of anything in view (mark `.seen`), and arm the read-dwell for
-// unread proactive messages. Skipped while the tab is hidden and re-run on
-// visibilitychange, so a message that arrived in the background is only counted
-// as read once the user is genuinely looking at it.
+// Settle the bar of anything in view to a calm dim (`.seen`). An unread proactive
+// message is held vivid until it's actually *read* (so a vivid bar and the "New"
+// divider stay in agreement): mobile reads it after a dwell in view; desktop holds
+// it until the user interacts (see noteInteraction). Skipped while the tab is
+// hidden and re-run on visibilitychange, so a message that arrived in the
+// background isn't counted until the user is genuinely looking at it.
 function flushSeen() {
   if (document.visibilityState !== "visible") return;
   logInner.querySelectorAll(".msg.aime").forEach((node) => {
     if (!node._inView) return;
-    node.classList.add("seen");
-    if (node.classList.contains("unread")) {
-      if (!node._readTimer) {
-        node._readTimer = setTimeout(() => {
-          node._readTimer = null; markProactiveRead(node);
-        }, READ_DWELL_MS);
-      }
-    } else if (node._seenTracked) {
-      seenObserver.unobserve(node); node._seenTracked = false;
+    if (!node.classList.contains("unread")) {
+      node.classList.add("seen");
+      if (node._seenTracked) { seenObserver.unobserve(node); node._seenTracked = false; }
+      return;
+    }
+    // Unread: mobile auto-reads on a dwell; desktop waits for an interaction.
+    if (mobileMQ.matches && !node._readTimer) {
+      node._readTimer = setTimeout(() => {
+        node._readTimer = null; markProactiveRead(node);
+      }, READ_DWELL_MS);
     }
   });
 }
 
-// Drop a proactive message's "new" state (pill + its claim on the divider).
+// Drop a proactive message's "new" state (its claim on the "New" divider) and
+// settle its bar to the calm dim now that it's read.
 function markProactiveRead(node) {
   if (!node.classList.contains("unread")) return;
   node.classList.remove("unread");
+  node.classList.add("seen");
   if (node._readTimer) { clearTimeout(node._readTimer); node._readTimer = null; }
-  if (node._seenTracked && node.classList.contains("seen")) {
-    seenObserver.unobserve(node); node._seenTracked = false;
-  }
+  if (node._seenTracked) { seenObserver.unobserve(node); node._seenTracked = false; }
   updateNewDivider();
 }
 
 // The user engaged (started a reply) — every pending "New" marker clears at once.
 function clearAllUnread() {
   logInner.querySelectorAll(".msg.aime.unread").forEach(markProactiveRead);
+}
+
+// Desktop stickiness: the "New" marker persists until the user interacts with the
+// page while the live chat is on screen, then holds READ_GRACE_MS more before
+// clearing — so a pushed message can't be missed by just sitting on the tab, and
+// doesn't disappear the instant the user twitches the mouse. Mobile auto-reads on
+// dwell instead (see flushSeen), so this is a no-op there.
+let readGraceTimer = null;
+function noteInteraction() {
+  if (mobileMQ.matches) return;                             // mobile: dwell-reads instead
+  if (viewingDay) return;                                   // reading a past day, not live chat
+  if (document.visibilityState !== "visible") return;
+  if (readGraceTimer) return;                               // grace already counting down
+  if (!logInner.querySelector(".msg.aime.unread")) return;  // nothing pending
+  readGraceTimer = setTimeout(() => {
+    readGraceTimer = null;
+    clearAllUnread();
+  }, READ_GRACE_MS);
+}
+
+// A freshly-arrived "New" resets the stickiness: cancel any grace countdown from
+// an earlier interaction so the new message gets held until the *next* one.
+function resetReadGrace() {
+  if (readGraceTimer) { clearTimeout(readGraceTimer); readGraceTimer = null; }
+}
+
+// Any genuine interaction with the page starts the grace countdown. pointerdown
+// covers clicks/taps/pen and a scrollbar drag; keydown covers typing and arrow-key
+// scrolling; wheel covers wheel/trackpad scrolling. We deliberately don't listen
+// on the log's `scroll` event — it also fires for programmatic scrolls (e.g.
+// auto-scroll on an incoming message), which aren't user interactions.
+for (const ev of ["pointerdown", "keydown", "wheel"]) {
+  document.addEventListener(ev, noteInteraction, { passive: true });
 }
 
 // A single "New" divider, repositioned just above the earliest still-unread
@@ -3866,7 +3907,7 @@ function updateNewDivider() {
 document.addEventListener("visibilitychange", flushSeen);
 
 input.addEventListener("input", () => {
-  if (input.value) clearAllUnread();
+  if (input.value) noteInteraction();
 });
 
 // Voice mode is enabled by the dedicated toggle in the composer toolbar.
@@ -5811,19 +5852,47 @@ const Link = {
   lastMsgAt: 0,
   watchdog: null,
   reconnectNotice: null,
+  // The local calendar day this window last saw. When it advances while the
+  // window stays open (past midnight, or a wake-from-sleep into a new day), we
+  // poke the server to roll onto a fresh Today — see maybeDayRoll. A reconnect
+  // already gets this for free via /stream's open-time check; this covers the
+  // live-stream-never-dropped case that check can't reach.
+  localDay: "",
   // The server pings at least every ~20s, so a gap well past that means the
   // stream is dead even if the browser still thinks it's open (sleep/wake, a
   // half-closing proxy). This is that threshold.
   STALE_MS: 50000,
 
   start() {
+    this.localDay = this.dayKey();
     this.connect();
     if (this.watchdog != null) clearInterval(this.watchdog);
     this.watchdog = setInterval(() => {
       if (document.hidden) return;   // throttled tabs don't get timely heartbeats
       this.reconnectIfStale();
+      this.maybeDayRoll();           // catch midnight on a foregrounded, live tab
     }, 10000);
     document.addEventListener("visibilitychange", () => this.onVisible());
+  },
+
+  // The window's current local calendar day, as a stable YYYY-M-D key. Local
+  // (not UTC) so it flips at the user's midnight, matching the server's per-user
+  // day boundary.
+  dayKey() {
+    const d = new Date();
+    return d.getFullYear() + "-" + (d.getMonth() + 1) + "-" + d.getDate();
+  },
+
+  // If the local day has advanced since we last looked, ask the server to roll
+  // onto a fresh Today. A due roll comes back as session_restart over the live
+  // stream and clears the view; if no roll is due it's a cheap server no-op. We
+  // always re-baseline so this fires once per day boundary, not every tick.
+  maybeDayRoll() {
+    const today = this.dayKey();
+    if (this.localDay && today !== this.localDay) {
+      fetch("/day-check", {method: "POST"}).catch(() => {});
+    }
+    this.localDay = today;
   },
 
   // Tear down and reopen the stream. Closing stops the browser's own reconnect
@@ -5882,6 +5951,7 @@ const Link = {
   onVisible() {
     if (document.visibilityState !== "visible") return;
     this.reconnectIfStale();
+    this.maybeDayRoll();   // returning to the tab in a new day rolls to Today
     refreshActivePane(true);
   },
 };
@@ -6020,9 +6090,12 @@ function onStreamMessage(e) {
         bubble.classList.add("seen");   // already-read history
       } else {
         // Out of band and unseen: flag it "New" (pill + divider) until the user
-        // has had a moment with it, and track it for the bar's seen-settle.
+        // has had a moment with it, and track it for the bar's seen-settle. A
+        // fresh arrival resets any in-flight grace countdown so this message is
+        // held sticky until the user's next interaction, not cleared by a stale one.
         bubble.classList.add("unread");
         observeForSeen(bubble);
+        resetReadGrace();
         updateNewDivider();
       }
       break;

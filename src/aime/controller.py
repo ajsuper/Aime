@@ -68,6 +68,21 @@ try:
 except ValueError:
     IDLE_ROLLOVER_SECONDS = 3600.0
 
+# A day-roll clears the view to a fresh Today (unlike the silent idle roll). We
+# only do it once the user has actually stepped away for at least this gap —
+# otherwise a conversation that happens to cross midnight would be wiped
+# mid-sentence. This is what distinguishes "came back on a new day" (clear) from
+# "still in one sitting that happens to straddle midnight" (keep the thread).
+# Independent of IDLE_ROLLOVER_SECONDS so clearing yesterday's view still works
+# even when the cost-driven idle roll is disabled (threshold 0). Overridable for
+# tests via AIME_DAY_ROLL_MIN_GAP_SECONDS.
+try:
+    DAY_ROLL_MIN_GAP_SECONDS = float(
+        os.environ.get("AIME_DAY_ROLL_MIN_GAP_SECONDS", "1800")
+    )
+except ValueError:
+    DAY_ROLL_MIN_GAP_SECONDS = 1800.0
+
 CoreEventKind = Literal[
     "user_message_shown",       # user msg accepted and sent to backend
     "user_message_queued",      # user msg queued (backend was busy)
@@ -806,16 +821,31 @@ class ConversationController:
                 pass
         return datetime.datetime.fromtimestamp(epoch).date()
 
+    def maybe_roll_session(self) -> None:
+        """Public entry point for the idle/day rollover check, so a client merely
+        *opening* or *reconnecting* (not only sending a message) lands on a fresh
+        Today. Idempotent: a no-op when no roll is due, mid-turn, headless, or
+        temporary — same as the dispatch-time check it shares."""
+        self._maybe_roll_session()
+
     def _maybe_roll_session(self) -> None:
-        """Before accepting a fresh user turn, roll onto a new backend session when
-        either (a) the thread has been quiet past IDLE_ROLLOVER_SECONDS (a cost
-        boundary), or (b) the user's local day has changed since the last activity.
+        """Roll onto a new backend session when either (a) the thread has been quiet
+        past IDLE_ROLLOVER_SECONDS (a cost boundary), or (b) the user's local day has
+        changed *and* they've stepped away at least DAY_ROLL_MIN_GAP_SECONDS.
+
+        Called both before accepting a fresh user turn and when a client opens or
+        reconnects (see maybe_roll_session), so a returning user lands on Today
+        without having to send first.
 
         The two rolls differ in how they're presented:
           * idle roll (same day) — silent: the transcript stays continuous within
             the day, with just a subtle divider marking the fresh, cheap session.
           * day roll — clears the transcript to a fresh "Today", so yesterday's
             messages don't bleed into today (they live in the History pane).
+
+        The day roll is gated on DAY_ROLL_MIN_GAP_SECONDS so a conversation that
+        crosses midnight isn't wiped mid-sentence: the clear waits until the user
+        has actually been away, not merely until the clock ticks over.
 
         Skipped in headless runs, temporary chats, and on an already-empty session."""
         if self._headless or self._temporary:
@@ -826,11 +856,15 @@ class ConversationController:
                     return  # mid-turn: this message will queue, don't roll
                 last = self._last_activity
             now = time.time()
+            gap = now - last
             idle_rolled = (
                 IDLE_ROLLOVER_SECONDS > 0
-                and now - last >= IDLE_ROLLOVER_SECONDS
+                and gap >= IDLE_ROLLOVER_SECONDS
             )
-            day_rolled = self._local_date(last) != self._local_date(now)
+            day_rolled = (
+                self._local_date(last) != self._local_date(now)
+                and gap >= DAY_ROLL_MIN_GAP_SECONDS
+            )
             if not (idle_rolled or day_rolled):
                 return
             if not self._backend.messages_snapshot():
