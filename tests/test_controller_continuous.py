@@ -38,9 +38,10 @@ class _FakeBackend:
     def messages_snapshot(self):
         return list(self._messages)
 
-    def append_assistant_message(self, text):
+    def append_assistant_message(self, text, pid=""):
         self._messages.append({"role": "assistant",
-                               "content": [{"type": "text", "text": text}]})
+                               "content": [{"type": "text", "text": text}],
+                               "pid": pid})
         self.appended.append(text)
         return True
 

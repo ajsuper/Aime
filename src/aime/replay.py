@@ -116,14 +116,16 @@ def replay_messages(messages: list[dict]) -> Iterator[CoreEvent]:
             if was_proactive:
                 # The out-of-band message itself: replay it as a proactive_message
                 # (a single Aime bubble) so the frontend renders it identically to
-                # a live push and can surface it as "New" if unacknowledged.
+                # a live push, carrying the stored id so it can tell whether this
+                # message has already been seen (→ "New" only if not).
                 body = "\n\n".join(
                     b.get("text", "") for b in content
                     if isinstance(b, dict) and b.get("type") == "text" and b.get("text")
                 )
                 if body:
                     yield CoreEvent(
-                        kind="proactive_message", text=body, from_replay=True
+                        kind="proactive_message", text=body, from_replay=True,
+                        pid=msg.get("pid", ""),
                     )
                 continue
             for block in content:

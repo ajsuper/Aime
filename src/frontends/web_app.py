@@ -1010,8 +1010,10 @@ class UserContext:
         }
         # A proactive message carries raw markup; pre-render it to HTML so the
         # frontend can drop it straight into a bubble (no client-side markup pass).
+        # Its `pid` is the anchor for per-message "seen"/"New" tracking on the client.
         if event.kind == "proactive_message":
             payload["text"] = _render_markup_to_html(event.text or "", final=True)
+            payload["pid"] = event.pid
         # Structured payload for events that carry one (e.g. `graphic`, which
         # holds {format, summary, source} for the frontend to render).
         if event.payload is not None:

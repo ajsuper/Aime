@@ -22,6 +22,7 @@ import json
 import os
 import threading
 import time
+import uuid
 import zoneinfo
 from dataclasses import dataclass, field
 from typing import Callable, Literal
@@ -53,6 +54,12 @@ from .active_events import active_events_prefix
 # FilterUsersEvents result — keeps the enrichment bounded for commitments with
 # long histories. The model can still call GetCommitmentHistory for the full set.
 _AUTO_HISTORY_LIMIT = 10
+
+
+def _new_proactive_id() -> str:
+    """A stable, unique id for a proactive message, stored with it so the frontend
+    can remember per-message whether it's been seen."""
+    return "p-" + uuid.uuid4().hex[:12]
 
 # After this many seconds of quiet, the next user message silently starts a
 # fresh backend session — a cost-bounded boundary that the user never sees (no
@@ -156,6 +163,11 @@ class CoreEvent:
     # Set on events emitted during /load history replay. Lets the frontend
     # skip live-only affordances like the "thinking…" placeholder.
     from_replay: bool = False
+    # Stable id for a proactive_message, assigned when the message is created and
+    # preserved on disk, so the frontend can track per-message whether it's been
+    # seen (and thus whether to show "New") across reconnects and reloads. Empty
+    # for ordinary events and for pre-existing messages written before this field.
+    pid: str = ""
     # User-message attachments (images, embedded text files). Each entry is
     # {"kind": "image", "media_type": str, "data": str (base64)} for images.
     # Text files are still embedded in `text` via <aime:file> sentinels; the
@@ -1201,12 +1213,15 @@ class ConversationController:
         with self._state_lock:
             if not self._is_idle:
                 return False
-        if not self._backend.append_assistant_message(body):
+        # A stable id, stored with the message, lets the frontend track per-message
+        # whether it's been seen (→ whether to show "New") across reconnects.
+        pid = _new_proactive_id()
+        if not self._backend.append_assistant_message(body, pid=pid):
             return False
         # A dedicated event (not assistant_text): the frontend renders it as a
         # standalone Aime bubble instantly, with no dependence on turn/typewriter
         # state — which is what kept proactive messages from showing in the chat.
-        self._emit(CoreEvent(kind="proactive_message", text=body))
+        self._emit(CoreEvent(kind="proactive_message", text=body, pid=pid))
         return True
 
     def deliver_inline_proactive(self, text: str) -> bool:

@@ -3773,37 +3773,32 @@ const voiceToggleInput = document.getElementById("voice-toggle-input");
 // with the tab focused. Proactive messages (ones Aime pushed out of band) also
 // sit beneath a "New" divider until the user has had a moment with them.
 // No blur, no breathing: the rainbow stays crisp throughout.
-// A pushed message's "New" marker is sticky: it stays until the user actually
-// interacts with the page (chat pane open), then lingers READ_GRACE_MS more so it
-// doesn't vanish the instant they touch something. There is deliberately no
-// "seen just by being on screen" path — only a real interaction (or a reply)
-// clears it, so the behavior is identical on desktop and mobile.
-const READ_GRACE_MS = 15000;   // keep "New" up this long after the first interaction
-
-// Which proactive messages this device has already acknowledged, so a stream
-// reconnect (which replays the whole history) doesn't re-flag as "New" a message
-// the user already read here. Keyed by a hash of the message's rendered HTML;
-// capped so it can't grow without bound. A message that arrived while we were
-// disconnected was never acknowledged here, so it's absent → it shows as New.
+// Per-message "seen" store. A proactive (out-of-band) message shows a "New"
+// marker until it's been seen; "seen" means the user interacted with the page
+// (clicked, typed, scrolled) while the live chat was on screen. Each message
+// carries a stable server id (`pid`); the ids of ones seen on this device are
+// persisted here, so a reconnect or reload (which replays the whole history)
+// keeps New state exactly right: a message seen before stays quiet, one that
+// arrived while we were away (never seen here) shows as New. Capped so it can't
+// grow without bound.
 const PROACTIVE_SEEN_KEY = "aime.proactiveSeen";
-const PROACTIVE_SEEN_CAP = 300;
-function _hashText(s) {
-  let h = 5381;
-  for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
-  return String(h);
-}
+const PROACTIVE_SEEN_CAP = 500;
 function _proactiveSeenLoad() {
   try { return JSON.parse(localStorage.getItem(PROACTIVE_SEEN_KEY)) || []; }
   catch (_) { return []; }
 }
-function proactiveSeenHas(html) {
-  return _proactiveSeenLoad().includes(_hashText(html || ""));
+function proactiveSeenHas(pid) {
+  return !!pid && _proactiveSeenLoad().includes(pid);
 }
-function proactiveSeenAdd(html) {
-  const id = _hashText(html || "");
+function proactiveSeenAdd(pids) {
+  const add = pids.filter(Boolean);
+  if (!add.length) return;
   const list = _proactiveSeenLoad();
-  if (list.includes(id)) return;
-  list.push(id);
+  let changed = false;
+  for (const pid of add) {
+    if (!list.includes(pid)) { list.push(pid); changed = true; }
+  }
+  if (!changed) return;
   if (list.length > PROACTIVE_SEEN_CAP) list.splice(0, list.length - PROACTIVE_SEEN_CAP);
   try { localStorage.setItem(PROACTIVE_SEEN_KEY, JSON.stringify(list)); } catch (_) {}
 }
@@ -3833,50 +3828,56 @@ function flushSeen() {
   });
 }
 
-// Drop a proactive message's "new" state (its claim on the "New" divider), settle
-// its bar to the calm dim, and remember on this device that it's been read so a
-// later reconnect (which replays history) doesn't resurface it as New.
-function markProactiveRead(node) {
-  if (!node.classList.contains("unread")) return;
-  node.classList.remove("unread");
-  node.classList.add("seen");
-  if (node._seenTracked) { seenObserver.unobserve(node); node._seenTracked = false; }
-  if (node._content) proactiveSeenAdd(node._content.innerHTML);
+const NEW_LINGER_MS = 15000;   // keep "New" up this long after the first interaction
+
+// Mark a specific set of messages seen: persist their ids (so a reconnect/reload
+// doesn't resurface them as New) and drop the "New" styling.
+function markNodesSeen(nodes) {
+  const pids = [];
+  nodes.forEach((n) => {
+    if (!n.classList.contains("unread")) return;
+    pids.push(n._pid);
+    n.classList.remove("unread");
+    n.classList.add("seen");
+    if (n._seenTracked) { seenObserver.unobserve(n); n._seenTracked = false; }
+  });
+  if (!pids.length) return;
+  proactiveSeenAdd(pids);
   updateNewDivider();
 }
 
-// The user engaged (started a reply) — every pending "New" marker clears at once.
-function clearAllUnread() {
-  logInner.querySelectorAll(".msg.aime.unread").forEach(markProactiveRead);
+// Every currently-shown New message, seen at once. Used when the user sends a
+// reply — an unambiguous "I've engaged", so no linger.
+function markDisplayedSeen() {
+  cancelSeenTimer();
+  markNodesSeen(Array.from(logInner.querySelectorAll(".msg.aime.unread")));
 }
 
-// Stickiness: the "New" marker persists until the user interacts with the page
-// while the live chat is on screen, then holds READ_GRACE_MS more before clearing
-// — so a pushed message can't be missed by just sitting on the tab, and doesn't
-// disappear the instant the user twitches the mouse. Same on desktop and mobile.
-let readGraceTimer = null;
+// "Seen" = the user interacted with the live chat — but we hold "New" for a beat
+// (NEW_LINGER_MS) after that first interaction so it doesn't blink away the instant
+// they touch something, then mark those messages seen. Messages that arrive during
+// the window aren't captured, so they wait for the user's next interaction.
+let seenTimer = null;
+function cancelSeenTimer() {
+  if (seenTimer) { clearTimeout(seenTimer); seenTimer = null; }
+}
 function noteInteraction() {
-  if (viewingDay) return;                                   // reading a past day, not live chat
+  if (viewingDay) return;                            // reading a past day, not the live chat
   if (document.visibilityState !== "visible") return;
-  if (readGraceTimer) return;                               // grace already counting down
-  if (!logInner.querySelector(".msg.aime.unread")) return;  // nothing pending
-  readGraceTimer = setTimeout(() => {
-    readGraceTimer = null;
-    clearAllUnread();
-  }, READ_GRACE_MS);
+  if (seenTimer) return;                             // linger already running (first interaction won)
+  const pending = Array.from(logInner.querySelectorAll(".msg.aime.unread"));
+  if (!pending.length) return;
+  seenTimer = setTimeout(() => {
+    seenTimer = null;
+    markNodesSeen(pending);
+  }, NEW_LINGER_MS);
 }
 
-// A freshly-arrived "New" resets the stickiness: cancel any grace countdown from
-// an earlier interaction so the new message gets held until the *next* one.
-function resetReadGrace() {
-  if (readGraceTimer) { clearTimeout(readGraceTimer); readGraceTimer = null; }
-}
-
-// Any genuine interaction with the page starts the grace countdown. pointerdown
-// covers clicks/taps/pen and a scrollbar drag; keydown covers typing and arrow-key
-// scrolling; wheel covers wheel/trackpad scrolling. We deliberately don't listen
-// on the log's `scroll` event — it also fires for programmatic scrolls (e.g.
-// auto-scroll on an incoming message), which aren't user interactions.
+// What counts as a genuine interaction: pointerdown covers clicks/taps/pen and a
+// scrollbar drag; keydown covers typing and arrow-key scrolling; wheel covers
+// wheel/trackpad scrolling. We deliberately don't listen on the log's `scroll`
+// event — it also fires for programmatic scrolls (auto-scroll on an incoming
+// message), which aren't user interactions.
 for (const ev of ["pointerdown", "keydown", "wheel"]) {
   document.addEventListener(ev, noteInteraction, { passive: true });
 }
@@ -5833,11 +5834,11 @@ function clearTranscriptView() {
   typewriter.rafId = null;
   resetHistoryState();
   // The transcript was just wiped — drop the divider handle, cancel any pending
-  // read-grace countdown (its target nodes are gone; left running it could clear
-  // the "New" markers the imminent snapshot rebuild is about to add), and stop
-  // observing the now-detached message nodes (fresh nodes re-observe as built).
+  // "New" linger (its target nodes are gone), and stop observing the now-detached
+  // message nodes (fresh nodes re-observe as they're rebuilt). New state isn't
+  // lost: it's re-derived from the persisted seen store as the snapshot replays.
   newDivider = null;
-  resetReadGrace();
+  cancelSeenTimer();
   seenObserver.disconnect();
 }
 
@@ -5992,8 +5993,8 @@ function onStreamMessage(e) {
       const row = renderAttachmentRow(attachments);
       if (row) msg.insertBefore(row, msg._content);
       if (!cleanedText && attachments.length) msg.classList.add("no-text");
-      // The user has replied — they've clearly engaged; clear any "New" markers.
-      clearAllUnread();
+      // The user has replied — they've clearly engaged; mark any "New" seen.
+      markDisplayedSeen();
       // Only a *live* user message starts a turn. Replayed history (loading
       // or switching conversations) must not flip the busy gate — otherwise
       // the first message in the loaded conversation gets held as a queued
@@ -6099,21 +6100,18 @@ function onStreamMessage(e) {
       bubble.classList.add("proactive");
       bubble._content.innerHTML = e.text || "";
       resolveGraphicTags(bubble._content);
+      bubble._pid = e.pid || "";
       if (!e.from_replay) scrollToBottom();
-      // A replayed proactive message is only "already read" if *this device*
-      // acknowledged it before. One that arrived while we were disconnected was
-      // never acknowledged here, so it replays as New — that's how a missed
-      // message surfaces on reconnect. A live arrival is always New.
-      const alreadyRead = e.from_replay && proactiveSeenHas(bubble._content.innerHTML);
-      if (alreadyRead) {
+      // Show "New" unless this message has already been seen on this device. A
+      // live arrival is always New. A replayed one is New only if its id isn't in
+      // the seen store — i.e. it arrived while we were away (a message with no id
+      // predates this feature, so treat it as already seen: never New).
+      const seen = e.from_replay && (!bubble._pid || proactiveSeenHas(bubble._pid));
+      if (seen) {
         bubble.classList.add("seen");
       } else {
-        // Out of band and unseen: flag it "New" until the user interacts. A live
-        // arrival also resets any in-flight grace countdown so it's held sticky
-        // until the user's next interaction, not cleared by a stale one.
         bubble.classList.add("unread");
         observeForSeen(bubble);
-        if (!e.from_replay) resetReadGrace();
         updateNewDivider();
       }
       break;

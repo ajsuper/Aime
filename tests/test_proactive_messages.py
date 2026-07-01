@@ -66,6 +66,29 @@ def test_append_into_empty_session_opens_with_hidden_user_turn(backend):
     assert msgs[1]["content"][0]["text"] == "Reminder: gig at 5:30!"
 
 
+def test_append_stores_pid_and_replay_surfaces_it(backend):
+    # The stable id given at append time is stored on the message and handed back
+    # by replay on the proactive_message event — the anchor the frontend uses to
+    # track whether the message has been seen (→ "New").
+    from aime.replay import replay_messages
+    assert backend.append_assistant_message("Gig at 5:30!", pid="p-abc123") is True
+    msgs = backend.messages_snapshot()
+    assert msgs[1]["pid"] == "p-abc123"
+    events = list(replay_messages(msgs))
+    assert [e.kind for e in events] == ["proactive_message"]
+    assert events[0].pid == "p-abc123"
+
+
+def test_replay_proactive_without_pid_has_empty_pid(backend):
+    # A message stored before the pid field exists replays with an empty id; the
+    # frontend treats an empty id as already-seen (never "New").
+    from aime.replay import replay_messages
+    backend.append_assistant_message("Old reminder")   # no pid passed
+    events = list(replay_messages(backend.messages_snapshot()))
+    assert events[0].kind == "proactive_message"
+    assert events[0].pid == ""
+
+
 def test_append_after_assistant_turn_inserts_trigger(backend):
     # Simulate a completed turn ending on an assistant message.
     backend._messages.append({"role": "user", "content": [{"type": "text", "text": "hi"}]})

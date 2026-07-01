@@ -10,6 +10,7 @@ import os
 import hashlib
 import threading
 import datetime
+import uuid
 import zoneinfo
 from dataclasses import dataclass
 from typing import Callable, Iterator, Literal, Protocol, runtime_checkable
@@ -264,14 +265,15 @@ class AgentBackend(Protocol):
         """Push a user/system/tool-result event into the conversation."""
         ...
 
-    def append_assistant_message(self, text: str) -> bool:
+    def append_assistant_message(self, text: str, pid: str = "") -> bool:
         """Record an out-of-band message *as if Aime said it* — an assistant
         turn appended to history without triggering a model turn. Used to make
         a proactive send (scheduler reminder, agent notification) appear inline
-        in the thread so the user's reply has coherent context. Returns True if
-        recorded. No-op (returns False) for backends without persistent history.
-        Must only be called between turns; appending mid-turn would corrupt the
-        in-flight assistant message / tool_result ordering."""
+        in the thread so the user's reply has coherent context. ``pid`` is a stable
+        id stored with the message so the frontend can track whether it's been
+        seen. Returns True if recorded. No-op (returns False) for backends without
+        persistent history. Must only be called between turns; appending mid-turn
+        would corrupt the in-flight assistant message / tool_result ordering."""
         return False
 
     def delete_session(self, session_id: str) -> None:
@@ -424,6 +426,10 @@ def append_proactive_message_offline(
     messages.append({
         "role": "assistant",
         "content": [{"type": "text", "text": body}],
+        # Stable id for per-message "seen"/"New" tracking (mirrors the live
+        # append_assistant_message path). A message written here arrived while the
+        # user was away, so it will surface as "New" when they next open Today.
+        "pid": "p-" + uuid.uuid4().hex[:12],
     })
     target_data["messages"] = messages
     target_data["id"] = target_id
@@ -1003,7 +1009,7 @@ class AnthropicMessagesBackend:
         self._terminate_active_stream()
         self.new_session()
 
-    def append_assistant_message(self, text: str) -> bool:
+    def append_assistant_message(self, text: str, pid: str = "") -> bool:
         body = (text or "").strip()
         if not body:
             return False
@@ -1019,10 +1025,15 @@ class AnthropicMessagesBackend:
                     "role": "user",
                     "content": [{"type": "text", "text": PROACTIVE_TRIGGER_MARKER}],
                 })
-            msgs.append({
+            msg = {
                 "role": "assistant",
                 "content": [{"type": "text", "text": body}],
-            })
+            }
+            # Stored with the message so replay can hand the frontend the same id
+            # it saw live — the anchor for per-message "seen"/"New" tracking.
+            if pid:
+                msg["pid"] = pid
+            msgs.append(msg)
         self._persist()
         # Deliberately do NOT set _turn_trigger: this records what Aime already
         # said out of band, it must not provoke a fresh model reply. The model
