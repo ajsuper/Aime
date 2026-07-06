@@ -738,6 +738,14 @@ class UserContext:
         self._client_queues: list[queue.Queue] = []
         self._history_lock = threading.Lock()
         self._history: list[dict] = []
+        # Monotonic sync cursor. Incremented (under _history_lock) each time an
+        # event is appended to the replayable history, and stamped onto that
+        # event as `_seq`. It is never reset for the life of the context — not
+        # even on session_restart — so "server head > what the client has
+        # applied" is an unambiguous "you missed events" signal. The head rides
+        # every `ping`, turning the heartbeat from a pure liveness pulse into a
+        # positive "you are current" assertion the client can check.
+        self._history_seq = 0
 
         # Streaming assistant text accumulator. Rich-markup tags can span
         # delta boundaries; we render to HTML once a block ends.
@@ -878,7 +886,7 @@ class UserContext:
 
     # ---- SSE primitives ---------------------------------------------------
 
-    def attach_client(self) -> tuple[queue.Queue, list[dict]]:
+    def attach_client(self) -> tuple[queue.Queue, list[dict], int]:
         """Snapshot history and subscribe in one atomic step — under both
         locks together so a concurrent broadcast can't slip an event in
         between the snapshot and the subscribe (which would either lose or
@@ -886,8 +894,15 @@ class UserContext:
         q: queue.Queue = queue.Queue(maxsize=8192)
         with self._history_lock, self._subscribers_lock:
             snapshot = list(self._history)
+            head_seq = self._history_seq
             self._client_queues.append(q)
-        return q, snapshot
+        return q, snapshot, head_seq
+
+    def current_seq(self) -> int:
+        """The current history head as a sync cursor (see _history_seq). Read
+        under lock so it's consistent with the appends _broadcast makes."""
+        with self._history_lock:
+            return self._history_seq
 
     def detach_client(self, q: queue.Queue) -> None:
         with self._subscribers_lock:
@@ -912,6 +927,11 @@ class UserContext:
                 # durable surface for budget state.
                 "usage_notice",
             ):
+                # Only history-appended events advance the sync cursor and carry
+                # a `_seq`. Transient events (deltas, presentational pings) don't,
+                # so they never register as drift on the client.
+                self._history_seq += 1
+                payload["_seq"] = self._history_seq
                 self._history.append(payload)
         with self._subscribers_lock:
             targets = list(self._client_queues)
@@ -3628,7 +3648,7 @@ def stream():
     # snapshot we're about to capture already reflects today — they don't have to
     # send a message to shed yesterday's thread. No-op when no roll is due.
     ctx.controller.maybe_roll_session()
-    q, snapshot = ctx.attach_client()
+    q, snapshot, head_seq = ctx.attach_client()
 
     def gen():
         try:
@@ -3646,11 +3666,16 @@ def stream():
             # `busy` carries the real turn state so a client that just
             # replayed history (where turn_end/ready don't appear) knows
             # whether the model is mid-response.
+            # `head_seq` is the cursor for everything in the snapshot just
+            # replayed. The client adopts it as its applied position, then
+            # advances it with each live event's `_seq`; a later `ping` reporting
+            # a higher head means events were missed → reconnect and reconcile.
             yield (
                 "data: "
                 + json.dumps({
                     "kind": "history_done",
                     "busy": not ctx.controller.is_idle,
+                    "head_seq": head_seq,
                 })
                 + "\n\n"
             )
@@ -3676,7 +3701,12 @@ def stream():
                     # to notice a dead stream and force a reconnect, which
                     # rebuilds its transcript from authoritative history. The
                     # client ignores this `ping` kind.
-                    yield f"data: {json.dumps({'kind': 'ping'})}\n\n"
+                    # The heartbeat carries the current history head so a client
+                    # on a still-open socket that silently dropped an event can
+                    # detect the drift (its applied cursor lags head) and
+                    # reconnect, instead of only self-healing when the queue
+                    # overflows or the socket is declared dead.
+                    yield f"data: {json.dumps({'kind': 'ping', 'head_seq': ctx.current_seq()})}\n\n"
                     continue
                 yield f"data: {json.dumps(payload)}\n\n"
         finally:

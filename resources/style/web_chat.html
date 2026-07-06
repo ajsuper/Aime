@@ -2665,10 +2665,9 @@
               title="Tasks" aria-label="Tasks">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
              stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <rect x="4" y="8" width="16" height="12" rx="2"/>
-          <path d="M12 8V4M9 4h6"/>
-          <circle cx="9" cy="14" r="1"/>
-          <circle cx="15" cy="14" r="1"/>
+          <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/>
+          <rect x="8" y="2" width="8" height="4" rx="1"/>
+          <polyline points="9 14 11 16 15 12"/>
         </svg>
       </button>
     </div>
@@ -5855,6 +5854,16 @@ const Link = {
   // server's `ping` heartbeat). Used to spot a half-open connection the browser
   // hasn't noticed and force a fresh reconnect.
   lastMsgAt: 0,
+  // When the tab last went hidden. Used instead of lastMsgAt to decide a
+  // wake-up reconnect: a ping buffered during sleep and flushed on wake
+  // refreshes lastMsgAt and would fool the staleness check into trusting a
+  // stream that already missed events. Time-hidden is immune to that.
+  hiddenAt: 0,
+  // Highest history-event cursor (`_seq`) we've applied. Adopted wholesale from
+  // `history_done` after a snapshot replay, then advanced by each live event.
+  // A `ping` reporting a higher server head means we silently dropped an event
+  // and must reconnect to reconcile. See onMessage.
+  appliedSeq: 0,
   watchdog: null,
   reconnectNotice: null,
   // The local calendar day this window last saw. When it advances while the
@@ -5877,7 +5886,10 @@ const Link = {
       this.reconnectIfStale();
       this.maybeDayRoll();           // catch midnight on a foregrounded, live tab
     }, 10000);
-    document.addEventListener("visibilitychange", () => this.onVisible());
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) { this.hiddenAt = Date.now(); return; }
+      this.onVisible();
+    });
   },
 
   // The window's current local calendar day, as a stable YYYY-M-D key. Local
@@ -5942,10 +5954,24 @@ const Link = {
   onMessage(ev) {
     this.lastMsgAt = Date.now();
     const e = JSON.parse(ev.data);
-    if (e.kind === "ping") return;   // heartbeat — purely a liveness signal
+    if (e.kind === "ping") {
+      // The heartbeat now also carries the server's history head. If it's ahead
+      // of what we've applied, we silently dropped one or more events on a
+      // socket that still looks alive — reconnect to rebuild from the snapshot.
+      // Skipped while reading a past day, where live events are ignored by
+      // design (and replayed on return to Today), so a lagging cursor is
+      // expected rather than drift.
+      if (!viewingDay && typeof e.head_seq === "number"
+          && e.head_seq > this.appliedSeq) {
+        this.connect();
+      }
+      return;
+    }
     // While reading a past day, ignore live transcript events. They stay in the
     // server snapshot and replay when we return to Today (which reconnects).
     if (viewingDay) return;
+    // Advance the sync cursor as history events (replayed or live) arrive.
+    if (typeof e._seq === "number") this.appliedSeq = e._seq;
     onStreamMessage(e);
   },
 
@@ -5955,7 +5981,17 @@ const Link = {
   // refresh whichever data pane is open so it reflects offscreen changes.
   onVisible() {
     if (document.visibilityState !== "visible") return;
-    this.reconnectIfStale();
+    // Decide the wake-up reconnect from how long we were actually hidden, not
+    // from lastMsgAt: a ping buffered during sleep and flushed on wake refreshes
+    // lastMsgAt and would make reconnectIfStale trust a zombie stream that
+    // already missed events. Any meaningful absence forces a fresh stream, whose
+    // snapshot replay reconciles whatever arrived while away — an overnight
+    // proactive message, or a midnight session roll that must clear yesterday's
+    // transcript. A quick tab-flip stays on the healthy existing stream.
+    const away = this.hiddenAt ? Date.now() - this.hiddenAt : 0;
+    this.hiddenAt = 0;
+    if (away > this.STALE_MS) this.connect();
+    else this.reconnectIfStale();
     this.maybeDayRoll();   // returning to the tab in a new day rolls to Today
     refreshActivePane(true);
   },
@@ -6112,6 +6148,10 @@ function onStreamMessage(e) {
       // first new message back as a queued draft. Also drops a lingering
       // "Working…" line left by replayed tool calls (chat.reconcile).
       chat.reconcile(e.busy === true);
+      // Adopt the server's history head as our applied cursor: the snapshot just
+      // replayed covers everything up to here, so from now on a `ping` reporting
+      // a higher head means we've missed a live event and should reconnect.
+      if (typeof e.head_seq === "number") Link.appliedSeq = e.head_seq;
       // The snapshot (today, live) is fully rendered. Land on the latest message;
       // the ResizeObserver then holds it there through any late layout.
       // Background-fill earlier-today sessions above (out of view, since we stay
