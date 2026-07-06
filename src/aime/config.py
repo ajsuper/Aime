@@ -137,6 +137,14 @@ CREATE_GRAPHICS_SCHEMA = "../resources/tools/api_create_graphics_schema.json"
 # with CreateGraphics; interactive sessions only.
 GET_GRAPHIC_SCHEMA = "../resources/tools/api_get_graphic_schema.json"
 
+# LoadGraphicsExamples serves compile-tested Vega-Lite skeletons for the harder
+# chart constructs (error bands, reference lines, grouped bars, dual axes, …) so
+# the model adapts a known-good spec rather than hand-writing layered grammar the
+# CreateGraphics compile gate would then reject. Like GetGraphic it's a client
+# tool whose (bulky) result is stripped from context after the drawing turn;
+# interactive sessions only, paired with CreateGraphics.
+LOAD_GRAPHICS_EXAMPLES_SCHEMA = "../resources/tools/api_load_graphics_examples_schema.json"
+
 
 # --- Usage limits / tiers (see aime.quota, docs/usage-limits.md) -------------
 # Per-user daily cost allowance, in USD, keyed by tier. A user's balance is a

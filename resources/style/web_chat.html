@@ -5621,6 +5621,7 @@ function toolLabel(toolName, toolDetails) {
     case "GetTopicContents":     return "Reading topic…";
     case "ReplaceTopicContents": return "Updating topic…";
     case "EditTopicContents":    return "Editing topic…";
+    case "LoadGraphicsExamples": return "Loading chart examples…";
     case "web_search": {
       const m = toolDetails && toolDetails.match(/^query="(.+)"$/);
       return m ? "Searching the web for '" + m[1] + "'…" : "Searching the web…";

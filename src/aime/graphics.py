@@ -208,6 +208,7 @@ def validate(fmt: str, source: str) -> str | None:
 
 GRAPHIC_TOOL_NAME = "CreateGraphics"
 GET_GRAPHIC_TOOL_NAME = "GetGraphic"
+LOAD_EXAMPLES_TOOL_NAME = "LoadGraphicsExamples"
 
 # A `[graphic-…]` tag in a chat reply or topic body. Matches the addressable
 # grammar — `graphic-<handle>:<n>` where the handle is `T` or `O:T` — plus the
@@ -278,10 +279,49 @@ _LOADED_SOURCE_SLIMMED = (
     "context. Call GetGraphic again if you still need it.]"
 )
 
+# Opening line of a LoadGraphicsExamples result. Like _LOADED_SOURCE_OPENER it
+# doubles as the sentinel the strip matches to slim the (bulky, one-turn) example
+# payload back down once the drawing turn it was loaded for has passed.
+_LOADED_EXAMPLES_OPENER = "[Vega-Lite examples for "
 
-def _result_carries_loaded_source(block) -> bool:
+_LOADED_EXAMPLES_SLIMMED = (
+    "[Vega-Lite examples were loaded here earlier and are omitted now to save "
+    "context. Call LoadGraphicsExamples again if you still need them.]"
+)
+
+
+def loaded_examples_result(kind: str, entries: list) -> str:
+    """The tool_result LoadGraphicsExamples hands the model: one or more compile-
+    tested Vega-Lite skeletons for `kind` (each entry a {title, note, spec} dict),
+    opened with a line that both instructs the model and lets the strip recognise
+    (and later slim) it. The `spec` is serialized to compact JSON the model copies
+    and adapts."""
+    blocks = []
+    for e in entries or []:
+        title = e.get("title") or kind
+        note = e.get("note") or ""
+        spec = json.dumps(e.get("spec") or {}, ensure_ascii=False)
+        blocks.append(f"# {title}\n{note}\n\n{spec}")
+    body = "\n\n".join(blocks)
+    return (
+        f"{_LOADED_EXAMPLES_OPENER}{kind} — adapt one below: swap the inline "
+        "`values` for your data, keep the layer/encoding shape, then call "
+        f"CreateGraphics with the result.]\n\n{body}"
+    )
+
+
+def _slimmed_for_loaded_result(block) -> str | None:
+    """If a tool_result carries a one-turn payload the strip should shrink later —
+    a reloaded GetGraphic source or a LoadGraphicsExamples set — return the short
+    text to replace it with; else None. Recognised by the payload's opener line."""
     content = block.get("content")
-    return isinstance(content, str) and content.startswith(_LOADED_SOURCE_OPENER)
+    if not isinstance(content, str):
+        return None
+    if content.startswith(_LOADED_SOURCE_OPENER):
+        return _LOADED_SOURCE_SLIMMED
+    if content.startswith(_LOADED_EXAMPLES_OPENER):
+        return _LOADED_EXAMPLES_SLIMMED
+    return None
 
 
 # Keep the most recently drawn graphic's source intact this many messages back.
@@ -298,8 +338,9 @@ def redact_history_graphics(messages):
     CreateGraphics `source` becomes a short placeholder (the model keeps the id +
     summary) — *except* the freshest graphic, kept intact through its continuation
     turn (see `_KEEP_RECENT_GRAPHIC_MESSAGES`) so the model never sees a stub
-    where the source it just wrote should be. Reloaded GetGraphic sources are
-    slimmed too, except one in the final message (the editing turn that needs it).
+    where the source it just wrote should be. Reloaded GetGraphic sources and
+    LoadGraphicsExamples payloads are slimmed too, except one in the final message
+    (the drawing/editing turn that still needs it).
 
     Pure and non-mutating: only the touched message/content/block dicts are
     copied, so the caller's persisted `self._messages` is untouched and the
@@ -329,8 +370,10 @@ def redact_history_graphics(messages):
                         gid, inp.get("summary") or "")}
                     replacement = {**block, "input": new_inp}
             elif (role == "user" and block.get("type") == "tool_result"
-                    and mi != last_index and _result_carries_loaded_source(block)):
-                replacement = {**block, "content": _LOADED_SOURCE_SLIMMED}
+                    and mi != last_index):
+                slim = _slimmed_for_loaded_result(block)
+                if slim is not None:
+                    replacement = {**block, "content": slim}
             if replacement is not None:
                 if new_content is None:
                     new_content = list(content)

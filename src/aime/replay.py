@@ -139,11 +139,13 @@ def replay_messages(messages: list[dict]) -> Iterator[CoreEvent]:
                             kind="assistant_text", text=text, from_replay=True
                         )
                 elif btype in ("tool_use", "server_tool_use"):
-                    # CreateGraphics / GetGraphic are internal plumbing on replay:
-                    # a graphic renders from the `[graphic-N]` tag the model wrote
-                    # into its own assistant text (resolved against the stored
-                    # asset), not from the tool_call, so don't surface either.
-                    if block.get("name") in ("CreateGraphics", "GetGraphic"):
+                    # CreateGraphics / GetGraphic / LoadGraphicsExamples are
+                    # internal plumbing on replay: a graphic renders from the
+                    # `[graphic-N]` tag the model wrote into its own assistant text
+                    # (resolved against the stored asset), not from the tool_call,
+                    # and the examples tool is pure scaffolding — so surface none.
+                    if block.get("name") in (
+                            "CreateGraphics", "GetGraphic", "LoadGraphicsExamples"):
                         continue
                     yield CoreEvent(
                         kind="tool_call",

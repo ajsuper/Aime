@@ -36,6 +36,8 @@ from .commitments import CommitmentService
 from .services import _events_from
 from . import graphics as _graphics
 from . import graphics_store as _graphics_store
+from . import graphics_examples as _graphics_examples
+from . import vega_compile as _vega_compile
 from .tool_formatting import (
     format_tool_details,
     format_tool_response,
@@ -1421,6 +1423,14 @@ class ConversationController:
         if tool_name == "GetGraphic":
             self._handle_get_graphic(event, tool_input)
             return
+        # LoadGraphicsExamples serves a compile-tested Vega-Lite skeleton for a
+        # harder chart construct so the model adapts a known-good spec instead of
+        # hand-writing layered grammar from memory. Like GetGraphic's reloaded
+        # source, the (bulky) example payload is stripped from history after the
+        # drawing turn, so it costs tokens only when pulled.
+        if tool_name == "LoadGraphicsExamples":
+            self._handle_load_graphics_examples(event, tool_input)
+            return
         # Commitment-pattern tools are computed in Python over get_events (see
         # CommitmentService); they return a ready-to-read text digest, never raw
         # JSON, so they bypass the gateway and format_tool_result_for_model.
@@ -1585,6 +1595,24 @@ class ConversationController:
             return
 
         error = _graphics.validate(fmt, source)
+        # For Vega-Lite, follow the cheap shape check with the authoritative
+        # compile gate: run the same vega-lite compile + vega parse the browser
+        # runs before it can render (aime.vega_compile), so a spec that is valid
+        # JSON but structurally broken — the usual failure mode for error bands,
+        # reference rules, and multi-series — is caught here and handed back for a
+        # same-turn fix, instead of being told "Saved" and then failing silently
+        # in the browser. The gate fails open (returns None) if Node/deps are
+        # missing, so this only ever *adds* rejections. Steer the model to the
+        # examples tool, which exists precisely for these constructs.
+        if not error and fmt == "vega-lite":
+            compile_err = _vega_compile.compile_error(source)
+            if compile_err:
+                error = (
+                    f"{compile_err} If this is a layered chart (error bands, a "
+                    "baseline/reference line, multiple series, point labels, dual "
+                    "axes, or a trend line), call LoadGraphicsExamples for a "
+                    "known-good skeleton and adapt it."
+                )
         if error:
             self._emit(CoreEvent(
                 kind="tool_result",
@@ -1788,6 +1816,45 @@ class ConversationController:
                 graphic_id, graphic.get("format") or "",
                 graphic.get("source") or "",
             ),
+        )
+
+    def _handle_load_graphics_examples(
+            self, event: BackendEvent, tool_input: dict) -> None:
+        """Client tool: return one or more compile-tested Vega-Lite skeletons for
+        the requested chart construct so the model adapts a known-good spec rather
+        than recalling layered grammar. The payload rides back as the tool_result
+        (opened with the strip sentinel so redact_history_graphics slims it after
+        the drawing turn); an unknown `kind` gets a friendly list of the ones we
+        have — recoverable, in the friendly-error style."""
+        payload = tool_input if isinstance(tool_input, dict) else {}
+        tool_name = event.tool_name or "LoadGraphicsExamples"
+        kind = (payload.get("kind") or "").strip()
+        entries = _graphics_examples.get(kind)
+        if not entries:
+            msg = (
+                f"No examples for {kind!r}. Choose a `kind` from: "
+                f"{', '.join(_graphics_examples.KINDS)}."
+                if kind else
+                "Provide a `kind` — one of: "
+                f"{', '.join(_graphics_examples.KINDS)}."
+            )
+            self._emit(CoreEvent(
+                kind="tool_result",
+                tool_name=tool_name,
+                tool_result_summary=f"no examples for {kind}".strip(),
+                tool_detail_full=msg,
+            ))
+            self._send_tool_result(event.tool_use_id, msg)
+            return
+
+        self._emit(CoreEvent(
+            kind="tool_result",
+            tool_name=tool_name,
+            tool_result_summary=f"loaded {kind} examples",
+        ))
+        self._send_tool_result(
+            event.tool_use_id,
+            _graphics.loaded_examples_result(kind, entries),
         )
 
     def _attach_commitment_histories(self, result, model_result: str) -> str:

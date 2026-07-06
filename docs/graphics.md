@@ -285,8 +285,12 @@ with [[model-routing-plan]] / [[web-search-offload]].
   result is delivered via `SubmitResult` / a message. Leaning *interactive-only*
   for v1 — an agent that draws into a void is wasted tokens. Revisit if a use
 case (a report-style result with an embedded chart) appears.
-- **Vega-Lite schema version** to validate against, and whether to pin it
-  vendored vs. fetch — vendored avoids a network dependency in the hot path.
+- **Vega-Lite validation.** *Resolved (see §11).* Instead of a vendored JSON
+  schema, CreateGraphics now runs the authoritative **compile gate** — the same
+  vega-lite compile + vega parse the browser runs — in a Node subprocess pinned to
+  the browser's major, so a structurally-broken spec is rejected with the real
+  reason and a same-turn retry, and a `LoadGraphicsExamples` tool serves compile-
+  tested skeletons for the harder layered constructs.
 - **Download format**: source-only (smallest, faithful) vs. rasterized PNG
   (shareable, needs a canvas pass per format). Could ship source-only first.
 - **Strip placeholder wording.** *Resolved:* the placeholder echoes the `fig-N`
@@ -297,4 +301,44 @@ case (a report-style result with an embedded chart) appears.
   SVG eating the generation turn's output budget — reject over some ceiling with
   a friendly note, or accept and rely on the strip. Probably a soft cap.
 - **Mermaid server-side validation.** Optimistic for v1; if malformed-spec cards
-  show up often, revisit (a headless mermaid parse in Node, or a lint pass).
+  show up often, revisit (a headless mermaid parse in Node, or a lint pass). The
+  Node harness added in §11 for Vega-Lite makes this cheaper to add later.
+
+---
+
+## 11. The Vega-Lite compile gate + examples tool (as-built)
+
+The model draws basic single-series charts well but gets *layered* Vega-Lite
+wrong from memory — error bands, `rule` reference lines, multi-series `color`,
+`text` labels, grouped bars, dual axes. Three gaps let those fail invisibly: the
+cheap `graphics.validate` can't tell a well-formed spec from a structurally-broken
+one; a broken-but-JSON-valid spec was told *"Saved"* and then failed only as a
+client-side "Couldn't render" card the model never saw (no retry); and the model
+got no examples for the hard constructs. Three coordinated pieces close them:
+
+- **The compile gate** (`aime/vega_compile.py` + `resources/vega/compile.mjs`).
+  After `validate` passes, CreateGraphics runs the *same* two steps the browser
+  runs before it can draw — `vegaLite.compile` → `vega.parse` — in a short-lived
+  Node subprocess pinned (via `package.json`) to the browser's major (`@5`). A
+  spec that won't compile comes back through the **existing** retry path with the
+  real reason, so self-correction now fires for exactly the failing cases. **Fails
+  open:** if Node/deps are absent or it times out, `compile_error` returns None and
+  CreateGraphics falls back to the loose gate — the gate only ever *adds*
+  rejections. `node_modules` is gitignored; run `npm install` at deploy.
+
+- **`LoadGraphicsExamples`** (`aime/graphics_examples.py` +
+  `api_load_graphics_examples_schema.json`). A client tool, dispatched like
+  `GetGraphic`, that returns a compile-tested, adaptable skeleton for a requested
+  `kind` (multi-series line, error band, reference line, point labels, grouped
+  bar, dual axis, scatter trend). Its result is **stripped from history after the
+  drawing turn** — reusing `redact_history_graphics` via a second opener sentinel —
+  so the guidance costs tokens only when pulled. A test compiles every recipe
+  through the gate so the library can't rot into specs the server would reject.
+
+- **The schema pointer.** `api_create_graphics_schema.json` tells the model to
+  call `LoadGraphicsExamples` first for anything beyond a simple single series,
+  and that specs are now compiled before saving.
+
+Parity, not perfection: `compile`+`parse` catches structural/spec errors — the
+dominant failure mode — but not every runtime/data quirk or aesthetic crowding;
+the recipes and `vegaThemeConfig` carry the legibility side.

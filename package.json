@@ -1,0 +1,10 @@
+{
+  "name": "aime-vega-compile",
+  "private": true,
+  "description": "Server-side Vega-Lite compile gate for CreateGraphics. Pinned to the same major (5) the web frontend loads (web_chat.html ensureVega), so the server rejects exactly what the browser can't render. Used by aime.vega_compile via resources/vega/compile.mjs.",
+  "type": "module",
+  "dependencies": {
+    "vega": "5.33.1",
+    "vega-lite": "5.23.0"
+  }
+}
