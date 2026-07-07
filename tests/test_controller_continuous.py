@@ -371,6 +371,36 @@ def test_deliver_inline_proactive_rolls_stale_day_into_today(monkeypatch):
     assert any(e.kind == "proactive_message" for e in events)
 
 
+def test_proactive_day_roll_survives_a_later_same_day_open(monkeypatch):
+    # Regression: an overnight reminder day-rolls onto a fresh Today at 7am and
+    # is recorded there. When the user opens hours later, /stream's open-time
+    # maybe_roll_session must NOT day-roll a *second* time — doing so wiped the
+    # message out of Today into History (it only reappeared on scroll-back).
+    # The roll and the proactive record both re-baseline _last_activity, so the
+    # later open sees "already touched today" and leaves the message in place.
+    monkeypatch.setattr(controller_mod, "IDLE_ROLLOVER_SECONDS", 3600)
+    monkeypatch.setattr(controller_mod, "DAY_ROLL_MIN_GAP_SECONDS", 1800)
+    c, backend, events = _controller(messages=[{"role": "user", "content": []}])
+    c._last_activity = time.time() - 2 * 86400   # last night's thread, real gap
+
+    # 7am: the reminder arrives and rolls onto a fresh Today.
+    assert c.deliver_inline_proactive("Your morning briefing is ready.") is True
+    assert backend.reset_calls == 1
+    events.clear()
+
+    # Hours later, same day: the user opens the page → /stream rolls if due.
+    c.maybe_roll_session()
+
+    assert backend.reset_calls == 1                       # no second roll
+    assert "session_restart" not in _kinds(events)        # Today not re-cleared
+    # The briefing is still in the live session, not stranded in History.
+    assert any(
+        m["role"] == "assistant"
+        and m["content"][0]["text"] == "Your morning briefing is ready."
+        for m in backend.messages_snapshot()
+    )
+
+
 def test_deliver_inline_proactive_when_busy_defers_to_turn_end():
     c, backend, events = _controller()
     c.dispatch_input("hold on")          # claims the turn (busy)

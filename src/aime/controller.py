@@ -893,6 +893,14 @@ class ConversationController:
                 # stranded in yesterday's bucket / History.
                 return
             self._swap_to_fresh_session()
+            # Re-baseline the activity clock onto the fresh session. Without this
+            # the next roll check still sees the *pre-roll* timestamp: a proactive
+            # message that day-rolls onto a new Today (e.g. a 7am reminder) would
+            # be re-rolled a second time when the user opens hours later — the
+            # clock still reads "yesterday", so day_rolled fires again and the
+            # session_restart wipes the message out of Today into History. A roll
+            # is itself the session's most recent activity, so anchor it here.
+            self._last_activity = now
             self._spawn_worker(self.run_stream_loop)
             if day_rolled:
                 # New day → wipe the view to a fresh Today (no "New conversation"
@@ -1209,6 +1217,11 @@ class ConversationController:
         pid = _new_proactive_id()
         if not self._backend.append_assistant_message(body, pid=pid):
             return False
+        # Writing an assistant message is activity on this session — anchor the
+        # idle/day-roll clock to it, exactly as turn_end does. Otherwise the
+        # session that just received an out-of-band message still looks "last
+        # touched yesterday" and a later open day-rolls it into History.
+        self._last_activity = time.time()
         # A dedicated event (not assistant_text): the frontend renders it as a
         # standalone Aime bubble instantly, with no dependence on turn/typewriter
         # state — which is what kept proactive messages from showing in the chat.
