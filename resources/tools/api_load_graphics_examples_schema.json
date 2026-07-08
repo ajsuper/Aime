@@ -1,0 +1,23 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "LoadGraphicsExamples",
+  "description": "Load a known-good, copy-adaptable Vega-Lite skeleton for a harder chart construct BEFORE you draw it with CreateGraphics. You reliably hand-write single-series bar/line/scatter charts, but layered constructs — error/confidence bands, baseline or target reference lines, per-point value labels, grouped bars, dual axes, trend lines — are easy to get subtly wrong from memory, and a wrong spec now fails the server compile check and bounces back. So for any of those, call this FIRST, then swap the returned skeleton's inline `values` for your real data and re-send it via CreateGraphics. Pick the `kind` that matches what you need; the result is a compile-tested spec plus a one-line note on what to change. The example is dropped from your context after this turn, so build your chart on it now.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["kind"],
+  "properties": {
+    "kind": {
+      "type": "string",
+      "enum": [
+        "line-multi-series",
+        "line-error-band",
+        "reference-line",
+        "point-labels",
+        "grouped-bar",
+        "dual-axis",
+        "scatter-trend"
+      ],
+      "description": "Which construct you need a skeleton for. `line-multi-series`: several lines, one per category (colour + legend). `line-error-band`: a line with a shaded confidence/error band. `reference-line`: a chart with a baseline/target rule (optionally labelled). `point-labels`: value labels on each point/bar. `grouped-bar`: clustered bars grouped within categories. `dual-axis`: two measures on independent left/right y-axes. `scatter-trend`: a scatter plot with a fitted trend line."
+    }
+  }
+}

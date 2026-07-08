@@ -17,18 +17,27 @@ event (worker thread for agent output; calling thread for input handlers);
 frontends are responsible for thread-marshaling if their UI toolkit needs it.
 """
 
+import datetime
 import json
+import os
 import threading
+import time
+import uuid
+import zoneinfo
 from dataclasses import dataclass, field
 from typing import Callable, Literal
 
-from provider_backend import AgentBackend, BackendEvent, SessionInfo
+from provider_backend import (
+    AgentBackend, BackendEvent, SessionInfo, session_started_at,
+)
 
 from .tool_gateway import ToolGateway
 from .commitments import CommitmentService
 from .services import _events_from
 from . import graphics as _graphics
 from . import graphics_store as _graphics_store
+from . import graphics_examples as _graphics_examples
+from . import vega_compile as _vega_compile
 from .tool_formatting import (
     format_tool_details,
     format_tool_response,
@@ -40,12 +49,48 @@ from .onboarding import (
     OnboardingState,
     ONBOARDING_PROMPT,
 )
+from .active_events import active_events_prefix
 
 
 # Cap on instances per commitment when auto-attaching history to a
 # FilterUsersEvents result — keeps the enrichment bounded for commitments with
 # long histories. The model can still call GetCommitmentHistory for the full set.
 _AUTO_HISTORY_LIMIT = 10
+
+
+def _new_proactive_id() -> str:
+    """A stable, unique id for a proactive message, stored with it so the frontend
+    can remember per-message whether it's been seen."""
+    return "p-" + uuid.uuid4().hex[:12]
+
+# After this many seconds of quiet, the next user message silently starts a
+# fresh backend session — a cost-bounded boundary that the user never sees (no
+# "New conversation" break; the thread keeps scrolling). The durable per-user
+# context (About Me / Pending / active events) re-injects on the new session, so
+# continuity is preserved; only verbatim recent banter is dropped. Compaction
+# still bounds *active* threads by length; this bounds *idle* ones by time.
+# Overridable for tests via AIME_IDLE_ROLLOVER_SECONDS (0 disables rollover).
+try:
+    IDLE_ROLLOVER_SECONDS = float(
+        os.environ.get("AIME_IDLE_ROLLOVER_SECONDS", "3600")
+    )
+except ValueError:
+    IDLE_ROLLOVER_SECONDS = 3600.0
+
+# A day-roll clears the view to a fresh Today (unlike the silent idle roll). We
+# only do it once the user has actually stepped away for at least this gap —
+# otherwise a conversation that happens to cross midnight would be wiped
+# mid-sentence. This is what distinguishes "came back on a new day" (clear) from
+# "still in one sitting that happens to straddle midnight" (keep the thread).
+# Independent of IDLE_ROLLOVER_SECONDS so clearing yesterday's view still works
+# even when the cost-driven idle roll is disabled (threshold 0). Overridable for
+# tests via AIME_DAY_ROLL_MIN_GAP_SECONDS.
+try:
+    DAY_ROLL_MIN_GAP_SECONDS = float(
+        os.environ.get("AIME_DAY_ROLL_MIN_GAP_SECONDS", "1800")
+    )
+except ValueError:
+    DAY_ROLL_MIN_GAP_SECONDS = 1800.0
 
 CoreEventKind = Literal[
     "user_message_shown",       # user msg accepted and sent to backend
@@ -76,15 +121,28 @@ CoreEventKind = Literal[
                                 # {"sources": [{"title", "url"}, ...]} in
                                 # `payload` so the frontend can render a source
                                 # bubble under the model's reply
+    "session_divider",          # boundary between two backend sessions in the
+                                # continuous transcript; carries
+                                # {session_id, title, saved_at} in `payload` so
+                                # the frontend can label the session above it and
+                                # use the id as the scroll-back cursor
+    "proactive_message",        # a message Aime sent the user out of band (a
+                                # scheduler reminder, an agent notification, a
+                                # SendMessage). Rendered as a self-contained Aime
+                                # bubble, instantly — no turn / typewriter state —
+                                # so it always appears in the chat
 ]
 
 
 Severity = Literal[
-    "info", "warning", "error", "success", "recovery", "loaded", "new_session",
+    "info", "warning", "error", "success", "recovery", "new_session",
     # Signal-only severities (no visible banner): tell the frontend that the
     # first-run onboarding flow has started / finished so it can show or hide
     # onboarding-only affordances like the empty-state upload nudge.
     "onboarding", "onboarding_done",
+    # Temporary Chat: "temporary" arms the incognito banner / styling; its
+    # text is the banner copy. "temporary_end" drops it on exit.
+    "temporary", "temporary_end",
 ]
 RestartReason = Literal["reset", "load"]
 
@@ -107,6 +165,11 @@ class CoreEvent:
     # Set on events emitted during /load history replay. Lets the frontend
     # skip live-only affordances like the "thinking…" placeholder.
     from_replay: bool = False
+    # Stable id for a proactive_message, assigned when the message is created and
+    # preserved on disk, so the frontend can track per-message whether it's been
+    # seen (and thus whether to show "New") across reconnects and reloads. Empty
+    # for ordinary events and for pre-existing messages written before this field.
+    pid: str = ""
     # User-message attachments (images, embedded text files). Each entry is
     # {"kind": "image", "media_type": str, "data": str (base64)} for images.
     # Text files are still embedded in `text` via <aime:file> sentinels; the
@@ -195,11 +258,21 @@ class ConversationController:
         headless: bool = False,
         messenger=None,
         message_recipient: str | None = None,
+        message_sink=None,
         reminder_service=None,
         record_sync=None,
         graphic_store_provider=None,
+        error_sink=None,
     ):
         self._backend = backend
+        # Optional diagnostics capture, called as
+        #   error_sink(exc, source=..., session_id=..., username=..., model=...)
+        # returning {"reference", "category", "user_message"}. Wired by the web
+        # layer to the ErrorStore; None for the TUI / background agents and in
+        # tests, where errors simply surface as before. The backend captures its
+        # own turn failures directly; this covers the controller-level sites
+        # (dispatch, stream loop, tool-result sends).
+        self._error_sink = error_sink
         self._tools = tool_gateway
         self._spawn_worker = worker_spawner
         # Optional graphic-store *provider* (built by the web layer). Given a
@@ -242,6 +315,13 @@ class ConversationController:
         # tool returns a friendly "not set up" result and the field is ignored.
         self._messenger = messenger
         self._message_recipient = (message_recipient or "").strip() or None
+        # Optional callback fired with the text of every message actually sent
+        # through the pipeline (see _deliver_message). Lets a background-agent run
+        # thread its outbound messages (SendMessage *and* SubmitResult) into the
+        # owning user's transcript — the single place every send is captured, so
+        # agent and interactive sends behave identically. None on the interactive
+        # user's own controller, which records into its own session instead.
+        self._message_sink = message_sink
         # Headless mode drives a background-agent run rather than an interactive
         # chat: start() skips the onboarding bootstrap and instead arms the
         # SubmitResult terminal tool, and the SubmitResult call is surfaced as
@@ -261,13 +341,44 @@ class ConversationController:
         # Conversation-level state. Presentation flags (e.g. whether the
         # "thinking…" line is visible) live in the frontend, not here.
         self._is_idle = True
+        # Wall-clock timestamp (epoch seconds) of the last conversation activity
+        # (a user message dispatched, or a turn ended). Drives the idle-gap silent
+        # rollover: a returning user past IDLE_ROLLOVER_SECONDS rolls onto a fresh
+        # session. Wall clock (not monotonic) so it can be seeded from a resumed
+        # session's persisted saved_at — see seed_last_activity().
+        self._last_activity = time.time()
         # Mirrors _is_idle as a threading.Event so stop_model() can block
         # until the in-flight turn has actually ended (so a follow-up
         # /send POSTed by the frontend is dispatched as the next turn
         # rather than landing in the queue during the gap and being lost).
         self._idle_event = threading.Event()
         self._idle_event.set()
-        self._pending_user_messages: list[str] = []
+        self._pending_user_messages: list[tuple] = []
+        # Temporary Chat (incognito): a throwaway session whose transcript is
+        # never persisted and never folds into the main continuous thread. Tool
+        # actions still persist. _main_session_id remembers the thread to return
+        # to on exit. While temporary, out-of-band proactive messages are routed
+        # to the *main* thread (not this one) — see deliver_inline_proactive.
+        self._temporary = False
+        self._main_session_id: str | None = None
+        # Text the model sent the user via the SendMessage tool *during* a turn.
+        # We can't append it to history mid-turn (it would corrupt the in-flight
+        # assistant/tool_result ordering), so it's stashed here and flushed as an
+        # inline assistant turn when the turn ends — so an interactive send shows
+        # in the thread just like a scheduler/agent one. Guarded by _state_lock.
+        self._pending_proactive: list[str] = []
+        # Two locks keep input dispatch race-free across the waitress request
+        # threads and the stream-worker thread:
+        #   * _dispatch_lock (reentrant) serializes a whole dispatch_input /
+        #     reset / load so a /send can't interleave with a conversation
+        #     switch. Held across stop_model()'s block — safe because the worker
+        #     thread never takes it (no deadlock on _idle_event).
+        #   * _state_lock guards the quick read-modify-write of _is_idle /
+        #     _pending_user_messages / _idle_event, shared between the dispatch
+        #     path and the worker's turn_end handling. Never held across a
+        #     blocking call or an _emit.
+        self._dispatch_lock = threading.RLock()
+        self._state_lock = threading.Lock()
         self._user_first_interaction = True
         self._log_model_thinking = False
         # Onboarding: a persisted per-user flag is the source of truth (see
@@ -286,6 +397,47 @@ class ConversationController:
     def _emit(self, event: CoreEvent) -> None:
         for sub in self._subscribers:
             sub(event)
+
+    def _emit_session_divider(
+        self, session_id: str | None, title: str = "", saved_at: str = "",
+    ) -> None:
+        """Mark a session boundary in the continuous transcript. The frontend
+        labels it with a date/time stamp (derived from the session id) so the user
+        sees where the model started fresh, and uses the id as the scroll-back
+        cursor for /history."""
+        self._emit(CoreEvent(
+            kind="session_divider",
+            payload={
+                "session_id": session_id or "",
+                "title": (title or "").strip(),
+                "saved_at": saved_at or "",
+                # Absolute instant so the client renders it in the user's tz.
+                "started_at": session_started_at(session_id or ""),
+            },
+        ))
+
+    def _capture(self, exc: Exception, *, source: str) -> dict | None:
+        """Hand a controller-level exception to the diagnostics sink (when
+        wired), returning its ``{reference, category, user_message}`` meta or
+        None. Best-effort — never raises into the path it's observing."""
+        if self._error_sink is None:
+            return None
+        try:
+            return self._error_sink(
+                exc, source=source,
+                session_id=getattr(self._backend, "session_id", None),
+            )
+        except Exception:
+            return None
+
+    def _emit_error(self, exc: Exception, *, source: str, label: str) -> None:
+        """Capture a controller-level exception and emit its error CoreEvent.
+
+        ``label`` is the developer-facing prefix kept in ``text`` (shown in
+        verbose mode, logged in the console); the calm user-facing line and the
+        reference id ride along in ``payload`` from the sink's classification."""
+        meta = self._capture(exc, source=source)
+        self._emit(CoreEvent(kind="error", text=f"{label}: {exc}", payload=meta))
 
     # --- lifecycle ---
 
@@ -326,9 +478,12 @@ class ConversationController:
             self._backend.submit(BackendEvent(
                 kind="system_send_message", text=ONBOARDING_PROMPT
             ))
-            self._is_idle = False
+            with self._state_lock:
+                self._is_idle = False
+                self._idle_event.clear()
         except Exception as exc:
-            self._emit(CoreEvent(kind="error", text=f"onboarding send failed: {exc}"))
+            self._emit_error(exc, source="onboarding",
+                             label="onboarding send failed")
 
     def _set_terminal_tool(self, active: bool) -> None:
         """Toggle the model-facing terminal tool (CompleteOnboarding in an
@@ -360,7 +515,22 @@ class ConversationController:
         the text sent to the model but NOT shown in the user_message_shown
         event — used for out-of-band context (e.g. <stale> markers) that the
         model should see but the user shouldn't have echoed back in their own
-        chat bubble. Returns True if the frontend should quit the app."""
+        chat bubble. Returns True if the frontend should quit the app.
+
+        Serialized under `_dispatch_lock` so concurrent requests (a /send racing
+        a /reset or /load) can't interleave their turn-state mutations — the race
+        that used to park a message in the pending queue and then wipe it."""
+        with self._dispatch_lock:
+            return self._dispatch_input_locked(
+                raw, images=images, hidden_prefix=hidden_prefix)
+
+    def _dispatch_input_locked(
+        self,
+        raw: str,
+        images: list[dict] | None = None,
+        *,
+        hidden_prefix: str = "",
+    ) -> bool:
         text = (raw or "").strip()
         if not text and not images:
             return False
@@ -368,6 +538,12 @@ class ConversationController:
             return True
         if text == "/reset":
             self.reset()
+            return False
+        if text == "/temp on":
+            self.enter_temporary_chat()
+            return False
+        if text == "/temp off":
+            self.exit_temporary_chat()
             return False
         if text.startswith("/load"):
             parts = text.split(maxsplit=1)
@@ -399,12 +575,30 @@ class ConversationController:
         *,
         hidden_prefix: str = "",
     ) -> None:
-        """Send (or queue) a plain user message without slash parsing."""
-        if not self._is_idle:
-            self._pending_user_messages.append((text, images))
+        """Send (or queue) a plain user message without slash parsing.
+
+        Claim-or-queue is atomic under `_state_lock`: either we flip the turn
+        busy and dispatch, or we append to the pending queue — never a torn
+        check-then-act that a concurrent turn_end could slip between. A queued
+        message is dispatched when the current turn ends (see the turn_end
+        handler), not discarded."""
+        # A returning user (quiet past the idle threshold, or arriving on a new
+        # day) silently rolls onto a fresh session before this message is accepted,
+        # so their live context stays cheap and each session sits in one local day.
+        # No-op mid-turn or on an already-fresh session.
+        self._maybe_roll_session()
+        with self._state_lock:
+            if not self._is_idle:
+                self._pending_user_messages.append((text, images, hidden_prefix))
+                queued = True
+            else:
+                self._is_idle = False
+                self._idle_event.clear()
+                queued = False
+        if queued:
             self._emit(CoreEvent(kind="user_message_queued", text=text))
-            return
-        self._dispatch_user_message(text, images=images, hidden_prefix=hidden_prefix)
+        else:
+            self._dispatch_user_message(text, images=images, hidden_prefix=hidden_prefix)
 
     def _dispatch_user_message(
         self,
@@ -413,6 +607,11 @@ class ConversationController:
         *,
         hidden_prefix: str = "",
     ) -> None:
+        # The caller (send_user_message or the turn_end drain) has already
+        # claimed the turn busy under _state_lock, so we only need to *release*
+        # that claim if the backend submit fails — otherwise the model would
+        # never start and the composer would wedge.
+        self._last_activity = time.time()
         attachments: list[dict] = []
         for img in (images or []):
             mt = img.get("media_type")
@@ -428,6 +627,13 @@ class ConversationController:
             bootstrap = bootstrap_special_topics(self._tools)
             if bootstrap:
                 self._backend.set_session_context(bootstrap)
+            # On the first message of a chat, tell the model exactly what events
+            # are happening right now (best-effort; never blocks the message).
+            # Interactive chats only — background-agent prompts stay curated.
+            if not self._headless:
+                active = active_events_prefix(self._tools, self._now_local())
+                if active:
+                    hidden_prefix = (active + "\n" + hidden_prefix) if hidden_prefix else active
             self._user_first_interaction = False
         # The prefix carries out-of-band context (e.g. <stale>…</stale>) that
         # the model should see but the user shouldn't — user_message_shown
@@ -437,10 +643,25 @@ class ConversationController:
             self._backend.submit(BackendEvent(
                 kind="user_send_message", text=backend_text, images=images,
             ))
-            self._is_idle = False
-            self._idle_event.clear()
         except Exception as exc:
-            self._emit(CoreEvent(kind="error", text=f"send failed: {exc}"))
+            with self._state_lock:
+                self._is_idle = True
+                self._idle_event.set()
+            self._emit_error(exc, source="controller_send",
+                             label="send failed")
+
+    def _now_local(self) -> datetime.datetime:
+        """Current time as a naive wall-clock datetime in the user's timezone
+        (falling back to the server's local time). Used to decide which events
+        are active 'now' from the user's point of view."""
+        if self._client_tz:
+            try:
+                return datetime.datetime.now(
+                    zoneinfo.ZoneInfo(self._client_tz)
+                ).replace(tzinfo=None)
+            except Exception:
+                pass
+        return datetime.datetime.now()
 
     def set_client_timezone(self, tz: str) -> None:
         """Forward the client's IANA timezone to the backend so per-turn
@@ -472,9 +693,11 @@ class ConversationController:
         conversation) and `load()` (switching conversations) all funnel
         through it, so the model never keeps replying into a conversation the
         user has already moved on from. The synchronicity matters: when this
-        returns, `_is_idle` is True, so a follow-up `/send` dispatches
-        immediately instead of racing into `_pending_user_messages` and being
-        discarded when turn_end fires.
+        returns, `_is_idle` is True, so the caller's follow-up work (a fresh
+        turn for `/interrupt`, a session swap for reset/load) runs against a
+        fully-idle controller. Input dispatch is separately serialized by
+        `_dispatch_lock`, and queued messages are drained on turn_end rather
+        than dropped — so a racing `/send` is delivered, not lost.
 
         Returns True if the controller became idle within the timeout, False
         if the deadline expired (a stuck model stream). reset()/load() ignore
@@ -487,75 +710,315 @@ class ConversationController:
         return self._idle_event.wait(timeout=timeout)
 
     def reset(self) -> None:
-        # Stop any in-flight turn first so the old conversation's reply can't
-        # bleed events into the fresh one.
+        with self._dispatch_lock:
+            self._swap_to_fresh_session()
+            # session_restart = "clear the transcript / wipe presentation state".
+            # The banner text follows separately as a notice so the frontend can
+            # render it after the clear. Only an *explicit* reset clears the view
+            # and shows the splash — a silent idle rollover does neither.
+            self._emit(CoreEvent(kind="session_restart", restart_reason="reset"))
+            # "new_session" severity (not "success") so the frontend renders it
+            # as a centered Aime-logo welcome splash rather than a corner notice.
+            self._emit(CoreEvent(
+                kind="notice",
+                severity="new_session",
+                text="New conversation started",
+            ))
+            self._spawn_worker(self.run_stream_loop)
+            # A returning user who never finished onboarding gets it again here,
+            # rather than a blank new chat. No-op (and cheap) once they've engaged.
+            self._maybe_start_onboarding()
+
+    def enter_temporary_chat(self) -> None:
+        """Switch into a Temporary Chat: a throwaway thread that starts fresh (no
+        main-thread history, but the durable About Me / Pending / active-events
+        context still bootstraps on the first message), is never persisted, and is
+        discarded on exit. Tool actions still persist. Proactive messages keep
+        landing in the main thread (see deliver_inline_proactive). Idempotent."""
+        with self._dispatch_lock:
+            if self._temporary or self._headless:
+                return
+            # Remember the thread to come back to. It's persisted on disk (turns
+            # save as they complete), so exit reloads it from there — including any
+            # proactive messages written to it while we were in temp mode.
+            self._main_session_id = getattr(self._backend, "session_id", None)
+            with self._state_lock:
+                self._pending_user_messages = []
+                self._pending_proactive = []
+            self.stop_model()
+            self._backend.start_ephemeral_session()
+            self._reset_internal_state()
+            self._temporary = True
+            # Clear the transcript to a fresh temp view (no main history), then a
+            # signal-only notice the frontend uses to show the temp-mode banner.
+            self._emit(CoreEvent(kind="session_restart", restart_reason="reset"))
+            self._emit(CoreEvent(
+                kind="notice",
+                severity="temporary",
+                text="Temporary chat — this conversation won't be saved.",
+            ))
+            self._spawn_worker(self.run_stream_loop)
+            self._maybe_start_onboarding()
+
+    def exit_temporary_chat(self) -> None:
+        """Leave a Temporary Chat, discarding its transcript, and restore the main
+        continuous thread (reloaded from disk so any proactive messages recorded
+        while we were away are present). Idempotent."""
+        with self._dispatch_lock:
+            if not self._temporary:
+                return
+            with self._state_lock:
+                self._pending_user_messages = []
+                self._pending_proactive = []
+            self.stop_model()
+            self._temporary = False
+            main_id = self._main_session_id
+            self._main_session_id = None
+            restored = False
+            if main_id:
+                try:
+                    self._backend.load_session(main_id)
+                    restored = True
+                except (OSError, ValueError):
+                    restored = False
+            if restored:
+                # Replays the main thread silently and spawns the worker.
+                self.seed_last_activity(self._saved_at_for(main_id))
+                self._load_after_swap(main_id)
+            elif not self.resume_latest_session():
+                # No main thread to restore (it was empty/unsaved): land on a
+                # fresh, normal session.
+                self._swap_to_fresh_session()
+                self._spawn_worker(self.run_stream_loop)
+            # Signal-only notice so the frontend drops the temp-mode banner.
+            self._emit(CoreEvent(kind="notice", severity="temporary_end"))
+
+    def _saved_at_for(self, session_id: str) -> str:
+        """The persisted saved_at for a session id (or '' if unknown), used to
+        seed the idle-rollover clock when restoring the main thread."""
+        for info in self._backend.list_sessions():
+            if info.id == session_id:
+                return info.saved_at or ""
+        return ""
+
+    @property
+    def is_temporary(self) -> bool:
+        return self._temporary
+
+    def _swap_to_fresh_session(self) -> None:
+        """Tear down the active backend session and start an empty one. Shared by
+        the user-visible `reset()` and the silent idle rollover; the difference is
+        purely what's emitted afterwards (a reset clears the transcript + shows a
+        splash; a rollover stays invisible). Caller holds `_dispatch_lock`."""
+        # Drop any queued messages first — they belong to the conversation we're
+        # leaving. Cleared *before* the interrupt so the worker's turn_end (woken
+        # by stop_model) can't re-dispatch one into the new session; _dispatch_lock
+        # keeps a concurrent /send from refilling it.
+        with self._state_lock:
+            self._pending_user_messages = []
+        # Stop any in-flight turn so the old conversation's reply can't bleed
+        # events into the fresh one.
         self.stop_model()
         self._backend.reset()
         self._reset_internal_state()
-        # session_restart = "clear the transcript / wipe presentation state".
-        # The banner text follows separately as a notice so the frontend can
-        # render it after the clear.
-        self._emit(CoreEvent(kind="session_restart", restart_reason="reset"))
-        # "new_session" severity (not "success") so the frontend renders it
-        # as a centered Aime-logo welcome splash rather than a corner notice.
-        self._emit(CoreEvent(
-            kind="notice",
-            severity="new_session",
-            text="New conversation started",
-        ))
-        self._spawn_worker(self.run_stream_loop)
-        # A returning user who never finished onboarding gets it again here,
-        # rather than a blank new chat. No-op (and cheap) once they've engaged.
-        self._maybe_start_onboarding()
+
+    def _local_date(self, epoch: float) -> datetime.date:
+        """The calendar date of an epoch time in the user's timezone (server-local
+        when no client zone is known). Used to detect a day boundary for rollover
+        and to keep each session inside a single local day."""
+        if self._client_tz:
+            try:
+                return datetime.datetime.fromtimestamp(
+                    epoch, zoneinfo.ZoneInfo(self._client_tz)
+                ).date()
+            except Exception:
+                pass
+        return datetime.datetime.fromtimestamp(epoch).date()
+
+    def maybe_roll_session(self) -> None:
+        """Public entry point for the idle/day rollover check, so a client merely
+        *opening* or *reconnecting* (not only sending a message) lands on a fresh
+        Today. Idempotent: a no-op when no roll is due, mid-turn, headless, or
+        temporary — same as the dispatch-time check it shares."""
+        self._maybe_roll_session()
+
+    def _maybe_roll_session(self) -> None:
+        """Roll onto a new backend session when either (a) the thread has been quiet
+        past IDLE_ROLLOVER_SECONDS (a cost boundary), or (b) the user's local day has
+        changed *and* they've stepped away at least DAY_ROLL_MIN_GAP_SECONDS.
+
+        Called both before accepting a fresh user turn and when a client opens or
+        reconnects (see maybe_roll_session), so a returning user lands on Today
+        without having to send first.
+
+        The two rolls differ in how they're presented:
+          * idle roll (same day) — silent: the transcript stays continuous within
+            the day, with just a subtle divider marking the fresh, cheap session.
+          * day roll — clears the transcript to a fresh "Today", so yesterday's
+            messages don't bleed into today (they live in the History pane).
+
+        The day roll is gated on DAY_ROLL_MIN_GAP_SECONDS so a conversation that
+        crosses midnight isn't wiped mid-sentence: the clear waits until the user
+        has actually been away, not merely until the clock ticks over.
+
+        Skipped in headless runs, temporary chats, and on an already-empty session."""
+        if self._headless or self._temporary:
+            return
+        with self._dispatch_lock:
+            with self._state_lock:
+                if not self._is_idle:
+                    return  # mid-turn: this message will queue, don't roll
+                last = self._last_activity
+            now = time.time()
+            gap = now - last
+            idle_rolled = (
+                IDLE_ROLLOVER_SECONDS > 0
+                and gap >= IDLE_ROLLOVER_SECONDS
+            )
+            day_rolled = (
+                self._local_date(last) != self._local_date(now)
+                and gap >= DAY_ROLL_MIN_GAP_SECONDS
+            )
+            if not (idle_rolled or day_rolled):
+                return
+            sid = getattr(self._backend, "session_id", None)
+            if not self._backend.messages_snapshot() and (
+                sid is None or self._is_today(sid)
+            ):
+                # Already on a fresh/empty session dated Today — nothing to roll.
+                # But an *empty yet stale* session (its id minted on a prior day,
+                # left unused across midnight) still rolls: its fresh id re-stamps
+                # to Today, so the next write — a typed message, or an out-of-band
+                # task/reminder — persists under a Today id instead of being
+                # stranded in yesterday's bucket / History.
+                return
+            self._swap_to_fresh_session()
+            # Re-baseline the activity clock onto the fresh session. Without this
+            # the next roll check still sees the *pre-roll* timestamp: a proactive
+            # message that day-rolls onto a new Today (e.g. a 7am reminder) would
+            # be re-rolled a second time when the user opens hours later — the
+            # clock still reads "yesterday", so day_rolled fires again and the
+            # session_restart wipes the message out of Today into History. A roll
+            # is itself the session's most recent activity, so anchor it here.
+            self._last_activity = now
+            self._spawn_worker(self.run_stream_loop)
+            if day_rolled:
+                # New day → wipe the view to a fresh Today (no "New conversation"
+                # splash — that's only for an explicit reset).
+                self._emit(CoreEvent(kind="session_restart", restart_reason="reset"))
+            # A subtle, timestamped divider marks the fresh session (title fills in
+            # from the first message). After a day roll it labels the top of Today.
+            self._emit_session_divider(
+                getattr(self._backend, "session_id", None),
+                "",
+                datetime.datetime.now().isoformat(timespec="seconds"),
+            )
+            self._maybe_start_onboarding()
 
     def load(self, session_id: str) -> None:
-        # Switching conversations stops the model mid-turn — see stop_model().
-        self.stop_model()
-        try:
-            self._backend.load_session(session_id)
-        except (OSError, ValueError) as exc:
-            self._emit(CoreEvent(
-                kind="notice",
-                severity="error",
-                text=f"Could not load conversation '{session_id}': {exc}",
-            ))
-            return
+        with self._dispatch_lock:
+            # Queued messages belong to the conversation we're leaving — drop
+            # them before switching (same reasoning as reset()).
+            with self._state_lock:
+                self._pending_user_messages = []
+            # Switching conversations stops the model mid-turn — see stop_model().
+            self.stop_model()
+            try:
+                self._backend.load_session(session_id)
+            except (OSError, ValueError) as exc:
+                self._emit(CoreEvent(
+                    kind="notice",
+                    severity="error",
+                    text=f"Could not load conversation '{session_id}': {exc}",
+                ))
+                return
+            self._load_after_swap(session_id)
+
+    def _load_after_swap(self, session_id: str) -> None:
         self._reset_internal_state()
         self._emit(CoreEvent(kind="session_restart", restart_reason="load"))
+        # Label the session at the top of the view (the scroll-back anchor): its
+        # id is the cursor the frontend pages /history from, its title/saved_at
+        # the divider copy.
+        title, saved_at = "", ""
+        for info in self._backend.list_sessions():
+            if info.id == session_id:
+                title, saved_at = (info.summary or "").strip(), info.saved_at
+                break
+        self._emit_session_divider(session_id, title, saved_at)
         # Replay deferred to keep the import graph shallow — replay imports
         # from controller for the CoreEvent type.
         from .replay import replay_messages
         for event in replay_messages(self._backend.messages_snapshot()):
             self._emit(event)
-        title = ""
-        for info in self._backend.list_sessions():
-            if info.id == session_id:
-                title = (info.summary or "").strip()
-                break
-        if title:
-            preview = title if len(title) <= 40 else title[:40].rstrip() + "..."
-            loaded_text = (
-                f'Loaded conversation "{preview}". Continue where you left off.'
-            )
-        else:
-            loaded_text = "Loaded conversation. Continue where you left off."
-        # "loaded" severity (not "success") so the frontend can center it and
-        # fade it away once the user sends a message — see web_chat.html.
-        self._emit(CoreEvent(
-            kind="notice",
-            severity="loaded",
-            text=loaded_text,
-        ))
+        # No "Loaded conversation… continue where you left off" banner: the thread
+        # just continues silently. That line was a switching affordance, and
+        # there's no longer a switcher — the chat is one continuous conversation.
         self._spawn_worker(self.run_stream_loop)
+
+    def resume_latest_session(self) -> bool:
+        """Open into a live "Today" at startup: resume the most recent session *only
+        if it belongs to the current local day*, so today continues where it left off
+        and any proactive message recorded while away is visible. A previous day's
+        thread is left for the History pane — it must not appear in Today. Returns
+        True if a (today's) session was resumed, False to stay on a fresh, empty
+        Today.
+
+        Called once at startup, after start(); the backend's epoch logic retires
+        the empty-session worker start() spawned (same swap dance as load())."""
+        if self._headless:
+            return False
+        with self._dispatch_lock:
+            sessions = self._backend.list_sessions()
+            if not sessions:
+                return False
+            latest = sessions[0]  # list_sessions is newest-first
+            if not self._is_today(latest.id):
+                return False      # latest is a past day → start fresh on Today
+            self.stop_model()
+            try:
+                self._backend.load_session(latest.id)
+            except (OSError, ValueError):
+                return False
+            self.seed_last_activity(latest.saved_at)
+            self._load_after_swap(latest.id)
+            return True
+
+    def _is_today(self, session_id: str) -> bool:
+        """True if a session started on the user's current local day. Unknown /
+        unparseable timestamps default to True (resume) — the safe, non-losing
+        choice. Uses the absolute instant from the id so it's tz-correct."""
+        iso = session_started_at(session_id)
+        if not iso:
+            return True
+        try:
+            epoch = datetime.datetime.fromisoformat(iso).timestamp()
+        except (ValueError, TypeError):
+            return True
+        return self._local_date(epoch) == self._local_date(time.time())
+
+    def seed_last_activity(self, saved_at: str) -> None:
+        """Seed the idle-rollover clock from a persisted ISO ``saved_at`` so a
+        resumed session's real age (not the moment we loaded it) decides whether
+        the next message rolls onto a fresh session. Unparseable timestamps leave
+        the clock at 'now' (no rollover), which is the safe default."""
+        try:
+            ts = datetime.datetime.fromisoformat(saved_at)
+            self._last_activity = ts.timestamp()
+        except (ValueError, TypeError):
+            self._last_activity = time.time()
 
     def _reset_internal_state(self) -> None:
         self._user_first_interaction = True
         # Withdraw the onboarding tool when leaving a conversation (reset/load).
         # reset() re-arms it via _maybe_start_onboarding if onboarding is due.
         self._set_terminal_tool(False)
-        self._is_idle = True
-        self._idle_event.set()
-        self._pending_user_messages = []
+        with self._state_lock:
+            self._is_idle = True
+            self._idle_event.set()
+            self._pending_user_messages = []
+            # Stashed inline echoes belong to the conversation we're leaving.
+            self._pending_proactive = []
 
     # --- queries used by frontends (e.g. autocomplete) ---
 
@@ -593,7 +1056,8 @@ class ConversationController:
                 if event.kind == "session_terminated":
                     return
         except Exception as exc:
-            self._emit(CoreEvent(kind="error", text=f"stream error: {exc}"))
+            self._emit_error(exc, source="controller_stream",
+                             label="stream error")
 
     def _handle_backend_event(self, event: BackendEvent) -> None:
         kind = event.kind
@@ -632,20 +1096,38 @@ class ConversationController:
                 kind="turn_end",
                 stop_reason=event.stop_reason or "",
             ))
+            # Mark the moment the thread last had activity, so the idle-rollover
+            # clock starts when Aime finishes replying (not when the user typed).
+            self._last_activity = time.time()
             if event.stop_reason in ("end_turn", "interrupted"):
-                self._is_idle = True
-                # Drafts that arrived during the turn are held client-side
-                # (see #queued-bar in web_chat.html) and sent only when the
-                # user explicitly clicks the queued pill's stop button —
-                # the backend never auto-dispatches them on turn_end. Any
-                # entries in self._pending_user_messages are leftovers from
-                # racy POSTs and are discarded silently.
-                self._pending_user_messages.clear()
-                # Wake stop_model() (and any other waiter) *after* we've
-                # cleared the queue and flipped _is_idle, so a follow-up
-                # /send that unblocks here sees a fully-idle controller.
-                self._idle_event.set()
-                self._emit(CoreEvent(kind="ready"))
+                # Turn finished. Either start the next queued message (a /send
+                # that arrived mid-turn — usually a race, since the frontend
+                # holds drafts client-side) or go idle. The claim-or-idle
+                # decision is atomic under _state_lock so a concurrent /send
+                # can't also claim the turn. A conversation switch clears the
+                # queue *before* interrupting (see reset/load), so nothing here
+                # ever bleeds a stale message into a new conversation.
+                with self._state_lock:
+                    self._is_idle = True
+                    if self._pending_user_messages:
+                        nxt = self._pending_user_messages.pop(0)
+                        self._is_idle = False
+                        self._idle_event.clear()
+                    else:
+                        nxt = None
+                        # Wake stop_model() (and any other waiter) *after* the
+                        # flip, so a follow-up /send sees a fully-idle controller.
+                        self._idle_event.set()
+                if nxt is not None:
+                    text, images, hidden_prefix = nxt
+                    self._dispatch_user_message(
+                        text, images=images, hidden_prefix=hidden_prefix)
+                else:
+                    # Now genuinely idle: flush any SendMessage texts the model
+                    # sent mid-turn as inline assistant turns, so they show in the
+                    # thread (and the model has them as context on the next reply).
+                    self._flush_pending_proactive()
+                    self._emit(CoreEvent(kind="ready"))
         elif kind == "session_terminated":
             self._emit(CoreEvent(kind="session_terminated"))
         elif kind == "history_recovered":
@@ -656,7 +1138,11 @@ class ConversationController:
                 kind="notice", severity="recovery", text=event.text or "",
             ))
         elif kind == "error":
-            self._emit(CoreEvent(kind="error", text=event.error or ""))
+            # The backend already captured this turn failure (it held the live
+            # exception); just forward its diagnostics meta so the frontend can
+            # show the calm, specific line + reference. Do not re-capture here.
+            self._emit(CoreEvent(kind="error", text=event.error or "",
+                                 payload=event.error_meta))
 
     def set_messaging_target(self, messenger, recipient: str | None) -> None:
         """Update the outbound-messaging destination for the live session, so a
@@ -670,7 +1156,12 @@ class ConversationController:
         """Send an outbound text to the user via the wired messenger. Returns
         (ok, human_note). Never raises — a missing messenger/recipient or a
         transport failure comes back as (False, friendly reason) so callers can
-        report it to the model or surface it in the UI without crashing a run."""
+        report it to the model or surface it in the UI without crashing a run.
+
+        This is the single pipeline chokepoint: every message Aime sends — the
+        interactive SendMessage tool, a background agent's SendMessage *or* its
+        SubmitResult message_to_user — flows through here, so on success we also
+        thread the same text into the transcript (model context + live UI)."""
         body = (text or "").strip()
         if not body:
             return False, "no message text to send"
@@ -682,7 +1173,113 @@ class ConversationController:
             self._messenger.send(self._message_recipient, body, subject=subject)
         except Exception as exc:
             return False, str(exc)
+        self._record_sent_message(body)
         return True, "message sent to the user"
+
+    def _record_sent_message(self, body: str) -> None:
+        """Thread a just-sent message into the transcript. A background-agent run
+        routes it to the owning user's transcript via the injected sink; the
+        interactive user's own controller stashes it (we're suspended mid-turn at
+        the tool_use yield, so a direct append would corrupt history) and flushes
+        it as an inline proactive bubble on turn_end."""
+        if self._message_sink is not None:
+            try:
+                self._message_sink(body)
+            except Exception as exc:
+                self._emit_error(exc, source="message_sink",
+                                 label="inline message failed")
+            return
+        if self._headless:
+            return  # headless run with no sink wired — nothing to thread into
+        with self._state_lock:
+            self._pending_proactive.append(body)
+
+    def record_proactive_message(self, text: str) -> bool:
+        """Make an out-of-band message that was sent to the user (a scheduler
+        reminder, a background-agent notification) appear inline in *this* live
+        session: append it as an assistant turn so the model has coherent context
+        when the user replies, and surface it to any attached frontend so it shows
+        in the thread immediately. Returns True if recorded inline.
+
+        Turn-safe and best-effort: if a model turn is in flight we skip the inline
+        record (appending mid-turn would corrupt the in-flight history) — the user
+        still got the message out of band, it just won't thread into this exact
+        moment. Intended for the interactive user's own controller; background
+        agents route here via their owning user's live context, not their run."""
+        body = (text or "").strip()
+        if not body:
+            return False
+        with self._state_lock:
+            if not self._is_idle:
+                return False
+        # A stable id, stored with the message, lets the frontend track per-message
+        # whether it's been seen (→ whether to show "New") across reconnects.
+        pid = _new_proactive_id()
+        if not self._backend.append_assistant_message(body, pid=pid):
+            return False
+        # Writing an assistant message is activity on this session — anchor the
+        # idle/day-roll clock to it, exactly as turn_end does. Otherwise the
+        # session that just received an out-of-band message still looks "last
+        # touched yesterday" and a later open day-rolls it into History.
+        self._last_activity = time.time()
+        # A dedicated event (not assistant_text): the frontend renders it as a
+        # standalone Aime bubble instantly, with no dependence on turn/typewriter
+        # state — which is what kept proactive messages from showing in the chat.
+        self._emit(CoreEvent(kind="proactive_message", text=body, pid=pid))
+        return True
+
+    def deliver_inline_proactive(self, text: str) -> bool:
+        """Thread an out-of-band message (scheduler reminder, agent notification)
+        into *this* live session as an inline assistant turn. If idle, record and
+        surface it now; if a turn is in flight, stash it to flush on turn_end —
+        never write mid-turn, which the turn's own persist would clobber. Returns
+        True when the live session has taken ownership (recorded or queued), so the
+        caller knows not to also write it to disk."""
+        body = (text or "").strip()
+        if not body:
+            return False
+        # In a Temporary Chat this live session isn't the main thread — let the
+        # caller route the message to the main thread (persisted) instead, so a
+        # reminder never lands in (or vanishes with) the throwaway chat.
+        if self._temporary:
+            return False
+        # Land the message in *Today*. A long-lived context can still be holding a
+        # previous day's session in memory (nothing pokes a rollover while the user
+        # is away), so without this an overnight task/reminder would thread into
+        # yesterday's session and be stranded in History when the user next opens a
+        # fresh Today. Rolling first — exactly as a returning client would — puts it
+        # on a fresh Today (creating one if needed) so it's actually visible.
+        self._maybe_roll_session()
+        with self._state_lock:
+            if not self._is_idle:
+                self._pending_proactive.append(body)
+                return True
+        if self.record_proactive_message(body):
+            return True
+        # Lost the idle race between the check and the record — stash it so the
+        # next turn_end flushes it rather than dropping (or racing) the write.
+        with self._state_lock:
+            self._pending_proactive.append(body)
+        return True
+
+    def _flush_pending_proactive(self) -> None:
+        """Record any SendMessage texts stashed during the just-ended turn as
+        inline assistant turns. Called from the turn_end idle transition, where
+        appending to history is safe again. Best-effort per message."""
+        with self._state_lock:
+            pending = self._pending_proactive
+            self._pending_proactive = []
+        for text in pending:
+            try:
+                if not self.record_proactive_message(text):
+                    # A racing /send claimed the turn between the idle flip and
+                    # here; re-stash so the next turn_end flushes it rather than
+                    # dropping the inline echo (the phone already has it).
+                    with self._state_lock:
+                        self._pending_proactive.append(text)
+            except Exception as exc:
+                self._emit_error(exc, source="proactive_flush",
+                                 label="inline message failed")
 
     def _handle_tool_use(self, event: BackendEvent) -> None:
         tool_name = event.tool_name or "tool"
@@ -720,7 +1317,8 @@ class ConversationController:
                     tool_result="Onboarding marked complete. Do not call this tool again.",
                 ))
             except Exception as exc:
-                self._emit(CoreEvent(kind="error", text=f"tool result send failed: {exc}"))
+                self._emit_error(exc, source="tool_result",
+                                 label="tool result send failed")
             return
         # SubmitResult is the terminal tool of a headless background-agent run:
         # the worker calls it once to deliver its result and finish. We surface
@@ -788,7 +1386,8 @@ class ConversationController:
                     tool_result=digest,
                 ))
             except Exception as exc:
-                self._emit(CoreEvent(kind="error", text=f"tool result send failed: {exc}"))
+                self._emit_error(exc, source="tool_result",
+                                 label="tool result send failed")
             return
         # SendMessage is a client tool (like WebSearch) handled here rather than
         # forwarded to the data backend: it pushes a short text to the user's
@@ -797,9 +1396,11 @@ class ConversationController:
         # wired in it returns a friendly result so the model can fall back to
         # telling the user in chat instead.
         if tool_name == "SendMessage":
+            # Threading the sent text into the transcript is handled centrally in
+            # _deliver_message (the single pipeline chokepoint), so interactive and
+            # agent sends behave identically.
             ok, note = self._deliver_message(
-                tool_input.get("text") or "", tool_input.get("subject"),
-            )
+                tool_input.get("text") or "", tool_input.get("subject"))
             self._emit(CoreEvent(
                 kind="tool_result",
                 tool_name=tool_name,
@@ -818,7 +1419,8 @@ class ConversationController:
                     tool_result=result_text,
                 ))
             except Exception as exc:
-                self._emit(CoreEvent(kind="error", text=f"tool result send failed: {exc}"))
+                self._emit_error(exc, source="tool_result",
+                                 label="tool result send failed")
             return
         # CreateGraphics is a client tool (like WebSearch / SendMessage): the
         # model supplies a chart/diagram/SVG spec, we validate it and emit it
@@ -833,6 +1435,14 @@ class ConversationController:
         # is paid for only on this editing turn, then stripped from history again.
         if tool_name == "GetGraphic":
             self._handle_get_graphic(event, tool_input)
+            return
+        # LoadGraphicsExamples serves a compile-tested Vega-Lite skeleton for a
+        # harder chart construct so the model adapts a known-good spec instead of
+        # hand-writing layered grammar from memory. Like GetGraphic's reloaded
+        # source, the (bulky) example payload is stripped from history after the
+        # drawing turn, so it costs tokens only when pulled.
+        if tool_name == "LoadGraphicsExamples":
+            self._handle_load_graphics_examples(event, tool_input)
             return
         # Commitment-pattern tools are computed in Python over get_events (see
         # CommitmentService); they return a ready-to-read text digest, never raw
@@ -852,7 +1462,8 @@ class ConversationController:
                     tool_result=digest,
                 ))
             except Exception as exc:
-                self._emit(CoreEvent(kind="error", text=f"tool result send failed: {exc}"))
+                self._emit_error(exc, source="tool_result",
+                                 label="tool result send failed")
             return
         # Event reminders are client tools too: handled in-process against the
         # user's ScheduleStore via the injected ReminderService, never forwarded
@@ -872,7 +1483,8 @@ class ConversationController:
                     tool_result=model_text,
                 ))
             except Exception as exc:
-                self._emit(CoreEvent(kind="error", text=f"tool result send failed: {exc}"))
+                self._emit_error(exc, source="tool_result",
+                                 label="tool result send failed")
             return
         # Topic sharing. A per-topic tool whose id is a "<owner>:<topic>" handle
         # addresses a topic in another user's silo, so it's rerouted (after a
@@ -935,7 +1547,8 @@ class ConversationController:
                 tool_result=result if model_result is None else model_result,
             ))
         except Exception as exc:
-            self._emit(CoreEvent(kind="error", text=f"tool result send failed: {exc}"))
+            self._emit_error(exc, source="tool_result",
+                             label="tool result send failed")
 
     def _send_tool_result(self, tool_use_id, text: str) -> None:
         """Hand a tool_result back to the model, surfacing a transport failure
@@ -947,7 +1560,8 @@ class ConversationController:
                 tool_result=text,
             ))
         except Exception as exc:
-            self._emit(CoreEvent(kind="error", text=f"tool result send failed: {exc}"))
+            self._emit_error(exc, source="tool_result",
+                             label="tool result send failed")
 
     def _handle_create_graphics(self, event: BackendEvent, tool_input: dict) -> None:
         """Client tool: the model supplies a chart/diagram/SVG spec; we validate
@@ -994,6 +1608,24 @@ class ConversationController:
             return
 
         error = _graphics.validate(fmt, source)
+        # For Vega-Lite, follow the cheap shape check with the authoritative
+        # compile gate: run the same vega-lite compile + vega parse the browser
+        # runs before it can render (aime.vega_compile), so a spec that is valid
+        # JSON but structurally broken — the usual failure mode for error bands,
+        # reference rules, and multi-series — is caught here and handed back for a
+        # same-turn fix, instead of being told "Saved" and then failing silently
+        # in the browser. The gate fails open (returns None) if Node/deps are
+        # missing, so this only ever *adds* rejections. Steer the model to the
+        # examples tool, which exists precisely for these constructs.
+        if not error and fmt == "vega-lite":
+            compile_err = _vega_compile.compile_error(source)
+            if compile_err:
+                error = (
+                    f"{compile_err} If this is a layered chart (error bands, a "
+                    "baseline/reference line, multiple series, point labels, dual "
+                    "axes, or a trend line), call LoadGraphicsExamples for a "
+                    "known-good skeleton and adapt it."
+                )
         if error:
             self._emit(CoreEvent(
                 kind="tool_result",
@@ -1197,6 +1829,45 @@ class ConversationController:
                 graphic_id, graphic.get("format") or "",
                 graphic.get("source") or "",
             ),
+        )
+
+    def _handle_load_graphics_examples(
+            self, event: BackendEvent, tool_input: dict) -> None:
+        """Client tool: return one or more compile-tested Vega-Lite skeletons for
+        the requested chart construct so the model adapts a known-good spec rather
+        than recalling layered grammar. The payload rides back as the tool_result
+        (opened with the strip sentinel so redact_history_graphics slims it after
+        the drawing turn); an unknown `kind` gets a friendly list of the ones we
+        have — recoverable, in the friendly-error style."""
+        payload = tool_input if isinstance(tool_input, dict) else {}
+        tool_name = event.tool_name or "LoadGraphicsExamples"
+        kind = (payload.get("kind") or "").strip()
+        entries = _graphics_examples.get(kind)
+        if not entries:
+            msg = (
+                f"No examples for {kind!r}. Choose a `kind` from: "
+                f"{', '.join(_graphics_examples.KINDS)}."
+                if kind else
+                "Provide a `kind` — one of: "
+                f"{', '.join(_graphics_examples.KINDS)}."
+            )
+            self._emit(CoreEvent(
+                kind="tool_result",
+                tool_name=tool_name,
+                tool_result_summary=f"no examples for {kind}".strip(),
+                tool_detail_full=msg,
+            ))
+            self._send_tool_result(event.tool_use_id, msg)
+            return
+
+        self._emit(CoreEvent(
+            kind="tool_result",
+            tool_name=tool_name,
+            tool_result_summary=f"loaded {kind} examples",
+        ))
+        self._send_tool_result(
+            event.tool_use_id,
+            _graphics.loaded_examples_result(kind, entries),
         )
 
     def _attach_commitment_histories(self, result, model_result: str) -> str:

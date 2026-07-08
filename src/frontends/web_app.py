@@ -21,6 +21,7 @@ import base64
 import zipfile
 import tempfile
 import datetime
+import zoneinfo
 import threading
 import time
 from functools import wraps
@@ -95,6 +96,8 @@ from aime import topic_shares as _topic_shares
 from aime import quota as _quota
 from aime import billing as _billing
 from aime import feedback as _feedback
+from aime import errors as _errors
+from aime import health as _health
 from aime.tool_formatting import TOOL_NAME_MAP
 
 from . import stt as _stt
@@ -143,6 +146,13 @@ _quota_store = _quota.QuotaStore(
 # beside auth.sql; read by the admin dashboard's Feedback tab.
 _feedback_store = _feedback.FeedbackStore(
     os.path.join(aime_config.DATABASE_DIR, "feedback.sql")
+)
+
+# Server-side error/diagnostics capture (aime.errors). Cross-user, root-level
+# beside feedback.sql; written by the per-user backend/controller via the sink
+# below and read by the admin dashboard's Errors tab.
+_error_store = _errors.ErrorStore(
+    os.path.join(aime_config.DATABASE_DIR, "errors.sql")
 )
 
 
@@ -622,6 +632,19 @@ def _render_markup_to_html(markup: str, final: bool = False) -> str:
     return html.strip("\n")
 
 
+def _drain_queue(q: "queue.Queue") -> None:
+    """Discard everything currently buffered in a client's SSE queue. Used when
+    a client has fallen so far behind that its queue overflowed: the backlog is
+    stale relative to the server's history, so we drop it wholesale and let the
+    client resync from a fresh snapshot rather than crawl through megabytes of
+    obsolete streaming partials."""
+    while True:
+        try:
+            q.get_nowait()
+        except queue.Empty:
+            return
+
+
 class UserContext:
     """Everything keyed to a single logged-in user: their controller, agent
     backend session, gateway, SSE subscribers, replay history, and streaming
@@ -692,7 +715,8 @@ class UserContext:
                 aime_config.SCHEMA_FILES
                 + aime_config.REMINDER_SCHEMA_FILES
                 + [aime_config.CREATE_GRAPHICS_SCHEMA,
-                   aime_config.GET_GRAPHIC_SCHEMA]
+                   aime_config.GET_GRAPHIC_SCHEMA,
+                   aime_config.LOAD_GRAPHICS_EXAMPLES_SCHEMA]
             ),
             conversations_dir=conv_dir,
             dek=dek,
@@ -703,6 +727,7 @@ class UserContext:
             ),
             terminal_tool_schema=aime_config.ONBOARDING_TOOL_SCHEMA,
             quota=quota_meter,
+            error_sink=_error_store.capture,
         )
         backend.new_session()
 
@@ -714,6 +739,14 @@ class UserContext:
         self._client_queues: list[queue.Queue] = []
         self._history_lock = threading.Lock()
         self._history: list[dict] = []
+        # Monotonic sync cursor. Incremented (under _history_lock) each time an
+        # event is appended to the replayable history, and stamped onto that
+        # event as `_seq`. It is never reset for the life of the context — not
+        # even on session_restart — so "server head > what the client has
+        # applied" is an unambiguous "you missed events" signal. The head rides
+        # every `ping`, turning the heartbeat from a pure liveness pulse into a
+        # positive "you are current" assertion the client can check.
+        self._history_seq = 0
 
         # Streaming assistant text accumulator. Rich-markup tags can span
         # delta boundaries; we render to HTML once a block ends.
@@ -758,6 +791,7 @@ class UserContext:
             reminder_service=reminder_service,
             record_sync=self.record_sync,
             graphic_store_provider=_make_graphic_store_provider(user_id),
+            error_sink=_error_store.capture,
         )
 
         # Seed the session with the user's last-seen zone so any turn that runs
@@ -777,6 +811,15 @@ class UserContext:
 
         self.controller.subscribe(self._fanout)
         self.controller.start()
+        # Continue the user's most recent thread rather than opening a blank one,
+        # so the chat reads as one continuous conversation across restarts and any
+        # proactive message recorded while they were away is already in view. The
+        # idle-rollover clock is seeded from the session's age, so a long-dormant
+        # thread still rolls onto a fresh, cheap session on the next message.
+        try:
+            self.controller.resume_latest_session()
+        except Exception:
+            app.logger.exception("resume_latest_session failed for user %s", user_id)
 
         # Tracks records the user has edited via the UI since the model last
         # took a turn. Drained as a compact <stale> tag on the next /send so
@@ -844,7 +887,7 @@ class UserContext:
 
     # ---- SSE primitives ---------------------------------------------------
 
-    def attach_client(self) -> tuple[queue.Queue, list[dict]]:
+    def attach_client(self) -> tuple[queue.Queue, list[dict], int]:
         """Snapshot history and subscribe in one atomic step — under both
         locks together so a concurrent broadcast can't slip an event in
         between the snapshot and the subscribe (which would either lose or
@@ -852,8 +895,15 @@ class UserContext:
         q: queue.Queue = queue.Queue(maxsize=8192)
         with self._history_lock, self._subscribers_lock:
             snapshot = list(self._history)
+            head_seq = self._history_seq
             self._client_queues.append(q)
-        return q, snapshot
+        return q, snapshot, head_seq
+
+    def current_seq(self) -> int:
+        """The current history head as a sync cursor (see _history_seq). Read
+        under lock so it's consistent with the appends _broadcast makes."""
+        with self._history_lock:
+            return self._history_seq
 
     def detach_client(self, q: queue.Queue) -> None:
         with self._subscribers_lock:
@@ -878,6 +928,11 @@ class UserContext:
                 # durable surface for budget state.
                 "usage_notice",
             ):
+                # Only history-appended events advance the sync cursor and carry
+                # a `_seq`. Transient events (deltas, presentational pings) don't,
+                # so they never register as drift on the client.
+                self._history_seq += 1
+                payload["_seq"] = self._history_seq
                 self._history.append(payload)
         with self._subscribers_lock:
             targets = list(self._client_queues)
@@ -885,7 +940,24 @@ class UserContext:
             try:
                 q.put_nowait(payload)
             except queue.Full:
-                pass
+                # This client's consumer has fallen far enough behind that its
+                # queue is full — typically a slow or janky browser applying
+                # backpressure mid-response. Silently dropping the event would
+                # desync that client *permanently*: the connection stays alive
+                # (the ping heartbeat keeps flowing), so neither the browser's
+                # EventSource nor the client-side liveness watchdog ever notices,
+                # and the user is stuck staring at a half-arrived reply until
+                # they manually reload. Instead, drop the now-stale backlog and
+                # hand the client a single `resync` marker — it reconnects and
+                # rebuilds the transcript from authoritative history. Goes
+                # straight to this one queue (not via history), so it can't
+                # replay onto other clients. Self-healing where the old code
+                # needed a manual refresh.
+                _drain_queue(q)
+                try:
+                    q.put_nowait({"kind": "resync"})
+                except queue.Full:
+                    pass
 
     def notify_remote_edit(self, source: str) -> None:
         """Tell every connected session of this user to re-fetch their
@@ -957,6 +1029,12 @@ class UserContext:
             "from_replay": event.from_replay,
             "attachments": event.attachments,
         }
+        # A proactive message carries raw markup; pre-render it to HTML so the
+        # frontend can drop it straight into a bubble (no client-side markup pass).
+        # Its `pid` is the anchor for per-message "seen"/"New" tracking on the client.
+        if event.kind == "proactive_message":
+            payload["text"] = _render_markup_to_html(event.text or "", final=True)
+            payload["pid"] = event.pid
         # Structured payload for events that carry one (e.g. `graphic`, which
         # holds {format, summary, source} for the frontend to render).
         if event.payload is not None:
@@ -1091,16 +1169,20 @@ def _wants_trusted_device() -> bool:
 
 # Content Security Policy. Inline styles are required (Rich produces inline
 # style="..." on every span), and we load marked + DOMPurify from jsdelivr.
-# Everything else is locked to same-origin.
+# In billing mode we also load Stripe.js (js.stripe.com) for the inline Payment
+# Element, which talks to api.stripe.com and renders its card fields + any 3-D
+# Secure step inside iframes from js.stripe.com / hooks.stripe.com. Everything
+# else is locked to same-origin.
 _CSP = (
     "default-src 'self'; "
-    "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+    "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://js.stripe.com; "
     "style-src 'self' 'unsafe-inline'; "
     # icons.duckduckgo.com serves the favicons on web-search source chips.
     "img-src 'self' data: blob: https://icons.duckduckgo.com; "
     "media-src 'self' blob:; "
-    "connect-src 'self'; "
+    "connect-src 'self' https://api.stripe.com; "
     "font-src 'self' data:; "
+    "frame-src https://js.stripe.com https://hooks.stripe.com; "
     "frame-ancestors 'none'; "
     "base-uri 'self'; "
     "form-action 'self'"
@@ -1151,6 +1233,10 @@ _RESET_PAGE_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "resources", "style", "reset_password.html",
 )
+_HEALTH_PAGE_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "resources", "style", "health.html",
+)
 
 
 def _load_page() -> str:
@@ -1168,6 +1254,30 @@ def _load_reset_page(error: str = "", notice: str = "") -> str:
     with open(_RESET_PAGE_PATH) as f:
         html = f.read()
     return html.replace("__ERROR__", _h(error)).replace("__NOTICE__", _h(notice))
+
+
+def _render_health_page(snap: dict) -> str:
+    """Fill the static status page with the server-rendered snapshot so it shows
+    real state with JS disabled; the page's script then polls /health.json to
+    keep it live. Component lookup is by id, so ordering in the snapshot doesn't
+    matter here."""
+    with open(_HEALTH_PAGE_PATH) as f:
+        html = f.read()
+    by_id = {c["id"]: c for c in snap.get("components", [])}
+    aime = by_id.get("aime", {})
+    anthropic = by_id.get("anthropic", {})
+    replacements = {
+        "__OVERALL_STATUS__": snap["overall"]["status"],
+        "__OVERALL_LABEL__": _h(snap["overall"]["label"]),
+        "__AIME_STATUS__": aime.get("status", "unknown"),
+        "__AIME_DETAIL__": _h(aime.get("detail", "")),
+        "__ANTHROPIC_STATUS__": anthropic.get("status", "unknown"),
+        "__ANTHROPIC_DETAIL__": _h(anthropic.get("detail", "")),
+        "__CHECKED__": "Checking…",
+    }
+    for token, value in replacements.items():
+        html = html.replace(token, value)
+    return html
 
 
 # Account creation is gated by AIME_ALLOW_SIGNUP. Default is off ("0") so a
@@ -1194,7 +1304,8 @@ if _ACCESS_MODE not in ("keys", "open", "billing"):
 if _ACCESS_MODE == "billing" and not _billing.billing_enabled():
     raise RuntimeError(
         "AIME_ACCESS_MODE=billing requires Stripe to be configured: set "
-        "AIME_STRIPE_SECRET_KEY, AIME_STRIPE_WEBHOOK_SECRET, a price per tier "
+        "AIME_STRIPE_SECRET_KEY, AIME_STRIPE_PUBLISHABLE_KEY, "
+        "AIME_STRIPE_WEBHOOK_SECRET, a price per tier "
         "(AIME_STRIPE_PRICE_LIGHT / AIME_STRIPE_PRICE_POWER), and "
         "AIME_PUBLIC_BASE_URL (absolute, for safe Stripe return URLs). See "
         "docs/billing.md. Refusing to start so users aren't locked out."
@@ -1213,6 +1324,26 @@ def _send_gate_armed() -> bool:
     """True when /send is gated behind each user's api_access flag. Armed in
     "keys" and "billing"; disarmed in "open" (trusted local use)."""
     return _ACCESS_MODE in ("keys", "billing")
+
+
+def _billing_self_heal(user):
+    """Re-derive a billing user's send access from live Stripe when the cached
+    api_access has gone stale, and return the (possibly refreshed) UserRecord.
+
+    This is the safety net that makes access *reliable* rather than dependent on
+    perfect webhook delivery: api_access is only a cache of Stripe's truth, so
+    whenever it's older than the recheck TTL the gate re-reads Stripe before
+    trusting it. A paying user whose grant webhook was lost is unlocked on their
+    next /send or /me; a lapsed one is eventually cut off. Bounded by the TTL in
+    aime.billing.access_is_stale, so the steady-state cost is ~zero Stripe calls.
+    No-op outside billing mode, for comped users, and for anyone who never
+    started checkout. Best-effort — a Stripe outage leaves cached access intact."""
+    if not _billing_armed() or user is None:
+        return user
+    if not _billing.access_is_stale(user, now=int(time.time())):
+        return user
+    _billing.refresh_access(_auth_backend, user)
+    return _auth_backend.lookup(user.id) or user
 
 
 def _usage_limits_armed() -> bool:
@@ -1434,18 +1565,59 @@ def api_access_required(view):
     """Gate a route behind the user's send access. Applies *under*
     login_required (which populates g.api_access). In "open" access mode the
     gate is disarmed and this is a pass-through; in "keys"/"billing" mode a user
-    without api_access gets a 403 telling them to redeem an invite key."""
+    without api_access gets a 403.
+
+    In billing mode the gate is *self-healing*: before refusing (or trusting a
+    stale grant), it re-derives api_access from live Stripe when the cache has
+    aged out — so a paying user whose grant webhook was lost is let through here
+    rather than wrongly blocked. See _billing_self_heal."""
     @wraps(view)
     def wrapper(*args, **kwargs):
-        if _send_gate_armed() and not g.get("api_access", False):
-            return jsonify({
-                "ok": False,
-                "error": "no_access",
-                "message": "This account doesn't have message access yet. "
-                           "Add an invite key in your profile settings.",
-            }), 403
+        if _send_gate_armed():
+            if _billing_armed():
+                user = _billing_self_heal(_auth_backend.lookup(g.user_id))
+                if user is not None:
+                    g.api_access = user.api_access
+            if not g.get("api_access", False):
+                # Billing mode points at the trial (or a plain subscribe, for an
+                # account that's no longer trial-eligible); keys mode at the
+                # invite key.
+                if _billing_armed():
+                    trial_ok = user is not None and not user.trial_used
+                    msg = ("Start your free trial in Billing settings to send "
+                           "messages." if trial_ok else
+                           "Subscribe in Billing settings to send messages.")
+                else:
+                    msg = ("This account doesn't have message access yet. Add an "
+                           "invite key in your profile settings.")
+                return jsonify({
+                    "ok": False,
+                    "error": "no_access",
+                    "message": msg,
+                }), 403
         return view(*args, **kwargs)
     return wrapper
+
+
+@app.route("/health")
+def health_page():
+    """Public, unauthenticated service-status page — it's what you reach for
+    when you *can't* get in, so it deliberately needs no session. It stays
+    low-detail on purpose: a status per component and a calm one-line summary,
+    never tracebacks, usernames, or references (those live in the admin Errors
+    tab). Rendered server-side so it's honest with JS off; the page then polls
+    /health.json to stay live."""
+    return Response(
+        _render_health_page(_health.snapshot(_error_store)),
+        mimetype="text/html",
+    )
+
+
+@app.route("/health.json")
+def health_json():
+    """Machine-readable companion to /health: the same snapshot the page polls
+    to refresh in place, and a handy probe for external uptime monitors."""
+    return jsonify(_health.snapshot(_error_store))
 
 
 @app.route("/login", methods=["GET"])
@@ -2381,6 +2553,11 @@ def me():
     # access_mode + api_access let the frontend show the invite-key field in
     # profile settings and disable the composer when sending is gated.
     user = _auth_backend.lookup(g.user_id)
+    # Self-heal stale billing access here too (refreshMe polls /me), so the
+    # composer unlocks for a paying user without them having to try to send
+    # first. Bounded by the recheck TTL — most /me calls do no Stripe work.
+    user = _billing_self_heal(user)
+    g.api_access = user.api_access if user is not None else g.api_access
     # Usage budget snapshot for the account meter. Computed straight off the
     # store (no per-session meter needed) so /me stays cheap. None when limits
     # are disarmed (open mode) — the frontend then hides the meter entirely.
@@ -2405,6 +2582,11 @@ def me():
             # Complimentary access (admin comp): the Billing tab shows a
             # "you're on the house" state instead of the trial CTA / portal.
             "comp": bool(user.comp_access),
+            # Whether a *first* subscription would come with the free trial.
+            # False once the trial's been used or the account was flagged
+            # ineligible (e.g. a beta tester at cutover) — the frontend then says
+            # "Subscribe" instead of "Start your free trial".
+            "trial_eligible": not user.trial_used,
         }
     return jsonify({
         "id": g.user_id,
@@ -2507,7 +2689,9 @@ def redeem():
 
 # ---------------------------------------------------------------------------
 # Stripe billing (AIME_ACCESS_MODE=billing only). See aime.billing + docs/
-# billing.md. The webhook is the sole authority that grants api_access; the
+# billing.md. api_access is granted off a live read of Stripe — the
+# subscribe-confirm route reconciles once immediately, and the webhook is the
+# standing authority for every later renewal/cancellation/revocation; the
 # Checkout/Portal routes only create hosted sessions (we never see card data).
 # Every route here 404s unless billing is armed, so keys/open are untouched.
 # ---------------------------------------------------------------------------
@@ -2519,49 +2703,139 @@ def _billing_base_url() -> str:
     return aime_config.PUBLIC_BASE_URL or request.url_root.rstrip("/")
 
 
-@app.route("/billing/checkout", methods=["POST"])
+def _default_billing_tier() -> str:
+    """The tier every new subscription starts on (no plan picker at signup —
+    users upgrade via 'Change plan'). USAGE_DEFAULT_TIER, guarded back to a real
+    priced tier if it's ever misconfigured so subscribe can't 500."""
+    t = aime_config.USAGE_DEFAULT_TIER
+    if t in aime_config.USAGE_TIERS:
+        return t
+    return next(iter(aime_config.USAGE_TIERS))
+
+
+@app.route("/billing/subscribe", methods=["POST"])
 @login_required
-def billing_checkout():
-    """Create a subscription Checkout Session for the chosen tier and return its
-    hosted URL. The client navigates to it (window.location); access is granted
-    later by the webhook, not by the success redirect."""
+def billing_subscribe():
+    """Step 1 of the inline subscribe flow: create a SetupIntent so the browser
+    can collect a card with the Payment Element. No subscription exists yet —
+    access is granted only later, when /billing/subscribe/confirm creates the
+    subscription and reconciles it (the webhook re-confirms). Returns the client
+    secret + publishable key the Payment Element needs."""
     if not _billing_armed():
         abort(404)
-    data = request.get_json(silent=True) or {}
-    tier = (data.get("tier") or "").strip().lower()
-    if tier not in aime_config.USAGE_TIERS:
-        return jsonify({"ok": False, "message": "Pick a plan to continue."}), 400
+    # Every new subscription starts on the default tier — there's no plan picker
+    # at signup. A user moves to a bigger plan via "Change plan" once subscribed
+    # (free during a trial). This caps the unpaid trial's cost exposure at the
+    # cheapest tier and keeps the expensive tier off the trial-farming path; the
+    # tier is forced server-side, never taken from the request body.
+    tier = _default_billing_tier()
     user = _auth_backend.lookup(g.user_id)
     if user is None:
         abort(404)
     try:
         customer_id = _billing.ensure_customer(_auth_backend, user)
-        # Guard against a second subscription (the UI hides the button once
-        # subscribed, but a direct POST would otherwise double-bill), and only
-        # grant the free trial to a customer who hasn't already used one
-        # (blocks cancel-and-restart trial farming on the same account). One
-        # Stripe round-trip answers both.
+        # Block a second subscription up front (the UI hides the button once
+        # subscribed, but a direct POST would otherwise double-bill).
+        if _billing.subscription_state(customer_id)["has_active"]:
+            return jsonify({"ok": False, "code": "already_subscribed",
+                            "message": "You already have an active subscription. "
+                                       "Use “Manage billing” to change "
+                                       "your plan."}), 409
+        intent = _billing.create_setup_intent(customer_id=customer_id, tier=tier)
+    except Exception:
+        app.logger.warning("billing: setup-intent create failed for user %s",
+                            g.user_id, exc_info=True)
+        return jsonify({"ok": False,
+                        "message": "We couldn't start checkout just now. "
+                                   "Please try again in a moment."}), 502
+    return jsonify({"ok": True,
+                    "client_secret": intent["client_secret"],
+                    "publishable_key": aime_config.STRIPE_PUBLISHABLE_KEY})
+
+
+@app.route("/billing/subscribe/confirm", methods=["POST"])
+@login_required
+def billing_subscribe_confirm():
+    """Step 2 of the inline subscribe flow: the browser has confirmed the
+    SetupIntent (card saved), so create the subscription on that card. The tier
+    is read off the SetupIntent metadata (server-side, never the client), and
+    the one-trial / no-double-subscription guards run here too — this is the
+    request that actually creates the subscription, so it's the real gate, not
+    step 1. Access is granted here by reconciling the live subscription right
+    after creating it (the webhook re-confirms), so the chat unlocks at once."""
+    if not _billing_armed():
+        abort(404)
+    data = request.get_json(silent=True) or {}
+    setup_intent_id = (data.get("setup_intent_id") or "").strip()
+    if not setup_intent_id:
+        return jsonify({"ok": False, "message": "Missing payment confirmation."}), 400
+    user = _auth_backend.lookup(g.user_id)
+    if user is None or not user.stripe_customer_id:
+        abort(404)
+    customer_id = user.stripe_customer_id
+    try:
+        payment_method_id, tier = _billing.saved_payment_method(
+            setup_intent_id, customer_id)
+    except ValueError:
+        # The card isn't confirmed / isn't ours — never create a subscription.
+        return jsonify({"ok": False,
+                        "message": "We couldn't confirm your card. "
+                                   "Please try again."}), 400
+    if tier not in aime_config.USAGE_TIERS:
+        return jsonify({"ok": False, "message": "Pick a plan to continue."}), 400
+    try:
+        # Re-check the guards now that we're about to create the real
+        # subscription: block a second one, and grant the free trial only to a
+        # customer who hasn't used one (blocks cancel-and-restart trial farming
+        # on the same account).
         state = _billing.subscription_state(customer_id)
         if state["has_active"]:
             return jsonify({"ok": False, "code": "already_subscribed",
                             "message": "You already have an active subscription. "
                                        "Use “Manage billing” to change "
                                        "your plan."}), 409
-        trial_days = 0 if state["used_trial"] else aime_config.STRIPE_TRIAL_DAYS
-        base = _billing_base_url()
-        url = _billing.create_checkout_session(
+        # Trial eligibility ORs Stripe's own one-trial check with this account's
+        # persisted trial_used flag: the flag denies a trial to a beta tester who
+        # never had a Stripe subscription (so Stripe sees no prior trial) but is
+        # deemed to have already had their run. Either source ⇒ no new trial,
+        # charged immediately.
+        trial_eligible = not state["used_trial"] and not user.trial_used
+        trial_days = aime_config.STRIPE_TRIAL_DAYS if trial_eligible else 0
+        _billing.create_subscription(
             user_id=user.id, customer_id=customer_id, tier=tier,
-            success_url=base + "/billing/return",
-            cancel_url=base + "/",
-            trial_days=trial_days,
+            payment_method_id=payment_method_id, trial_days=trial_days,
         )
+        # Stamp the account as having used its trial the moment we grant one, so
+        # the flag (not just Stripe) reflects it everywhere (the /me headline, a
+        # future resubscribe). Harmless if it was already set.
+        if trial_eligible:
+            _auth_backend.set_trial_used(user.id, True)
     except Exception:
-        app.logger.warning("billing: checkout create failed for user %s",
+        app.logger.warning("billing: subscription create failed for user %s",
                             g.user_id, exc_info=True)
         return jsonify({"ok": False,
-                        "message": "We couldn't start checkout just now. "
-                                   "Please try again in a moment."}), 502
-    return jsonify({"ok": True, "url": url})
+                        "message": "We saved your card but couldn't start your "
+                                   "plan. Please try again in a moment."}), 502
+
+    # Fast-path grant: reconcile right now off a *live* read of the subscription
+    # we just created, so send access opens the instant the trial starts instead
+    # of hanging on the webhook round-trip. This is not client-asserted — like
+    # the webhook, reconcile_customer re-fetches state from Stripe — so the trust
+    # boundary is unchanged. The webhook remains the ongoing authority (renewals,
+    # cancellations, revocation) and a safety net if this read blips; reconcile is
+    # idempotent, so the two can't conflict. Without this, a misconfigured webhook
+    # (the classic sandbox case: no `stripe listen`, or a stale whsec_ that fails
+    # signature verification) leaves api_access=0 even though the subscription is
+    # live — the user is told to subscribe when they already have.
+    try:
+        _billing.reconcile_customer(_auth_backend, customer_id)
+    except Exception:
+        # Non-fatal: the subscription exists and the webhook will still grant
+        # access. Don't fail the request — the card was saved and the plan made.
+        app.logger.warning("billing: post-create reconcile failed for user %s "
+                            "(webhook will grant access)", g.user_id,
+                            exc_info=True)
+    return jsonify({"ok": True})
 
 
 @app.route("/billing/portal", methods=["POST"])
@@ -2590,6 +2864,162 @@ def billing_portal():
     return jsonify({"ok": True, "url": url})
 
 
+# --- Inline management (the common Portal actions, rebuilt in-card) ----------
+# The hosted Portal can't be embedded, so these routes back the native Billing-
+# tab controls: update card, switch plan, cancel, resume. Each operates on the
+# customer's single live subscription and reconciles immediately off a live
+# Stripe read (the webhook re-confirms), so /me reflects the change at once
+# without waiting on the webhook. Invoices/receipts/tax stay on /billing/portal.
+
+@app.route("/billing/update-card", methods=["POST"])
+@login_required
+def billing_update_card():
+    """Step 1 of inline card update: a SetupIntent so the browser can collect a
+    replacement card with the Payment Element. No tier — this swaps the card, it
+    doesn't pick a plan. Step 2 (/confirm) sets it as the default."""
+    if not _billing_armed():
+        abort(404)
+    user = _auth_backend.lookup(g.user_id)
+    if user is None or not user.stripe_customer_id:
+        return jsonify({"ok": False,
+                        "message": "No billing account yet — start your free "
+                                   "trial first."}), 400
+    try:
+        intent = _billing.create_card_update_intent(
+            customer_id=user.stripe_customer_id)
+    except Exception:
+        app.logger.warning("billing: card-update setup-intent failed for user %s",
+                            g.user_id, exc_info=True)
+        return jsonify({"ok": False,
+                        "message": "We couldn't start the card update just now. "
+                                   "Please try again in a moment."}), 502
+    return jsonify({"ok": True,
+                    "client_secret": intent["client_secret"],
+                    "publishable_key": aime_config.STRIPE_PUBLISHABLE_KEY})
+
+
+@app.route("/billing/update-card/confirm", methods=["POST"])
+@login_required
+def billing_update_card_confirm():
+    """Step 2 of inline card update: the browser confirmed the SetupIntent, so
+    make that saved card the default on the customer and their subscription. The
+    card belonging to this customer is verified server-side (saved_payment_method
+    inside update_payment_method) — a forged intent id is rejected."""
+    if not _billing_armed():
+        abort(404)
+    data = request.get_json(silent=True) or {}
+    setup_intent_id = (data.get("setup_intent_id") or "").strip()
+    if not setup_intent_id:
+        return jsonify({"ok": False, "message": "Missing card confirmation."}), 400
+    user = _auth_backend.lookup(g.user_id)
+    if user is None or not user.stripe_customer_id:
+        abort(404)
+    try:
+        _billing.update_payment_method(user.stripe_customer_id, setup_intent_id)
+    except ValueError:
+        return jsonify({"ok": False,
+                        "message": "We couldn't confirm your card. "
+                                   "Please try again."}), 400
+    except Exception:
+        app.logger.warning("billing: card update failed for user %s",
+                            g.user_id, exc_info=True)
+        return jsonify({"ok": False,
+                        "message": "We couldn't update your card just now. "
+                                   "Please try again in a moment."}), 502
+    return jsonify({"ok": True})
+
+
+@app.route("/billing/change-plan", methods=["POST"])
+@login_required
+def billing_change_plan():
+    """Switch the user's live subscription to another tier, prorated. The new
+    tier is reconciled immediately off the live Price (never trusted from this
+    request body) so /me reflects it at once; the webhook re-confirms."""
+    if not _billing_armed():
+        abort(404)
+    data = request.get_json(silent=True) or {}
+    tier = (data.get("tier") or "").strip().lower()
+    if tier not in aime_config.USAGE_TIERS:
+        return jsonify({"ok": False, "message": "Pick a plan to continue."}), 400
+    user = _auth_backend.lookup(g.user_id)
+    if user is None or not user.stripe_customer_id:
+        return jsonify({"ok": False,
+                        "message": "No subscription to change — start your free "
+                                   "trial first."}), 400
+    try:
+        _billing.change_plan(user.stripe_customer_id, tier)
+    except ValueError:
+        return jsonify({"ok": False,
+                        "message": "No active subscription to change. "
+                                   "Start a plan first."}), 409
+    except Exception:
+        app.logger.warning("billing: plan change failed for user %s",
+                            g.user_id, exc_info=True)
+        return jsonify({"ok": False,
+                        "message": "We couldn't switch your plan just now. "
+                                   "Please try again in a moment."}), 502
+    _billing_reconcile_quiet(user.stripe_customer_id)
+    return jsonify({"ok": True})
+
+
+@app.route("/billing/cancel", methods=["POST"])
+@login_required
+def billing_cancel():
+    """Schedule the user's subscription to cancel at period end — they keep the
+    access they've paid for through the current period and can resume any time
+    before it lapses. Reversible via /billing/resume."""
+    if not _billing_armed():
+        abort(404)
+    user = _auth_backend.lookup(g.user_id)
+    if user is None or not user.stripe_customer_id:
+        return jsonify({"ok": False,
+                        "message": "No subscription to cancel."}), 400
+    try:
+        _billing.cancel_subscriptions(user.stripe_customer_id)
+    except Exception:
+        app.logger.warning("billing: cancel failed for user %s",
+                            g.user_id, exc_info=True)
+        return jsonify({"ok": False,
+                        "message": "We couldn't cancel just now. "
+                                   "Please try again in a moment."}), 502
+    _billing_reconcile_quiet(user.stripe_customer_id)
+    return jsonify({"ok": True})
+
+
+@app.route("/billing/resume", methods=["POST"])
+@login_required
+def billing_resume():
+    """Undo a pending cancel_at_period_end, keeping the subscription running."""
+    if not _billing_armed():
+        abort(404)
+    user = _auth_backend.lookup(g.user_id)
+    if user is None or not user.stripe_customer_id:
+        return jsonify({"ok": False,
+                        "message": "No subscription to resume."}), 400
+    try:
+        _billing.resume_subscriptions(user.stripe_customer_id)
+    except Exception:
+        app.logger.warning("billing: resume failed for user %s",
+                            g.user_id, exc_info=True)
+        return jsonify({"ok": False,
+                        "message": "We couldn't resume just now. "
+                                   "Please try again in a moment."}), 502
+    _billing_reconcile_quiet(user.stripe_customer_id)
+    return jsonify({"ok": True})
+
+
+def _billing_reconcile_quiet(customer_id: str) -> None:
+    """Reconcile a customer off a live Stripe read so /me reflects a just-made
+    change immediately. Non-fatal: the webhook is the standing authority, so a
+    blip here only delays the persisted-column update, it doesn't lose it."""
+    try:
+        _billing.reconcile_customer(_auth_backend, customer_id)
+    except Exception:
+        app.logger.warning("billing: post-change reconcile failed for customer "
+                            "%s (webhook will catch up)", customer_id,
+                            exc_info=True)
+
+
 @app.route("/billing/summary", methods=["GET"])
 @login_required
 def billing_summary():
@@ -2610,17 +3040,6 @@ def billing_summary():
         return jsonify({"ok": False,
                         "message": "Couldn't load your billing details."}), 502
     return jsonify(summary)
-
-
-@app.route("/billing/return", methods=["GET"])
-@login_required
-def billing_return():
-    """Landing page after Checkout. Access is granted by the webhook (usually
-    within a second), so this just sends the user back to the app, which polls
-    /me and unlocks the composer once the webhook lands."""
-    if not _billing_armed():
-        abort(404)
-    return redirect("/")
 
 
 @app.route("/billing/webhook", methods=["POST"])
@@ -2660,14 +3079,6 @@ def billing_webhook():
             # Terminal — a retrieve would 404, so the embedded object is the
             # authoritative final state.
             _billing.reconcile_subscription(_auth_backend, obj)
-        elif etype == "checkout.session.completed":
-            # Bind customer→user early and reconcile if a subscription exists.
-            # The subscription.* events also fire and are the main path; this
-            # just tightens the window. Best-effort.
-            sub_id = obj.get("subscription")
-            if sub_id:
-                sub = _billing.retrieve_subscription(sub_id)
-                _billing.reconcile_subscription(_auth_backend, sub)
     except Exception:
         # Unexpected — let Stripe retry (idempotent reconcile makes that safe).
         app.logger.warning("billing: webhook %s handling failed", etype,
@@ -3215,11 +3626,30 @@ def interrupt():
     return jsonify({"ok": True})
 
 
+@app.route("/day-check", methods=["POST"])
+@login_required
+def day_check():
+    """Cheap, idempotent rollover poke for a *live* client (one whose stream never
+    dropped, so /stream's open-time check never re-ran). The client fires it when
+    it notices its own local day has advanced — on tab focus or a midnight tick —
+    so a window left open overnight clears to a fresh Today on its own instead of
+    showing yesterday until the next message. The roll, if due, emits
+    session_restart over the existing stream, which is what clears the view."""
+    ctx = _context_for(g.user_id)
+    ctx.controller.maybe_roll_session()
+    return jsonify({"ok": True})
+
+
 @app.route("/stream")
 @login_required
 def stream():
     ctx = _context_for(g.user_id)
-    q, snapshot = ctx.attach_client()
+    # Opening (or reconnecting) is itself a "the user came back" signal: roll onto
+    # a fresh Today first if the day turned over while they were away, so the
+    # snapshot we're about to capture already reflects today — they don't have to
+    # send a message to shed yesterday's thread. No-op when no roll is due.
+    ctx.controller.maybe_roll_session()
+    q, snapshot, head_seq = ctx.attach_client()
 
     def gen():
         try:
@@ -3237,11 +3667,16 @@ def stream():
             # `busy` carries the real turn state so a client that just
             # replayed history (where turn_end/ready don't appear) knows
             # whether the model is mid-response.
+            # `head_seq` is the cursor for everything in the snapshot just
+            # replayed. The client adopts it as its applied position, then
+            # advances it with each live event's `_seq`; a later `ping` reporting
+            # a higher head means events were missed → reconnect and reconcile.
             yield (
                 "data: "
                 + json.dumps({
                     "kind": "history_done",
                     "busy": not ctx.controller.is_idle,
+                    "head_seq": head_seq,
                 })
                 + "\n\n"
             )
@@ -3267,7 +3702,12 @@ def stream():
                     # to notice a dead stream and force a reconnect, which
                     # rebuilds its transcript from authoritative history. The
                     # client ignores this `ping` kind.
-                    yield f"data: {json.dumps({'kind': 'ping'})}\n\n"
+                    # The heartbeat carries the current history head so a client
+                    # on a still-open socket that silently dropped an event can
+                    # detect the drift (its applied cursor lags head) and
+                    # reconnect, instead of only self-healing when the queue
+                    # overflows or the socket is declared dead.
+                    yield f"data: {json.dumps({'kind': 'ping', 'head_seq': ctx.current_seq()})}\n\n"
                     continue
                 yield f"data: {json.dumps(payload)}\n\n"
         finally:
@@ -3279,11 +3719,188 @@ def stream():
 @app.route("/sessions")
 @login_required
 def sessions():
+    from provider_backend import session_started_at
     items = [
-        {"id": s.id, "summary": s.summary, "saved_at": s.saved_at}
+        {"id": s.id, "summary": s.summary, "saved_at": s.saved_at,
+         "started_at": session_started_at(s.id)}
         for s in _context_for(g.user_id).controller.list_sessions()
     ]
     return jsonify({"sessions": items})
+
+
+def _user_tz(user_id: int) -> str:
+    rec = _auth_backend.lookup(user_id)
+    return (rec.tz if rec else "") or ""
+
+
+def _session_local_day(session_id: str, tz_name: str) -> str:
+    """The user-local calendar day (YYYY-MM-DD) a session belongs to, from its
+    start instant. Day-boundary rollover keeps a session within one local day, so
+    this groups history into clean daily buckets."""
+    from provider_backend import session_started_at
+    iso = session_started_at(session_id)
+    if not iso:
+        return ""
+    try:
+        dt = datetime.datetime.fromisoformat(iso)
+    except ValueError:
+        return ""
+    if tz_name:
+        try:
+            dt = dt.astimezone(zoneinfo.ZoneInfo(tz_name))
+        except Exception:
+            pass
+    return dt.date().isoformat()
+
+
+def _session_render_events(messages: list[dict]) -> list[dict]:
+    """Replay a stored message list into render-ready payloads for the scroll-back
+    view. Reuses ``replay_messages`` (so hidden model-only prefixes are stripped
+    and the proactive trigger turns are skipped) and pre-renders assistant markup
+    to HTML, exactly like the live SSE path — so the frontend renders history with
+    the same bubbles it uses for live messages."""
+    from aime.replay import replay_messages
+    out: list[dict] = []
+    for ev in replay_messages(messages):
+        if ev.kind == "user_message_shown":
+            out.append({
+                "kind": "user_message_shown",
+                "text": ev.text,
+                "attachments": ev.attachments,
+            })
+        elif ev.kind in ("assistant_text", "proactive_message"):
+            # A past-day read-back is a quiet re-read, so a proactive message
+            # renders as an ordinary Aime bubble here — never flagged "New" (that's
+            # only for the live Today snapshot, which goes through _fanout).
+            out.append({
+                "kind": "assistant_html",
+                "text": _render_markup_to_html(ev.text, final=True),
+            })
+        elif ev.kind == "tool_call":
+            out.append({"kind": "tool_call", "tool_name": ev.tool_name})
+        # Notices (e.g. recovery) and other live-only events are dropped from the
+        # historical view — it's a quiet read-back, not a re-run.
+    return out
+
+
+def _build_history_page(infos, before, limit, load_messages):
+    """Pure pagination + assembly for /history, split out so it's testable
+    without Flask. ``infos`` is the newest-first SessionInfo list; ``before`` is
+    the oldest session id currently shown (the cursor) or "" for the newest page;
+    ``load_messages`` maps a session id to its stored message list. Returns
+    ``{"sessions": [...oldest-first...], "has_more": bool}``."""
+    start = 0
+    if before:
+        for i, info in enumerate(infos):
+            if info.id == before:
+                start = i + 1
+                break
+        else:
+            # Cursor not found (e.g. the session was deleted): nothing reliable to
+            # page from, so report the end rather than risk duplicating content.
+            return {"sessions": [], "has_more": False}
+    page = infos[start:start + limit]
+    has_more = len(infos) > start + limit
+    from provider_backend import session_started_at
+    sessions = []
+    for info in page:
+        msgs = load_messages(info.id) or []
+        sessions.append({
+            "id": info.id,
+            "title": info.summary or "",
+            "saved_at": info.saved_at or "",
+            # Absolute instant so the client renders the divider in the user's tz.
+            "started_at": session_started_at(info.id),
+            "events": _session_render_events(msgs),
+        })
+    # Oldest-first so the client can prepend the whole page as one chronological
+    # block above what's already shown.
+    sessions.reverse()
+    return {"sessions": sessions, "has_more": has_more}
+
+
+@app.route("/history")
+@login_required
+def history():
+    """Scroll-back read model: the sessions immediately older than ``before``
+    (the oldest session currently shown), rendered like the live transcript so the
+    frontend can prepend them as you scroll up — one continuous thread, with a
+    labeled divider per session."""
+    before = request.args.get("before") or ""
+    try:
+        limit = int(request.args.get("limit") or 12)
+    except (TypeError, ValueError):
+        limit = 12
+    limit = max(1, min(limit, 30))
+    infos = _context_for(g.user_id).controller.list_sessions()  # newest-first
+    dek = _auth_backend.get_dek(g.user_id)
+    conv_dir = _conversations_dir(g.user_id)
+    from provider_backend import read_session_messages
+    page = _build_history_page(
+        infos, before, limit,
+        lambda sid: read_session_messages(conv_dir, dek, sid),
+    )
+    return jsonify(page)
+
+
+def _group_days(infos, day_of):
+    """Group newest-first SessionInfos into per-day buckets, newest day first.
+    ``day_of(session_id)`` returns the YYYY-MM-DD the session belongs to. Pure, so
+    it's testable without Flask. Each bucket carries the day, a session count, and
+    the day's most recent saved_at (the first one seen, since infos are newest)."""
+    order: list[str] = []
+    by_day: dict[str, dict] = {}
+    for info in infos:
+        day = day_of(info.id)
+        if not day:
+            continue
+        bucket = by_day.get(day)
+        if bucket is None:
+            by_day[day] = {"date": day, "count": 1, "last_activity": info.saved_at or ""}
+            order.append(day)
+        else:
+            bucket["count"] += 1
+    return [by_day[d] for d in order]
+
+
+@app.route("/days")
+@login_required
+def days():
+    """The daily buckets for the history pane — newest day first. Sessions are
+    grouped by the user's local day (kept whole by the day-boundary rollover)."""
+    tz = _user_tz(g.user_id)
+    infos = _context_for(g.user_id).controller.list_sessions()  # newest-first
+    return jsonify({"days": _group_days(infos, lambda sid: _session_local_day(sid, tz))})
+
+
+@app.route("/day/<date>")
+@login_required
+def day_view(date: str):
+    """A whole day's transcript: every session on ``date`` (user-local), oldest
+    first, rendered into the same event payloads the live view uses, with a labeled
+    divider before each session. Read-only — viewing the past doesn't touch the
+    live session."""
+    tz = _user_tz(g.user_id)
+    infos = _context_for(g.user_id).controller.list_sessions()  # newest-first
+    day_sessions = [i for i in infos if _session_local_day(i.id, tz) == date]
+    day_sessions.reverse()  # oldest-first for chronological rendering
+    dek = _auth_backend.get_dek(g.user_id)
+    conv_dir = _conversations_dir(g.user_id)
+    from provider_backend import read_session_messages, session_started_at
+    events: list[dict] = []
+    for info in day_sessions:
+        events.append({
+            "kind": "session_divider",
+            "payload": {
+                "session_id": info.id,
+                "title": info.summary or "",
+                "saved_at": info.saved_at or "",
+                "started_at": session_started_at(info.id),
+            },
+        })
+        msgs = read_session_messages(conv_dir, dek, info.id) or []
+        events.extend(_session_render_events(msgs))
+    return jsonify({"date": date, "events": events})
 
 
 @app.route("/sessions/<session_id>", methods=["DELETE"])
@@ -3346,22 +3963,79 @@ def _scheduler_run_agent(agent_id: str, user_id: int, tz: str | None) -> None:
     _launch_agent_run(definition_to_spec(record), user_id, tz, agent_id=agent_id)
 
 
-def _scheduler_send_message(user_id: int, text: str) -> None:
-    """Scheduler action: deliver a reminder to the user's stored contact over the
-    configured channel. Best-effort — messaging off, no contact connected, or a
-    transport hiccup all degrade to a quiet skip rather than a hard failure."""
-    from aime import messaging as _aime_messaging
-    messenger = _aime_messaging.get_messenger()
-    if messenger is None:
+def _record_proactive_in_user_thread(user_id: int, text: str) -> None:
+    """Make an out-of-band message Aime sent (a scheduler reminder, a
+    background-agent notification) appear inline in the user's conversation, so
+    it reads as a text Aime sent in-thread and a reply lands with context.
+
+    Routes to the live session when the user is connected (records the assistant
+    turn and pushes it to their open chat immediately); otherwise writes straight
+    to their most recent persisted session, visible the next time they open it.
+    Always best-effort — recording is additive to the out-of-band delivery, so any
+    failure is logged and swallowed rather than affecting the send."""
+    body = (text or "").strip()
+    if not body:
+        return
+    try:
+        ctx = _user_contexts.get(user_id)
+        if ctx is not None and ctx.controller.deliver_inline_proactive(body):
+            # A live (non-temporary) session owns it: recorded now if idle (and
+            # pushed to the open chat as a proactive_message), or queued to flush
+            # on turn_end if busy. Don't also write to disk.
+            app.logger.info(
+                "proactive: threaded live for user %s (%d chars)", user_id, len(body))
+            return
+        # No live session for this user, OR they're in a Temporary Chat: persist
+        # into *today's* session file directly so the message threads into Today,
+        # present on next load / on exiting temp mode.
+        from provider_backend import append_proactive_message_offline
+        append_proactive_message_offline(
+            _conversations_dir(user_id), _auth_backend.get_dek(user_id), body,
+            _user_tz(user_id),
+        )
+        app.logger.info(
+            "proactive: wrote offline for user %s (ctx=%s)", user_id, ctx is not None)
+        # If they're sitting in a temporary chat, let them know a message landed
+        # in their main thread (the phone already got it too).
+        if ctx is not None and ctx.controller.is_temporary:
+            ctx._broadcast({
+                "kind": "notice",
+                "severity": "info",
+                "text": "Aime sent a message to your main chat.",
+            })
+    except Exception:
+        app.logger.exception(
+            "failed to record proactive message inline for user %s", user_id
+        )
+
+
+def _pipeline_send(user_id: int, text: str, subject: str | None = None) -> None:
+    """The single outbound chokepoint. Every out-of-band message Aime sends the
+    user routes through here so the messaging pipeline and the chat transcript can
+    never diverge: it (1) delivers out of band over the configured channel
+    (Telegram/email), and (2) threads the same text into the user's transcript —
+    recorded so the model sees it, and shown live in the UI as an Aime bubble.
+    Best-effort throughout; a failure in either half never blocks the other."""
+    body = (text or "").strip()
+    if not body:
         return
     rec = _auth_backend.lookup(user_id)
     contact = rec.messaging_contact if rec else None
-    if not contact:
-        return
-    try:
-        messenger.send(contact, text)
-    except _aime_messaging.MessageSendError as exc:
-        app.logger.warning("scheduled reminder to user %s failed: %s", user_id, exc)
+    from aime import messaging as _aime_messaging
+    messenger = _aime_messaging.get_messenger()
+    if messenger is not None and contact:
+        try:
+            messenger.send(contact, body, subject=subject)
+        except _aime_messaging.MessageSendError as exc:
+            app.logger.warning("pipeline send to user %s failed: %s", user_id, exc)
+    # Thread into the transcript + live UI, even when no channel/contact is wired
+    # up (the chat becomes the surface).
+    _record_proactive_in_user_thread(user_id, body)
+
+
+def _scheduler_send_message(user_id: int, text: str) -> None:
+    """Scheduler action: a reminder. Routes through the single outbound pipeline."""
+    _pipeline_send(user_id, text)
 
 
 def _scheduler_upcoming_events(user_id: int) -> list:
@@ -3502,6 +4176,13 @@ def _launch_agent_run(
                 usage_label=username,
                 client_tz=client_tz,
                 messaging_contact=messaging_contact,
+                # Every message this run sends — a SendMessage tool call *or* its
+                # SubmitResult message_to_user — flows through the controller's
+                # _deliver_message, which calls this sink to thread the same text
+                # into the owning user's transcript + live UI. So agent messages
+                # appear in the chat exactly like interactive ones (the gap that
+                # made agent/reminder messages reach Telegram but not the UI).
+                message_sink=lambda t: _record_proactive_in_user_thread(user_id, t),
                 api_url=aime_config.API_URL,
                 agent_id=agent_id,
                 # Debit this run's real cost against the user's budget (None when
@@ -3882,7 +4563,8 @@ def calendar_event_update(event_id: int):
     # (e.g. saving a description edit never resets status or commitment_id).
     extra = {
         key: data[key]
-        for key in ("status", "commitment_id", "status_change_reason", "rescheduled_from")
+        for key in ("status", "commitment_id", "status_change_reason",
+                    "rescheduled_from", "end_date", "end_time", "duration")
         if isinstance(data.get(key), str)
     }
     ctx = _context_for(g.user_id)
@@ -4321,13 +5003,9 @@ def _notify_share(user_id: int, message_text: str) -> None:
             ctx.notify_share_update()
         except Exception:
             pass
+    # Out of band + into the transcript, via the single pipeline chokepoint.
     try:
-        rec = _auth_backend.lookup(user_id)
-        if rec and rec.messaging_contact:
-            from aime import messaging as _aime_messaging
-            messenger = _aime_messaging.get_messenger()
-            if messenger is not None:
-                messenger.send(rec.messaging_contact, message_text)
+        _pipeline_send(user_id, message_text)
     except Exception:
         pass
 

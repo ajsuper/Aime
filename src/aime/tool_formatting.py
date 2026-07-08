@@ -25,6 +25,27 @@ TOOL_NAME_MAP = {
 }
 
 
+def format_event_when(ev: dict) -> str:
+    """One-line start→end stamp for an event dict (keys: date/time/end_date/
+    end_time). Collapses a same-day end to just its time, and omits the end
+    entirely for a point-in-time event. e.g. '10/06/2026 10:00 → 11:00',
+    '10/06/2026 → 14/06/2026', '10/06/2026 09:00'."""
+    date_ = ev.get("date") or "?"
+    time_ = ev.get("time") or ""
+    start = f"{date_} {time_}".strip()
+    end_date = ev.get("end_date") or ""
+    end_time = ev.get("end_time") or ""
+    if not end_date and not end_time:
+        return start
+    # A same-day end shows only the time; a different end date shows the date
+    # (plus time if the event is timed).
+    if end_date and end_date != date_:
+        end = f"{end_date} {end_time}".strip()
+    else:
+        end = end_time or end_date
+    return f"{start} → {end}" if end else start
+
+
 def _truncate_for_log(value, limit: int = 60) -> str:
     if value is None:
         return ""
@@ -58,11 +79,15 @@ def format_tool_details(name: str, inp: dict) -> str:
         parts.append(f"\"{title}\" on {date_}")
         if inp.get("time"):
             parts.append(f"at {inp['time']}")
+        if inp.get("duration"):
+            parts.append(f"for {inp['duration']}")
+        elif inp.get("end_date") or inp.get("end_time"):
+            parts.append(f"until {inp.get('end_date') or ''} {inp.get('end_time') or ''}".strip())
         if inp.get("category"):
             parts.append(f"#{inp['category']}")
     elif name == "EditEvent":
         parts.append(f"id={inp.get('id', '?')}")
-        for field in ("title", "date", "time", "category", "summary"):
+        for field in ("title", "date", "time", "duration", "end_date", "end_time", "category", "summary"):
             if inp.get(field):
                 parts.append(f"{field}={_truncate_for_log(inp[field], 30)}")
     elif name == "FilterTopics":
@@ -104,6 +129,9 @@ def format_tool_details(name: str, inp: dict) -> str:
         summary = _truncate_for_log(inp.get("summary"), 50)
         if summary:
             parts.append(f"\"{summary}\"")
+    elif name == "LoadGraphicsExamples":
+        if inp.get("kind"):
+            parts.append(str(inp["kind"]))
     elif name == "CreateReminder":
         parts.append(f"event #{inp.get('event_id', '?')}")
         days = inp.get("days_before")
@@ -160,9 +188,7 @@ def _render_events(events: list) -> str:
             continue
         eid = ev.get("id", "?")
         title = (ev.get("title") or "(untitled)").strip()
-        when = ev.get("date") or "?"
-        if ev.get("time"):
-            when += f" {ev['time']}"
+        when = format_event_when(ev)
         head = f"• #{eid} {title} | {when}"
         if ev.get("category"):
             head += f" | {ev['category']}"

@@ -10,9 +10,10 @@ import os
 import hashlib
 import threading
 import datetime
+import uuid
 import zoneinfo
 from dataclasses import dataclass
-from typing import Iterator, Literal, Protocol, runtime_checkable
+from typing import Callable, Iterator, Literal, Protocol, runtime_checkable
 
 from anthropic import Anthropic, BadRequestError
 from cryptography.exceptions import InvalidTag
@@ -33,6 +34,14 @@ _CONV_SUFFIX = ".json.enc"
 # a conversation as a short recovery notice instead of dumping the condensed
 # transcript into one giant verbatim bubble.
 RECOVERY_MARKER = "[Aime conversation recovered]"
+
+# Prefix on the synthetic user turn we insert ahead of an out-of-band proactive
+# assistant message (a scheduler reminder, a background-agent notification) when
+# the history would otherwise be empty or end on an assistant turn. It keeps the
+# message list API-valid (opens on a user turn, no two assistant turns in a row)
+# and tells the model its following message was delivered to the user out of
+# band. Replay skips any user turn that starts with it so the user never sees it.
+PROACTIVE_TRIGGER_MARKER = "[Aime reached out proactively]"
 
 
 def _jsonable(obj):
@@ -187,6 +196,11 @@ class BackendEvent:
     expects_response: bool = True
     stop_reason: str | None = None
     error: str | None = None
+    # Structured diagnostics for `error` events, from the error sink:
+    #   {"reference": str|None, "category": str, "user_message": str|None}.
+    # Lets the controller surface a calm, specific line + a reference id without
+    # re-deriving anything. None on non-error events (and when no sink is wired).
+    error_meta: dict | None = None
     # Optional image attachments for user_send_message events. Each entry:
     #   {"media_type": "image/png" | "image/jpeg" | ..., "data": "<base64>"}
     images: list[dict] | None = None
@@ -210,6 +224,11 @@ class AgentBackend(Protocol):
 
     def new_session(self) -> str:
         """Start a fresh session. Returns the session id."""
+        ...
+
+    def start_ephemeral_session(self) -> str:
+        """Start a throwaway session that is never persisted (a Temporary Chat).
+        Backends without persistence can treat this as ``new_session``."""
         ...
 
     def list_sessions(self) -> list[SessionInfo]:
@@ -246,6 +265,17 @@ class AgentBackend(Protocol):
         """Push a user/system/tool-result event into the conversation."""
         ...
 
+    def append_assistant_message(self, text: str, pid: str = "") -> bool:
+        """Record an out-of-band message *as if Aime said it* — an assistant
+        turn appended to history without triggering a model turn. Used to make
+        a proactive send (scheduler reminder, agent notification) appear inline
+        in the thread so the user's reply has coherent context. ``pid`` is a stable
+        id stored with the message so the frontend can track whether it's been
+        seen. Returns True if recorded. No-op (returns False) for backends without
+        persistent history. Must only be called between turns; appending mid-turn
+        would corrupt the in-flight assistant message / tool_result ordering."""
+        return False
+
     def delete_session(self, session_id: str) -> None:
         """Delete a saved session by id. No-op for backends without enumerable
         history. If the deleted session is currently active, also resets to a
@@ -267,10 +297,12 @@ class AgentBackend(Protocol):
         ...
 
     def interrupt_turn(self) -> None:
-        """Best-effort cancel of the in-flight assistant turn. Any partial
-        assistant response is discarded so the next turn starts from a clean
-        history. No-op if no turn is active or the backend cannot interrupt
-        in the middle of a stream."""
+        """Best-effort cancel of the in-flight assistant turn. Any text the model
+        already streamed is kept, and an in-progress tool call is summarized into
+        a note, so the next turn still sees what it was doing; only the unanswered
+        tool_use scaffolding is dropped to keep history API-valid. No-op if no
+        turn is active or the backend cannot interrupt in the middle of a
+        stream."""
         ...
 
 
@@ -279,6 +311,143 @@ class AgentBackend(Protocol):
 import aime.encryption as _enc
 import aime.dateformat as dateformat
 from aime import graphics as _graphics
+
+
+def session_started_at(session_id: str) -> str:
+    """The session's start time as an absolute (tz-aware) ISO instant, derived
+    from the timestamp embedded in its id (``msgs-YYYYMMDD-HHMMSS-…``). The id
+    stamp is server-local wall time, so we localize it to the server's zone to get
+    an absolute instant the client can render in the *user's* timezone. Returns ""
+    if the id doesn't carry a parseable stamp."""
+    parts = (session_id or "").split("-")
+    if len(parts) < 3 or parts[0] != "msgs":
+        return ""
+    try:
+        dt = datetime.datetime.strptime(parts[1] + parts[2], "%Y%m%d%H%M%S")
+    except ValueError:
+        return ""
+    return dt.astimezone().isoformat()
+
+
+def read_session_messages(
+    conversations_dir: str, dek: bytes, session_id: str,
+) -> list[dict] | None:
+    """Decrypt and return a stored session's message list, read-only and without
+    touching any live backend — used by the /history scroll-back read model.
+    Returns None when the file is missing or unreadable."""
+    path = os.path.join(conversations_dir, f"{session_id}{_CONV_SUFFIX}")
+    try:
+        with open(path, "rb") as f:
+            blob = f.read()
+        plaintext = _enc.decrypt_blob(dek, blob, aad=session_id.encode("utf-8"))
+        data = json.loads(plaintext)
+    except (OSError, ValueError, InvalidTag):
+        return None
+    msgs = data.get("messages")
+    return msgs if isinstance(msgs, list) else []
+
+
+def append_proactive_message_offline(
+    conversations_dir: str, dek: bytes, text: str, tz_name: str = "",
+) -> bool:
+    """Append an out-of-band assistant message to a user's *current-day* session
+    *without* a live backend in memory — used when the user is offline so a
+    scheduler reminder still threads into their conversation and is visible the
+    next time they open Today. Mirrors ``append_assistant_message`` / ``_persist``
+    exactly (same hidden-trigger guard, same encryption + atomic write, AAD =
+    session id) so the live and offline paths produce identical files.
+
+    Targets today's session (in the user's ``tz_name``) so the message lands in
+    Today, not a past day's bucket — creating a fresh today session if the most
+    recent one is from a previous day (or there are none). Returns True if written.
+
+    Best-effort: the caller uses this only when no in-memory session is loaded,
+    so there is no live writer to race; a decrypt/parse failure on any one file
+    is skipped rather than fatal."""
+    body = (text or "").strip()
+    if not body:
+        return False
+    tz = None
+    if tz_name:
+        try:
+            tz = zoneinfo.ZoneInfo(tz_name)
+        except Exception:
+            tz = None
+    today = (datetime.datetime.now(tz) if tz else datetime.datetime.now()).date()
+
+    def _session_day(session_id: str):
+        iso = session_started_at(session_id)
+        if not iso:
+            return None
+        try:
+            dt = datetime.datetime.fromisoformat(iso)
+        except ValueError:
+            return None
+        return (dt.astimezone(tz) if tz else dt.astimezone()).date()
+
+    try:
+        names = [
+            n for n in os.listdir(conversations_dir) if n.endswith(_CONV_SUFFIX)
+        ]
+    except OSError:
+        names = []
+    target_id: str | None = None
+    target_data: dict | None = None
+    best_saved = ""
+    for name in names:
+        session_id = name[: -len(_CONV_SUFFIX)]
+        try:
+            with open(os.path.join(conversations_dir, name), "rb") as f:
+                blob = f.read()
+            plaintext = _enc.decrypt_blob(dek, blob, aad=session_id.encode("utf-8"))
+            data = json.loads(plaintext)
+        except (OSError, ValueError, InvalidTag):
+            continue
+        saved = data.get("saved_at", "")
+        if target_id is None or saved >= best_saved:
+            best_saved = saved
+            target_id = data.get("id") or session_id
+            target_data = data
+    # Only append to the latest session if it's *today's* — otherwise the message
+    # would land in a past day. Start a fresh today session instead.
+    if target_id is not None and _session_day(target_id) != today:
+        target_id = None
+        target_data = None
+    if target_id is None or target_data is None:
+        stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        target_id = f"msgs-{stamp}-" + hashlib.sha1(os.urandom(8)).hexdigest()[:8]
+        target_data = {"id": target_id, "summary": "none", "messages": []}
+    messages = target_data.get("messages") or []
+    if not messages or messages[-1].get("role") == "assistant":
+        messages.append({
+            "role": "user",
+            "content": [{"type": "text", "text": PROACTIVE_TRIGGER_MARKER}],
+        })
+    messages.append({
+        "role": "assistant",
+        "content": [{"type": "text", "text": body}],
+        # Stable id for per-message "seen"/"New" tracking (mirrors the live
+        # append_assistant_message path). A message written here arrived while the
+        # user was away, so it will surface as "New" when they next open Today.
+        "pid": "p-" + uuid.uuid4().hex[:12],
+    })
+    target_data["messages"] = messages
+    target_data["id"] = target_id
+    target_data["saved_at"] = datetime.datetime.now().isoformat(timespec="seconds")
+    if not target_data.get("summary"):
+        target_data["summary"] = "none"
+    try:
+        os.makedirs(conversations_dir, exist_ok=True)
+        path = os.path.join(conversations_dir, f"{target_id}{_CONV_SUFFIX}")
+        plaintext = json.dumps(target_data, default=_jsonable).encode("utf-8")
+        blob = _enc.encrypt_blob(dek, plaintext, aad=target_id.encode("utf-8"))
+        tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+        with open(tmp, "wb") as f:
+            f.write(blob)
+        os.replace(tmp, path)
+    except (OSError, TypeError, ValueError):
+        return False
+    return True
 
 
 class AnthropicMessagesBackend:
@@ -323,8 +492,14 @@ class AnthropicMessagesBackend:
         persist_enabled: bool = True,
         usage_source: str = "interactive",
         quota=None,
+        error_sink=None,
     ):
         self._client = Anthropic(max_retries=3)
+        # Optional diagnostics capture. Called as
+        #   error_sink(exc, source=..., session_id=..., username=..., model=...)
+        # returning {"reference", "category", "user_message"}. None = no capture
+        # (keeps the backend decoupled from the store and trivially testable).
+        self._error_sink = error_sink
         self._system_prompt = system_prompt
         # `model` is the *default* / fallback. When a router is attached, each
         # turn picks between Haiku and Sonnet; the default is what we fall
@@ -404,6 +579,13 @@ class AnthropicMessagesBackend:
         # they never litter the user's saved-conversation list; their audit
         # trail is the separate run record (see aime.agents.store).
         self._persist_enabled = persist_enabled
+        # Runtime persistence suspend for a Temporary Chat: the session lives only
+        # in memory and is discarded on exit, even though this backend is normally
+        # persistence-capable. Separate from _persist_enabled (the static
+        # capability) so toggling temp mode never re-enables persistence on a
+        # backend that was built without it (an agent run). Reset on every
+        # new_session()/load_session(); set by start_ephemeral_session().
+        self._persist_suspended = False
         # Per-session dynamic context (e.g. bootstrapped topic contents). Lives
         # in the system array rather than the message history so it stays out
         # of compaction and doesn't get replayed inside user turns.
@@ -427,6 +609,11 @@ class AnthropicMessagesBackend:
         # True while a background _generate_title thread is in flight, so
         # submit() doesn't spawn a duplicate one on the next message.
         self._title_generating = False
+        # Optional callback fired (session_id, title) whenever a session's title
+        # is (re)generated, so the controller can backfill a live session-divider
+        # whose label was still a timestamp. Set by the controller; None in tests
+        # / headless runs. Called off the turn thread, so it must not block.
+        self._on_title: "Callable[[str, str], None] | None" = None
         # True while a background compaction thread is in flight. Compaction
         # makes two sequential Haiku calls (summary + title refresh) so it's
         # run off the turn thread; this flag prevents stacking up duplicates
@@ -606,6 +793,9 @@ class AnthropicMessagesBackend:
             self._session_context = ""
             self._current_turn_model = None
             self._current_turn_label = None
+            # A normal fresh session persists (subject to the static capability);
+            # only start_ephemeral_session() re-suspends after this.
+            self._persist_suspended = False
         self._terminated.clear()
         self._turn_trigger.clear()
         stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -615,6 +805,24 @@ class AnthropicMessagesBackend:
         # /reset (or app launch) doesn't litter conversations/ with empty
         # placeholders.
         return self._session_id
+
+    def set_title_callback(self, cb: "Callable[[str, str], None] | None") -> None:
+        """Register a callback fired (session_id, title) when a session's title is
+        (re)generated, so the controller can backfill a live session divider whose
+        label was still a timestamp. Called off the turn thread."""
+        self._on_title = cb
+
+    def start_ephemeral_session(self) -> str:
+        """Begin a Temporary Chat: a throwaway in-memory session that is never
+        written to disk and never folds into the persisted thread. Identical to
+        new_session() except persistence stays suspended for its whole life, so
+        exiting temp mode (a load_session back to the main thread) simply drops
+        it. Tool actions taken during it still persist — they go through the data
+        stores, not the conversation file."""
+        sid = self.new_session()
+        with self._lock:
+            self._persist_suspended = True
+        return sid
 
     def messages_snapshot(self) -> list[dict]:
         """Copy of the current message list, safe for the UI to iterate
@@ -646,6 +854,9 @@ class AnthropicMessagesBackend:
             self._session_context = ""
             self._current_turn_model = None
             self._current_turn_label = None
+            # Returning to a real (persisted) session — e.g. exiting a Temporary
+            # Chat back to the main thread — resumes normal persistence.
+            self._persist_suspended = False
         self._terminated.clear()
         self._turn_trigger.clear()
 
@@ -688,7 +899,8 @@ class AnthropicMessagesBackend:
         return sessions
 
     def _persist(self) -> None:
-        if not self._session_id or not self._persist_enabled:
+        if (not self._session_id or not self._persist_enabled
+                or self._persist_suspended):
             return
         # Hold _persist_lock across the snapshot *and* the file write, so a
         # slow writer can't os.replace() a stale snapshot over a newer one
@@ -797,6 +1009,37 @@ class AnthropicMessagesBackend:
         self._terminate_active_stream()
         self.new_session()
 
+    def append_assistant_message(self, text: str, pid: str = "") -> bool:
+        body = (text or "").strip()
+        if not body:
+            return False
+        with self._lock:
+            msgs = self._messages
+            # Keep the message list API-valid: it must open on a user turn and
+            # never carry two assistant turns back to back. When the history is
+            # empty (e.g. just after a silent idle rollover) or already ends on
+            # an assistant turn, slip in a hidden trigger turn the model reads as
+            # "your next message goes to the user out of band". Replay skips it.
+            if not msgs or msgs[-1].get("role") == "assistant":
+                msgs.append({
+                    "role": "user",
+                    "content": [{"type": "text", "text": PROACTIVE_TRIGGER_MARKER}],
+                })
+            msg = {
+                "role": "assistant",
+                "content": [{"type": "text", "text": body}],
+            }
+            # Stored with the message so replay can hand the frontend the same id
+            # it saw live — the anchor for per-message "seen"/"New" tracking.
+            if pid:
+                msg["pid"] = pid
+            msgs.append(msg)
+        self._persist()
+        # Deliberately do NOT set _turn_trigger: this records what Aime already
+        # said out of band, it must not provoke a fresh model reply. The model
+        # sees it as prior context on the user's next real message.
+        return True
+
     def delete_session(self, session_id: str) -> None:
         if not session_id:
             return
@@ -855,6 +1098,7 @@ class AnthropicMessagesBackend:
                     if msg["role"] == "user"
                     for block in msg["content"]
                     if isinstance(block, dict) and block.get("type") == "text"
+                    and not block["text"].startswith(PROACTIVE_TRIGGER_MARKER)
                 ]
                 needs_title = (
                     not self._summary
@@ -869,7 +1113,7 @@ class AnthropicMessagesBackend:
             if needs_title and event.kind == "user_send_message":
                 threading.Thread(
                     target=self._generate_title,
-                    args=(title_prompt,),
+                    args=(title_prompt, self._session_id),
                     daemon=True,
                 ).start()
             self._turn_trigger.set()
@@ -985,7 +1229,8 @@ class AnthropicMessagesBackend:
         except Exception as exc:
             if not self._is_malformed_history_error(exc):
                 self._discard_failed_assistant_placeholder()
-                yield BackendEvent(kind="error", error=str(exc))
+                yield BackendEvent(kind="error", error=str(exc),
+                                   error_meta=self._capture_error(exc))
                 yield BackendEvent(kind="turn_end", stop_reason="error")
                 return
             # The API rejected the request itself as malformed. Flatten the
@@ -998,8 +1243,27 @@ class AnthropicMessagesBackend:
             yield from self._run_turn()
         except Exception as exc:
             self._discard_failed_assistant_placeholder()
-            yield BackendEvent(kind="error", error=str(exc))
+            yield BackendEvent(kind="error", error=str(exc),
+                               error_meta=self._capture_error(exc))
             yield BackendEvent(kind="turn_end", stop_reason="error")
+
+    def _capture_error(self, exc: Exception) -> dict | None:
+        """Hand a live turn exception to the diagnostics sink (when wired) and
+        log it. This is the richest capture point — the exception still carries
+        its status_code / Anthropic request_id / traceback here, all of which is
+        lost once it's flattened to the BackendEvent's `error` string. Returns
+        the sink's ``{reference, category, user_message}`` meta, or None."""
+        logger.error("turn failed: %s", exc, exc_info=True)
+        if self._error_sink is None:
+            return None
+        try:
+            return self._error_sink(
+                exc, source="provider_turn", session_id=self._session_id,
+                username=self._usage_label, model=self._current_turn_model,
+            )
+        except Exception:  # never let diagnostics break the error path
+            logger.debug("error sink failed", exc_info=True)
+            return None
 
     @staticmethod
     def _is_malformed_history_error(exc: Exception) -> bool:
@@ -1566,27 +1830,60 @@ class AnthropicMessagesBackend:
         substitute a single `[interrupted]` text block so the assistant
         slot isn't empty (the API rejects messages with empty content).
         Caller must hold self._lock. Updates `_expected_tool_use_ids` to
-        drop any IDs we just orphaned."""
+        drop any IDs we just orphaned.
+
+        The raw tool_use block can't stay — it has no matching tool_result and
+        the API rejects an orphan — but we don't want the model to forget what it
+        was mid-way through when the user cut in. So each stripped tool_use is
+        summarized into a text note appended after whatever the model streamed,
+        keeping the work visible to the next turn."""
         content = message.get("content")
         if not isinstance(content, list):
             return
+        interrupted_tools: list[str] = []
         for blk in content:
             if isinstance(blk, dict) and blk.get("type") in ("tool_use", "server_tool_use"):
                 self._expected_tool_use_ids.discard(blk.get("id"))
+                interrupted_tools.append(self._describe_interrupted_tool(blk))
         kept = [
             b for b in content
             if isinstance(b, dict)
             and b.get("type") == "text"
             and (b.get("text") or "").strip()
         ]
+        if interrupted_tools:
+            note = ("[Interrupted by the user while working on: "
+                    + "; ".join(interrupted_tools) + "]")
+            kept.append({"type": "text", "text": note})
         if not kept:
             kept = [{"type": "text", "text": "[interrupted]"}]
         message["content"] = kept
 
-    def _generate_title(self, prompt_text: str) -> None:
+    @staticmethod
+    def _describe_interrupted_tool(blk: dict) -> str:
+        """One-line summary of an orphaned tool_use block — the tool name plus a
+        bounded rendering of its input — for the interrupt note. Bounded so a
+        large input (e.g. a document edit) doesn't bloat the history."""
+        name = blk.get("name") or "a tool"
+        raw = blk.get("input")
+        if not raw:
+            return name
+        try:
+            detail = json.dumps(raw, ensure_ascii=False)
+        except (TypeError, ValueError):
+            detail = str(raw)
+        if len(detail) > 300:
+            detail = detail[:300] + "…"
+        return f"{name}({detail})"
+
+    def _generate_title(self, prompt_text: str, session_id: str | None = None) -> None:
         """Background: one cheap Haiku call turning the user's opening prompt
         into a one-sentence session description, then persist it. Best-effort —
-        any failure just leaves the summary empty so the next submit() retries."""
+        any failure just leaves the summary empty so the next submit() retries.
+
+        ``session_id`` is the session the title is for (captured at spawn), so a
+        late title only updates the right session even if the active one has since
+        rolled over — and the on_title callback can target the matching divider."""
         try:
             try:
                 resp = self._client.messages.create(
@@ -1616,8 +1913,20 @@ class AnthropicMessagesBackend:
                 return
             if title:
                 with self._lock:
-                    self._summary = title
-                self._persist()
+                    # Only apply to the session the title was generated for — if
+                    # the active session has since rolled over, don't stamp the old
+                    # title onto the new one.
+                    same = session_id is None or self._session_id == session_id
+                    if same:
+                        self._summary = title
+                if same:
+                    self._persist()
+                cb = self._on_title
+                if cb is not None:
+                    try:
+                        cb(session_id or "", title)
+                    except Exception:
+                        pass
         finally:
             with self._lock:
                 self._title_generating = False
@@ -1959,6 +2268,11 @@ class SessionsBackend:
                 environment_id=self._env_id,
             )
         return self._session.id
+
+    def start_ephemeral_session(self) -> str:
+        # No client-side persistence here, so a temporary chat is just a fresh
+        # server-side session.
+        return self.new_session()
 
     def load_session(self, session_id: str) -> None:
         # Sessions are server-side; "loading" just means attaching to the id.

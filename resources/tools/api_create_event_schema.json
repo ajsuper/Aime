@@ -9,12 +9,26 @@
     "date": {
       "type": "string",
       "pattern": "^\\d{2}/\\d{2}/\\d{4}$",
-      "description": "DD/MM/YYYY. For a multi-day event, the start date."
+      "description": "DD/MM/YYYY start date. For a multi-day event, set end_date (or duration) for the end."
     },
     "time": {
       "type": "string",
       "pattern": "^\\d{2}:\\d{2}$",
       "description": "Start time, HH:MM. Optional."
+    },
+    "duration": {
+      "type": "string",
+      "description": "How long the event lasts, as sugar that the server converts to an absolute end. Compact unit-tagged form: '90m', '2h', '1h30m', '3d', '2w', '2mo', '1y'. Hours/minutes need a `time`; day-and-up units also work on all-day events. Use this OR end_date/end_time, never both. The resulting end is absolute — it does NOT auto-shift if you later move the event."
+    },
+    "end_date": {
+      "type": "string",
+      "pattern": "^\\d{2}/\\d{2}/\\d{4}$",
+      "description": "DD/MM/YYYY the event ends on (its last day, for a multi-day event). Optional; alternative to `duration`. Must be on or after `date`."
+    },
+    "end_time": {
+      "type": "string",
+      "pattern": "^\\d{2}:\\d{2}$",
+      "description": "End time, HH:MM. Optional; requires `time` to be set. For a same-day timed event, set end_date to the start date (or omit it) and give end_time."
     },
     "category": {
       "type": "string",

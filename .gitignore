@@ -64,6 +64,11 @@ compile_commands.json
 # vcpkg
 vcpkg_installed/
 
+# Node (server-side Vega-Lite compile gate — see package.json / aime.vega_compile).
+# package.json + package-lock.json are committed; run `npm install` at deploy to
+# materialize node_modules. The compile gate fails open if it's absent.
+node_modules/
+
 # debug information files
 *.dwo
 

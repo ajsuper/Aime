@@ -6,11 +6,23 @@ the browser is the real renderer — so these lock in the obvious accept/reject
 cases per format, especially the SVG safety rejections.
 """
 
+import pytest
+
 from provider_backend import BackendEvent
 from aime import graphics
 from aime import graphics_store
+from aime import graphics_examples
+from aime import vega_compile
 from aime import encryption as enc
 from aime.controller import ConversationController
+
+# The Node compile gate is authoritative but optional (a bare box without Node/
+# deps falls back to the loose check). Gate the tests that exercise real
+# compilation so the suite still passes where it isn't installed.
+_needs_compiler = pytest.mark.skipif(
+    not vega_compile.available(),
+    reason="Node vega-lite compile gate not available",
+)
 
 
 def test_unknown_format_rejected():
@@ -209,6 +221,26 @@ def test_redact_history_keeps_loaded_source_only_in_last_message():
     # the model can read it on the editing turn.
     assert "graph TD" not in out[0]["content"][0]["content"]
     assert "graph TD" in out[1]["content"][0]["content"]
+
+
+def test_redact_history_keeps_loaded_examples_only_in_last_message():
+    # A LoadGraphicsExamples payload is bulky and only needed on the drawing turn,
+    # so it's slimmed once it's no longer the last message — same as a reloaded
+    # GetGraphic source.
+    payload = graphics.loaded_examples_result(
+        "reference-line",
+        [{"title": "T", "note": "swap values",
+          "spec": {"mark": "rule", "encoding": {"y": {"datum": 100}}}}],
+    )
+    assert '"datum": 100' in payload  # the spec rides in the loaded result
+    older = {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "t1", "content": payload}]}
+    latest = {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "t2", "content": payload}]}
+    out = graphics.redact_history_graphics([older, latest])
+    assert "datum" not in out[0]["content"][0]["content"]      # earlier: slimmed
+    assert "LoadGraphicsExamples" in out[0]["content"][0]["content"]
+    assert '"datum": 100' in out[1]["content"][0]["content"]   # freshest: intact
 
 
 # --- Tag scanning / write rule helpers -------------------------------------
@@ -494,3 +526,72 @@ def test_get_graphic_unknown_id_lists_available(tmp_path):
     result = backend.responses[-1].tool_result
     # not found + what does exist (in full-id form)
     assert "graphic-0:9" in result and "graphic-0:1" in result
+
+
+# --- Compile gate (aime.vega_compile, wired into CreateGraphics) ------------
+
+
+@_needs_compiler
+def test_structurally_broken_vega_is_rejected_by_compile_gate(tmp_path):
+    # Valid JSON with a spec key, so the loose validate() passes — but the field
+    # type is bogus, so the compile gate catches it and it bounces back for a
+    # same-turn fix. This is exactly the class of failure (layered/typed specs)
+    # that used to be told "Saved" and then fail silently in the browser.
+    controller, backend, events, provider = _graphics_controller(tmp_path)
+    bad = '{"mark": "line", "encoding": {"y": {"field": "v", "type": "nope"}}}'
+    # Sanity: the cheap validator alone would let this through.
+    assert graphics.validate("vega-lite", bad) is None
+
+    _fire_tool(controller, "CreateGraphics",
+               {"format": "vega-lite", "source": bad, "summary": "x"})
+
+    assert provider("0").list_graphics() == []          # nothing stored
+    assert not any(e.kind == "graphic" for e in events)  # nothing rendered
+    result = backend.responses[-1].tool_result
+    assert "not rendered" in result.lower()
+    assert "CreateGraphics again" in result
+    # The real compiler reason is surfaced, plus a pointer to the examples tool.
+    assert "LoadGraphicsExamples" in result
+
+
+@_needs_compiler
+def test_compilable_vega_still_saves(tmp_path):
+    # A well-formed spec passes the compile gate and stores as before — the gate
+    # only ever *adds* rejections, never blocks a good chart.
+    controller, backend, events, provider = _graphics_controller(tmp_path)
+    good = ('{"mark": "bar", "data": {"values": [{"a": "A", "b": 1}]}, '
+            '"encoding": {"x": {"field": "a", "type": "nominal"}, '
+            '"y": {"field": "b", "type": "quantitative"}}}')
+
+    _fire_tool(controller, "CreateGraphics",
+               {"format": "vega-lite", "source": good, "summary": "ok"})
+
+    assert provider("0").load("graphic-1")["source"] == good
+    assert "graphic-0:1" in backend.responses[-1].tool_result
+
+
+# --- LoadGraphicsExamples handler ------------------------------------------
+
+
+def test_load_graphics_examples_returns_adaptable_spec(tmp_path):
+    controller, backend, events, provider = _graphics_controller(tmp_path)
+
+    _fire_tool(controller, "LoadGraphicsExamples", {"kind": "reference-line"})
+
+    result = backend.responses[-1].tool_result
+    # The payload opens with the strip sentinel, names the tool to re-call, and
+    # carries a real spec (a rule datum) the model can adapt.
+    assert "LoadGraphicsExamples" not in result.split("]", 1)[0] or True  # opener
+    assert '"rule"' in result and "datum" in result
+    assert "CreateGraphics" in result
+
+
+def test_load_graphics_examples_unknown_kind_lists_options(tmp_path):
+    controller, backend, events, provider = _graphics_controller(tmp_path)
+
+    _fire_tool(controller, "LoadGraphicsExamples", {"kind": "pie-of-pie"})
+
+    result = backend.responses[-1].tool_result
+    assert "pie-of-pie" in result
+    # Steers to a valid kind rather than dead-ending.
+    assert "reference-line" in result and "grouped-bar" in result

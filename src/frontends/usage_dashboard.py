@@ -63,6 +63,7 @@ from aime import auth as _auth  # noqa: E402
 from aime import accounts as _accounts  # noqa: E402
 from aime import quota as _quota  # noqa: E402
 from aime import feedback as _feedback  # noqa: E402
+from aime import errors as _errors  # noqa: E402
 
 app = Flask(__name__)
 
@@ -206,6 +207,20 @@ def _feedback_store() -> _feedback.FeedbackStore:
             os.path.join(_config.DATABASE_DIR, "feedback.sql")
         )
     return _feedback_store_singleton
+
+
+# Lazily-built error/diagnostics store (aime.errors), opened only when the
+# Errors tab renders or an error row is triaged. Written by the per-user web app.
+_error_store_singleton: _errors.ErrorStore | None = None
+
+
+def _error_store() -> _errors.ErrorStore:
+    global _error_store_singleton
+    if _error_store_singleton is None:
+        _error_store_singleton = _errors.ErrorStore(
+            os.path.join(_config.DATABASE_DIR, "errors.sql")
+        )
+    return _error_store_singleton
 
 
 def _log_path() -> str:
@@ -3732,6 +3747,170 @@ _FRAGMENT_FEEDBACK = """
   {% endif %}"""
 
 
+# Errors tab. The server-side companion to Feedback: every error Aime itself hit
+# (a transient Anthropic outage, a malformed request, an unexpected exception),
+# captured automatically with the diagnostic bits that help — exception class,
+# HTTP status, Anthropic request-id, model, the user/session, and a traceback.
+# Identical errors are folded onto one row with a Count so an outage burst stays
+# readable. Triaged like feedback: new → seen → resolved, plus a note. The short
+# `reference` is what the user is shown in chat, so a user report lines up here.
+_FRAGMENT_ERRORS = """
+  <h2 title="Errors Aime hit, captured automatically. Triage them here.">Errors &amp; diagnostics</h2>
+
+  <div class="userfilter" style="margin-bottom: 1rem;">
+    <a class="chipbtn {{ 'active' if not status_filter else '' }}" href="/?{{ qs_all }}">All <span class="note">{{ counts.total }}</span></a>
+    <a class="chipbtn {{ 'active' if status_filter == 'new' else '' }}" href="/?{{ qs_new }}">New <span class="note">{{ counts.new }}</span></a>
+    <a class="chipbtn {{ 'active' if status_filter == 'seen' else '' }}" href="/?{{ qs_seen }}">Seen <span class="note">{{ counts.seen }}</span></a>
+    <a class="chipbtn {{ 'active' if status_filter == 'resolved' else '' }}" href="/?{{ qs_resolved }}">Resolved <span class="note">{{ counts.resolved }}</span></a>
+  </div>
+
+  {% if not errors %}
+    <p class="empty">No {{ status_filter if status_filter else '' }} errors. {% if not status_filter %}Nothing has gone wrong — or nothing has been captured yet.{% endif %}</p>
+  {% else %}
+  <p class="note" style="margin: 0 0 .6rem;">Click a row to see the full error and triage it.</p>
+  <table class="err-table">
+    <thead>
+      <tr>
+        <th title="Most recent occurrence (UTC).">Last seen</th>
+        <th title="How the error was classified for the user-facing message.">Category</th>
+        <th title="The exception class and, where present, the HTTP status.">Error</th>
+        <th title="Account it happened to.">User</th>
+        <th title="How many times this exact error has fired in the dedup window.">Count</th>
+        <th title="Triage state.">Status</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for e in errors %}
+      <tr class="err-row" tabindex="0" role="button"
+        title="Click to open this error."
+        data-id="{{ e.id }}"
+        data-title="{{ e.error_class or 'Error' }}{% if e.status_code %} · {{ e.status_code }}{% endif %}"
+        data-last-seen="{{ e.last_seen }} UTC"
+        data-category="{{ e.category }}"
+        data-source="{{ e.source or '—' }}"
+        data-request-id="{{ e.request_id or '—' }}"
+        data-model="{{ e.model or '—' }}"
+        data-username="{{ e.username or '(unknown)' }}"
+        data-count="{{ e.count }}"
+        data-reference="{{ e.reference }}"
+        data-status="{{ e.status }}"
+        data-message="{{ e.message or '(no message)' }}"
+        data-traceback="{{ e.traceback or '' }}"
+        data-note="{{ e.admin_note or '' }}">
+        <td title="{{ e.last_seen }} UTC">{{ e.last_seen }}</td>
+        <td><span class="pill pill-{{ e.category }}">{{ e.category }}</span></td>
+        <td>{{ e.error_class or '(unknown)' }}{% if e.status_code %} <span class="note">{{ e.status_code }}</span>{% endif %}</td>
+        <td>{{ e.username or '(unknown)' }}</td>
+        <td>{% if e.count and e.count > 1 %}<strong>{{ e.count }}×</strong>{% else %}{{ e.count }}{% endif %}</td>
+        <td><span class="pill pill-{{ e.status }}">{{ e.status }}</span></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  <!-- One shared card the rows open, populated from the clicked row's data-*
+       via textContent (no innerHTML, so message/traceback/user-derived text
+       can't inject markup). The status + note forms POST as before; their
+       hidden id and current values are filled in when the card opens. Admin
+       tabs render server-side on load, so this inline script runs; the tab
+       never polls /fragment. -->
+  <div id="err-modal" class="err-modal" hidden>
+    <div class="err-card" role="dialog" aria-modal="true" aria-labelledby="err-card-title">
+      <div class="err-card-head">
+        <strong id="err-card-title"></strong>
+        <button type="button" class="err-close" aria-label="Close">&times;</button>
+      </div>
+
+      <dl class="err-meta">
+        <div><dt>Last seen</dt><dd id="err-card-last-seen"></dd></div>
+        <div><dt>Category</dt><dd id="err-card-category"></dd></div>
+        <div><dt>Status</dt><dd id="err-card-statusval"></dd></div>
+        <div><dt>User</dt><dd id="err-card-username"></dd></div>
+        <div><dt>Source</dt><dd id="err-card-source"></dd></div>
+        <div><dt>Model</dt><dd id="err-card-model"></dd></div>
+        <div><dt>Count</dt><dd id="err-card-count"></dd></div>
+        <div><dt>Reference</dt><dd><code id="err-card-reference"></code></dd></div>
+        <div><dt>Request id</dt><dd><code id="err-card-request-id"></code></dd></div>
+      </dl>
+
+      <h4>Message</h4>
+      <pre id="err-card-message"></pre>
+      <h4 id="err-card-tb-head">Traceback</h4>
+      <pre id="err-card-tb"></pre>
+
+      <div class="err-triage">
+        <form method="post" action="errors/status" class="err-triage-status">
+          <input type="hidden" name="csrf" value="{{ csrf }}">
+          <input type="hidden" name="id" id="err-status-id" value="">
+          <input type="hidden" name="status_filter" value="{{ status_filter }}">
+          <label>Status
+            <select name="status" id="err-status-select" onchange="this.form.submit()" title="Set the error status.">
+              {% for s in statuses %}
+              <option value="{{ s }}">{{ s }}</option>
+              {% endfor %}
+            </select>
+          </label>
+          <noscript><button type="submit">Set</button></noscript>
+        </form>
+        <form method="post" action="errors/note" class="err-triage-note">
+          <input type="hidden" name="csrf" value="{{ csrf }}">
+          <input type="hidden" name="id" id="err-note-id" value="">
+          <input type="hidden" name="status_filter" value="{{ status_filter }}">
+          <label>Triage note
+            <textarea name="note" id="err-note-text" rows="5" placeholder="Jot a triage note…"></textarea>
+          </label>
+          <button type="submit">Save note</button>
+        </form>
+      </div>
+    </div>
+  </div>
+  <script>
+  (function () {
+    var modal = document.getElementById("err-modal");
+    if (!modal || modal._wired) return;
+    modal._wired = true;
+    function set(id, val) { document.getElementById(id).textContent = val || ""; }
+    var statuses = {{ statuses|tojson }};
+    function openCard(row) {
+      var d = row.dataset;
+      set("err-card-title", d.title + " · ref " + d.reference);
+      set("err-card-last-seen", d.lastSeen);
+      set("err-card-category", d.category);
+      set("err-card-statusval", d.status);
+      set("err-card-username", d.username);
+      set("err-card-source", d.source);
+      set("err-card-model", d.model);
+      set("err-card-count", d.count);
+      set("err-card-reference", d.reference);
+      set("err-card-request-id", d.requestId);
+      set("err-card-message", d.message || "(no message)");
+      var tb = document.getElementById("err-card-tb");
+      tb.textContent = d.traceback || "";
+      tb.hidden = !d.traceback;
+      document.getElementById("err-card-tb-head").hidden = !d.traceback;
+      document.getElementById("err-status-id").value = d.id;
+      var sel = document.getElementById("err-status-select");
+      sel.value = statuses.indexOf(d.status) >= 0 ? d.status : statuses[0];
+      document.getElementById("err-note-id").value = d.id;
+      document.getElementById("err-note-text").value = d.note || "";
+      modal.hidden = false;
+    }
+    function closeCard() { modal.hidden = true; }
+    document.addEventListener("click", function (e) {
+      var row = e.target.closest(".err-row");
+      if (row) { openCard(row); return; }
+      if (e.target === modal || e.target.closest(".err-close")) closeCard();
+    });
+    document.addEventListener("keydown", function (e) {
+      var row = e.target.closest && e.target.closest(".err-row");
+      if (row && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); openCard(row); return; }
+      if (e.key === "Escape" && !modal.hidden) closeCard();
+    });
+  })();
+  </script>
+  {% endif %}"""
+
+
 # Billing tab. In billing mode this shows each subscriber's Stripe status as the
 # webhook last recorded it (read-only — Stripe is the system of record; see
 # aime.billing, docs/billing.md). In keys/open mode it documents the tiers and
@@ -3815,7 +3994,7 @@ _FRAGMENT_ACCOUNTS = """
       <tr>
         <td>#{{ u.id }}</td>
         <td>{{ u.username }}</td>
-        <td class="{{ 'good' if u.api_access else 'bad' }}">{{ 'yes' if u.api_access else 'no' }}{% if u.comp_access %} <span class="note" title="Complimentary full access — granted by an admin, not billed. Stripe won't revoke it.">comp</span>{% endif %}</td>
+        <td class="{{ 'good' if u.api_access else 'bad' }}">{{ 'yes' if u.api_access else 'no' }}{% if u.comp_access %} <span class="note" title="Complimentary full access — granted by an admin, not billed. Stripe won't revoke it.">comp</span>{% endif %}{% if billing_mode and u.trial_used %} <span class="note" title="No free trial — a (re)subscribe is charged immediately. New accounts get the trial by default; this one used it or was flagged ineligible.">no trial</span>{% endif %}</td>
         <td>
           <form method="post" action="accounts/set-tier" class="inline-action">
             <input type="hidden" name="csrf" value="{{ csrf }}">
@@ -3838,6 +4017,12 @@ _FRAGMENT_ACCOUNTS = """
             <input type="hidden" name="username" value="{{ u.username }}">
             <input type="hidden" name="grant" value="{{ '0' if u.comp_access else '1' }}">
             <button type="submit" title="Complimentary full access: gives this user send access with no subscription, and stops Stripe from revoking them.">{{ 'Remove full access' if u.comp_access else 'Grant full access' }}</button>
+          </form>
+          <form method="post" action="accounts/trial">
+            <input type="hidden" name="csrf" value="{{ csrf }}">
+            <input type="hidden" name="username" value="{{ u.username }}">
+            <input type="hidden" name="used" value="{{ '0' if u.trial_used else '1' }}">
+            <button type="submit" title="Free-trial eligibility. 'Deny free trial' marks this account as having used its trial, so a (re)subscribe is charged immediately. 'Allow free trial' restores it. New signups are eligible by default.">{{ 'Allow free trial' if u.trial_used else 'Deny free trial' }}</button>
           </form>
           {% else %}
           <form method="post" action="accounts/access">
@@ -3881,6 +4066,14 @@ _FRAGMENT_ACCOUNTS = """
     <button type="submit" class="danger">Revoke send access for everyone</button>
     <span class="note">Zeroes api_access for every account (billing cutover).</span>
   </form>
+  {% if billing_mode %}
+  <form method="post" action="accounts/deny-trial-all" class="inline-action"
+    onsubmit="return confirm('Deny a fresh free trial to ALL existing accounts? New signups will still get one.')">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <button type="submit" class="danger">Deny free trial to everyone</button>
+    <span class="note">The other half of the cutover: existing accounts subscribe with no trial; new signups still get one.</span>
+  </form>
+  {% endif %}
   {% endif %}
 
   <h2 title="Accounts that have been soft-deleted. Their data is retained until the grace period expires, then a purge can permanently remove them.">Soft-deleted accounts</h2>
@@ -4071,6 +4264,48 @@ _PAGE = """<!doctype html>
       font-size: .78rem; }
     .ticket-note textarea { width: 100%; box-sizing: border-box; min-height: 2.2rem;
       font: inherit; font-size: .82rem; }
+    /* Errors tab: each table row opens the shared error card. */
+    .err-table { width: 100%; }
+    .err-row { cursor: pointer; }
+    .err-row:hover td { background: #8881; }
+    .err-row:focus-visible { outline: 2px solid #2f6fd0; outline-offset: -2px; }
+    /* Two-column meta grid inside the error card. */
+    .err-meta { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: .35rem 1.2rem; margin: .4rem 0 0; }
+    .err-meta div { display: flex; gap: .5rem; min-width: 0; }
+    .err-meta dt { flex: 0 0 6.5rem; margin: 0; color: #888; font-size: .78rem;
+      text-transform: uppercase; letter-spacing: .04em; }
+    .err-meta dd { margin: 0; font-size: .85rem; word-break: break-word; min-width: 0; }
+    .err-meta code { word-break: break-all; }
+    /* Status + note controls live in the card, stacked under the detail. */
+    .err-triage { margin-top: 1rem; border-top: 1px solid #8883; padding-top: .9rem;
+      display: flex; flex-direction: column; gap: .9rem; }
+    .err-triage label { display: flex; flex-direction: column; gap: .3rem;
+      font-size: .78rem; color: #888; text-transform: uppercase; letter-spacing: .04em; }
+    .err-triage select { font: inherit; font-size: .9rem; padding: .25rem .4rem;
+      max-width: 12rem; }
+    .err-triage textarea { width: 100%; box-sizing: border-box; font: inherit;
+      font-size: .88rem; min-height: 5rem; resize: vertical; padding: .5rem .6rem; }
+    .err-triage button { align-self: flex-start; }
+    .err-modal { position: fixed; inset: 0; z-index: 1000; padding: 1.2rem;
+      display: flex; align-items: center; justify-content: center;
+      background: #0008; }
+    .err-modal[hidden] { display: none; }
+    .err-card { background: Canvas; color: CanvasText; border: 1px solid #8886;
+      border-radius: 10px; width: 100%; max-width: 800px; max-height: 84vh;
+      overflow: auto; padding: 1rem 1.2rem; box-shadow: 0 12px 40px #0007;
+      text-align: left; }
+    .err-card-head { display: flex; align-items: center; justify-content: space-between;
+      gap: 1rem; margin-bottom: .3rem; }
+    .err-card-head strong { font-size: .95rem; word-break: break-word; }
+    .err-card h4 { margin: .9rem 0 .25rem; font-size: .72rem; color: #888;
+      text-transform: uppercase; letter-spacing: .05em; }
+    .err-card pre { white-space: pre-wrap; word-break: break-word; margin: 0;
+      background: #8881; border: 1px solid #8883; border-radius: 6px;
+      padding: .6rem .7rem; font-size: .8rem; }
+    .err-close { background: none; border: none; color: #888; cursor: pointer;
+      font-size: 1.5rem; line-height: 1; padding: 0 .2rem; }
+    .err-close:hover { color: inherit; }
 
     /* Used by the session-detail timeline to soften the tool-record rows. */
     tr.dim td { color: #888; }
@@ -4332,6 +4567,8 @@ _PAGE = """<!doctype html>
       title="Audit log of failed logins, lockouts, and signup throttles.">Security</a>
     <a href="/?{{ qs_feedback }}" class="{{ 'active' if tab == 'feedback' else '' }}"
       title="User-submitted feedback and error reports — a basic ticket queue.">Feedback{% if feedback_open %} <span class="tab-badge">{{ feedback_open }}</span>{% endif %}</a>
+    <a href="/?{{ qs_errors }}" class="{{ 'active' if tab == 'errors' else '' }}"
+      title="Errors Aime captured automatically — transient outages, bad requests, exceptions.">Errors{% if errors_open %} <span class="tab-badge">{{ errors_open }}</span>{% endif %}</a>
   </nav>
 
   {% for f in flashes %}
@@ -5496,7 +5733,7 @@ def _tab(args) -> str:
     return t if t in ("overview", "cache", "activity", "tools", "agents",
                       "trends", "users", "conversations", "routing", "accounts",
                       "keys", "billing", "system", "security",
-                      "feedback") else "users"
+                      "feedback", "errors") else "users"
 
 
 def _render_fragment(ctx, tab) -> str:
@@ -5515,6 +5752,7 @@ def _render_fragment(ctx, tab) -> str:
         "system": _FRAGMENT_SYSTEM,
         "security": _FRAGMENT_SECURITY,
         "feedback": _FRAGMENT_FEEDBACK,
+        "errors": _FRAGMENT_ERRORS,
         "overview": _FRAGMENT_OVERVIEW,
     }.get(tab, _FRAGMENT_USERS)
     return render_template_string(template, **ctx)
@@ -5600,6 +5838,11 @@ def index():
         ctx["csrf"] = csrf
         auto = 0
         page_ctx = empty_page_ctx
+    elif tab == "errors":
+        ctx = _errors_context(request.args)
+        ctx["csrf"] = csrf
+        auto = 0
+        page_ctx = empty_page_ctx
     else:
         ctx = _compute(request.args)
         auto = _refresh_seconds(request.args)
@@ -5638,7 +5881,7 @@ def index():
     qs = {t: urlencode({**keep, "tab": t})
           for t in ("overview", "cache", "activity", "tools", "agents", "trends",
                     "users", "conversations", "routing", "accounts", "keys",
-                    "billing", "system", "security", "feedback")}
+                    "billing", "system", "security", "feedback", "errors")}
 
     # Unresolved-ticket count for the nav badge — shown on every tab. Guarded so
     # a feedback-store hiccup never takes down the whole dashboard.
@@ -5646,11 +5889,17 @@ def index():
         feedback_open = _feedback_store().counts()["unresolved"]
     except Exception:
         feedback_open = 0
+    # Likewise for unresolved (new + seen) captured errors.
+    try:
+        errors_open = _error_store().counts()["unresolved"]
+    except Exception:
+        errors_open = 0
 
     return render_template_string(
         _PAGE, fragment=fragment, tab=tab, auto=auto,
         auto_label=_AUTO_LABELS.get(auto, "second"),
         csrf=csrf, flashes=flashes, feedback_open=feedback_open,
+        errors_open=errors_open,
         qs_overview=qs["overview"], qs_cache=qs["cache"],
         qs_activity=qs["activity"], qs_tools=qs["tools"],
         qs_agents=qs["agents"],
@@ -5659,7 +5908,7 @@ def index():
         qs_routing=qs["routing"],
         qs_accounts=qs["accounts"], qs_keys=qs["keys"], qs_billing=qs["billing"],
         qs_system=qs["system"], qs_security=qs["security"],
-        qs_feedback=qs["feedback"], **page_ctx,
+        qs_feedback=qs["feedback"], qs_errors=qs["errors"], **page_ctx,
     )
 
 
@@ -5680,6 +5929,26 @@ def _feedback_context(args) -> dict:
         "qs_open": urlencode({"tab": "feedback", "status": "open"}),
         "qs_in_progress": urlencode({"tab": "feedback", "status": "in_progress"}),
         "qs_resolved": urlencode({"tab": "feedback", "status": "resolved"}),
+    }
+
+
+def _errors_context(args) -> dict:
+    """Captured errors for the Errors tab, optionally filtered by status, plus
+    the per-status counts for the summary chips."""
+    store = _error_store()
+    status = args.get("status", "")
+    if status not in _errors.STATUSES:
+        status = ""
+    rows = store.list(status or None)
+    return {
+        "errors": rows,
+        "counts": store.counts(),
+        "status_filter": status,
+        "statuses": _errors.STATUSES,
+        "qs_all": urlencode({"tab": "errors"}),
+        "qs_new": urlencode({"tab": "errors", "status": "new"}),
+        "qs_seen": urlencode({"tab": "errors", "status": "seen"}),
+        "qs_resolved": urlencode({"tab": "errors", "status": "resolved"}),
     }
 
 
@@ -5937,6 +6206,35 @@ def account_revoke_all():
     return redirect(url_for("index", tab="accounts"))
 
 
+@app.route("/accounts/trial", methods=["POST"])
+@admin_post
+def account_trial():
+    """Toggle one account's free-trial eligibility. used=1 → a (re)subscribe is
+    charged immediately, no fresh trial; used=0 → eligible again. The web
+    equivalent of `access_keys.py deny-trial / allow-trial <user>`."""
+    username = (request.form.get("username") or "").strip()
+    used = request.form.get("used") == "1"
+    if _auth_backend().set_trial_used_by_username(username, used):
+        _flash("ok", (f"{username!r} will be charged immediately on subscribe "
+                      f"(no free trial)." if used else
+                      f"{username!r} is eligible for the free trial again."))
+    else:
+        _flash("bad", f"No such user: {username!r}.")
+    return redirect(url_for("index", tab="accounts"))
+
+
+@app.route("/accounts/deny-trial-all", methods=["POST"])
+@admin_post
+def account_deny_trial_all():
+    """Billing-cutover bulk: deny a fresh free trial to every existing account
+    (new signups still get one). Pairs with revoke-all. Mirrors
+    `access_keys.py deny-trial --all`."""
+    n = _auth_backend().mark_all_trial_used()
+    _flash("ok", f"Marked {n} account(s) trial-used — no fresh trial on "
+                 f"subscribe (new signups still get one).")
+    return redirect(url_for("index", tab="accounts"))
+
+
 # ---------------------------------------------------------------------------
 # Routes — invite-key administration
 # ---------------------------------------------------------------------------
@@ -6017,6 +6315,48 @@ def feedback_note():
     else:
         _flash("bad", f"No such ticket: #{ticket_id}.")
     return _feedback_redirect()
+
+
+def _errors_redirect():
+    """Back to the Errors tab, preserving the active status filter."""
+    status_filter = (request.form.get("status_filter") or "").strip()
+    args = {"tab": "errors"}
+    if status_filter in _errors.STATUSES:
+        args["status"] = status_filter
+    return redirect(url_for("index", **args))
+
+
+@app.route("/errors/status", methods=["POST"])
+@admin_post
+def errors_status():
+    try:
+        error_id = int(request.form.get("id", ""))
+    except (TypeError, ValueError):
+        _flash("bad", "Bad error id.")
+        return _errors_redirect()
+    status = (request.form.get("status") or "").strip()
+    if _error_store().set_status(error_id, status):
+        _flash("ok", f"Error #{error_id} moved to {status!r}.")
+    else:
+        _flash("bad", f"Couldn't update error #{error_id} "
+                      f"(unknown status or missing row).")
+    return _errors_redirect()
+
+
+@app.route("/errors/note", methods=["POST"])
+@admin_post
+def errors_note():
+    try:
+        error_id = int(request.form.get("id", ""))
+    except (TypeError, ValueError):
+        _flash("bad", "Bad error id.")
+        return _errors_redirect()
+    note = request.form.get("note") or ""
+    if _error_store().set_note(error_id, note):
+        _flash("ok", f"Saved note on error #{error_id}.")
+    else:
+        _flash("bad", f"No such error: #{error_id}.")
+    return _errors_redirect()
 
 
 def main() -> None:

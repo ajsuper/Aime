@@ -27,6 +27,12 @@ Examples:
     # Kill an unredeemed key; zero everyone for a billing cutover
     ./scripts/access_keys.py revoke-key <key>
     ./scripts/access_keys.py revoke-all
+
+    # Billing cutover: deny existing accounts a fresh free trial (new signups
+    # still get one). Run alongside revoke-all. Per-user variants too.
+    ./scripts/access_keys.py deny-trial --all
+    ./scripts/access_keys.py deny-trial alice
+    ./scripts/access_keys.py allow-trial bob
 """
 
 import os
@@ -138,6 +144,46 @@ def cmd_revoke_key(args: argparse.Namespace) -> int:
     return 1
 
 
+def cmd_deny_trial(args: argparse.Namespace) -> int:
+    """Mark account(s) as having used their free trial, so a (re)subscribe is
+    charged immediately with no new 30-day trial. With --all, flag every active
+    account (the billing-cutover bulk: deny long-time beta testers a fresh
+    trial). Otherwise flag a single username."""
+    backend = _backend()
+    if args.all:
+        if not args.yes:
+            reply = input("Deny a fresh free trial to ALL existing accounts? "
+                          "(new signups still get one). Type 'yes' to confirm: ")
+            if reply.strip().lower() != "yes":
+                print("Aborted.")
+                return 1
+        n = backend.mark_all_trial_used()
+        print(f"Marked {n} account(s) as trial-used (no fresh trial on "
+              f"subscribe).")
+        return 0
+    if not args.username:
+        print("Give a username, or --all to flag every account.",
+              file=sys.stderr)
+        return 1
+    if backend.set_trial_used_by_username(args.username, True):
+        print(f"{args.username!r} will be charged immediately on subscribe "
+              f"(no free trial).")
+        return 0
+    print(f"No such user: {args.username!r}", file=sys.stderr)
+    return 1
+
+
+def cmd_allow_trial(args: argparse.Namespace) -> int:
+    """Restore free-trial eligibility to an account — the inverse of deny-trial.
+    Their next first-time subscribe gets the 30-day trial again (unless Stripe
+    already records a prior trial on the customer)."""
+    if _backend().set_trial_used_by_username(args.username, False):
+        print(f"{args.username!r} is eligible for the free trial again.")
+        return 0
+    print(f"No such user: {args.username!r}", file=sys.stderr)
+    return 1
+
+
 def cmd_revoke_all(args: argparse.Namespace) -> int:
     if not args.yes:
         reply = input("Revoke send access for ALL users? This is the billing "
@@ -189,6 +235,22 @@ def main() -> int:
     p_ra.add_argument("--yes", action="store_true",
                       help="skip the confirmation prompt")
     p_ra.set_defaults(func=cmd_revoke_all)
+
+    p_dt = sub.add_parser("deny-trial",
+                          help="deny the free trial (charge on subscribe); "
+                               "--all for the billing cutover")
+    p_dt.add_argument("username", nargs="?",
+                      help="user to flag (omit when using --all)")
+    p_dt.add_argument("--all", action="store_true",
+                      help="flag every existing account (cutover bulk)")
+    p_dt.add_argument("--yes", action="store_true",
+                      help="skip the --all confirmation prompt")
+    p_dt.set_defaults(func=cmd_deny_trial)
+
+    p_at = sub.add_parser("allow-trial",
+                          help="restore free-trial eligibility to a user")
+    p_at.add_argument("username")
+    p_at.set_defaults(func=cmd_allow_trial)
 
     args = parser.parse_args()
     return args.func(args)

@@ -60,7 +60,7 @@ _USER_PROJECTION = (
     "SELECT id, username, api_access, email, messaging_contact, "
     "first_name, last_name, tz, date_format, time_format, tier, "
     "stripe_customer_id, stripe_subscription_id, subscription_status, "
-    "trial_end, comp_access"
+    "trial_end, comp_access, billing_synced_at, trial_used"
 )
 
 
@@ -156,6 +156,23 @@ class UserRecord:
     # them alone (reconcile skips comped users) so a lapsed/absent subscription
     # never revokes them. Kept in lockstep with api_access by set_comp_access.
     comp_access: bool = False
+    # Unix-seconds of the last time api_access was re-derived from *live* Stripe
+    # state (any reconcile path: webhook, confirm, or the gate's lazy self-heal).
+    # The send gate treats api_access as a cache of Stripe truth and re-checks it
+    # when this is older than the recheck TTL — so a missed webhook can't leave a
+    # paying user locked out (or a lapsed one with access) indefinitely. NULL =
+    # never synced (treated as maximally stale). See aime.billing.access_is_stale.
+    billing_synced_at: int | None = None
+    # Billing mode: True once this account has had (or is deemed to have had) its
+    # one free trial, so a (re)subscribe is charged immediately instead of
+    # starting another trial. New signups default False (trial offered). The
+    # billing migration backfills every *pre-existing* account to True, so a
+    # deployment that switches to billing doesn't hand its long-time beta testers
+    # a fresh trial — only accounts created after the cutover get one. Admins flip
+    # it from the dashboard / CLI. ORed with Stripe's own one-trial check, so it
+    # is a belt-and-suspenders override, not the sole authority. See aime.billing
+    # + docs/billing.md.
+    trial_used: bool = False
 
     @property
     def display_name(self) -> str:
@@ -296,6 +313,13 @@ class AuthBackend(Protocol):
         self, user_id: int, *, subscription_id: str | None,
         status: str | None, trial_end: int | None,
     ) -> bool: ...
+    def mark_billing_synced(self, user_id: int, ts: int) -> bool: ...
+    # Free-trial eligibility (billing mode). set_trial_used flips the per-account
+    # flag; mark_all_trial_used is the billing-cutover bulk (deny every existing
+    # account a fresh trial). See aime.billing + docs/billing.md.
+    def set_trial_used(self, user_id: int, used: bool) -> bool: ...
+    def set_trial_used_by_username(self, username: str, used: bool) -> bool: ...
+    def mark_all_trial_used(self) -> int: ...
     def redeem_key(self, user_id: int, key: str) -> bool: ...
     def generate_access_key(self, note: str = "") -> str: ...
     def list_access_keys(self) -> list[AccessKeyRecord]: ...
@@ -604,6 +628,34 @@ class LocalAuthBackend:
                 )
             # END comp-access MIGRATION
 
+            # billing-sync MIGRATION — unix-seconds of the last live-Stripe
+            # reconcile, so the send gate can lazily re-derive a stale api_access
+            # instead of trusting a cache the webhook may have failed to update.
+            # NULL on every existing row = "never synced" (maximally stale), which
+            # makes the first gate hit in billing mode self-heal. Inert in
+            # keys/open mode. See aime.billing.access_is_stale / refresh_access.
+            if "billing_synced_at" not in existing_cols:
+                self._conn.execute(
+                    "ALTER TABLE users ADD COLUMN billing_synced_at INTEGER"
+                )
+            # END billing-sync MIGRATION
+
+            # trial-used MIGRATION — billing mode: True once an account has had
+            # its one free trial, so a (re)subscribe is charged immediately. The
+            # column defaults 0 (eligible) so *new* signups after this point get
+            # the trial, but we backfill every PRE-EXISTING row to 1 in the same
+            # step: a deployment switching to billing has its long-time beta
+            # testers already "used" their run, so they subscribe without a fresh
+            # 30-day freebie, while genuinely new accounts still get one. (A fresh
+            # DB has no rows to backfill.) Admins adjust individuals from the
+            # dashboard / CLI. Inert in keys/open mode. See aime.billing.
+            if "trial_used" not in existing_cols:
+                self._conn.execute(
+                    "ALTER TABLE users ADD COLUMN trial_used INTEGER NOT NULL DEFAULT 0"
+                )
+                self._conn.execute("UPDATE users SET trial_used = 1")
+            # END trial-used MIGRATION
+
             # Pending email-verification rows. Used for three flows:
             #   purpose='signup'    — username/password are being held until
             #                         the 6-digit code mailed to `email` is
@@ -892,7 +944,8 @@ class LocalAuthBackend:
             date_format=row[8], time_format=row[9], tier=row[10] or "light",
             stripe_customer_id=row[11], stripe_subscription_id=row[12],
             subscription_status=row[13], trial_end=row[14],
-            comp_access=bool(row[15]),
+            comp_access=bool(row[15]), billing_synced_at=row[16],
+            trial_used=bool(row[17]),
         )
 
     def lookup_by_username(self, username: str) -> UserRecord | None:
@@ -956,6 +1009,22 @@ class LocalAuthBackend:
                 "subscription_status = ?, trial_end = ? "
                 "WHERE id = ? AND deleted_at IS NULL",
                 (subscription_id, status, trial_end, user_id),
+            )
+            self._conn.commit()
+        return cur.rowcount > 0
+
+    def mark_billing_synced(self, user_id: int, ts: int) -> bool:
+        """Stamp the moment api_access was last re-derived from live Stripe, so
+        the send gate's staleness check (aime.billing.access_is_stale) can bound
+        how often it re-reads Stripe. Called by every reconcile path — webhook,
+        confirm, and the gate's lazy self-heal (which stamps even when the
+        customer turned out to have no subscription, so a non-paying user isn't
+        re-checked on every request). Returns False if no active account."""
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE users SET billing_synced_at = ? "
+                "WHERE id = ? AND deleted_at IS NULL",
+                (ts, user_id),
             )
             self._conn.commit()
         return cur.rowcount > 0
@@ -1221,6 +1290,44 @@ class LocalAuthBackend:
             self._conn.commit()
         return cur.rowcount
 
+    def set_trial_used(self, user_id: int, used: bool) -> bool:
+        """Mark whether this account has had its one free trial. True → a
+        (re)subscribe is charged immediately, no new trial; False → eligible
+        again. Admin override for billing mode (ORed with Stripe's own one-trial
+        check in the subscribe-confirm route). Returns False if no such user."""
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE users SET trial_used = ? WHERE id = ? AND deleted_at IS NULL",
+                (1 if used else 0, user_id),
+            )
+            self._conn.commit()
+        return cur.rowcount > 0
+
+    def set_trial_used_by_username(self, username: str, used: bool) -> bool:
+        """Username-keyed variant for admin tooling (CLI / dashboard)."""
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE users SET trial_used = ? "
+                "WHERE username = ? AND deleted_at IS NULL",
+                (1 if used else 0, username),
+            )
+            self._conn.commit()
+        return cur.rowcount > 0
+
+    def mark_all_trial_used(self) -> int:
+        """Set trial_used = 1 for every active account — the billing-cutover bulk
+        that denies a fresh free trial to accounts that already existed (e.g.
+        long-time beta testers). New signups created afterward still default to
+        eligible. The migration backfills this automatically when the column is
+        first added; this is the explicit re-runnable equivalent. Returns the
+        number of rows affected."""
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE users SET trial_used = 1 WHERE deleted_at IS NULL"
+            )
+            self._conn.commit()
+        return cur.rowcount
+
     def generate_access_key(self, note: str = "") -> str:
         """Mint a new single-use invite key, store its hash, and return the
         raw key. The raw value is shown to the admin once here and is then
@@ -1313,13 +1420,15 @@ class LocalAuthBackend:
         with self._lock:
             rows = self._conn.execute(
                 "SELECT id, username, api_access, tier, "
-                "subscription_status, stripe_customer_id, comp_access FROM users "
+                "subscription_status, stripe_customer_id, comp_access, "
+                "trial_used FROM users "
                 "WHERE deleted_at IS NULL ORDER BY id"
             ).fetchall()
         return [
             UserRecord(id=r[0], username=r[1], api_access=bool(r[2]),
                        tier=r[3] or "light", subscription_status=r[4],
-                       stripe_customer_id=r[5], comp_access=bool(r[6]))
+                       stripe_customer_id=r[5], comp_access=bool(r[6]),
+                       trial_used=bool(r[7]))
             for r in rows
         ]
 

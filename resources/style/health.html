@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Status — Aime</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=Hanken+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      color-scheme: dark;
+      --font-body: "Hanken Grotesk", ui-sans-serif, system-ui, -apple-system, sans-serif;
+      --font-display: "Fraunces", Georgia, "Times New Roman", serif;
+      --r-sm: 10px; --r-md: 14px; --r-lg: 20px;
+      --bg: #1E1C18;
+      --bg-elev: #28251F;
+      --bg-input: #302C25;
+      --border: #3B362D;
+      --text: #EDE8DD;
+      --muted: #998F7E;
+      --accent: #E0AAB4;
+      --shadow-1: 0 1px 2px rgba(0,0,0,0.35), 0 4px 14px rgba(0,0,0,0.32);
+      --shadow-2: 0 8px 24px rgba(0,0,0,0.5), 0 28px 60px rgba(0,0,0,0.6);
+      --edge-light: rgba(255,255,255,0.07);
+      --rainbow: linear-gradient(90deg,
+        #8CC09C 0 16.66%, #DBCA7C 16.66% 33.33%, #DEB07E 33.33% 50%,
+        #DA9898 50% 66.66%, #A992CE 66.66% 83.33%, #8EAFD6 83.33% 100%);
+      /* Status palette, drawn from the signature rainbow so the page stays
+         on-brand: green from the rainbow's leading stop, amber from its second,
+         red from the app's error tone, grey from muted. */
+      --ok: #8CC09C;
+      --warn: #DBCA7C;
+      --down: #EC9090;
+      --unknown: #998F7E;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; }
+    body { background: var(--bg); color: var(--text);
+           font-family: var(--font-body);
+           display: flex; align-items: center; justify-content: center;
+           padding: 1.5rem;
+           -webkit-font-smoothing: antialiased; }
+    .card { position: relative; background: var(--bg-elev);
+            border: 1px solid var(--border); border-radius: var(--r-lg);
+            width: 100%; max-width: 440px;
+            padding: 1.9rem 1.9rem 1.5rem;
+            box-shadow: var(--shadow-2); }
+    /* Faint top edge highlight — the "lit from above" cue used across the app. */
+    .card::before { content: ""; position: absolute; inset: 0;
+                    border-radius: inherit; pointer-events: none;
+                    box-shadow: inset 0 1px 0 var(--edge-light); }
+    .wordmark { font-family: var(--font-display); font-weight: 600;
+                font-size: 2.2rem; line-height: 1.1; color: var(--text);
+                width: fit-content; margin: 0.1rem auto 0.2rem;
+                letter-spacing: -0.01em; }
+    .wordmark::after { content: ""; display: block; height: 3px;
+                       margin-top: 0.3rem; border-radius: 2px;
+                       background: var(--rainbow); }
+    .subtitle { font-family: var(--font-display); color: var(--muted);
+                font-size: 0.95rem; text-align: center;
+                margin: 0 0 1.5rem; font-style: italic; font-weight: 400; }
+
+    /* Overall banner — a big dot + headline summarising every component. */
+    .banner { display: flex; align-items: center; gap: 0.7rem;
+              background: var(--bg-input); border: 1px solid var(--border);
+              border-radius: var(--r-md); padding: 0.9rem 1rem;
+              margin-bottom: 1.1rem; }
+    .banner .dot { width: 13px; height: 13px; }
+    .banner-label { font-family: var(--font-display); font-weight: 600;
+                    font-size: 1.12rem; }
+
+    .components { display: flex; flex-direction: column; gap: 0.55rem; }
+    .row { display: flex; align-items: center; gap: 0.7rem;
+           padding: 0.8rem 0.9rem; border: 1px solid var(--border);
+           border-radius: var(--r-md); }
+    .row .dot { width: 10px; height: 10px; margin-top: 0.05rem;
+                flex: 0 0 auto; }
+    .row .meta { flex: 1; min-width: 0; }
+    .row .name { font-family: var(--font-display); font-weight: 500;
+                 font-size: 0.98rem; }
+    .row .detail { color: var(--muted); font-size: 0.85rem;
+                   margin-top: 0.1rem; }
+    .row .state { font-family: var(--font-display); font-size: 0.82rem;
+                  font-weight: 500; text-transform: capitalize;
+                  color: var(--muted); white-space: nowrap; }
+
+    /* The dot's colour is driven by the status class on its container. A soft
+       glow echoes the app's lit surfaces and makes the state readable at a
+       glance. */
+    .dot { border-radius: 50%; display: inline-block; }
+    .s-operational .dot { background: var(--ok);
+                          box-shadow: 0 0 0 3px rgba(140,192,156,0.18); }
+    .s-degraded .dot { background: var(--warn);
+                       box-shadow: 0 0 0 3px rgba(219,202,124,0.18); }
+    .s-outage .dot { background: var(--down);
+                     box-shadow: 0 0 0 3px rgba(236,144,144,0.18); }
+    .s-unknown .dot { background: var(--unknown);
+                      box-shadow: 0 0 0 3px rgba(153,143,126,0.16); }
+    .s-operational .state { color: var(--ok); }
+    .s-degraded .state { color: var(--warn); }
+    .s-outage .state { color: var(--down); }
+
+    .footer { display: flex; justify-content: space-between; align-items: center;
+              margin-top: 1.3rem; }
+    .checked { color: var(--muted); font-size: 0.8rem; }
+    .home { font-family: var(--font-display); font-size: 0.85rem;
+            color: var(--accent); text-decoration: none; }
+    .home:hover { color: var(--text); }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="wordmark">Aime</div>
+    <p class="subtitle">Service status</p>
+
+    <div class="banner s-__OVERALL_STATUS__" id="overall">
+      <span class="dot"></span>
+      <span class="banner-label" id="overall-label">__OVERALL_LABEL__</span>
+    </div>
+
+    <div class="components">
+      <div class="row s-__AIME_STATUS__" data-id="aime">
+        <span class="dot"></span>
+        <div class="meta">
+          <div class="name">Aime service</div>
+          <div class="detail">__AIME_DETAIL__</div>
+        </div>
+        <span class="state">__AIME_STATUS__</span>
+      </div>
+      <div class="row s-__ANTHROPIC_STATUS__" data-id="anthropic">
+        <span class="dot"></span>
+        <div class="meta">
+          <div class="name">Anthropic API</div>
+          <div class="detail">__ANTHROPIC_DETAIL__</div>
+        </div>
+        <span class="state">__ANTHROPIC_STATUS__</span>
+      </div>
+    </div>
+
+    <div class="footer">
+      <span class="checked" id="checked">__CHECKED__</span>
+      <a class="home" href="/">Back to Aime</a>
+    </div>
+  </div>
+
+  <script>
+    const STATES = ["operational", "degraded", "outage", "unknown"];
+    function setStatus(el, status) {
+      if (!el) return;
+      STATES.forEach(s => el.classList.remove("s-" + s));
+      el.classList.add("s-" + (STATES.includes(status) ? status : "unknown"));
+    }
+    async function refresh() {
+      try {
+        const r = await fetch("/health.json", { cache: "no-store" });
+        if (!r.ok) return;
+        const d = await r.json();
+        setStatus(document.getElementById("overall"), d.overall.status);
+        document.getElementById("overall-label").textContent = d.overall.label;
+        for (const c of d.components) {
+          const row = document.querySelector(`.row[data-id="${c.id}"]`);
+          if (!row) continue;
+          setStatus(row, c.status);
+          row.querySelector(".detail").textContent = c.detail;
+          row.querySelector(".state").textContent = c.status;
+        }
+        const when = new Date(d.checked_at);
+        document.getElementById("checked").textContent =
+          "Updated " + when.toLocaleTimeString();
+      } catch (e) {
+        /* Network hiccup — leave the last-good state on screen. */
+      }
+    }
+    // Refresh the rendered timestamp to the viewer's local clock, then poll.
+    refresh();
+    setInterval(refresh, 30000);
+  </script>
+</body>
+</html>

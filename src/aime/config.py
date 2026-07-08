@@ -137,6 +137,14 @@ CREATE_GRAPHICS_SCHEMA = "../resources/tools/api_create_graphics_schema.json"
 # with CreateGraphics; interactive sessions only.
 GET_GRAPHIC_SCHEMA = "../resources/tools/api_get_graphic_schema.json"
 
+# LoadGraphicsExamples serves compile-tested Vega-Lite skeletons for the harder
+# chart constructs (error bands, reference lines, grouped bars, dual axes, …) so
+# the model adapts a known-good spec rather than hand-writing layered grammar the
+# CreateGraphics compile gate would then reject. Like GetGraphic it's a client
+# tool whose (bulky) result is stripped from context after the drawing turn;
+# interactive sessions only, paired with CreateGraphics.
+LOAD_GRAPHICS_EXAMPLES_SCHEMA = "../resources/tools/api_load_graphics_examples_schema.json"
+
 
 # --- Usage limits / tiers (see aime.quota, docs/usage-limits.md) -------------
 # Per-user daily cost allowance, in USD, keyed by tier. A user's balance is a
@@ -214,6 +222,12 @@ def tier_daily_cap(tier: str | None) -> float:
 # Price is what the user is billed.
 STRIPE_SECRET_KEY = os.environ.get("AIME_STRIPE_SECRET_KEY", "").strip()
 STRIPE_WEBHOOK_SECRET = os.environ.get("AIME_STRIPE_WEBHOOK_SECRET", "").strip()
+# Publishable key (pk_...). Unlike the secret key this is safe to ship to the
+# browser — Stripe.js needs it to mount the inline Payment Element. It must come
+# from the SAME Stripe account/mode as the secret key (a live pk_ with a test
+# sk_ — or vice-versa — fails at confirm time), so it's a required piece of a
+# configured billing deployment.
+STRIPE_PUBLISHABLE_KEY = os.environ.get("AIME_STRIPE_PUBLISHABLE_KEY", "").strip()
 # Stripe Price IDs, one per tier (the recurring subscription price the customer
 # pays). Mapped to tiers below.
 STRIPE_PRICE_BY_TIER = {
@@ -247,13 +261,15 @@ def tier_for_stripe_price(price_id: str | None) -> str | None:
 
 def stripe_configured() -> bool:
     """True when every piece billing needs is present: the secret key, the
-    webhook secret, a Price for each tier, and the public base URL. The
+    publishable key, the webhook secret, a Price for each tier, and the public
+    base URL. The
     billing-mode startup check refuses to launch without these — missing keys
     would leave the send gate armed with no way to gain access, and a missing
     PUBLIC_BASE_URL would let the Stripe return URLs be built from the
     attacker-controllable Host header (a post-checkout phishing redirect)."""
     return bool(
         STRIPE_SECRET_KEY
+        and STRIPE_PUBLISHABLE_KEY
         and STRIPE_WEBHOOK_SECRET
         and PUBLIC_BASE_URL
         and all(STRIPE_PRICE_BY_TIER.get(t) for t in USAGE_TIERS)
