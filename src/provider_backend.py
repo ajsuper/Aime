@@ -72,6 +72,30 @@ def _jsonable(obj):
         return str(obj)
 
 
+def message_identity(msg: dict) -> str:
+    """A stable, content-addressed id for a single conversation message.
+
+    Used to fingerprint the transcript (see
+    ``AnthropicMessagesBackend.history_fingerprint``) so the live SSE replay
+    cache can be validated against the durable store on reconnect, and as the
+    per-message anchor for the sync hash-chain. Deterministic across processes
+    and restarts: a proactive message already carries a stable ``pid`` (reused
+    directly); every other turn is identified by a hash of its role + canonical
+    content, so two runs over the same durable messages produce identical ids
+    with no on-disk migration.
+    """
+    pid = msg.get("pid")
+    if isinstance(pid, str) and pid:
+        return pid
+    role = msg.get("role", "")
+    canonical = json.dumps(
+        msg.get("content"), sort_keys=True, separators=(",", ":"), default=_jsonable
+    )
+    return hashlib.sha1(
+        (role + "\x1f" + canonical).encode("utf-8")
+    ).hexdigest()[:12]
+
+
 class _ClockTagStripper:
     """Removes ``<clock ...>...</clock>`` spans from a streamed text block.
 
@@ -829,6 +853,28 @@ class AnthropicMessagesBackend:
         without holding the backend lock."""
         with self._lock:
             return list(self._messages)
+
+    def history_fingerprint(self) -> tuple[int, str]:
+        """A cheap (count, digest) fingerprint of the durable transcript.
+
+        Lets the frontend detect when its in-memory SSE replay cache has drifted
+        from the authoritative message list — offline proactive writes,
+        background compaction, and stale-day sessions all mutate ``_messages``
+        without refreshing that cache, so a plain reconnect would keep replaying
+        stale content. Folding a content-addressed per-message id (see
+        ``message_identity``) into a running sha256 makes the digest sensitive to
+        added, dropped, reordered, *and* rewritten messages — not just a count.
+        No markup is rendered here, so it's fast enough to run on every connect.
+        """
+        with self._lock:
+            msgs = list(self._messages)
+        h = hashlib.sha256()
+        for msg in msgs:
+            h.update(b"\x1f")
+            h.update(msg.get("role", "").encode("utf-8"))
+            h.update(b"\x1f")
+            h.update(message_identity(msg).encode("utf-8"))
+        return len(msgs), h.hexdigest()
 
     def load_session(self, session_id: str) -> None:
         path = self._session_path(session_id)

@@ -170,6 +170,11 @@ class CoreEvent:
     # seen (and thus whether to show "New") across reconnects and reloads. Empty
     # for ordinary events and for pre-existing messages written before this field.
     pid: str = ""
+    # Client-assigned id echoed back on a user_message_shown so the frontend can
+    # retire the exact optimistic "Sending…" bubble this message came from,
+    # rather than clearing on the /send 200 (which loses the text if the echo is
+    # dropped). Empty for events that don't originate from a client send.
+    client_msg_id: str = ""
     # User-message attachments (images, embedded text files). Each entry is
     # {"kind": "image", "media_type": str, "data": str (base64)} for images.
     # Text files are still embedded in `text` via <aime:file> sentinels; the
@@ -508,6 +513,7 @@ class ConversationController:
         images: list[dict] | None = None,
         *,
         hidden_prefix: str = "",
+        client_msg_id: str = "",
     ) -> bool:
         """Process a line of user input (slash commands or plain text).
         Optional `images` are forwarded to the backend with the next user
@@ -515,14 +521,17 @@ class ConversationController:
         the text sent to the model but NOT shown in the user_message_shown
         event — used for out-of-band context (e.g. <stale> markers) that the
         model should see but the user shouldn't have echoed back in their own
-        chat bubble. Returns True if the frontend should quit the app.
+        chat bubble. `client_msg_id` is echoed back on user_message_shown so the
+        frontend can retire the matching optimistic bubble. Returns True if the
+        frontend should quit the app.
 
         Serialized under `_dispatch_lock` so concurrent requests (a /send racing
         a /reset or /load) can't interleave their turn-state mutations — the race
         that used to park a message in the pending queue and then wipe it."""
         with self._dispatch_lock:
             return self._dispatch_input_locked(
-                raw, images=images, hidden_prefix=hidden_prefix)
+                raw, images=images, hidden_prefix=hidden_prefix,
+                client_msg_id=client_msg_id)
 
     def _dispatch_input_locked(
         self,
@@ -530,6 +539,7 @@ class ConversationController:
         images: list[dict] | None = None,
         *,
         hidden_prefix: str = "",
+        client_msg_id: str = "",
     ) -> bool:
         text = (raw or "").strip()
         if not text and not images:
@@ -565,7 +575,9 @@ class ConversationController:
                 text=f"Log model thinking set to: {self._log_model_thinking}",
             ))
             return False
-        self.send_user_message(text, images=images, hidden_prefix=hidden_prefix)
+        self.send_user_message(
+            text, images=images, hidden_prefix=hidden_prefix,
+            client_msg_id=client_msg_id)
         return False
 
     def send_user_message(
@@ -574,6 +586,7 @@ class ConversationController:
         images: list[dict] | None = None,
         *,
         hidden_prefix: str = "",
+        client_msg_id: str = "",
     ) -> None:
         """Send (or queue) a plain user message without slash parsing.
 
@@ -589,7 +602,8 @@ class ConversationController:
         self._maybe_roll_session()
         with self._state_lock:
             if not self._is_idle:
-                self._pending_user_messages.append((text, images, hidden_prefix))
+                self._pending_user_messages.append(
+                    (text, images, hidden_prefix, client_msg_id))
                 queued = True
             else:
                 self._is_idle = False
@@ -598,7 +612,9 @@ class ConversationController:
         if queued:
             self._emit(CoreEvent(kind="user_message_queued", text=text))
         else:
-            self._dispatch_user_message(text, images=images, hidden_prefix=hidden_prefix)
+            self._dispatch_user_message(
+                text, images=images, hidden_prefix=hidden_prefix,
+                client_msg_id=client_msg_id)
 
     def _dispatch_user_message(
         self,
@@ -606,6 +622,7 @@ class ConversationController:
         images: list[dict] | None = None,
         *,
         hidden_prefix: str = "",
+        client_msg_id: str = "",
     ) -> None:
         # The caller (send_user_message or the turn_end drain) has already
         # claimed the turn busy under _state_lock, so we only need to *release*
@@ -622,6 +639,7 @@ class ConversationController:
                 })
         self._emit(CoreEvent(
             kind="user_message_shown", text=text, attachments=attachments,
+            client_msg_id=client_msg_id,
         ))
         if self._user_first_interaction:
             bootstrap = bootstrap_special_topics(self._tools)
@@ -956,6 +974,36 @@ class ConversationController:
         # there's no longer a switcher — the chat is one continuous conversation.
         self._spawn_worker(self.run_stream_loop)
 
+    def resync_view(self) -> None:
+        """Re-emit the current session's transcript from the durable message list,
+        so a frontend can rebuild a replay cache that has drifted from the
+        authoritative store (a dropped live event, background compaction).
+
+        Unlike load(), this keeps the same session, doesn't touch the running
+        stream worker, and doesn't reset onboarding/first-interaction state — it
+        only replays what's persisted. The emitted `session_restart` clears the
+        frontend's transcript; the divider + replayed messages rebuild it, exactly
+        as _load_after_swap does. No-op mid-turn (wiping the view under a running
+        typewriter would strand the in-flight reply) and in a Temporary Chat (its
+        throwaway session isn't the persisted thread to reconcile against)."""
+        if self._headless or self._temporary:
+            return
+        with self._dispatch_lock:
+            with self._state_lock:
+                if not self._is_idle:
+                    return
+            session_id = getattr(self._backend, "session_id", None)
+            self._emit(CoreEvent(kind="session_restart", restart_reason="load"))
+            title, saved_at = "", ""
+            for info in self._backend.list_sessions():
+                if info.id == session_id:
+                    title, saved_at = (info.summary or "").strip(), info.saved_at
+                    break
+            self._emit_session_divider(session_id, title, saved_at)
+            from .replay import replay_messages
+            for event in replay_messages(self._backend.messages_snapshot()):
+                self._emit(event)
+
     def resume_latest_session(self) -> bool:
         """Open into a live "Today" at startup: resume the most recent session *only
         if it belongs to the current local day*, so today continues where it left off
@@ -1119,9 +1167,10 @@ class ConversationController:
                         # flip, so a follow-up /send sees a fully-idle controller.
                         self._idle_event.set()
                 if nxt is not None:
-                    text, images, hidden_prefix = nxt
+                    text, images, hidden_prefix, client_msg_id = nxt
                     self._dispatch_user_message(
-                        text, images=images, hidden_prefix=hidden_prefix)
+                        text, images=images, hidden_prefix=hidden_prefix,
+                        client_msg_id=client_msg_id)
                 else:
                     # Now genuinely idle: flush any SendMessage texts the model
                     # sent mid-turn as inline assistant turns, so they show in the

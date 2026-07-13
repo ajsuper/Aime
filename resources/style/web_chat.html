@@ -5777,6 +5777,20 @@ function renderAttachmentRow(attachments) {
 // underneath. When the real user_message_shown arrives we drop this
 // placeholder and let the server-rendered bubble take its place.
 let pendingSendBubble = null;
+// Client-assigned id for the message currently being sent. It rides along the
+// /send body and comes back on the authoritative `user_message_shown` echo, so
+// the optimistic "Sending…" bubble is retired only when *its* echo is applied —
+// not blindly on the 200. That keeps the user's text on screen through a dropped
+// echo (healed by the gap check's reconnect) instead of vanishing until it
+// eventually replays. Null when nothing is in flight.
+let pendingSendId = null;
+
+function newClientMsgId() {
+  try {
+    if (window.crypto && crypto.randomUUID) return "c-" + crypto.randomUUID();
+  } catch (_) {}
+  return "c-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10);
+}
 
 function showOptimisticUserMessage(displayText, images) {
   clearOptimisticUserMessage();
@@ -5793,6 +5807,8 @@ function showOptimisticUserMessage(displayText, images) {
   sending.className = "sending-indicator";
   sending.textContent = "Sending";
   msg.appendChild(sending);
+  pendingSendId = newClientMsgId();
+  msg._clientMsgId = pendingSendId;
   pendingSendBubble = msg;
   scrollToBottom(true);
 }
@@ -5802,6 +5818,7 @@ function clearOptimisticUserMessage() {
     pendingSendBubble.remove();
     pendingSendBubble = null;
   }
+  pendingSendId = null;
 }
 
 // Tear down the rendered transcript and all per-turn streaming state so it can
@@ -5817,6 +5834,7 @@ function clearTranscriptView() {
   currentAssistant = null;
   pendingHtmlTarget = null;
   pendingSendBubble = null;
+  pendingSendId = null;
   turnSources = [];
   turnSourceBubble = null;
   if (typewriter.rafId != null) cancelAnimationFrame(typewriter.rafId);
@@ -5971,6 +5989,20 @@ const Link = {
     // While reading a past day, ignore live transcript events. They stay in the
     // server snapshot and replay when we return to Today (which reconnects).
     if (viewingDay) return;
+    // Gap check: live history events carry contiguous `_seq`. If the next one
+    // jumps past what we've applied, a history event was silently dropped on a
+    // still-open socket — and the ping head check alone can't catch it, because
+    // once later events slide the cursor up to the head there's no lag left to
+    // notice. Catch it the moment the next event arrives and rebuild from the
+    // authoritative snapshot (which includes the dropped one). Replayed events
+    // are exempt: their `_seq` is the original stamp, so a fresh cursor starting
+    // below it isn't a gap. Guarded on a non-zero cursor so the first event of a
+    // connection (before history_done seeds the head) can't false-trigger.
+    if (!e.from_replay && typeof e._seq === "number"
+        && this.appliedSeq && e._seq > this.appliedSeq + 1) {
+      this.connect();
+      return;
+    }
     // Advance the sync cursor as history events (replayed or live) arrive.
     if (typeof e._seq === "number") this.appliedSeq = e._seq;
     onStreamMessage(e);
@@ -6009,11 +6041,16 @@ function onStreamMessage(e) {
       currentAssistant = null;
       pendingHtmlTarget = null;
       // The server has echoed the message back — drop the local "Sending…"
-      // placeholder so the authoritative bubble replaces it. Cleared on replay
-      // too: if the live event was missed (stream attached after /send
-      // broadcast) the message only arrives as replay, and a stray placeholder
-      // must still be reconciled away rather than left stuck.
-      clearOptimisticUserMessage();
+      // placeholder so the authoritative bubble replaces it. Match on
+      // client_msg_id so we retire the bubble for *this* send and not a bubble
+      // for a later, still-pending message. When the echo carries no id (an
+      // older persisted message replayed, or a pre-upgrade server), fall back to
+      // clearing unconditionally — the old behavior. Cleared on replay too: if
+      // the live echo was missed, the message only arrives as replay, and a
+      // stray placeholder must still be reconciled away rather than left stuck.
+      if (!e.client_msg_id || e.client_msg_id === pendingSendId) {
+        clearOptimisticUserMessage();
+      }
       const {text: cleanedText, files} = extractAttachedFiles(e.text);
       const attachments = (e.attachments || []).concat(files);
       const msg = appendMessage("user", "you", cleanedText);
@@ -6679,6 +6716,10 @@ function viewingTopic() {
 // from an optimistic conversation switch that never landed.
 async function sendText(text, images) {
   let r;
+  // The id of the optimistic bubble this send is for (if any). It comes back on
+  // the `user_message_shown` echo so we retire exactly that bubble. Captured
+  // before the await so a rapid follow-up send can't swap it out from under us.
+  const clientMsgId = pendingSendId;
   try {
     const vt = viewingTopic();
     r = await fetch("/send", {
@@ -6686,6 +6727,7 @@ async function sendText(text, images) {
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify({text, images: images || [], tz: clientTimezone(),
         date_format: clientDateFormat(), time_format: clientTimeFormat(),
+        client_msg_id: clientMsgId,
         viewing_topic: vt ? vt.id : null,
         viewing_topic_title: vt ? vt.title : null}),
     });
@@ -6718,15 +6760,12 @@ async function sendText(text, images) {
     chat.abortTurn();
     return false;
   }
-  // Success. The live `user_message_shown` normally already swapped the
-  // optimistic bubble for the authoritative one (it's emitted synchronously
-  // during this request). But on the very first message the stream can attach
-  // *after* that broadcast, so the live event is missed and only arrives later
-  // as replay (from_replay=true) — which by design doesn't clear the
-  // placeholder. Clearing it here on the 200 guarantees the "Sending…" bubble
-  // never sticks; the authoritative bubble still renders from the live or
-  // replayed event.
-  if (r.ok) clearOptimisticUserMessage();
+  // Success, but we deliberately do NOT retire the optimistic bubble here. The
+  // authoritative `user_message_shown` echo (matched by client_msg_id) does that
+  // — so if the echo is dropped, the user still sees their text as "Sending…"
+  // rather than having it vanish on the 200, and the gap check's reconnect
+  // reconciles it to the real bubble. Terminal failures above still clear it,
+  // since no echo will ever come.
   return r.ok;
 }
 
