@@ -730,6 +730,10 @@ class UserContext:
             error_sink=_error_store.capture,
         )
         backend.new_session()
+        # Kept for durable-authority reconciliation: the replay cache (_history)
+        # is validated against this backend's message list on every connect (see
+        # reconcile_history_with_durable).
+        self._backend = backend
 
         # SSE plumbing: one queue per connected client, plus a replayable
         # history for refreshes. Locks are per-user so concurrent users don't
@@ -739,6 +743,15 @@ class UserContext:
         self._client_queues: list[queue.Queue] = []
         self._history_lock = threading.Lock()
         self._history: list[dict] = []
+        # The durable fingerprint (see AnthropicMessagesBackend.history_fingerprint)
+        # that `_history` currently reflects. Refreshed on every history-appending
+        # broadcast — so it tracks the message list as long as `_history` is kept
+        # in step through the normal path — and compared on connect. When an
+        # out-of-band write mutates the durable store without a matching broadcast
+        # (a dropped event, background compaction), this goes stale and the
+        # mismatch drives a rebuild from the authoritative message list. `None`
+        # means "unknown — rebuild on next connect".
+        self._history_source_fp: tuple[int, str] | None = None
         # Monotonic sync cursor. Incremented (under _history_lock) each time an
         # event is appended to the replayable history, and stamped onto that
         # event as `_seq`. It is never reset for the life of the context — not
@@ -820,6 +833,10 @@ class UserContext:
             self.controller.resume_latest_session()
         except Exception:
             app.logger.exception("resume_latest_session failed for user %s", user_id)
+        # Seed the drift fingerprint to the state `_history` was just built from
+        # (the resumed session, or an empty Today), so the first connect doesn't
+        # see a spurious mismatch and rebuild needlessly.
+        self._history_source_fp = self._backend.history_fingerprint()
 
         # Tracks records the user has edited via the UI since the model last
         # took a turn. Drained as a compact <stale> tag on the next /send so
@@ -905,6 +922,36 @@ class UserContext:
         with self._history_lock:
             return self._history_seq
 
+    def reconcile_history_with_durable(self) -> None:
+        """Make the durable message list the authority for the replay cache.
+
+        Called on every connect (before attach_client): if `_history` has drifted
+        from the backend's message list — a live event that never made it into the
+        cache, background compaction, any out-of-band mutation — rebuild the cache
+        from the authoritative store. This is what makes a refresh actually recover
+        missing messages again: a plain reconnect only ever replays `_history`, so
+        if the cache itself is stale, refreshing forever replays the same stale
+        content. Comparing a cheap fingerprint and rebuilding only on mismatch
+        keeps the common (in-sync) reconnect free.
+
+        The rebuild goes through `controller.resync_view`, whose re-emitted events
+        flow through `_broadcast` — clearing and repopulating `_history`,
+        re-stamping `_seq` so any already-connected client also reconciles, and
+        refreshing `_history_source_fp` as a side effect."""
+        fp_now = self._backend.history_fingerprint()
+        with self._history_lock:
+            if self._history_source_fp == fp_now:
+                return
+        self.controller.resync_view()
+
+    def invalidate_history_cache(self) -> None:
+        """Mark the replay cache as needing a rebuild on the next connect. Used
+        after a write that bypassed the live broadcast path (an offline proactive
+        message threaded straight to disk), so the drift is caught even though no
+        broadcast refreshed the fingerprint."""
+        with self._history_lock:
+            self._history_source_fp = None
+
     def detach_client(self, q: queue.Queue) -> None:
         with self._subscribers_lock:
             if q in self._client_queues:
@@ -934,6 +981,13 @@ class UserContext:
                 self._history_seq += 1
                 payload["_seq"] = self._history_seq
                 self._history.append(payload)
+                # This append brought `_history` level with the durable message
+                # list, so record the fingerprint it now reflects. Cheap (a hash
+                # over message ids, no rendering) and only on real message events
+                # — streaming deltas are excluded above. If the message list later
+                # changes without a matching broadcast, this stays behind and the
+                # next connect's reconcile rebuilds from the authoritative store.
+                self._history_source_fp = self._backend.history_fingerprint()
         with self._subscribers_lock:
             targets = list(self._client_queues)
         for q in targets:
@@ -1028,6 +1082,10 @@ class UserContext:
             "stop_reason": event.stop_reason,
             "from_replay": event.from_replay,
             "attachments": event.attachments,
+            # Echoed back so the frontend retires the exact optimistic bubble
+            # this message came from (see showOptimisticUserMessage). Only set on
+            # a user_message_shown from a client send; empty otherwise.
+            "client_msg_id": event.client_msg_id,
         }
         # A proactive message carries raw markup; pre-render it to HTML so the
         # frontend can drop it straight into a bubble (no client-side markup pass).
@@ -3605,8 +3663,11 @@ def send():
     # currently has open. Joined with a newline so multiple tags stay legible.
     hidden_parts = [t for t in (ctx.drain_stale_tag(),
                                 _viewing_topic_tag(data)) if t]
+    cmid = data.get("client_msg_id")
+    cmid = cmid if isinstance(cmid, str) else ""
     should_quit = ctx.controller.dispatch_input(
         text, images=images or None, hidden_prefix="\n".join(hidden_parts),
+        client_msg_id=cmid,
     )
     return jsonify({"ok": True, "quit": should_quit})
 
@@ -3649,6 +3710,10 @@ def stream():
     # snapshot we're about to capture already reflects today — they don't have to
     # send a message to shed yesterday's thread. No-op when no roll is due.
     ctx.controller.maybe_roll_session()
+    # Durable-authority check: rebuild the replay cache from the message list if
+    # it has drifted, so the snapshot we're about to hand this client is complete.
+    # Must run before attach_client so the snapshot reflects any rebuild.
+    ctx.reconcile_history_with_durable()
     q, snapshot, head_seq = ctx.attach_client()
 
     def gen():
@@ -3993,6 +4058,11 @@ def _record_proactive_in_user_thread(user_id: int, text: str) -> None:
             _conversations_dir(user_id), _auth_backend.get_dek(user_id), body,
             _user_tz(user_id),
         )
+        # This wrote straight to disk, bypassing the live broadcast path, so the
+        # in-memory replay cache doesn't know about it. Flag it for a rebuild on
+        # the next connect so the message surfaces without a manual refresh.
+        if ctx is not None:
+            ctx.invalidate_history_cache()
         app.logger.info(
             "proactive: wrote offline for user %s (ctx=%s)", user_id, ctx is not None)
         # If they're sitting in a temporary chat, let them know a message landed

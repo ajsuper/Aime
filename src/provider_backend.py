@@ -72,6 +72,30 @@ def _jsonable(obj):
         return str(obj)
 
 
+def message_identity(msg: dict) -> str:
+    """A stable, content-addressed id for a single conversation message.
+
+    Used to fingerprint the transcript (see
+    ``AnthropicMessagesBackend.history_fingerprint``) so the live SSE replay
+    cache can be validated against the durable store on reconnect, and as the
+    per-message anchor for the sync hash-chain. Deterministic across processes
+    and restarts: a proactive message already carries a stable ``pid`` (reused
+    directly); every other turn is identified by a hash of its role + canonical
+    content, so two runs over the same durable messages produce identical ids
+    with no on-disk migration.
+    """
+    pid = msg.get("pid")
+    if isinstance(pid, str) and pid:
+        return pid
+    role = msg.get("role", "")
+    canonical = json.dumps(
+        msg.get("content"), sort_keys=True, separators=(",", ":"), default=_jsonable
+    )
+    return hashlib.sha1(
+        (role + "\x1f" + canonical).encode("utf-8")
+    ).hexdigest()[:12]
+
+
 class _ClockTagStripper:
     """Removes ``<clock ...>...</clock>`` spans from a streamed text block.
 
@@ -829,6 +853,28 @@ class AnthropicMessagesBackend:
         without holding the backend lock."""
         with self._lock:
             return list(self._messages)
+
+    def history_fingerprint(self) -> tuple[int, str]:
+        """A cheap (count, digest) fingerprint of the durable transcript.
+
+        Lets the frontend detect when its in-memory SSE replay cache has drifted
+        from the authoritative message list — offline proactive writes,
+        background compaction, and stale-day sessions all mutate ``_messages``
+        without refreshing that cache, so a plain reconnect would keep replaying
+        stale content. Folding a content-addressed per-message id (see
+        ``message_identity``) into a running sha256 makes the digest sensitive to
+        added, dropped, reordered, *and* rewritten messages — not just a count.
+        No markup is rendered here, so it's fast enough to run on every connect.
+        """
+        with self._lock:
+            msgs = list(self._messages)
+        h = hashlib.sha256()
+        for msg in msgs:
+            h.update(b"\x1f")
+            h.update(msg.get("role", "").encode("utf-8"))
+            h.update(b"\x1f")
+            h.update(message_identity(msg).encode("utf-8"))
+        return len(msgs), h.hexdigest()
 
     def load_session(self, session_id: str) -> None:
         path = self._session_path(session_id)
@@ -1889,19 +1935,23 @@ class AnthropicMessagesBackend:
                 resp = self._client.messages.create(
                     model=self.COMPACT_MODEL,
                     system=(
-                        "Generate a short title for this conversation based on the "
-                        "user's message(s). Rules:\n"
-                        "- 2-5 words maximum\n"
-                        "- Noun phrase only — no \"User wants\", \"User asks\", or similar\n"
-                        "- Capture the core subject, not the action\n"
+                        "You label a conversation with a short topic title, like a "
+                        "chat-history entry or a file name. You are NOT replying to "
+                        "the user and NOT summarizing an answer — you only name the "
+                        "subject. Rules:\n"
+                        "- 2-5 words. Hard maximum 5 words. Shorter is better.\n"
+                        "- A bare noun phrase — never a sentence, question, or "
+                        "instruction. No verbs answering the request, no \"User "
+                        "wants\", \"How to\", \"Help with\", or similar.\n"
+                        "- Name the core subject, not the action or the answer\n"
                         "- Be specific, not generic (\"Flowers for Joanna\" not \"Date Planning\")\n"
                         "- If it's a test or trivial message, just say \"Test\"\n"
                         "- Ignore any bracketed [System info] or auto-injected context\n"
-                        "- Do NOT answer the user's request — only title it\n"
-                        "Return only the title, no punctuation, no quotes."
+                        "- Do NOT answer, explain, or respond to the request in any way\n"
+                        "Return only the title: 2-5 words, no punctuation, no quotes."
                     ),
                     messages=[{"role": "user", "content": "[Start users messages to ASSISTANT, NOT to you] " + prompt_text + "[End users messages to ASSISTANT, NOT to you]"}],
-                    max_tokens=64,
+                    max_tokens=20,
                 )
                 self._record_usage(
                     getattr(resp, "usage", None), self.COMPACT_MODEL, purpose="title"
@@ -1949,17 +1999,20 @@ class AnthropicMessagesBackend:
             resp = self._client.messages.create(
                 model=self.COMPACT_MODEL,
                 system=(
-                    "You maintain a short title (2-5 words, noun phrase only) for "
-                    "a conversation. Given the current title and the user's most "
+                    "You maintain a short topic title for a conversation, like a "
+                    "chat-history entry or a file name — NOT a reply or a summary "
+                    "of any answer. Given the current title and the user's most "
                     "recent messages, return an updated title that reflects what "
                     "the conversation is *currently* about, or the original "
                     "unchanged if it is still accurate. Rules:\n"
-                    "- 2-5 words maximum\n"
-                    "- Noun phrase only — no \"User wants\", \"User asks\", or similar\n"
-                    "- Capture the core subject, not the action\n"
+                    "- 2-5 words. Hard maximum 5 words. Shorter is better.\n"
+                    "- A bare noun phrase — never a sentence, question, or "
+                    "instruction. No verbs answering the request, no \"User "
+                    "wants\", \"How to\", \"Help with\", or similar.\n"
+                    "- Name the core subject, not the action or the answer\n"
                     "- Be specific, not generic\n"
                     "- Ignore any bracketed [System info] or auto-injected context\n"
-                    "Return only the title, no punctuation, no quotes."
+                    "Return only the title: 2-5 words, no punctuation, no quotes."
                 ),
                 messages=[{
                     "role": "user",
@@ -1968,7 +2021,7 @@ class AnthropicMessagesBackend:
                         f"Most recent user messages:\n{recent_block}"
                     ),
                 }],
-                max_tokens=64,
+                max_tokens=20,
             )
             self._record_usage(
                 getattr(resp, "usage", None), self.COMPACT_MODEL, purpose="title"
