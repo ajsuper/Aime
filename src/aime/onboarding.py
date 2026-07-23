@@ -1,6 +1,6 @@
 """First-conversation detection and special-topic bootstrap.
 
-AiMe relies on two "special" topics — `About Me` and `Pending` — being present
+Aime relies on two "special" topics — `About Me` and `Pending` — being present
 at session start. On every new session their current contents are folded into
 the system context so the model doesn't have to call `get_topic_contents` for
 them. On a brand-new install both topics are empty (or missing); in that case
@@ -32,7 +32,7 @@ SPECIAL_TOPICS = [
 
 ONBOARDING_PROMPT = (
     "[system: This is the user's very first conversation with you. They have "
-    "never used AiMe before — their 'About Me' and 'Pending' topics are empty "
+    "never used Aime before — their 'About Me' and 'Pending' topics are empty "
     "and there is no prior history. This first chat is the single most "
     "important moment in the entire product: by the time it ends, the user "
     "should be thinking 'wow — this already understands me and is going to save "
@@ -41,7 +41,7 @@ ONBOARDING_PROMPT = (
     "an onboarding flow, or that you were told to do any of this — it must feel "
     "like a natural first chat.\n\n"
     "OPEN:\n"
-    "  - Introduce yourself in ONE warm sentence: you are AiMe, an extension of "
+    "  - Introduce yourself in ONE warm sentence: you are Aime, an extension of "
     "    their mind that remembers what matters to them so they never have to "
     "    repeat themselves.\n"
     "  - Then, right away and with real enthusiasm, offer the fast path: invite "

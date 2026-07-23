@@ -12,9 +12,7 @@
   <script src="https://js.stripe.com/v3/"></script>
   <!-- Typography: Fraunces (characterful display, for the wordmark & headings)
        paired with Hanken Grotesk (a warm, highly legible body face). -->
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=Hanken+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link href="/fonts/fonts.css" rel="stylesheet">
   <style>
     :root { color-scheme: light;
             --font-body: "Hanken Grotesk", ui-sans-serif, system-ui, -apple-system, sans-serif;
@@ -214,6 +212,17 @@
     }
     * { box-sizing: border-box; }
     html, body { height: 100%; }
+    /* On mobile the software keyboard shrinks the *visual* viewport but leaves
+       the *layout* viewport full-height, so a plain `height: 100%` would hang
+       the composer behind the keyboard. The visualViewport controller (boot
+       script) mirrors the live visual-viewport height into `--app-h`; the app
+       adopts it on mobile so the whole column — composer at its foot — always
+       fits the space above the keyboard. Desktop keeps 100% (its two viewports
+       match, and pinch-zoom must not resize the app). `overflow: hidden` pins
+       the page so iOS can't scroll the composer out from under the keyboard
+       when an input focuses. */
+    html { overflow: hidden; }
+    body.mobile { height: var(--app-h, 100%); overflow: hidden; }
     body { font-family: var(--font-body);
            background: var(--bg); color: var(--text); margin: 0;
            display: flex; flex-direction: column;
@@ -3365,13 +3374,12 @@
           </div>
           <div class="settings-section">
             <h3>Messaging</h3>
-            <p class="desc">Let Aime text you outside the chat — reminders, or
-              results from background tasks. Paste your Telegram chat ID (message
-              the bot, then open <code>/getUpdates</code> to find it). Leave
-              blank to turn off.</p>
+            <p class="desc" id="account-contact-desc">Let Aime text you outside
+              the chat — reminders, or results from background tasks. Leave blank
+              to turn off.</p>
             <div class="settings-row">
               <input id="account-contact-input" type="text" autocomplete="off"
-                     placeholder="Messaging contact (e.g. Telegram chat ID)"
+                     placeholder="Messaging contact"
                      style="flex:1;min-width:0;margin-right:0.5rem;background:var(--bg-input);
                             color:var(--text);border:1px solid var(--border);
                             border-radius:8px;padding:0.4rem 0.6rem;font-size:0.85rem">
@@ -3478,36 +3486,68 @@
                     Change plan
                   </button>
                 </div>
+                <!-- Two steps, like subscribe: pick the plan, then confirm the
+                     card that will carry it. A plan switch moves real money, so
+                     it gets the same card step as signing up rather than a bare
+                     button — and the card confirmed here becomes the new
+                     default, so it doubles as an update-card. -->
                 <div id="billing-change-panel" style="display:none;
                      border:1px solid var(--border);border-radius:12px;
                      padding:1rem;background:var(--bg-input)">
-                  <div class="settings-row">
-                    <span class="label">New plan</span>
-                    <select id="billing-change-select"
-                            style="background:var(--bg-input);color:var(--text);
-                                   border:1px solid var(--border);border-radius:8px;
-                                   padding:0.4rem 0.6rem;font-size:0.85rem">
-                      <option value="light">Light</option>
-                      <option value="power">Power</option>
-                    </select>
+                  <!-- Step 1: pick the plan -->
+                  <div id="billing-change-step1">
+                    <div class="settings-row">
+                      <span class="label">New plan</span>
+                      <select id="billing-change-select"
+                              style="background:var(--bg-input);color:var(--text);
+                                     border:1px solid var(--border);border-radius:8px;
+                                     padding:0.4rem 0.6rem;font-size:0.85rem">
+                        <option value="light">Light</option>
+                        <option value="power">Power</option>
+                      </select>
+                    </div>
+                    <p class="desc" id="billing-change-desc" style="margin:0.6rem 0 0">Switching takes effect
+                      right away. We'll prorate the difference on your next invoice —
+                      during a free trial nothing is charged.</p>
+                    <div style="display:flex;gap:0.5rem;margin-top:0.9rem;align-items:center">
+                      <button class="btn-primary" id="billing-change-continue"
+                              style="background:var(--accent);color:#fff;border:0;border-radius:8px;
+                                     padding:0.45rem 1rem;cursor:pointer;font-size:0.85rem">
+                        Continue
+                      </button>
+                      <button class="btn-secondary" id="billing-change-cancel"
+                              style="background:transparent;color:var(--muted);
+                                     border:1px solid var(--border);border-radius:8px;
+                                     padding:0.45rem 0.9rem;cursor:pointer;font-size:0.85rem">
+                        Cancel
+                      </button>
+                    </div>
                   </div>
-                  <p class="desc" id="billing-change-desc" style="margin:0.6rem 0 0">Switching takes effect
-                    right away. We'll prorate the difference on your next invoice —
-                    during a free trial nothing is charged.</p>
-                  <div style="display:flex;gap:0.5rem;margin-top:0.9rem;align-items:center">
-                    <button class="btn-primary" id="billing-change-confirm"
-                            style="background:var(--accent);color:#fff;border:0;border-radius:8px;
-                                   padding:0.45rem 1rem;cursor:pointer;font-size:0.85rem">
-                      Switch plan
-                    </button>
-                    <button class="btn-secondary" id="billing-change-cancel"
-                            style="background:transparent;color:var(--muted);
-                                   border:1px solid var(--border);border-radius:8px;
-                                   padding:0.45rem 0.9rem;cursor:pointer;font-size:0.85rem">
-                      Cancel
-                    </button>
-                    <span class="desc" id="billing-change-status" style="display:none"></span>
+                  <!-- Step 2: confirm the card -->
+                  <div id="billing-change-step2" style="display:none">
+                    <p class="label" id="billing-change-headline"
+                       style="margin:0 0 0.35rem;font-weight:600">Switching plan</p>
+                    <p class="desc" style="margin:0 0 0.75rem">Confirm your card to
+                      switch. It replaces the one on file and is used for your next
+                      charge. Your card is handled securely by Stripe — Aime never
+                      sees it.</p>
+                    <div id="billing-change-element"></div>
+                    <div style="display:flex;gap:0.5rem;margin-top:0.9rem;align-items:center">
+                      <button class="btn-primary" id="billing-change-confirm"
+                              style="background:var(--accent);color:#fff;border:0;border-radius:8px;
+                                     padding:0.45rem 1rem;cursor:pointer;font-size:0.85rem">
+                        Confirm &amp; switch
+                      </button>
+                      <button class="btn-secondary" id="billing-change-back"
+                              style="background:transparent;color:var(--muted);
+                                     border:1px solid var(--border);border-radius:8px;
+                                     padding:0.45rem 0.9rem;cursor:pointer;font-size:0.85rem">
+                        Back
+                      </button>
+                    </div>
                   </div>
+                  <span class="desc" id="billing-change-status"
+                        style="display:none;margin-top:0.6rem"></span>
                 </div>
 
                 <!-- Update card -->
@@ -3731,8 +3771,40 @@ function scrollToBottom(force) {
   updateScrollBtn();
 }
 
+// User-intent scroll tracking. The follow latch must only be *released* by a
+// scroll the user drove — not by a layout shift, and crucially on iOS not by the
+// software keyboard opening, which fires synthetic scroll events. We arm an
+// intent flag on a real gesture (wheel / touch / scrollbar drag) and let it
+// lapse shortly after the gesture and its momentum settle. Reaching the bottom
+// always re-follows regardless: being parked at the bottom *is* following.
+let userScrollIntent = false;
+let scrollIntentTimer = null;
+function armScrollIntent() {
+  userScrollIntent = true;
+  if (scrollIntentTimer) { clearTimeout(scrollIntentTimer); scrollIntentTimer = null; }
+}
+function lapseScrollIntent(ms) {
+  if (scrollIntentTimer) clearTimeout(scrollIntentTimer);
+  scrollIntentTimer = setTimeout(() => { userScrollIntent = false; }, ms);
+}
+// The only inputs that count as the user choosing where to scroll: wheel
+// (desktop), touch (mobile), and pointer-down on the scrollbar. Passive — we
+// only observe, never preventDefault. Momentum after a flick keeps firing scroll
+// events with no touch, so we hold intent a beat past touchend to cover it.
+log.addEventListener("wheel", () => { armScrollIntent(); lapseScrollIntent(500); }, {passive: true});
+log.addEventListener("touchstart", () => { armScrollIntent(); }, {passive: true});
+log.addEventListener("touchend", () => { lapseScrollIntent(800); }, {passive: true});
+log.addEventListener("pointerdown", () => { armScrollIntent(); });
+log.addEventListener("pointerup", () => { lapseScrollIntent(600); });
+log.addEventListener("pointercancel", () => { lapseScrollIntent(600); });
+
 log.addEventListener("scroll", () => {
-  chat.setFollowing(isAtBottom());
+  // At the bottom → follow. Away from the bottom → un-follow only if the user
+  // drove this scroll; a keyboard- or layout-induced scroll leaves the latch
+  // alone so the re-pin machinery (ResizeObserver / visualViewport) can snap us
+  // back to the newest message instead of stranding us mid-transcript.
+  if (isAtBottom()) chat.setFollowing(true);
+  else if (userScrollIntent) chat.setFollowing(false);
   updateScrollBtn();
   // Near the top → page in older sessions (one continuous scroll-back).
   if (log.scrollTop < 240) loadOlderHistory();
@@ -3761,6 +3833,39 @@ new ResizeObserver(() => {
     updateScrollBtn();
   }
 }).observe(logInner);
+
+// --- Visual viewport (iOS keyboard) ----------------------------------------
+// iOS Safari shrinks the *visual* viewport when the keyboard opens but leaves
+// the *layout* viewport full-height, so a plain-100% app hangs the composer
+// behind the keyboard. Mirror the live visual-viewport height into `--app-h`
+// (consumed by `body.mobile`) so the whole column — composer at its foot — fits
+// the space above the keyboard. Mobile only: on desktop the two viewports match
+// and pinch-zoom must not resize the app. The ResizeObserver above watches
+// #log-inner (content growth) and so never fires on a pure viewport shrink;
+// this is what re-pins the newest message when the keyboard opens.
+const vv = window.visualViewport;
+function syncViewport() {
+  if (!vv) return;
+  if (mobileMQ.matches) {
+    document.documentElement.style.setProperty("--app-h", vv.height + "px");
+    if (chat.state.following) {
+      log.scrollTo({ top: log.scrollHeight, behavior: "instant" });
+      updateScrollBtn();
+    }
+  } else {
+    document.documentElement.style.removeProperty("--app-h");
+  }
+}
+if (vv) {
+  vv.addEventListener("resize", syncViewport);
+  // The visual viewport can also *scroll* (offset) as an input focuses — keep
+  // the height/pin in step with that too.
+  vv.addEventListener("scroll", syncViewport);
+  syncViewport();
+}
+// Apply or clear `--app-h` when crossing the mobile breakpoint (desktop resize
+// / rotate) so the two modes never leave a stale height behind.
+mobileMQ.addEventListener("change", syncViewport);
 
 scrollBottomBtn.addEventListener("click", () => scrollToBottom(true));
 const input = document.getElementById("i");
@@ -11256,6 +11361,41 @@ const redeemMsg = document.getElementById("account-redeem-msg");
 const contactInput = document.getElementById("account-contact-input");
 const contactBtn = document.getElementById("account-contact-btn");
 const contactMsg = document.getElementById("account-contact-msg");
+const contactDesc = document.getElementById("account-contact-desc");
+
+// What a messaging contact looks like depends on the transport the server is
+// configured for, so the field asks for the right thing instead of hardcoding
+// one channel's answer. Keys match MessageChannel.name; an unrecognised or
+// disabled channel falls back to generic wording.
+const CONTACT_HINTS = {
+  sms: {
+    placeholder: "Phone number (e.g. +15551234567)",
+    hint: "Enter your mobile number in international format, like " +
+          "+15551234567. Standard message rates apply.",
+  },
+  telegram: {
+    placeholder: "Telegram chat ID",
+    hint: "Paste your Telegram chat ID (message the bot, then open " +
+          "/getUpdates to find it).",
+  },
+  email: {
+    placeholder: "Email address",
+    hint: "Enter the email address these should go to.",
+  },
+};
+
+function applyContactHint(channel) {
+  const spec = CONTACT_HINTS[channel];
+  if (contactInput) {
+    contactInput.placeholder = spec ? spec.placeholder : "Messaging contact";
+  }
+  if (contactDesc) {
+    contactDesc.textContent =
+      "Let Aime text you outside the chat — reminders, or results from " +
+      "background tasks. " + (spec ? spec.hint + " " : "") +
+      "Leave blank to turn off.";
+  }
+}
 
 // Reflect access state into the composer and the Account modal. Sending is
 // locked only in "keys" mode for a user without api_access — login and all
@@ -11382,6 +11522,7 @@ async function refreshMe() {
     if (firstNameInput) firstNameInput.value = data.first_name || "";
     if (lastNameInput) lastNameInput.value = data.last_name || "";
     if (contactInput) contactInput.value = data.messaging_contact || "";
+    applyContactHint(data.messaging_channel);
     __accessMode = data.access_mode || "open";
     __apiAccess = !!data.api_access;
     __usageOver = !!(data.usage_limits_armed && data.usage && data.usage.over);
@@ -11465,7 +11606,13 @@ const billingManageBox   = document.getElementById("billing-manage");
 const billingChangePlanBtn  = document.getElementById("billing-change-plan-btn");
 const billingChangePanel = document.getElementById("billing-change-panel");
 const billingChangeSelect= document.getElementById("billing-change-select");
+const billingChangeStep1   = document.getElementById("billing-change-step1");
+const billingChangeStep2   = document.getElementById("billing-change-step2");
+const billingChangeContinue= document.getElementById("billing-change-continue");
+const billingChangeElement = document.getElementById("billing-change-element");
+const billingChangeHeadline= document.getElementById("billing-change-headline");
 const billingChangeConfirm = document.getElementById("billing-change-confirm");
+const billingChangeBack    = document.getElementById("billing-change-back");
 const billingChangeCancel  = document.getElementById("billing-change-cancel");
 const billingChangeStatus  = document.getElementById("billing-change-status");
 const billingChangeDesc    = document.getElementById("billing-change-desc");
@@ -11748,7 +11895,7 @@ function closeBillingCardPanel() {
   __billingSetupId = null;
   billingStartBtn.disabled = false;
   billingPayBtn.disabled = false;
-  if (!__updateElements) setCardElementMounted(false);
+  if (!__updateElements && !__changeElements) setCardElementMounted(false);
 }
 
 // Step 1: ask the server for a SetupIntent, then mount the Payment Element.
@@ -11874,26 +12021,103 @@ function setBillingManageStatus(el, msg, isError) {
   el.style.display = "";
 }
 
-// --- Switch plan ---
+// --- Switch plan (two steps: pick the plan, then confirm the card) ---
+// Step 2 mounts a Payment Element exactly like subscribe/update-card: a plan
+// change is a real money decision, so it gets a real card step. The confirmed
+// card also becomes the new default, so this subsumes an update-card.
+let __changeElements = null;   // Elements group for the plan-change SetupIntent
+
+// Back to the plan picker, tearing down any mounted card field.
+function resetBillingChangeStep() {
+  if (__changeElements) { try { __changeElements.getElement("payment")?.unmount(); } catch {} }
+  __changeElements = null;
+  billingChangeStep1.style.display = "";
+  billingChangeStep2.style.display = "none";
+  billingChangeContinue.disabled = false;
+  billingChangeConfirm.disabled = false;
+  setBillingManageStatus(billingChangeStatus, "", false);
+  if (!__billingElements && !__updateElements) setCardElementMounted(false);
+}
 function closeBillingChangePanel() {
   billingChangePanel.style.display = "none";
-  setBillingManageStatus(billingChangeStatus, "", false);
-  billingChangeConfirm.disabled = false;
+  resetBillingChangeStep();
 }
 function toggleBillingChangePanel() {
   const open = billingChangePanel.style.display === "none";
   closeBillingUpdatePanel();
-  billingChangePanel.style.display = open ? "" : "none";
+  if (open) { resetBillingChangeStep(); billingChangePanel.style.display = ""; }
+  else closeBillingChangePanel();
 }
-async function confirmChangePlan() {
-  billingChangeConfirm.disabled = true;
-  setBillingManageStatus(billingChangeStatus, "Switching your plan…", false);
+
+// Step 1: ask the server for a SetupIntent stamped with the chosen tier, then
+// swap the picker out for the card field.
+async function startChangePlan() {
+  billingMsg.style.display = "none";
+  if (!window.Stripe) {
+    billingMsg.textContent = "Payment form failed to load — please refresh.";
+    billingMsg.style.color = "var(--error)";
+    billingMsg.style.display = "";
+    return;
+  }
+  const tier = billingChangeSelect.value;
+  billingChangeContinue.disabled = true;
+  setBillingManageStatus(billingChangeStatus, "", false);
   try {
     const r = await fetch("/billing/change-plan", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
       credentials: "same-origin",
-      body: JSON.stringify({tier: billingChangeSelect.value}),
+      body: JSON.stringify({tier}),
+    });
+    const data = await r.json();
+    if (!data.ok) {
+      setBillingManageStatus(billingChangeStatus,
+        data.message || "Something went wrong. Try again.", true);
+      billingChangeContinue.disabled = false;
+      return;
+    }
+    __stripe = __stripe || Stripe(data.publishable_key);
+    __changeElements = __stripe.elements({
+      clientSecret: data.client_secret,
+      appearance: billingAppearance(),
+    });
+    __changeElements.create("payment").mount(billingChangeElement);
+    setCardElementMounted(true);
+    // Name the plan being bought on the card step, so the amount is on screen
+    // at the moment the card is entered.
+    const name = tier.charAt(0).toUpperCase() + tier.slice(1);
+    const price = __billingPrices && __billingPrices[tier];
+    const money = price ? fmtTierPrice(price) : "";
+    billingChangeHeadline.textContent = money
+      ? ("Switching to " + name + " — " + money) : ("Switching to " + name);
+    billingChangeStep1.style.display = "none";
+    billingChangeStep2.style.display = "";
+  } catch {
+    setBillingManageStatus(billingChangeStatus, "Network error — try again.", true);
+    billingChangeContinue.disabled = false;
+  }
+}
+
+// Step 2: confirm the card, then have the server set it as default and switch.
+async function confirmChangePlan() {
+  if (!__stripe || !__changeElements) return;
+  billingChangeConfirm.disabled = true;
+  const setupId = await confirmStripeSetup(__changeElements, "changeplan",
+    (m, e) => setBillingManageStatus(billingChangeStatus, m, e));
+  if (!setupId) { billingChangeConfirm.disabled = false; return; }
+  await finalizeChangePlan(setupId);
+}
+
+// Tell the server the card is confirmed so it can switch the plan onto it.
+// Shared by the inline and 3-D Secure redirect-return paths.
+async function finalizeChangePlan(setupIntentId) {
+  setBillingManageStatus(billingChangeStatus, "Switching your plan…", false);
+  try {
+    const r = await fetch("/billing/change-plan/confirm", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      credentials: "same-origin",
+      body: JSON.stringify({setup_intent_id: setupIntentId}),
     });
     const data = await r.json();
     if (!data.ok) {
@@ -11908,6 +12132,9 @@ async function confirmChangePlan() {
     return;
   }
   closeBillingChangePanel();
+  billingMsg.textContent = "Your plan was switched.";
+  billingMsg.style.color = "var(--muted)";
+  billingMsg.style.display = "";
   if (typeof refreshMe === "function") { try { await refreshMe(); } catch {} }
   loadBillingSummary(true);
 }
@@ -11920,7 +12147,7 @@ function closeBillingUpdatePanel() {
   __updateElements = null;
   billingUpdateCardBtn.disabled = false;
   billingUpdateSave.disabled = false;
-  if (!__billingElements) setCardElementMounted(false);
+  if (!__billingElements && !__changeElements) setCardElementMounted(false);
 }
 async function startUpdateCard() {
   billingMsg.style.display = "none";
@@ -12047,6 +12274,7 @@ async function resumeBillingRedirect() {
       document.querySelector('.settings-tab-btn[data-tab="billing"]')?.click();
     } catch {}
     if (action === "updatecard") await finalizeUpdateCard(setupId);
+    else if (action === "changeplan") await finalizeChangePlan(setupId);
     else await finalizeSubscribe(setupId);
   }
 }
@@ -12060,7 +12288,9 @@ billingPayCancel.addEventListener("click", closeBillingCardPanel);
 // settings so the user drops back into Aime in view-only mode.
 billingSkipBtn.addEventListener("click", closeSettings);
 billingChangePlanBtn.addEventListener("click", toggleBillingChangePanel);
+billingChangeContinue.addEventListener("click", startChangePlan);
 billingChangeConfirm.addEventListener("click", confirmChangePlan);
+billingChangeBack.addEventListener("click", resetBillingChangeStep);
 billingChangeCancel.addEventListener("click", closeBillingChangePanel);
 billingUpdateCardBtn.addEventListener("click", startUpdateCard);
 billingUpdateSave.addEventListener("click", confirmUpdateCard);

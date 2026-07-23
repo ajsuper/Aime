@@ -6,9 +6,7 @@
   <title>Sign in — Aime</title>
   __SIGNUP_DISABLED_STYLE__
   __EMAIL_VERIFICATION_DISABLED_STYLE__
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=Hanken+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link href="/fonts/fonts.css" rel="stylesheet">
   <style>
     :root {
       color-scheme: dark;
@@ -110,6 +108,16 @@
                   font-family: var(--font-display); font-size: 0.9rem;
                   text-decoration: none; }
     .recover-no:hover { color: var(--text); }
+    /* Terms consent — a normal-weight row rather than a form label, since it's
+       a statement being agreed to, not a field name. */
+    .consent { display: flex; gap: 0.55rem; align-items: flex-start;
+               font-family: var(--font-body); font-weight: 400;
+               font-size: 0.85rem; color: var(--muted); line-height: 1.45;
+               margin-top: 0.35rem; cursor: pointer; }
+    .consent input { flex: none; width: 1rem; height: 1rem; margin: 0.13rem 0 0;
+                     accent-color: var(--cta); cursor: pointer; }
+    .consent a { color: var(--accent); text-decoration: none; }
+    .consent a:hover { text-decoration: underline; }
   </style>
 </head>
 <body>
@@ -164,6 +172,18 @@
       <label for="signup-password2">Confirm password</label>
       <input id="signup-password2" name="password2" type="password"
              autocomplete="new-password" minlength="8" required>
+      <!-- Terms consent. `required` gives the browser's own blocking prompt;
+           the server re-checks it (never trust the form) and records which
+           revision was agreed to. Links open in a new tab so a half-filled
+           form isn't lost to a navigation. -->
+      <label class="consent" for="signup-terms">
+        <input id="signup-terms" name="accept_terms" type="checkbox"
+               value="1" required>
+        <span>I agree to the
+          <a href="/terms" target="_blank" rel="noopener">Terms of Service</a>
+          and <a href="/privacy" target="_blank" rel="noopener">Privacy
+          Policy</a>.</span>
+      </label>
       <p class="error" data-error="signup">__SIGNUP_ERROR__</p>
       <button class="submit" type="submit">Create account</button>
     </form>

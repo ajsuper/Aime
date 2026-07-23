@@ -45,7 +45,8 @@ except Exception:  # noqa: BLE001 - image conversion is best-effort
     _PIL_AVAILABLE = False
 
 from flask import (
-    Flask, Response, request, jsonify, session, redirect, g, url_for, abort
+    Flask, Response, request, jsonify, session, redirect, g, url_for, abort,
+    send_from_directory
 )
 from rich.console import Console
 from rich.markup import Tag, _parse
@@ -1287,6 +1288,25 @@ _FORGOT_PAGE_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "resources", "style", "forgot_password.html",
 )
+# Legal pages: one shared shell (styling, wordmark) plus a body file per
+# document, so the text can be replaced by whoever owns it without touching
+# markup. See resources/legal/*.html.
+_LEGAL_SHELL_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "resources", "style", "legal.html",
+)
+_LEGAL_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "resources", "legal",
+)
+# Self-hosted webfonts (Fraunces + Hanken Grotesk) and the stylesheet that
+# declares them. Served from our own origin: the CSP allows neither
+# fonts.googleapis.com nor fonts.gstatic.com, so the old Google Fonts <link>
+# was silently blocked and every page fell back to system faces.
+_FONTS_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "resources", "style", "fonts",
+)
 _RESET_PAGE_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "resources", "style", "reset_password.html",
@@ -1524,6 +1544,25 @@ def _load_login_page(
     )
 
 
+def _load_legal_page(slug: str, title: str) -> str:
+    """Render a legal document: the body file for `slug` dropped into the shared
+    shell. `slug` is never taken from user input (the two routes below pass a
+    literal), so there's no path-traversal surface here."""
+    with open(_LEGAL_SHELL_PATH) as f:
+        shell = f.read()
+    with open(os.path.join(_LEGAL_DIR, f"{slug}.html")) as f:
+        body = f.read()
+    # The body is trusted first-party markup (it's a checked-in document, not
+    # user content), so it is substituted as-is; only the version string, which
+    # is configurable, gets escaped.
+    return (
+        shell
+        .replace("__LEGAL_TITLE__", _h(title))
+        .replace("__LEGAL_BODY__",
+                 body.replace("__TERMS_VERSION__", _h(aime_config.TERMS_VERSION)))
+    )
+
+
 def _mask_email(email: str) -> str:
     """Show enough of an email to confirm "yes that's the one I gave you"
     without putting the full address on a page that might be over the user's
@@ -1699,6 +1738,42 @@ def login_page():
     session.pop("pending_email_user_id", None)
     session.pop("pending_email_was_reinitialized", None)
     return Response(_load_login_page(), mimetype="text/html")
+
+
+@app.route("/fonts/<path:filename>", methods=["GET"])
+def font_asset(filename):
+    """Serve the self-hosted webfonts and their stylesheet.
+
+    Public and unauthenticated, like any static asset — the login page needs
+    them before a session exists. `send_from_directory` rejects any path that
+    escapes the directory, so the wildcard can't be walked up out of
+    resources/style/fonts. Only the two extensions we actually publish are
+    served, so this can't become a general file-read of that directory.
+
+    Cached hard (a year, immutable): the filenames change whenever the fonts are
+    regenerated, so a stale cache entry can't pin an old face.
+    """
+    if not filename.endswith((".woff2", ".css")):
+        abort(404)
+    return send_from_directory(
+        _FONTS_DIR, filename,
+        max_age=31536000,
+    )
+
+
+# Legal documents. Public and unauthenticated on purpose: the signup form links
+# to them, so they have to be readable before an account exists.
+
+@app.route("/terms", methods=["GET"])
+def terms_page():
+    return Response(_load_legal_page("terms", "Terms of Service"),
+                    mimetype="text/html")
+
+
+@app.route("/privacy", methods=["GET"])
+def privacy_page():
+    return Response(_load_legal_page("privacy", "Privacy Policy"),
+                    mimetype="text/html")
 
 
 def _grant_full_session(user, was_reinitialized: bool) -> Response:
@@ -2349,6 +2424,16 @@ def signup_submit():
     if password != password2:
         return _signup_err("Passwords do not match.")
 
+    # Terms consent. The checkbox is `required` on the form, but that's only a
+    # browser convenience — a direct POST skips it, so the real gate is here. No
+    # account is created without it, and the accepted revision is recorded on
+    # the row (aime.config.TERMS_VERSION; see /terms and /privacy).
+    if (request.form.get("accept_terms") or "") != "1":
+        return _signup_err(
+            "Please accept the Terms of Service and Privacy Policy to continue."
+        )
+    terms_version = aime_config.TERMS_VERSION
+
     # When email verification is off, behave like the pre-2FA signup: create
     # the account directly and log the user in. The Email field is hidden on
     # the form (via _EMAIL_VERIFICATION_DISABLED_STYLE), so any value submitted
@@ -2359,6 +2444,7 @@ def signup_submit():
                 username, password, api_access=(_ACCESS_MODE == "open"),
                 first_name=first_name, last_name=last_name,
                 tier=aime_config.USAGE_DEFAULT_TIER,
+                terms_version=terms_version,
             )
         except _auth.UsernameTaken:
             return _signup_err("That username is already taken.", status=409)
@@ -2378,6 +2464,7 @@ def signup_submit():
             username, password, email,
             api_access=(_ACCESS_MODE == "open"),
             first_name=first_name, last_name=last_name,
+            terms_version=terms_version,
         )
     except _auth.UsernameTaken:
         return _signup_err("That username is already taken.", status=409)
@@ -2610,6 +2697,8 @@ def account_recover():
 def me():
     # access_mode + api_access let the frontend show the invite-key field in
     # profile settings and disable the composer when sending is gated.
+    from aime import messaging as _aime_messaging
+
     user = _auth_backend.lookup(g.user_id)
     # Self-heal stale billing access here too (refreshMe polls /me), so the
     # composer unlocks for a paying user without them having to try to send
@@ -2651,6 +2740,10 @@ def me():
         "username": g.username,
         "email": user.email if user else None,
         "messaging_contact": user.messaging_contact if user else None,
+        # Which transport is configured, so the settings UI can ask for the
+        # right *kind* of contact (a phone number under SMS, a chat id under
+        # Telegram). The value is opaque to the server either way.
+        "messaging_channel": _aime_messaging.active_channel_name(),
         "first_name": user.first_name if user else None,
         "last_name": user.last_name if user else None,
         "access_mode": _ACCESS_MODE,
@@ -2990,9 +3083,11 @@ def billing_update_card_confirm():
 @app.route("/billing/change-plan", methods=["POST"])
 @login_required
 def billing_change_plan():
-    """Switch the user's live subscription to another tier, prorated. The new
-    tier is reconciled immediately off the live Price (never trusted from this
-    request body) so /me reflects it at once; the webhook re-confirms."""
+    """Step 1 of the plan switch: a SetupIntent so the browser can collect the
+    card that will carry the change, with the chosen tier stamped into its
+    metadata. Nothing moves yet — step 2 (/confirm) reads the tier back off
+    Stripe and does the switch. Mirrors subscribe and update-card, so all three
+    money-moving actions go through the same card step."""
     if not _billing_armed():
         abort(404)
     data = request.get_json(silent=True) or {}
@@ -3005,11 +3100,43 @@ def billing_change_plan():
                         "message": "No subscription to change — start your free "
                                    "trial first."}), 400
     try:
-        _billing.change_plan(user.stripe_customer_id, tier)
-    except ValueError:
+        intent = _billing.create_plan_change_intent(
+            customer_id=user.stripe_customer_id, tier=tier)
+    except Exception:
+        app.logger.warning("billing: plan-change setup-intent failed for user %s",
+                            g.user_id, exc_info=True)
         return jsonify({"ok": False,
-                        "message": "No active subscription to change. "
-                                   "Start a plan first."}), 409
+                        "message": "We couldn't start the plan change just now. "
+                                   "Please try again in a moment."}), 502
+    return jsonify({"ok": True,
+                    "client_secret": intent["client_secret"],
+                    "publishable_key": aime_config.STRIPE_PUBLISHABLE_KEY})
+
+
+@app.route("/billing/change-plan/confirm", methods=["POST"])
+@login_required
+def billing_change_plan_confirm():
+    """Step 2 of the plan switch: the browser confirmed the SetupIntent, so make
+    that card the default and move the subscription onto the tier recorded in the
+    intent's metadata — read server-side off Stripe, never from this request
+    body. Reconciled immediately off the live Price so /me reflects it at once;
+    the webhook re-confirms."""
+    if not _billing_armed():
+        abort(404)
+    data = request.get_json(silent=True) or {}
+    setup_intent_id = (data.get("setup_intent_id") or "").strip()
+    if not setup_intent_id:
+        return jsonify({"ok": False, "message": "Missing card confirmation."}), 400
+    user = _auth_backend.lookup(g.user_id)
+    if user is None or not user.stripe_customer_id:
+        abort(404)
+    try:
+        _billing.change_plan_with_card(user.stripe_customer_id, setup_intent_id)
+    except ValueError:
+        # Unconfirmed / forged intent, or no live subscription to move.
+        return jsonify({"ok": False,
+                        "message": "We couldn't confirm your card. "
+                                   "Please try again."}), 400
     except Exception:
         app.logger.warning("billing: plan change failed for user %s",
                             g.user_id, exc_info=True)

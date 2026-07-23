@@ -911,7 +911,7 @@ def test_subscribe_blocks_second_subscription():
         _BILLING_ENV,
         "import frontends.web_app as w\n"
         "c = w.app.test_client()\n"
-        "c.post('/signup', data={'username':'owner','password':'Sufficiently-long-pw-1','password2':'Sufficiently-long-pw-1'})\n"
+        "c.post('/signup', data={'username':'owner','password':'Sufficiently-long-pw-1','password2':'Sufficiently-long-pw-1','accept_terms':'1'})\n"
         "w._billing.ensure_customer = lambda ab, u: 'cus_1'\n"
         "w._billing.subscription_state = lambda cid: {'has_active': True, 'used_trial': True}\n"
         "r = c.post('/billing/subscribe', json={'tier':'power'})\n"
@@ -930,7 +930,7 @@ def test_subscribe_returns_client_secret():
         _BILLING_ENV,
         "import frontends.web_app as w\n"
         "c = w.app.test_client()\n"
-        "c.post('/signup', data={'username':'owner','password':'Sufficiently-long-pw-1','password2':'Sufficiently-long-pw-1'})\n"
+        "c.post('/signup', data={'username':'owner','password':'Sufficiently-long-pw-1','password2':'Sufficiently-long-pw-1','accept_terms':'1'})\n"
         "w._billing.ensure_customer = lambda ab, u: 'cus_1'\n"
         "w._billing.subscription_state = lambda cid: {'has_active': False, 'used_trial': False}\n"
         "w._billing.create_setup_intent = lambda **k: {'client_secret': 'seti_secret', 'setup_intent_id': 'seti_1'}\n"
@@ -953,7 +953,7 @@ def test_subscribe_forces_default_tier():
         _BILLING_ENV,
         "import frontends.web_app as w\n"
         "c = w.app.test_client()\n"
-        "c.post('/signup', data={'username':'owner','password':'Sufficiently-long-pw-1','password2':'Sufficiently-long-pw-1'})\n"
+        "c.post('/signup', data={'username':'owner','password':'Sufficiently-long-pw-1','password2':'Sufficiently-long-pw-1','accept_terms':'1'})\n"
         "w._billing.ensure_customer = lambda ab, u: 'cus_1'\n"
         "w._billing.subscription_state = lambda cid: {'has_active': False, 'used_trial': False}\n"
         "seen = {}\n"
@@ -976,7 +976,7 @@ def test_subscribe_confirm_denies_trial_when_flagged():
         _BILLING_ENV,
         "import frontends.web_app as w\n"
         "c = w.app.test_client()\n"
-        "c.post('/signup', data={'username':'owner','password':'Sufficiently-long-pw-1','password2':'Sufficiently-long-pw-1'})\n"
+        "c.post('/signup', data={'username':'owner','password':'Sufficiently-long-pw-1','password2':'Sufficiently-long-pw-1','accept_terms':'1'})\n"
         "w._auth_backend.set_stripe_customer(1, 'cus_1')\n"
         "w._auth_backend.set_trial_used_by_username('owner', True)\n"
         "w._billing.saved_payment_method = lambda sid, cid: ('pm_1', 'power')\n"
@@ -1000,7 +1000,7 @@ def test_me_reports_trial_eligibility():
         _BILLING_ENV,
         "import frontends.web_app as w\n"
         "c = w.app.test_client()\n"
-        "c.post('/signup', data={'username':'owner','password':'Sufficiently-long-pw-1','password2':'Sufficiently-long-pw-1'})\n"
+        "c.post('/signup', data={'username':'owner','password':'Sufficiently-long-pw-1','password2':'Sufficiently-long-pw-1','accept_terms':'1'})\n"
         "assert c.get('/me').get_json()['billing']['trial_eligible'] is True\n"
         "w._auth_backend.set_trial_used_by_username('owner', True)\n"
         "assert c.get('/me').get_json()['billing']['trial_eligible'] is False\n"
@@ -1018,7 +1018,7 @@ def test_subscribe_confirm_trial_gate():
         _BILLING_ENV,
         "import frontends.web_app as w\n"
         "c = w.app.test_client()\n"
-        "c.post('/signup', data={'username':'owner','password':'Sufficiently-long-pw-1','password2':'Sufficiently-long-pw-1'})\n"
+        "c.post('/signup', data={'username':'owner','password':'Sufficiently-long-pw-1','password2':'Sufficiently-long-pw-1','accept_terms':'1'})\n"
         "w._auth_backend.set_stripe_customer(1, 'cus_1')\n"
         "w._billing.saved_payment_method = lambda sid, cid: ('pm_1', 'power')\n"
         "seen = {}\n"
@@ -1047,7 +1047,7 @@ def test_subscribe_confirm_grants_access_immediately():
         _BILLING_ENV,
         "import frontends.web_app as w\n"
         "c = w.app.test_client()\n"
-        "c.post('/signup', data={'username':'owner','password':'Sufficiently-long-pw-1','password2':'Sufficiently-long-pw-1'})\n"
+        "c.post('/signup', data={'username':'owner','password':'Sufficiently-long-pw-1','password2':'Sufficiently-long-pw-1','accept_terms':'1'})\n"
         "w._auth_backend.set_stripe_customer(1, 'cus_1')\n"
         "assert w._auth_backend.lookup(1).api_access is False\n"
         "w._billing.saved_payment_method = lambda sid, cid: ('pm_1', 'power')\n"
@@ -1077,7 +1077,7 @@ def test_subscribe_confirm_succeeds_when_reconcile_fails():
         _BILLING_ENV,
         "import frontends.web_app as w\n"
         "c = w.app.test_client()\n"
-        "c.post('/signup', data={'username':'owner','password':'Sufficiently-long-pw-1','password2':'Sufficiently-long-pw-1'})\n"
+        "c.post('/signup', data={'username':'owner','password':'Sufficiently-long-pw-1','password2':'Sufficiently-long-pw-1','accept_terms':'1'})\n"
         "w._auth_backend.set_stripe_customer(1, 'cus_1')\n"
         "w._billing.saved_payment_method = lambda sid, cid: ('pm_1', 'power')\n"
         "w._billing.subscription_state = lambda cid: {'has_active': False, 'used_trial': False}\n"
@@ -1101,7 +1101,7 @@ def test_send_gate_self_heals_paying_user():
         _BILLING_ENV,
         "import frontends.web_app as w\n"
         "c = w.app.test_client()\n"
-        "c.post('/signup', data={'username':'owner','password':'Sufficiently-long-pw-1','password2':'Sufficiently-long-pw-1'})\n"
+        "c.post('/signup', data={'username':'owner','password':'Sufficiently-long-pw-1','password2':'Sufficiently-long-pw-1','accept_terms':'1'})\n"
         "w._auth_backend.set_stripe_customer(1, 'cus_1')\n"
         "assert w._auth_backend.lookup(1).api_access is False\n"
         "calls = {'n': 0}\n"
@@ -1132,7 +1132,7 @@ def test_send_gate_denies_non_paying_user_with_billing_message():
         _BILLING_ENV,
         "import frontends.web_app as w\n"
         "c = w.app.test_client()\n"
-        "c.post('/signup', data={'username':'owner','password':'Sufficiently-long-pw-1','password2':'Sufficiently-long-pw-1'})\n"
+        "c.post('/signup', data={'username':'owner','password':'Sufficiently-long-pw-1','password2':'Sufficiently-long-pw-1','accept_terms':'1'})\n"
         "w._auth_backend.set_stripe_customer(1, 'cus_1')\n"
         "w._billing.reconcile_customer = lambda ab, cid: False\n"   # no subscription
         "r = c.post('/send', json={})\n"
@@ -1153,7 +1153,7 @@ def test_me_self_heals_paying_user():
         _BILLING_ENV,
         "import frontends.web_app as w\n"
         "c = w.app.test_client()\n"
-        "c.post('/signup', data={'username':'owner','password':'Sufficiently-long-pw-1','password2':'Sufficiently-long-pw-1'})\n"
+        "c.post('/signup', data={'username':'owner','password':'Sufficiently-long-pw-1','password2':'Sufficiently-long-pw-1','accept_terms':'1'})\n"
         "w._auth_backend.set_stripe_customer(1, 'cus_1')\n"
         "w._billing.reconcile_customer = lambda ab, cid: (ab.set_api_access(1, True) or True)\n"
         "r = c.get('/me')\n"
@@ -1170,7 +1170,7 @@ def test_subscribe_confirm_rejects_unconfirmed_card():
         _BILLING_ENV,
         "import frontends.web_app as w\n"
         "c = w.app.test_client()\n"
-        "c.post('/signup', data={'username':'owner','password':'Sufficiently-long-pw-1','password2':'Sufficiently-long-pw-1'})\n"
+        "c.post('/signup', data={'username':'owner','password':'Sufficiently-long-pw-1','password2':'Sufficiently-long-pw-1','accept_terms':'1'})\n"
         "w._auth_backend.set_stripe_customer(1, 'cus_1')\n"
         "def boom(sid, cid):\n"
         "    raise ValueError('card has not been confirmed yet')\n"
@@ -1191,7 +1191,7 @@ def test_account_delete_cancels_subscription():
         _BILLING_ENV,
         "import frontends.web_app as w\n"
         "c = w.app.test_client()\n"
-        "c.post('/signup', data={'username':'owner','password':'Sufficiently-long-pw-1','password2':'Sufficiently-long-pw-1'})\n"
+        "c.post('/signup', data={'username':'owner','password':'Sufficiently-long-pw-1','password2':'Sufficiently-long-pw-1','accept_terms':'1'})\n"
         "uid = w._auth_backend.lookup_by_username('owner').id\n"
         "w._auth_backend.set_stripe_customer(uid, 'cus_1')\n"
         "seen = {}\n"
@@ -1205,27 +1205,65 @@ def test_account_delete_cancels_subscription():
     assert "OK" in proc.stdout
 
 
-def test_change_plan_route_validates_and_reconciles():
-    """A valid tier switches the plan and reconciles immediately; an unknown
-    tier is rejected before any Stripe call."""
+def test_change_plan_route_starts_card_step():
+    """Step 1 only mints a SetupIntent for the card step — it must NOT switch the
+    plan on its own. An unknown tier is rejected before any Stripe call."""
     proc = _run_snippet(
         _BILLING_ENV,
         "import frontends.web_app as w\n"
         "c = w.app.test_client()\n"
-        "c.post('/signup', data={'username':'owner','password':'Sufficiently-long-pw-1','password2':'Sufficiently-long-pw-1'})\n"
+        "c.post('/signup', data={'username':'owner','password':'Sufficiently-long-pw-1','password2':'Sufficiently-long-pw-1','accept_terms':'1'})\n"
         "uid = w._auth_backend.lookup_by_username('owner').id\n"
         "w._auth_backend.set_stripe_customer(uid, 'cus_1')\n"
         "seen = {}\n"
         "w._billing.change_plan = lambda cid, tier: seen.update(changed=(cid, tier))\n"
-        "w._billing.reconcile_customer = lambda ab, cid: seen.update(reconciled=cid)\n"
+        "w._billing.change_plan_with_card = lambda cid, sid: seen.update(switched=(cid, sid))\n"
+        "w._billing.create_plan_change_intent = lambda **k: (seen.update(intent=k) or {'client_secret':'seti_secret','setup_intent_id':'seti_1'})\n"
         "r = c.post('/billing/change-plan', json={'tier':'power'})\n"
         "assert r.status_code == 200, r.status_code\n"
-        "assert seen.get('changed') == ('cus_1','power'), seen\n"
-        "assert seen.get('reconciled') == 'cus_1', seen\n"
+        "assert r.get_json()['client_secret'] == 'seti_secret', r.get_json()\n"
+        "assert seen.get('intent') == {'customer_id':'cus_1','tier':'power'}, seen\n"
+        # The card step hasn't happened yet, so nothing may have moved.
+        "assert 'changed' not in seen and 'switched' not in seen, seen\n"
         "seen.clear()\n"
         "r = c.post('/billing/change-plan', json={'tier':'bogus'})\n"
         "assert r.status_code == 400, r.status_code\n"
-        "assert 'changed' not in seen, seen\n"
+        "assert seen == {}, seen\n"
+        "print('OK')\n",
+    )
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "OK" in proc.stdout
+
+
+def test_change_plan_confirm_switches_and_reconciles():
+    """Step 2 switches the plan onto the confirmed card and reconciles at once.
+    An unconfirmed / forged intent (ValueError) switches nothing."""
+    proc = _run_snippet(
+        _BILLING_ENV,
+        "import frontends.web_app as w\n"
+        "c = w.app.test_client()\n"
+        "c.post('/signup', data={'username':'owner','password':'Sufficiently-long-pw-1','password2':'Sufficiently-long-pw-1','accept_terms':'1'})\n"
+        "uid = w._auth_backend.lookup_by_username('owner').id\n"
+        "w._auth_backend.set_stripe_customer(uid, 'cus_1')\n"
+        "seen = {}\n"
+        "w._billing.change_plan_with_card = lambda cid, sid: (seen.update(switched=(cid, sid)) or 'power')\n"
+        "w._billing.reconcile_customer = lambda ab, cid: seen.update(reconciled=cid)\n"
+        "r = c.post('/billing/change-plan/confirm', json={'setup_intent_id':'seti_1'})\n"
+        "assert r.status_code == 200, r.status_code\n"
+        "assert seen.get('switched') == ('cus_1','seti_1'), seen\n"
+        "assert seen.get('reconciled') == 'cus_1', seen\n"
+        # A missing intent id never reaches Stripe.
+        "seen.clear()\n"
+        "r = c.post('/billing/change-plan/confirm', json={})\n"
+        "assert r.status_code == 400, r.status_code\n"
+        "assert seen == {}, seen\n"
+        # An unconfirmed or non-matching intent must not switch the plan.
+        "def boom(cid, sid):\n"
+        "    raise ValueError('card has not been confirmed yet')\n"
+        "w._billing.change_plan_with_card = boom\n"
+        "r = c.post('/billing/change-plan/confirm', json={'setup_intent_id':'seti_x'})\n"
+        "assert r.status_code == 400, r.status_code\n"
+        "assert 'reconciled' not in seen, seen\n"
         "print('OK')\n",
     )
     assert proc.returncode == 0, proc.stderr + proc.stdout
@@ -1237,7 +1275,7 @@ def test_cancel_and_resume_routes_reconcile():
         _BILLING_ENV,
         "import frontends.web_app as w\n"
         "c = w.app.test_client()\n"
-        "c.post('/signup', data={'username':'owner','password':'Sufficiently-long-pw-1','password2':'Sufficiently-long-pw-1'})\n"
+        "c.post('/signup', data={'username':'owner','password':'Sufficiently-long-pw-1','password2':'Sufficiently-long-pw-1','accept_terms':'1'})\n"
         "uid = w._auth_backend.lookup_by_username('owner').id\n"
         "w._auth_backend.set_stripe_customer(uid, 'cus_1')\n"
         "seen = {}\n"
@@ -1262,7 +1300,7 @@ def test_update_card_confirm_rejects_unconfirmed():
         _BILLING_ENV,
         "import frontends.web_app as w\n"
         "c = w.app.test_client()\n"
-        "c.post('/signup', data={'username':'owner','password':'Sufficiently-long-pw-1','password2':'Sufficiently-long-pw-1'})\n"
+        "c.post('/signup', data={'username':'owner','password':'Sufficiently-long-pw-1','password2':'Sufficiently-long-pw-1','accept_terms':'1'})\n"
         "uid = w._auth_backend.lookup_by_username('owner').id\n"
         "w._auth_backend.set_stripe_customer(uid, 'cus_1')\n"
         "def boom(cid, si):\n"

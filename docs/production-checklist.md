@@ -162,6 +162,40 @@ silently disables every email flow, and because the login second factor
 fails *closed*, that turns into users being refused at login (HTTP 502),
 not a soft degradation.
 
+## 11. Terms of Service and Privacy Policy — **BLOCKING**
+
+Signup requires the user to tick a box agreeing to the Terms and Privacy
+Policy. The plumbing is done; **the documents themselves are placeholders and
+must be replaced before you open signups.**
+
+- The text lives in `resources/legal/terms.html` and
+  `resources/legal/privacy.html` (bodies only — `resources/style/legal.html`
+  supplies the page shell). They are served at `/terms` and `/privacy`, public
+  and unauthenticated, because the signup form links to them.
+- Both currently open with a **"Draft — not yet in force"** banner and are
+  peppered with `[BRACKETED]` blanks (entity name, jurisdiction, contact
+  addresses, retention periods, sub-processors). They have **not** been
+  reviewed by a lawyer and are not binding.
+- The privacy draft asserts things about how the code behaves — encryption at
+  rest, the 30-day deletion window, which third parties see your data. Check
+  each against *your* deployment before publishing it.
+- `AIME_TERMS_VERSION` (default: the date in `aime.config.TERMS_VERSION`)
+  records *which* revision each account agreed to, stamped onto
+  `users.terms_accepted_at` / `users.terms_version` at signup. **Bump it
+  whenever the documents change materially** — otherwise old acceptances read
+  as agreement to text those users never saw. Keep it in step with the
+  "Version" line inside the documents.
+- Accounts created before this feature have both columns NULL: we record only
+  consent actually witnessed rather than backfilling one nobody gave. If you
+  need existing users on the new terms, prompt them — the columns tell you who
+  is outstanding.
+
+```bash
+# No draft banner and no unfilled blanks should survive to launch
+curl -s https://your-domain/terms   | grep -c 'draft-banner\|class="blank"'   # expect 0
+curl -s https://your-domain/privacy | grep -c 'draft-banner\|class="blank"'   # expect 0
+```
+
 ## Quick verification before launch
 
 ```bash
@@ -178,4 +212,24 @@ curl -sI https://your-domain/login | grep -i 'set-cookie'
 # 4. Logout requires POST
 curl -sX GET https://your-domain/logout    # expect 405
 curl -sX POST https://your-domain/logout   # expect 302 → /login
+
+# 5. Signup refuses consent-less posts (the checkbox is not the real gate)
+curl -sX POST https://your-domain/signup \
+  -d 'username=probe&password=Sufficiently-long-pw-1&password2=Sufficiently-long-pw-1'
+# expect 400 and no account created
+
+# 6. Fonts are served by us, not Google (the CSP would block a remote load,
+#    and the page would fall back to system faces without telling anyone)
+curl -s https://your-domain/login | grep -c 'fonts.googleapis.com'   # expect 0
+curl -sI https://your-domain/fonts/fraunces-latin.woff2 | head -1    # expect 200
 ```
+
+### A note on webfonts
+
+Fraunces and Hanken Grotesk are **self-hosted** in `resources/style/fonts/`
+and served from `/fonts/`. This is deliberate, not incidental: the CSP allows
+neither `fonts.googleapis.com` (`style-src`) nor `fonts.gstatic.com`
+(`font-src`), so a Google Fonts `<link>` fails *silently* — the page renders in
+Georgia / system-ui and nothing logs an error. It also means no third-party
+request, and no visitor IP handed to Google, on the pre-login pages. If you add
+a page, link `/fonts/fonts.css`; `tests/test_fonts.py` will fail if you don't.

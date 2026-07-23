@@ -365,6 +365,55 @@ def update_payment_method(customer_id: str, setup_intent_id: str) -> None:
         stripe.Subscription.modify(_get(sub, "id"), default_payment_method=pm)
 
 
+def create_plan_change_intent(*, customer_id: str, tier: str) -> dict:
+    """SetupIntent to collect the card that will carry a *plan switch* (Payment
+    Element). Same primitive as ``create_setup_intent`` — the tier rides in
+    metadata so the confirm step reads it back server-side — but for a customer
+    who already has a live subscription. Returns
+    ``{client_secret, setup_intent_id}``.
+
+    Switching plans deliberately re-collects the card rather than silently
+    reusing the one on file: a plan change moves real money, so it gets the same
+    weight as signing up. The card confirmed here also becomes the new default
+    (see ``change_plan_with_card``), folding "update card" into the switch."""
+    init_stripe()
+    intent = stripe.SetupIntent.create(
+        customer=customer_id,
+        usage="off_session",
+        automatic_payment_methods={"enabled": True},
+        metadata={"aime_tier": tier},
+    )
+    return {
+        "client_secret": _get(intent, "client_secret"),
+        "setup_intent_id": _get(intent, "id"),
+    }
+
+
+def change_plan_with_card(customer_id: str, setup_intent_id: str) -> str:
+    """Finish a card-backed plan switch: make the just-confirmed card the default
+    (customer + subscription) and move the subscription onto the tier recorded in
+    the SetupIntent's metadata. Returns that tier.
+
+    The tier comes from Stripe's copy of the intent, never the request body — the
+    same trust boundary as the subscribe flow. ``saved_payment_method`` raises
+    ValueError if the intent isn't ours or hasn't succeeded; ``change_plan``
+    raises it if there's no live subscription or no Price for the tier. The card
+    is set first so a plan change can never land on a stale card."""
+    init_stripe()
+    pm, tier = saved_payment_method(setup_intent_id, customer_id)
+    if tier not in config.USAGE_TIERS:
+        raise ValueError(f"setup intent carries no known tier: {tier!r}")
+    stripe.Customer.modify(
+        customer_id, invoice_settings={"default_payment_method": pm},
+    )
+    sub = _current_live_subscription(customer_id)
+    if sub is None:
+        raise ValueError("no live subscription to change")
+    stripe.Subscription.modify(_get(sub, "id"), default_payment_method=pm)
+    change_plan(customer_id, tier)
+    return tier
+
+
 def change_plan(customer_id: str, tier: str) -> None:
     """Switch the customer's live subscription to the Price for ``tier``,
     prorating the difference (``create_prorations`` — the standard fair behavior:

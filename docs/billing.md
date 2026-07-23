@@ -57,7 +57,8 @@ signup (billing mode)            account created, api_access=0
                                                                    ▼
                                           POST /billing/webhook (signature-verified)
                                                    └─ reconcile: status→api_access, price→tier
-   Switch plan ──► POST /billing/change-plan ──► Subscription.modify (price, prorated)
+   Switch plan ──► POST /billing/change-plan[/confirm] ──► SetupIntent → default PM
+                                                          + Subscription.modify (prorated)
    Update card ──► POST /billing/update-card[/confirm] ──► SetupIntent → default PM
    Cancel / resume ─► POST /billing/{cancel,resume} ──► cancel_at_period_end on/off
         (all four reconcile immediately off a live read; the webhook re-confirms)
@@ -280,11 +281,20 @@ whole backdrop to re-blur on the main thread — which visibly stuttered typing 
 the card field.
 
 - **A paying user** changes their own plan **inline** in the Billing tab
-  ("Change plan"), which `POST`s `/billing/change-plan`. The route calls
+  ("Change plan"), in **two steps like subscribe** — pick the plan, then confirm
+  a card. This is deliberate: a plan switch moves real money, so it gets the
+  same weight as signing up rather than a bare button, and all three
+  money-moving actions (subscribe, change plan, update card) share one shape.
+  Step 1 (`/billing/change-plan`) only mints a SetupIntent with the chosen tier
+  in its metadata — nothing moves yet. Step 2 (`/billing/change-plan/confirm`)
+  calls `billing.change_plan_with_card`, which reads the tier back **off
+  Stripe's copy of the intent** (never the request body), makes the confirmed
+  card the default on both the customer and the subscription — so the switch
+  doubles as an update-card and can never land on a stale card — and then calls
   `billing.change_plan` (`Subscription.modify` swapping the item's Price,
   `proration_behavior="create_prorations"` — Stripe handles the proration; during
-  a trial nothing is charged) and then reconciles immediately so the new tier
-  shows at once. The change also fires `customer.subscription.updated`, which the
+  a trial nothing is charged). The route then reconciles immediately so the new
+  tier shows at once. The change also fires `customer.subscription.updated`, which the
   webhook reconciles the same way — new Price → new tier — so the inline path and
   the webhook can't disagree. (A Portal-side switch via "More options" works
   identically.) The new tier is always read off the live Price server-side, never
@@ -402,7 +412,8 @@ of record. Plan/payment changes happen in Stripe or the user's own portal.
   `set_trial_used_by_username` / `mark_all_trial_used`.
 - `src/frontends/web_app.py` — `_billing_armed()`, the fail-closed startup
   check, the `/billing/{subscribe,subscribe/confirm,update-card,
-  update-card/confirm,change-plan,cancel,resume,portal,summary,webhook}` routes
+  update-card/confirm,change-plan,change-plan/confirm,cancel,resume,portal,
+  summary,webhook}` routes
   (`subscribe/confirm` enforces one-subscription / one-trial *and* honors
   `trial_used`; the inline-manage routes reconcile immediately via
   `_billing_reconcile_quiet`; the webhook 500s on unexpected errors so Stripe
@@ -412,7 +423,9 @@ of record. Plan/payment changes happen in Stripe or the user's own portal.
 - `src/aime/billing.py` helpers — `create_setup_intent` /
   `saved_payment_method` / `create_subscription` (the two-step inline subscribe),
   `create_card_update_intent` / `update_payment_method` (inline card swap),
-  `change_plan` (inline prorated tier switch), `subscription_state` (the
+  `create_plan_change_intent` / `change_plan_with_card` (the two-step
+  card-backed plan switch) over `change_plan` (the bare prorated tier swap,
+  also used by the webhook-agnostic paths), `subscription_state` (the
   subscribe guards), `cancel_subscriptions` / `resume_subscriptions` (inline
   cancel/resume *and* account delete/recover), `_current_live_subscription`.
 - `resources/style/web_chat.html` — the Billing settings tab (incl. the inline
