@@ -222,7 +222,11 @@
        the page so iOS can't scroll the composer out from under the keyboard
        when an input focuses. */
     html { overflow: hidden; }
-    body.mobile { height: var(--app-h, 100%); overflow: hidden; }
+    /* Fixed to the layout viewport (not in flow) so iOS can't scroll the page
+       under the keyboard; the controller sizes it to the visual viewport and
+       translates it to track the visual viewport's offset. */
+    body.mobile { position: fixed; top: 0; left: 0; right: 0;
+                  height: var(--app-h, 100%); overflow: hidden; }
     body { font-family: var(--font-body);
            background: var(--bg); color: var(--text); margin: 0;
            display: flex; flex-direction: column;
@@ -3848,12 +3852,20 @@ function syncViewport() {
   if (!vv) return;
   if (mobileMQ.matches) {
     document.documentElement.style.setProperty("--app-h", vv.height + "px");
+    // iOS anchors `position: fixed` to the *layout* viewport, so when it offsets
+    // the visual viewport (scrolling the focused input into view) our fixed app
+    // drifts up and the composer floats above the keyboard. Translate down by
+    // that offset to re-glue the app to the visible region — the composer then
+    // lands exactly on the keyboard rather than above it.
+    document.body.style.transform =
+      vv.offsetTop ? "translateY(" + vv.offsetTop + "px)" : "";
     if (chat.state.following) {
       log.scrollTo({ top: log.scrollHeight, behavior: "instant" });
       updateScrollBtn();
     }
   } else {
     document.documentElement.style.removeProperty("--app-h");
+    document.body.style.transform = "";
   }
 }
 if (vv) {
