@@ -1315,6 +1315,10 @@ _FONTS_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "resources", "style", "fonts",
 )
+_STYLE_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "resources", "style",
+)
 _RESET_PAGE_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "resources", "style", "reset_password.html",
@@ -1766,6 +1770,18 @@ def font_asset(filename):
     return send_from_directory(
         _FONTS_DIR, filename,
         max_age=31536000,
+    )
+
+
+@app.route("/favicon.svg", methods=["GET"])
+def favicon():
+    """The browser-tab icon (the pastel-rainbow bar-chart mark). Public and
+    unauthenticated — the browser fetches it for the login page too, before a
+    session exists. Cached a day; short enough that a refreshed mark shows up
+    without a hard bust."""
+    return send_from_directory(
+        _STYLE_DIR, "favicon.svg",
+        mimetype="image/svg+xml", max_age=86400,
     )
 
 
