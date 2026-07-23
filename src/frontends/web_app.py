@@ -923,6 +923,14 @@ class UserContext:
         with self._history_lock:
             return self._history_seq
 
+    def backlog_slice(self, before_seq: int, limit: int) -> dict:
+        """A page of renderable history events older than `before_seq`, for the
+        client's scroll-back once it has consumed the inline replay tail. Read
+        under the history lock so it's consistent with concurrent broadcasts."""
+        with self._history_lock:
+            history = list(self._history)
+        return _backlog_slice(history, before_seq, limit)
+
     def reconcile_history_with_durable(self) -> None:
         """Make the durable message list the authority for the replay cache.
 
@@ -3845,7 +3853,16 @@ def stream():
 
     def gen():
         try:
-            for payload in snapshot:
+            # Replay only the trailing window inline so a (re)connect rebuilds the
+            # visible transcript cheaply; older events of the same thread page in
+            # on scroll-back via /backlog. `oldest_seq` is the cursor the client
+            # pages older than; `has_backlog` says whether anything older than the
+            # tail exists in memory to fetch.
+            tail = (snapshot[-REPLAY_TAIL_EVENTS:]
+                    if len(snapshot) > REPLAY_TAIL_EVENTS else snapshot)
+            has_backlog = len(snapshot) > len(tail)
+            oldest_seq = tail[0].get("_seq", head_seq) if tail else head_seq
+            for payload in tail:
                 # Everything in the snapshot is history relative to *this*
                 # connection, even live events from earlier in the session. Force
                 # from_replay so a reconnect (phone wake, network change) renders
@@ -3869,6 +3886,8 @@ def stream():
                     "kind": "history_done",
                     "busy": not ctx.controller.is_idle,
                     "head_seq": head_seq,
+                    "oldest_seq": oldest_seq,
+                    "has_backlog": has_backlog,
                 })
                 + "\n\n"
             )
@@ -3975,6 +3994,49 @@ def _session_render_events(messages: list[dict]) -> list[dict]:
     return out
 
 
+# How many trailing history events a fresh /stream connection replays inline. The
+# rest of the (potentially long) in-memory thread pages in on scroll-back via
+# /backlog, so every (re)connect rebuilds the visible transcript in bounded
+# O(tail) work instead of re-rendering the whole day. See gen() and the client's
+# loadBacklog. The window is generous enough to fill a tall viewport on its own.
+REPLAY_TAIL_EVENTS = 40
+
+
+# Event kinds that carry a *self-contained* rendered bubble the scroll-back view
+# can prepend on its own — no streaming/turn state to stitch. Mirrors what the
+# client's buildHistoryNode handles. Deliberately excludes the streaming pair
+# (`assistant_text` / `assistant_html_partial`, already folded into a single
+# `assistant_html` in history), transient chrome (notice, error, turn_routing,
+# thinking), and turn/link control events — matching the quiet read-back the disk
+# path (`_session_render_events`) produces.
+_BACKLOG_RENDER_KINDS = frozenset({
+    "user_message_shown", "assistant_html", "graphic", "proactive_message",
+    "tool_call", "session_divider",
+})
+
+
+def _normalize_backlog_events(events):
+    """Keep only the self-contained render events the scroll-back prepend path
+    understands. A completed assistant turn already sits in history as one
+    rendered `assistant_html`, so the streaming `assistant_text`/partials (which
+    the live path stitches into a single bubble via turn state) are dropped —
+    keeping every returned event independently renderable."""
+    return [e for e in events if e.get("kind") in _BACKLOG_RENDER_KINDS]
+
+
+def _backlog_slice(history, before_seq, limit):
+    """Pure pagination for /backlog: the page of renderable history events
+    immediately *older* than `before_seq` (by `_seq`), oldest-first, plus whether
+    still-older renderable events remain. `history` is the oldest-first in-memory
+    replay cache; each event carries a monotone `_seq`."""
+    older = _normalize_backlog_events(
+        e for e in history if e.get("_seq", 0) < before_seq
+    )
+    has_more = len(older) > limit
+    page = older[-limit:] if limit > 0 else []
+    return {"events": page, "has_more": has_more}
+
+
 def _build_history_page(infos, before, limit, load_messages):
     """Pure pagination + assembly for /history, split out so it's testable
     without Flask. ``infos`` is the newest-first SessionInfo list; ``before`` is
@@ -4033,6 +4095,25 @@ def history():
         lambda sid: read_session_messages(conv_dir, dek, sid),
     )
     return jsonify(page)
+
+
+@app.route("/backlog")
+@login_required
+def backlog():
+    """Older in-memory history events for scroll-back, paged by `_seq`. The live
+    /stream replays only a trailing window (REPLAY_TAIL_EVENTS); this serves the
+    rest of the current in-memory thread as the user scrolls up, oldest-first, so
+    a rebuild stays cheap without losing scroll-back reach within the day."""
+    try:
+        before_seq = int(request.args.get("before_seq") or 0)
+    except (TypeError, ValueError):
+        before_seq = 0
+    try:
+        limit = int(request.args.get("limit") or REPLAY_TAIL_EVENTS)
+    except (TypeError, ValueError):
+        limit = REPLAY_TAIL_EVENTS
+    limit = max(1, min(limit, 100))
+    return jsonify(_context_for(g.user_id).backlog_slice(before_seq, limit))
 
 
 def _group_days(infos, day_of):

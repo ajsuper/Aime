@@ -2483,7 +2483,11 @@
          padding clears the home indicator / rounded display corners via
          the safe-area inset (viewport-fit=cover exposes it). */
       #log { padding: 0.75rem 0.6rem 0.5rem; }
-      form { padding: 0.6rem 0.5rem calc(0.6rem + env(safe-area-inset-bottom) * 0.5);
+      /* Tight top padding so the composer pill hugs the chat above it; the
+         generous bottom padding is the intentional device inset (home indicator
+         / rounded corners via safe-area). Keeping the top slack equal to the
+         bottom left an unwanted gap between the pill and the transcript. */
+      form { padding: 0.2rem 0.5rem calc(0.6rem + env(safe-area-inset-bottom) * 0.5);
              gap: 0.4rem; }
       .composer-row { gap: 0.4rem; }
       .msg.user { max-width: 88%; }
@@ -4716,13 +4720,21 @@ function appendNotice(text, severity) {
 // from /history — prepended above, with the scroll position preserved.
 
 let historyHasMore = true;     // are there older sessions still to page in?
-let historyLoading = false;    // a /history fetch is in flight
+let historyLoading = false;    // a /history OR /backlog fetch is in flight
 let historyRow = null;         // the transient "loading earlier…" row at the top
 let viewingDay = null;         // a past day being read read-only (null = live Today)
+// In-memory replay backlog: /stream replays only the trailing REPLAY_TAIL_EVENTS,
+// so the rest of the current thread pages in from /backlog on scroll-up before we
+// ever fall back to disk sessions. `backlogOldestSeq` is the `_seq` we page older
+// than (seeded from history_done); `backlogHasMore` is whether any remain.
+let backlogOldestSeq = null;
+let backlogHasMore = false;
 
 function resetHistoryState() {
   historyHasMore = true;
   historyLoading = false;
+  backlogOldestSeq = null;
+  backlogHasMore = false;
   if (historyRow) { historyRow.remove(); historyRow = null; }
 }
 
@@ -4799,6 +4811,22 @@ function buildHistoryNode(ev) {
     resolveGraphicTags(node._content);
     return node;
   }
+  if (ev.kind === "proactive_message") {
+    // A past out-of-band message, pre-rendered to HTML server-side. Quiet
+    // read-back: an ordinary (dim, already-seen) Aime bubble, never flagged New.
+    const node = makeMessageNode("aime", "aime", "");
+    node.classList.add("proactive", "seen");
+    node._content.innerHTML = ev.text || "";
+    resolveGraphicTags(node._content);
+    return node;
+  }
+  if (ev.kind === "graphic") {
+    // Detached card; hydratePendingGraphics renders it once it's in the DOM.
+    return buildGraphicCard(ev.payload || {});
+  }
+  if (ev.kind === "session_divider") {
+    return buildSessionDivider(ev.payload || {});
+  }
   if (ev.kind === "tool_call" && verbosity === "verbose") {
     const node = document.createElement("div");
     node.className = "msg notice info";
@@ -4828,16 +4856,68 @@ function buildHistoryFragment(sessions) {
 // current conversation leaves the user with no way to trigger scroll-back at all.
 // Self-limiting: it stops as soon as the content overflows or history runs out.
 function maybeFillViewport() {
-  if (historyHasMore && !historyLoading && !chat.replaying() && !viewingDay &&
+  if ((historyHasMore || backlogHasMore) && !historyLoading &&
+      !chat.replaying() && !viewingDay &&
       log.scrollHeight - log.clientHeight < 40) {
     loadOlderHistory();
+  }
+}
+
+// Page in the next slice of the in-memory replay backlog (older events of the
+// current thread that weren't in the inline replay tail). Prepended above with
+// the reading position held, mirroring loadOlderHistory — but message-granular
+// (keyed on `_seq`) rather than session-granular, since a single live session
+// can be far longer than the replay tail.
+async function loadBacklog() {
+  if (historyLoading || !backlogHasMore || backlogOldestSeq == null ||
+      chat.replaying() || viewingDay) return;
+  historyLoading = true;
+  const holdPosition = !chat.state.following;
+  if (holdPosition) {
+    historyRow = document.createElement("div");
+    historyRow.className = "history-loading";
+    historyRow.textContent = "loading earlier…";
+    logInner.insertBefore(historyRow, logInner.firstChild);
+  }
+  try {
+    const r = await fetch(
+      "/backlog?before_seq=" + encodeURIComponent(backlogOldestSeq) + "&limit=40");
+    const data = await r.json();
+    if (historyRow) { historyRow.remove(); historyRow = null; }
+    const events = data.events || [];
+    if (!events.length) { backlogHasMore = false; return; }
+    // The oldest event returned becomes the next page's cursor.
+    const first = events[0];
+    if (typeof first._seq === "number") backlogOldestSeq = first._seq;
+    backlogHasMore = data.has_more === true;
+    const prevHeight = log.scrollHeight;
+    const prevTop = log.scrollTop;
+    const frag = document.createDocumentFragment();
+    events.forEach(ev => { const node = buildHistoryNode(ev); if (node) frag.appendChild(node); });
+    logInner.insertBefore(frag, logInner.firstChild);
+    hydratePendingGraphics(logInner);   // render any historical graphics now in-DOM
+    if (holdPosition) {
+      log.scrollTo({
+        top: prevTop + (log.scrollHeight - prevHeight), behavior: "instant",
+      });
+    }
+  } catch (e) {
+    if (historyRow) { historyRow.remove(); historyRow = null; }
+    // Leave backlogHasMore as-is so a later scroll retries.
+  } finally {
+    historyLoading = false;
+    requestAnimationFrame(maybeFillViewport);
   }
 }
 
 async function loadOlderHistory() {
   // Scroll-back is a Today affordance only. A past day is a fixed, read-only
   // snapshot — never page other days into it.
-  if (historyLoading || !historyHasMore || chat.replaying() || viewingDay) return;
+  if (historyLoading || chat.replaying() || viewingDay) return;
+  // First exhaust the in-memory replay backlog (the rest of the current thread);
+  // only once it's drained do we fall back to paging older sessions from disk.
+  if (backlogHasMore) { await loadBacklog(); return; }
+  if (!historyHasMore) return;
   // Page from the oldest session currently shown (its divider is the topmost).
   const firstDivider = logInner.querySelector(".session-divider");
   const cursor = firstDivider ? (firstDivider.dataset.sessionId || "") : "";
@@ -5527,7 +5607,11 @@ function makeGraphicDownloadButton(body, baseName) {
   return btn;
 }
 
-function renderGraphic(payload) {
+// Build a graphic card *detached* (no append, no render kicked off). Renderers
+// like mermaid/vega need the node in the DOM to size themselves, so building and
+// rendering are split: callers append the card, then hydrate it. Refs needed for
+// hydration are stashed on the node.
+function buildGraphicCard(payload) {
   const card = document.createElement("div");
   card.className = "msg graphic";
   const inner = document.createElement("div");
@@ -5559,15 +5643,44 @@ function renderGraphic(payload) {
   }
   inner.appendChild(idBar);
   card.appendChild(inner);
-  logInner.appendChild(card);
-  scrollToBottom();
+  card._graphicBody = body;
+  card._graphicIdBar = idBar;
+  card._graphicPayload = payload;
+  card._graphicDisplay = display;
+  card.dataset.graphicPending = "1";   // hydrated after it lands in the DOM
+  return card;
+}
+
+// Render the graphic into an already-inserted card (idempotent: clears the
+// pending flag so it renders once). `onRender` fires after the render settles.
+function hydrateGraphicCard(card, onRender) {
+  if (!card || !card.dataset.graphicPending) return;
+  delete card.dataset.graphicPending;
+  const body = card._graphicBody;
+  const idBar = card._graphicIdBar;
+  const payload = card._graphicPayload || {};
+  const display = card._graphicDisplay || "";
   renderGraphicInto(body, payload.format, payload.source, () => {
-    scrollToBottom();
+    if (onRender) onRender();
     if (!idBar.querySelector(".id-dl-btn")) {
       idBar.appendChild(makeGraphicDownloadButton(
         body, display ? "graphic-" + display.replace(/:/g, "-") : "graphic"));
     }
   });
+}
+
+// Hydrate every not-yet-rendered graphic card under `root` (used after a
+// scroll-back backlog page prepends historical graphics).
+function hydratePendingGraphics(root) {
+  (root || logInner).querySelectorAll('.msg.graphic[data-graphic-pending]')
+    .forEach(card => hydrateGraphicCard(card));
+}
+
+function renderGraphic(payload) {
+  const card = buildGraphicCard(payload);
+  logInner.appendChild(card);
+  scrollToBottom();
+  hydrateGraphicCard(card, () => scrollToBottom());
 }
 
 // In-flight/lookup cache for `[graphic-N]` tag resolution, so the same id placed
@@ -6317,6 +6430,12 @@ function onStreamMessage(e) {
       // replayed covers everything up to here, so from now on a `ping` reporting
       // a higher head means we've missed a live event and should reconnect.
       if (typeof e.head_seq === "number") Link.appliedSeq = e.head_seq;
+      // Seed the in-memory backlog cursor: only the trailing window was replayed
+      // inline, so older events of this thread page in from /backlog on scroll-up
+      // (before we ever touch disk sessions). `oldest_seq` is the _seq of the
+      // oldest event just replayed; `has_backlog` whether older ones remain.
+      if (typeof e.oldest_seq === "number") backlogOldestSeq = e.oldest_seq;
+      backlogHasMore = e.has_backlog === true;
       // The snapshot (today, live) is fully rendered. Land on the latest message;
       // the ResizeObserver then holds it there through any late layout.
       // Background-fill earlier-today sessions above (out of view, since we stay
