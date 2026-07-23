@@ -3852,6 +3852,13 @@ new ResizeObserver(() => {
 // #log-inner (content growth) and so never fires on a pure viewport shrink;
 // this is what re-pins the newest message when the keyboard opens.
 const vv = window.visualViewport;
+// `chat` is defined much further down; syncViewport runs once at boot (before
+// then) and again on later viewport events (after). Guard the re-pin so the boot
+// call never dereferences `chat` in its temporal dead zone — a `const` read
+// before its declaration throws and would abort the whole boot script (and, on
+// mobile where this branch runs, leave the app blank). `&&` short-circuits, so
+// `chat` is only touched once chatReady is set true (right after chat is built).
+let chatReady = false;
 function syncViewport() {
   if (!vv) return;
   if (mobileMQ.matches) {
@@ -3863,7 +3870,7 @@ function syncViewport() {
     // lands exactly on the keyboard rather than above it.
     document.body.style.transform =
       vv.offsetTop ? "translateY(" + vv.offsetTop + "px)" : "";
-    if (chat.state.following) {
+    if (chatReady && chat.state.following) {
       log.scrollTo({ top: log.scrollHeight, behavior: "instant" });
       updateScrollBtn();
     }
@@ -4565,6 +4572,8 @@ const chat = {
   // -- scroll ----------------------------------------------------------------
   setFollowing(v) { this.state.following = v; },
 };
+// `chat` now exists — let syncViewport's re-pin read it (see the guard above).
+chatReady = true;
 
 // -- Typewriter: progressively reveal characters of the server-rendered HTML.
 // One stream-in-flight at a time, since the controller serializes turns.
