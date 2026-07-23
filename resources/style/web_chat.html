@@ -6145,6 +6145,25 @@ const Link = {
   // half-closing proxy). This is that threshold.
   STALE_MS: 50000,
 
+  // ── Reconnect coordinator ───────────────────────────────────────────────
+  // Every "we need a fresh stream" signal (watchdog staleness, tab wake, a
+  // ping-head gap, a `_seq` gap, a server `resync`, a failed conversation
+  // switch) routes through scheduleReconnect rather than calling connect()
+  // directly. Two problems that fixes, both acute on a flaky phone connection:
+  //  • Stampede — a burst of triggers used to each tear down and rebuild the
+  //    stream (and replay the snapshot). One pending timer now coalesces a burst
+  //    into a single reconnect.
+  //  • Racing the browser — EventSource auto-reconnects on its own after a drop;
+  //    left alone, that runs alongside our reconnect. onError now closes the
+  //    socket (stopping the browser's retry) so the coordinator is the sole
+  //    owner, and backs off on repeated failures instead of hammering.
+  reconnectTimer: null,   // pending coalesced reconnect (null = none scheduled)
+  reconnectBackoff: 0,    // consecutive failed connects; drives the retry delay
+  RECONNECT_DEBOUNCE_MS: 300,   // coalesce window when the link is healthy
+  RECONNECT_BASE_MS: 500,       // first backoff step after a failure
+  RECONNECT_MAX_MS: 8000,       // backoff ceiling
+  BACKOFF_CAP: 6,               // cap the step count so the shift can't overflow
+
   start() {
     this.localDay = this.dayKey();
     this.connect();
@@ -6186,6 +6205,12 @@ const Link = {
   // (e.g. a conversation switch whose `session_restart` was missed on a zombie
   // stream).
   connect() {
+    // We're (re)connecting now — drop any pending scheduled attempt so it can't
+    // fire a second, redundant reconnect on top of this one.
+    if (this.reconnectTimer != null) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     if (this.es) { try { this.es.close(); } catch (_) {} }
     this.es = new EventSource("/stream");
     this.es.onopen = () => this.onOpen();
@@ -6193,9 +6218,23 @@ const Link = {
     this.es.onerror = () => this.onError();
     this.lastMsgAt = Date.now();
   },
-  reconnect() { this.connect(); },
+  // Coalesce a reconnect request. A burst of triggers within the window collapses
+  // to one connect; while the link is healthy that window is a short debounce,
+  // and after failures it grows (capped) so a dead network isn't hammered.
+  scheduleReconnect(reason) {
+    if (this.reconnectTimer != null) return;   // already pending — coalesce
+    const delay = this.reconnectBackoff === 0
+      ? this.RECONNECT_DEBOUNCE_MS
+      : Math.min(this.RECONNECT_MAX_MS,
+                 this.RECONNECT_BASE_MS * (1 << (this.reconnectBackoff - 1)));
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this.connect();
+    }, delay);
+  },
+  reconnect() { this.scheduleReconnect("manual"); },
   reconnectIfStale() {
-    if (Date.now() - this.lastMsgAt > this.STALE_MS) this.connect();
+    if (Date.now() - this.lastMsgAt > this.STALE_MS) this.scheduleReconnect("stale");
   },
 
   onOpen() {
@@ -6204,19 +6243,25 @@ const Link = {
     chat.linkOpen(this.connectedOnce);
     this.connectedOnce = true;
     this.lastMsgAt = Date.now();
+    this.reconnectBackoff = 0;   // a live connection resets the retry delay
     if (this.reconnectNotice) { this.reconnectNotice.remove(); this.reconnectNotice = null; }
   },
 
   onError() {
-    // Fires when the connection drops or fails to open. The browser will try to
-    // auto-reconnect on its own; we just surface a calm, deduped banner so a long
-    // outage isn't silent. A truly dead (half-open) socket that never errors is
-    // handled by the watchdog instead. State is reconciled authoritatively by the
-    // snapshot replay + history_done once a connection is re-established.
+    // Fires when the connection drops or fails to open. Take ownership: close the
+    // socket so the browser's built-in auto-reconnect can't run alongside ours,
+    // then schedule our own retry with a growing backoff so a real outage isn't
+    // hammered. A calm, deduped banner keeps a long outage from being silent; a
+    // half-open socket that never errors is caught by the watchdog instead. State
+    // is reconciled authoritatively by the snapshot replay + history_done once a
+    // connection is re-established.
+    if (this.es) { try { this.es.close(); } catch (_) {} }
     chat.linkDown();
     if (!this.reconnectNotice) {
       this.reconnectNotice = appendNotice("Connection lost — reconnecting…", "warning");
     }
+    this.reconnectBackoff = Math.min(this.reconnectBackoff + 1, this.BACKOFF_CAP);
+    this.scheduleReconnect("error");
   },
 
   onMessage(ev) {
@@ -6231,7 +6276,7 @@ const Link = {
       // expected rather than drift.
       if (!viewingDay && typeof e.head_seq === "number"
           && e.head_seq > this.appliedSeq) {
-        this.connect();
+        this.scheduleReconnect("ping-head");
       }
       return;
     }
@@ -6249,7 +6294,7 @@ const Link = {
     // connection (before history_done seeds the head) can't false-trigger.
     if (!e.from_replay && typeof e._seq === "number"
         && this.appliedSeq && e._seq > this.appliedSeq + 1) {
-      this.connect();
+      this.scheduleReconnect("seq-gap");
       return;
     }
     // Advance the sync cursor as history events (replayed or live) arrive.
@@ -6272,7 +6317,7 @@ const Link = {
     // transcript. A quick tab-flip stays on the healthy existing stream.
     const away = this.hiddenAt ? Date.now() - this.hiddenAt : 0;
     this.hiddenAt = 0;
-    if (away > this.STALE_MS) this.connect();
+    if (away > this.STALE_MS) this.scheduleReconnect("wake");
     else this.reconnectIfStale();
     this.maybeDayRoll();   // returning to the tab in a new day rolls to Today
     refreshActivePane(true);
