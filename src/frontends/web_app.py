@@ -56,7 +56,7 @@ from rich.text import Span, Text
 # Allow `python -m frontends.web_app` from src/ to find provider_backend / aime.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from provider_backend import AnthropicMessagesBackend
+from provider_backend import AnthropicMessagesBackend, _jsonable
 
 from aime import (
     ConversationController,
@@ -589,6 +589,41 @@ def _md_to_rich(markup: str, final: bool, stash) -> str:
     return markup
 
 
+def _sse_frame(payload: dict) -> str:
+    """Encode one SSE `data:` frame. This must never raise.
+
+    Everything the user sees arrives through this function, and the events it
+    encodes carry values from a lot of places (model tool inputs, tool results,
+    error metadata, agent results, graphic payloads). A single value that
+    `json.dumps` can't handle used to raise *inside the /stream generator*,
+    which killed that connection mid-replay. The client treats a dropped stream
+    as a reconnect, and a reconnect wipes the transcript before replaying — so
+    the browser cleared the chat, replayed up to the same bad event, died
+    again, and looped: a blank chat that no amount of refreshing fixed, because
+    the offending event was sitting in the in-memory replay cache. Only a
+    process restart (which rebuilds that cache from the durable message list)
+    cleared it.
+
+    So: coerce anything exotic (`_jsonable`, the same helper the durable writer
+    uses), and if even that fails, degrade to a placeholder event rather than
+    tearing down the stream. Both fallbacks log loudly with the event kind —
+    reaching them is a bug worth naming, just not one worth blanking a chat over.
+    """
+    try:
+        return f"data: {json.dumps(payload)}\n\n"
+    except (TypeError, ValueError):
+        kind = payload.get("kind") if isinstance(payload, dict) else "?"
+        try:
+            body = json.dumps(payload, default=_jsonable)
+            app.logger.warning(
+                "sse: coerced unserializable payload (kind=%s)", kind)
+            return f"data: {body}\n\n"
+        except (TypeError, ValueError):
+            app.logger.exception(
+                "sse: dropped unencodable payload (kind=%s)", kind)
+            return f"data: {json.dumps({'kind': 'notice', 'severity': 'info'})}\n\n"
+
+
 def _render_markup_to_html(markup: str, final: bool = False) -> str:
     """Convert the model's chat output — Rich console markup with a Markdown
     layer on top — to inline-styled HTML.
@@ -633,6 +668,12 @@ def _render_markup_to_html(markup: str, final: bool = False) -> str:
     return html.strip("\n")
 
 
+# Pushed into a client's SSE queue to ask its generator to finish, releasing the
+# waitress thread it occupies. Distinguishable from any real event because it
+# isn't a dict. See UserContext.attach_client.
+_STREAM_CLOSE = object()
+
+
 def _drain_queue(q: "queue.Queue") -> None:
     """Discard everything currently buffered in a client's SSE queue. Used when
     a client has fallen so far behind that its queue overflowed: the backlog is
@@ -653,6 +694,12 @@ class UserContext:
     lifetime of the process — we don't try to evict yet because controller
     state (conversation history) is expensive to rebuild and personal use
     won't run into pressure."""
+
+    # Most concurrent /stream connections one user may hold. A person on a
+    # laptop and a phone with a couple of tabs open is well under this; the cap
+    # exists to stop zombie streams (see attach_client) from accumulating until
+    # they starve the server's thread pool.
+    MAX_CLIENT_STREAMS = 6
 
     def __init__(self, user_id: int, username: str | None = None):
         self.user_id = user_id
@@ -909,12 +956,42 @@ class UserContext:
         """Snapshot history and subscribe in one atomic step — under both
         locks together so a concurrent broadcast can't slip an event in
         between the snapshot and the subscribe (which would either lose or
-        duplicate it)."""
+        duplicate it).
+
+        Also trims this user's oldest streams past MAX_CLIENT_STREAMS. Every
+        open stream parks one waitress thread for as long as it lives, and a
+        stream only *learns* its peer is gone when a write to the socket fails
+        — which behind a buffering proxy can take a very long time, or never.
+        Phone sleep/wake, network changes and tab churn each leave one of those
+        behind, so they accumulate. Once they outnumber the thread pool nothing
+        gets served at all: new /stream requests queue instead of running, so
+        every device shows an empty chat and sends hang, until enough zombies
+        drain and the whole backlog suddenly comes back at once.
+
+        Evicting the oldest is safe: a genuinely live client treats the close
+        as a dropped connection and reconnects (rebuilding from the snapshot),
+        and a zombie has nobody left to notice.
+        """
         q: queue.Queue = queue.Queue(maxsize=8192)
+        evicted: list[queue.Queue] = []
         with self._history_lock, self._subscribers_lock:
             snapshot = list(self._history)
             head_seq = self._history_seq
             self._client_queues.append(q)
+            while len(self._client_queues) > self.MAX_CLIENT_STREAMS:
+                evicted.append(self._client_queues.pop(0))
+        for dead in evicted:
+            # Sentinel rather than an event: the generator returns on it, so the
+            # thread is released now instead of at its next failed write.
+            _drain_queue(dead)
+            try:
+                dead.put_nowait(_STREAM_CLOSE)
+            except queue.Full:
+                pass
+        if evicted:
+            app.logger.info(
+                "stream: evicted %d stale stream(s) for user %s (cap %d)",
+                len(evicted), self.user_id, self.MAX_CLIENT_STREAMS)
         return q, snapshot, head_seq
 
     def current_seq(self) -> int:
@@ -949,7 +1026,27 @@ class UserContext:
         refreshing `_history_source_fp` as a side effect."""
         fp_now = self._backend.history_fingerprint()
         with self._history_lock:
-            if self._history_source_fp == fp_now:
+            prev = self._history_source_fp
+            if prev == fp_now:
+                return
+            # A *shrinking* durable list is never a dropped event — it's the
+            # backend legitimately moving on, and resyncing off it destroys
+            # transcript the user can still see. Two ways it happens, both
+            # routine and both previously fatal to the view:
+            #
+            #   * an idle/day rollover swapped in a fresh, empty session while
+            #     `_history` still holds the day's earlier messages. Replaying
+            #     that session rebuilds the view from nothing — the chat goes
+            #     blank, and because the resync re-anchors the fingerprint the
+            #     loss sticks across every reload until the process restarts.
+            #   * a background compaction folded the oldest messages into a
+            #     summary (only fires on long conversations, so effectively
+            #     production-only). Replaying that drops everything folded.
+            #
+            # Re-anchor to the new source and leave the view alone; the replay
+            # cache is still the better record of what the user has seen.
+            if fp_now[0] == 0 or (prev is not None and fp_now[0] < prev[0]):
+                self._history_source_fp = fp_now
                 return
         self.controller.resync_view()
 
@@ -3891,7 +3988,7 @@ def stream():
                 # reconnect, so these can't duplicate what's already on screen.
                 if not payload.get("from_replay"):
                     payload = {**payload, "from_replay": True}
-                yield f"data: {json.dumps(payload)}\n\n"
+                yield _sse_frame(payload)
             # Sentinel: from here on, events are live (typewriter eligible).
             # `busy` carries the real turn state so a client that just
             # replayed history (where turn_end/ready don't appear) knows
@@ -3900,17 +3997,13 @@ def stream():
             # replayed. The client adopts it as its applied position, then
             # advances it with each live event's `_seq`; a later `ping` reporting
             # a higher head means events were missed → reconnect and reconcile.
-            yield (
-                "data: "
-                + json.dumps({
-                    "kind": "history_done",
-                    "busy": not ctx.controller.is_idle,
-                    "head_seq": head_seq,
-                    "oldest_seq": oldest_seq,
-                    "has_backlog": has_backlog,
-                })
-                + "\n\n"
-            )
+            yield _sse_frame({
+                "kind": "history_done",
+                "busy": not ctx.controller.is_idle,
+                "head_seq": head_seq,
+                "oldest_seq": oldest_seq,
+                "has_backlog": has_backlog,
+            })
             while True:
                 try:
                     payload = q.get(timeout=20)
@@ -3938,13 +4031,36 @@ def stream():
                     # detect the drift (its applied cursor lags head) and
                     # reconnect, instead of only self-healing when the queue
                     # overflows or the socket is declared dead.
-                    yield f"data: {json.dumps({'kind': 'ping', 'head_seq': ctx.current_seq()})}\n\n"
+                    yield _sse_frame(
+                        {"kind": "ping", "head_seq": ctx.current_seq()})
                     continue
-                yield f"data: {json.dumps(payload)}\n\n"
+                if payload is _STREAM_CLOSE:
+                    # Evicted as a stale stream (see attach_client). End the
+                    # response so this worker thread goes back to the pool; a
+                    # client that's still really there just reconnects.
+                    return
+                yield _sse_frame(payload)
         finally:
             ctx.detach_client(q)
 
-    return Response(gen(), mimetype="text/event-stream")
+    return Response(gen(), mimetype="text/event-stream", headers={
+        # A buffering reverse proxy is fatal to SSE and the failure looks
+        # nothing like a proxy problem: nginx buffers upstream responses by
+        # default, so events pile up in the proxy instead of reaching the
+        # browser. The tab sits there with an "open" EventSource that has
+        # simply never been told anything — the transcript never renders, a
+        # sent message never gets its echo, and every device looks equally
+        # broken because they are all behind the same proxy. Then the buffer
+        # flushes and the whole backlog lands at once.
+        #
+        # `X-Accel-Buffering: no` turns nginx's buffering off for this response
+        # (Caddy doesn't buffer, and ignores it harmlessly); `no-transform`
+        # tells any intermediary not to compress it, which is the other common
+        # way a proxy ends up holding bytes back.
+        "Cache-Control": "no-cache, no-store, no-transform",
+        "X-Accel-Buffering": "no",
+        "Connection": "keep-alive",
+    })
 
 
 @app.route("/sessions")
@@ -5968,14 +6084,23 @@ def _serve_production(host: str, port: int) -> None:
     reverse proxy (the documented docker-compose setup); the AIME_HTTPS direct
     path is handled separately below.
 
-    Thread count matters here because /send streams its reply over a
-    long-lived SSE connection that occupies one worker thread for the whole
-    generation. The pool must comfortably exceed the expected number of
-    concurrent in-flight chats, so the default is generous and tunable via
-    AIME_THREADS. (If you ever outgrow a single process you'd move to an async
-    server, but then the scheduler/limiters need to move to shared state.)
+    Thread count matters more than it looks. Every open /stream connection
+    occupies one worker thread for its entire life — not for the length of a
+    generation, but for as long as the browser tab exists. So the pool has to
+    exceed the number of concurrently *open tabs and devices*, plus the zombie
+    connections that outlive their client (see UserContext.attach_client),
+    plus enough headroom to still serve ordinary requests. Size it by open
+    clients, never by active chats.
+
+    When the pool is exhausted every request simply queues — the page stops
+    loading, chats look empty, sends hang — and it clears itself only when
+    connections drain, which reads as an outage that "fixed itself". The
+    default is therefore deliberately generous; these threads are idle almost
+    all the time. Tunable via AIME_THREADS. (If you ever outgrow a single
+    process you'd move to an async server, but then the scheduler/limiters
+    need to move to shared state.)
     """
-    threads = int(os.environ.get("AIME_THREADS", "16"))
+    threads = int(os.environ.get("AIME_THREADS", "64"))
     from waitress import serve as _waitress_serve
     _waitress_serve(app, host=host, port=port, threads=threads, ident="Aime")
 
