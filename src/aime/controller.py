@@ -19,6 +19,7 @@ frontends are responsible for thread-marshaling if their UI toolkit needs it.
 
 import datetime
 import json
+import logging
 import os
 import threading
 import time
@@ -50,6 +51,9 @@ from .onboarding import (
     ONBOARDING_PROMPT,
 )
 from .active_events import active_events_prefix
+
+
+logger = logging.getLogger(__name__)
 
 
 # Cap on instances per commitment when auto-attaching history to a
@@ -401,7 +405,24 @@ class ConversationController:
 
     def _emit(self, event: CoreEvent) -> None:
         for sub in self._subscribers:
-            sub(event)
+            try:
+                sub(event)
+            except Exception as exc:
+                # A frontend that chokes on one event must never take the
+                # session down with it. `_emit` runs on the stream worker
+                # (mid-turn) and on the /send thread; an exception here used to
+                # propagate out and kill the worker. Because a turn is claimed
+                # busy *before* dispatch and only released on `turn_end`, a dead
+                # worker meant the controller stayed busy forever: every later
+                # message queued behind a turn that could never end, leaving the
+                # composer stuck on "Sending…" until the process restarted.
+                #
+                # Captured for the admin Errors tab rather than re-emitted —
+                # emitting from inside the failing emit path is how you get
+                # infinite recursion.
+                self._capture(exc, source="subscriber")
+                logger.exception(
+                    "subscriber failed handling %s event", event.kind)
 
     def _emit_session_divider(
         self, session_id: str | None, title: str = "", saved_at: str = "",
@@ -625,39 +646,57 @@ class ConversationController:
         client_msg_id: str = "",
     ) -> None:
         # The caller (send_user_message or the turn_end drain) has already
-        # claimed the turn busy under _state_lock, so we only need to *release*
-        # that claim if the backend submit fails — otherwise the model would
-        # never start and the composer would wedge.
-        self._last_activity = time.time()
-        attachments: list[dict] = []
-        for img in (images or []):
-            mt = img.get("media_type")
-            data = img.get("data")
-            if mt and data:
-                attachments.append({
-                    "kind": "image", "media_type": mt, "data": data,
-                })
-        self._emit(CoreEvent(
-            kind="user_message_shown", text=text, attachments=attachments,
-            client_msg_id=client_msg_id,
-        ))
-        if self._user_first_interaction:
-            bootstrap = bootstrap_special_topics(self._tools)
-            if bootstrap:
-                self._backend.set_session_context(bootstrap)
-            # On the first message of a chat, tell the model exactly what events
-            # are happening right now (best-effort; never blocks the message).
-            # Interactive chats only — background-agent prompts stay curated.
-            if not self._headless:
-                active = active_events_prefix(self._tools, self._now_local())
-                if active:
-                    hidden_prefix = (active + "\n" + hidden_prefix) if hidden_prefix else active
-            self._user_first_interaction = False
-        # The prefix carries out-of-band context (e.g. <stale>…</stale>) that
-        # the model should see but the user shouldn't — user_message_shown
-        # above used the raw text, so the chat bubble doesn't include this.
-        backend_text = (hidden_prefix + "\n" + text) if hidden_prefix else text
+        # claimed the turn busy under _state_lock, so the claim has to be
+        # *released* if we fail to get the turn started — otherwise the model
+        # never starts, no `turn_end` is ever emitted, and the controller stays
+        # busy for the life of the process: every later message queues behind a
+        # turn that can't end, and the composer sits on "Sending…" forever.
+        # Hence the whole body is guarded, not just the submit: everything
+        # between the claim and the submit (context bootstrap, tool-gateway
+        # reads) can fail too.
         try:
+            self._last_activity = time.time()
+            attachments: list[dict] = []
+            for img in (images or []):
+                mt = img.get("media_type")
+                data = img.get("data")
+                if mt and data:
+                    attachments.append({
+                        "kind": "image", "media_type": mt, "data": data,
+                    })
+            self._emit(CoreEvent(
+                kind="user_message_shown", text=text, attachments=attachments,
+                client_msg_id=client_msg_id,
+            ))
+            if self._user_first_interaction:
+                # Cleared up front so a gateway that's down costs this chat its
+                # opening context once, not a failed round trip on every message.
+                self._user_first_interaction = False
+                try:
+                    bootstrap = bootstrap_special_topics(self._tools)
+                    if bootstrap:
+                        self._backend.set_session_context(bootstrap)
+                    # On the first message of a chat, tell the model exactly what
+                    # events are happening right now. Interactive chats only —
+                    # background-agent prompts stay curated.
+                    if not self._headless:
+                        active = active_events_prefix(self._tools, self._now_local())
+                        if active:
+                            hidden_prefix = (
+                                (active + "\n" + hidden_prefix) if hidden_prefix
+                                else active
+                            )
+                except Exception as exc:
+                    # Best-effort, as documented: both of these read through the
+                    # tool gateway (an HTTP hop to the data backend), and a blip
+                    # there must cost the model some opening context — never the
+                    # user's message.
+                    self._capture(exc, source="session_bootstrap")
+                    logger.exception("session context bootstrap failed")
+            # The prefix carries out-of-band context (e.g. <stale>…</stale>) that
+            # the model should see but the user shouldn't — user_message_shown
+            # above used the raw text, so the chat bubble doesn't include this.
+            backend_text = (hidden_prefix + "\n" + text) if hidden_prefix else text
             self._backend.submit(BackendEvent(
                 kind="user_send_message", text=backend_text, images=images,
             ))
@@ -1100,7 +1139,17 @@ class ConversationController:
         `session_terminated`."""
         try:
             for event in self._backend.stream():
-                self._handle_backend_event(event)
+                try:
+                    self._handle_backend_event(event)
+                except Exception as exc:
+                    # Handling one event must never retire the worker. Without a
+                    # live worker there is nothing left to emit `turn_end`, so
+                    # the in-flight turn stays claimed and every later message
+                    # queues behind it forever — a composer wedged on "Sending…"
+                    # that only a restart clears. Report the event and keep
+                    # consuming; the turn can still end normally.
+                    self._emit_error(exc, source="controller_event",
+                                     label="event handling failed")
                 if event.kind == "session_terminated":
                     return
         except Exception as exc:

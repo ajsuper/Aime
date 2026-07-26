@@ -57,10 +57,13 @@ services:
       # deployment; set 0 only for genuinely plain-HTTP access over a
       # non-localhost address.
       AIME_SECURE_COOKIES: "${AIME_SECURE_COOKIES:-1}"
-      # Worker-thread pool for the waitress server (AIME_HTTPS=0 path). Each
-      # in-flight /send streams over one thread for the generation's lifetime,
-      # so size this above your expected concurrent chats.
-      AIME_THREADS: "${AIME_THREADS:-16}"
+      # Worker-thread pool for the waitress server (AIME_HTTPS=0 path). Every
+      # open chat tab holds one thread for as long as it stays open (the SSE
+      # stream), not just while a reply is generating — so size this by
+      # concurrent open clients, with headroom for connections that outlive
+      # their browser. Exhausting the pool stalls *every* request: pages stop
+      # loading and chats look empty until connections drain.
+      AIME_THREADS: "${AIME_THREADS:-64}"
       AIME_BIND: "0.0.0.0"
       AIME_ALLOW_SIGNUP: "${AIME_ALLOW_SIGNUP:-0}"
       # "keys" (safe default) requires an invite key before a user can send;
