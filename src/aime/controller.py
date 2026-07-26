@@ -1147,14 +1147,14 @@ class ConversationController:
             # Mark the moment the thread last had activity, so the idle-rollover
             # clock starts when Aime finishes replying (not when the user typed).
             self._last_activity = time.time()
-            if event.stop_reason in ("end_turn", "interrupted"):
-                # Turn finished. Either start the next queued message (a /send
-                # that arrived mid-turn — usually a race, since the frontend
-                # holds drafts client-side) or go idle. The claim-or-idle
-                # decision is atomic under _state_lock so a concurrent /send
-                # can't also claim the turn. A conversation switch clears the
-                # queue *before* interrupting (see reset/load), so nothing here
-                # ever bleeds a stale message into a new conversation.
+            # Turn finished — regardless of stop_reason (end_turn, interrupted,
+            # max_tokens, stop_sequence, error, etc.), release the turn and
+            # either dispatch the next queued message or go idle. The
+            # claim-or-idle decision is atomic under _state_lock so a concurrent
+            # /send can't also claim the turn. A conversation switch clears the
+            # queue *before* interrupting (see reset/load), so nothing here ever
+            # bleeds a stale message into a new conversation.
+            if True:
                 with self._state_lock:
                     self._is_idle = True
                     if self._pending_user_messages:
