@@ -36,6 +36,30 @@ def test_unserializable_value_is_coerced_not_raised():
     assert isinstance(got["payload"]["when"], str)
 
 
+def test_sse_headers_are_wsgi_legal():
+    """No hop-by-hop headers on the /stream response.
+
+    PEP 3333 forbids a WSGI app from setting them and waitress enforces it with
+    an AssertionError — so a `Connection: keep-alive` copied from the usual SSE
+    recipe doesn't degrade the stream, it 500s the whole response. Every
+    EventSource then fails, retries, fails again: a permanent "Connection lost
+    — reconnecting…" with no chat at all.
+    """
+    hop_by_hop = {
+        "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+        "te", "trailers", "transfer-encoding", "upgrade",
+    }
+    offenders = {h for h in web_app._SSE_HEADERS if h.lower() in hop_by_hop}
+    assert not offenders, f"hop-by-hop header(s) on /stream: {offenders}"
+
+
+def test_sse_headers_disable_proxy_buffering():
+    # The reason these headers exist at all: nginx buffers upstream responses by
+    # default, which silently swallows an SSE stream until the buffer flushes.
+    assert web_app._SSE_HEADERS["X-Accel-Buffering"] == "no"
+    assert "no-transform" in web_app._SSE_HEADERS["Cache-Control"]
+
+
 def test_unencodable_payload_degrades_to_a_harmless_event():
     circular = {}
     circular["self"] = circular

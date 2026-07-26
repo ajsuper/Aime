@@ -674,6 +674,34 @@ def _render_markup_to_html(markup: str, final: bool = False) -> str:
 _STREAM_CLOSE = object()
 
 
+# Response headers for /stream.
+#
+# A buffering reverse proxy is fatal to SSE, and the failure looks nothing like
+# a proxy problem: nginx buffers upstream responses by default, so events pile
+# up in the proxy instead of reaching the browser. The tab sits there with an
+# "open" EventSource that has simply never been told anything — the transcript
+# never renders, a sent message never gets its echo, and every device looks
+# equally broken because they are all behind the same proxy. Then the buffer
+# flushes and the whole backlog lands at once.
+#
+# `X-Accel-Buffering: no` turns nginx's buffering off for this response (Caddy
+# doesn't buffer, and ignores it harmlessly); `no-transform` tells any
+# intermediary not to compress it, which is the other common way a proxy ends up
+# holding bytes back.
+#
+# NB: no `Connection: keep-alive` here, however often the SSE recipes online
+# include it. It is a hop-by-hop header, which PEP 3333 forbids a WSGI app from
+# setting — waitress enforces that with an AssertionError, so adding it doesn't
+# degrade the stream, it fails the whole response. The browser then reports a
+# dead EventSource and retries forever ("Connection lost — reconnecting…"). It
+# buys nothing either way: HTTP/1.1 connections are persistent by default, and
+# the client-side hop belongs to the proxy.
+_SSE_HEADERS = {
+    "Cache-Control": "no-cache, no-store, no-transform",
+    "X-Accel-Buffering": "no",
+}
+
+
 def _drain_queue(q: "queue.Queue") -> None:
     """Discard everything currently buffered in a client's SSE queue. Used when
     a client has fallen so far behind that its queue overflowed: the backlog is
@@ -4043,24 +4071,8 @@ def stream():
         finally:
             ctx.detach_client(q)
 
-    return Response(gen(), mimetype="text/event-stream", headers={
-        # A buffering reverse proxy is fatal to SSE and the failure looks
-        # nothing like a proxy problem: nginx buffers upstream responses by
-        # default, so events pile up in the proxy instead of reaching the
-        # browser. The tab sits there with an "open" EventSource that has
-        # simply never been told anything — the transcript never renders, a
-        # sent message never gets its echo, and every device looks equally
-        # broken because they are all behind the same proxy. Then the buffer
-        # flushes and the whole backlog lands at once.
-        #
-        # `X-Accel-Buffering: no` turns nginx's buffering off for this response
-        # (Caddy doesn't buffer, and ignores it harmlessly); `no-transform`
-        # tells any intermediary not to compress it, which is the other common
-        # way a proxy ends up holding bytes back.
-        "Cache-Control": "no-cache, no-store, no-transform",
-        "X-Accel-Buffering": "no",
-        "Connection": "keep-alive",
-    })
+    return Response(gen(), mimetype="text/event-stream",
+                    headers=dict(_SSE_HEADERS))
 
 
 @app.route("/sessions")
