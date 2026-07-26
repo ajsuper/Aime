@@ -1468,16 +1468,19 @@ def _user_over_budget(user_id: int) -> bool:
     return _quota_store.read(rec.username, cap, ceiling) <= 0
 
 
-def _usage_exhausted_response():
+def _usage_exhausted_response(seconds_to_reset=None):
     """The shared 402 body for a budget-blocked on-demand action (chat or an
     on-demand agent run), so the message stays identical across paths. The
     frontend keys off the 402 status; the budget tops up again at the next daily
-    reset."""
+    reset. When *seconds_to_reset* is provided the response includes an
+    approximate hours-until-reset so the frontend can show a concrete ETA."""
+    hours = max(1, round(seconds_to_reset / 3600)) if seconds_to_reset is not None else None
     return jsonify({
         "ok": False,
         "error": "usage_exhausted",
         "message": "You've used up today's Aime. Your access will be back "
                    "tomorrow.",
+        "hours_until_reset": hours,
     }), 402
 
 
@@ -3782,9 +3785,10 @@ def send():
     # next day. We answer 402 (distinct from the api_access gate's 403) so the
     # frontend locks the composer with a calm, *temporary* "back tomorrow"
     # message rather than the permanent invite-key prompt.
-    if _usage_limits_armed() and ctx.quota_meter is not None \
-            and ctx.quota_meter.status().get("over"):
-        return _usage_exhausted_response()
+    if _usage_limits_armed() and ctx.quota_meter is not None:
+        qstatus = ctx.quota_meter.status()
+        if qstatus.get("over"):
+            return _usage_exhausted_response(qstatus.get("seconds_to_reset"))
     # The browser sends its IANA timezone (e.g. "America/New_York") with each
     # message so per-turn timestamps the model sees track the user's local
     # time. Refreshed every send — self-corrects if the user travels.

@@ -6526,8 +6526,13 @@ function onStreamMessage(e) {
         // That turn spent the last of today's budget. Sending is now locked
         // until the next daily top-up — refreshMe() flips __usageOver and
         // applyAccessState() disables the composer with the matching message.
-        appendNotice("Your Aime is empty for now. It tops up again with a fresh "
-          + "charge at the start of the next day — check back then.", "warning");
+        const hrs = Math.round((e.payload && e.payload.seconds_to_reset || 0) / 3600);
+        appendNotice(hrs > 0
+          ? "Your Aime is empty for now. It tops up again in "
+            + humanizeRecharge(hrs) + "."
+          : "Your Aime is empty for now. It tops up again with a fresh "
+            + "charge at the start of the next day — check back then.",
+          "warning");
       } else {
         appendNotice("Your Aime is running low. You'll get a fresh charge "
           + "at your next daily top-up.", "info");
@@ -7047,8 +7052,19 @@ async function sendText(text, images) {
   if (r.status === 402) {
     clearOptimisticUserMessage();
     chat.abortTurn();
-    appendNotice("Your Aime is empty for now. It tops up again with a fresh "
-      + "charge at the start of the next day — check back then.", "warning");
+    // Read the hours-until-reset from the response body for a concrete ETA.
+    r.json().then(body => {
+      const hrs = body && body.hours_until_reset;
+      appendNotice(hrs
+        ? "Your Aime is empty for now. It tops up again in "
+          + humanizeRecharge(hrs) + "."
+        : "Your Aime is empty for now. It tops up again with a fresh "
+          + "charge at the start of the next day — check back then.",
+        "warning");
+    }).catch(() => {
+      appendNotice("Your Aime is empty for now. It tops up again with a fresh "
+        + "charge at the start of the next day — check back then.", "warning");
+    });
     refreshMe();
     return false;
   }
@@ -8395,6 +8411,11 @@ const DEFAULT_DAY_START = 7;     // earliest hour visible if no events run earli
 const DEFAULT_DAY_END = 23;      // latest hour boundary visible if no events run later
 
 function computeHourWindow(events) {
+  // endHour caps at 25 (not 24) so events starting near midnight have one
+  // extra hour of visual space in the column. Without it, a 23:59 event
+  // with DEFAULT_EV_MIN duration would be clipped below the column bottom.
+  // buildDayColumn uses maxVisMin = Math.min(endHour, 24) * 60 for
+  // now-line and ladder-marker visibility (these never draw past midnight).
   let startHour = DEFAULT_DAY_START;
   let endHour = DEFAULT_DAY_END;
   events.forEach(ev => {
@@ -8406,7 +8427,7 @@ function computeHourWindow(events) {
     if (tail > endHour) endHour = tail;
   });
   startHour = Math.max(0, startHour);
-  endHour = Math.min(24, endHour);
+  endHour = Math.min(25, endHour);
   if (endHour <= startHour) endHour = startHour + 1;
   return { startHour, endHour };
 }
@@ -9703,6 +9724,7 @@ function buildDayColumn(date, events, multiDay, sched, allDayCol, hourPx, startH
     + `transparent ${hourPx - 1}px, var(--border) ${hourPx - 1}px, `
     + `var(--border) ${hourPx}px)`;
   const startMin = startHour * 60;
+  const maxVisMin = Math.min(endHour, 24) * 60;
   const dayEvents = (events[eventKey(date)] || []);
 
   // Split into timed vs all-day. All-day events become items in the all-day
@@ -9765,12 +9787,12 @@ function buildDayColumn(date, events, multiDay, sched, allDayCol, hourPx, startH
     if (startTime === null) return;            // all-day span: strip only, no clock anchor
     const sd = parseBackendDate(ev.date);
     const ed = parseBackendDate(ev.end_date);
-    if (sd && sd.getTime() === colMs && startTime >= startMin && startTime <= endHour * 60) {
+    if (sd && sd.getTime() === colMs && startTime >= startMin && startTime <= maxVisMin) {
       col.appendChild(buildLadderMarker(ev, "begin", startTime, startMin, hourPx));
     }
     const endTime = timeStrToMinutes(ev.end_time);
     if (endTime !== null && ed && ed.getTime() === colMs
-        && endTime >= startMin && endTime <= endHour * 60) {
+        && endTime >= startMin && endTime <= maxVisMin) {
       col.appendChild(buildLadderMarker(ev, "end", endTime, startMin, hourPx));
     }
   });
@@ -9779,7 +9801,7 @@ function buildDayColumn(date, events, multiDay, sched, allDayCol, hourPx, startH
   // shown window (no point pointing at an hour we've cropped out).
   if (sameYMD(date, now)) {
     const mins = now.getHours() * 60 + now.getMinutes();
-    if (mins >= startMin && mins <= endHour * 60) {
+    if (mins >= startMin && mins <= maxVisMin) {
       const line = document.createElement("div");
       line.className = "now-line";
       line.style.top = ((mins - startMin) / 60 * hourPx) + "px";
@@ -11533,6 +11555,10 @@ let __apiAccess = true;
 // composer like a missing api_access does, but temporarily — it clears on its
 // own at the next daily top-up (see aime.quota). Synced from /me's `usage`.
 let __usageOver = false;
+// Hours until the next daily top-up, derived from /me's
+// `usage.seconds_to_reset`. Used in the composer placeholder and notices to
+// give a concrete ETA instead of a vague "check back tomorrow".
+let __usageHoursToReset = 0;
 // Cheap billing snapshot from /me ({status, trial_end, has_subscription}) or
 // null outside billing mode. Drives nothing on its own — the Billing tab loads
 // live detail lazily — but kept for quick state checks. See aime.billing.
@@ -11604,7 +11630,7 @@ function applyAccessState() {
     else if (billingLocked) input.placeholder = (__billing && __billing.trial_eligible === false)
       ? "View-only mode — subscribe in Billing settings to chat"
       : "View-only mode — start a free trial in Billing settings to chat";
-    else if (__usageOver) input.placeholder = "Out of Aime for now — it tops up with a fresh charge each day, so check back then";
+    else if (__usageOver) input.placeholder = "Out of Aime for now — it tops up again in " + humanizeRecharge(__usageHoursToReset) + ".";
     else if (input.placeholder.startsWith("Add invite key") || input.placeholder.startsWith("View-only mode") || input.placeholder.startsWith("Out of Aime")) input.placeholder = "Message Aime…";
   }
   if (sendBtn) sendBtn.disabled = locked;
@@ -11624,16 +11650,13 @@ function applyAccessState() {
   redeemRow.style.display = "";
 }
 
-// A refill duration in hours rendered as a calm, approximate phrase. Used for
-// the recharge ETA so the user gets a concrete "when" without seeing dollars.
+// A recharge duration in hours rendered as a direct number. Used for the ETA
+// so the user sees the exact countdown rather than a softened phrase.
 function humanizeRecharge(hours) {
-  if (hours <= 0) return "moments";
-  if (hours < 1) return "under an hour";
-  if (hours < 1.5) return "about an hour";
-  if (hours < 23.5) return "about " + Math.round(hours) + " hours";
-  const days = hours / 24;
-  if (days < 1.5) return "about a day";
-  return "about " + Math.round(days) + " days";
+  if (hours <= 0) return "less than 1 hour";
+  if (hours < 1) return "less than 1 hour";
+  if (hours < 2) return "1 hour";
+  return Math.round(hours) + " hours";
 }
 
 // Render the usage meter in the Account modal from /me's `usage`. The mechanic
@@ -11712,6 +11735,8 @@ async function refreshMe() {
     __accessMode = data.access_mode || "open";
     __apiAccess = !!data.api_access;
     __usageOver = !!(data.usage_limits_armed && data.usage && data.usage.over);
+    __usageHoursToReset = (data.usage && data.usage.seconds_to_reset)
+        ? Math.round(data.usage.seconds_to_reset / 3600) : 0;
     applyUsageMeter(data.usage_limits_armed, data.usage);
     // Show the Billing tab only in billing mode (CSS gates .billing-only on
     // this class). The cheap /me billing block drives the locked-composer copy;
