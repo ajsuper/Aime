@@ -4477,9 +4477,10 @@ const chat = {
     if (this.state.turn === "idle" && this.state.draft) flushQueuedDraft();
   },
 
-  // Natural or interrupted end of a turn.
+  // Any turn_end — including max_tokens, stop_sequence, error — releases the
+  // busy gate so the composer unblocks. Previously only end_turn and interrupted
+  // were handled, leaving the client permanently busy on other stop_reasons.
   endTurn(stopReason) {
-    if (stopReason !== "end_turn" && stopReason !== "interrupted") return;
     this.state.turn = "idle";
     // Auto-send a held draft when the turn finishes naturally ("answer this,
     // then send my follow-up"). Not on "interrupted" — the stop button already
@@ -7077,13 +7078,20 @@ async function sendText(text, images) {
     chat.abortTurn();
     return false;
   }
+  // Any other non-200 (500, 504 from proxy timeout, etc.) — the request didn't
+  // land. Clear the optimistic bubble and drop the turn so the user can retry.
+  if (!r.ok) {
+    clearOptimisticUserMessage();
+    chat.abortTurn();
+    return false;
+  }
   // Success, but we deliberately do NOT retire the optimistic bubble here. The
   // authoritative `user_message_shown` echo (matched by client_msg_id) does that
   // — so if the echo is dropped, the user still sees their text as "Sending…"
   // rather than having it vanish on the 200, and the gap check's reconnect
   // reconciles it to the real bubble. Terminal failures above still clear it,
   // since no echo will ever come.
-  return r.ok;
+  return true;
 }
 
 // --- Queued draft (above the prompt) ------------------------------------
