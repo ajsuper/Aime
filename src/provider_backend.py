@@ -1842,7 +1842,20 @@ class AnthropicMessagesBackend:
                 # Between-turn case: no placeholder owned by this call.
                 # Decide based on the last message's role.
                 if not self._messages:
-                    self._persist()
+                    # The session was swapped out from under this turn — a
+                    # reset, an idle/day rollover, or a conversation switch
+                    # raced the interrupt, and new_session() emptied the list
+                    # before the worker got here. There is no history left to
+                    # repair, and an empty session is deliberately never
+                    # written to disk (see new_session), so there is nothing
+                    # to persist either.
+                    #
+                    # Must NOT call _persist() here: it re-acquires
+                    # `self._lock`, a plain non-reentrant Lock we are already
+                    # holding, so the call parks this thread forever *while
+                    # holding the backend lock*. That wedges every turn,
+                    # /send and /stream for this user permanently — only a
+                    # process restart clears it.
                     return
                 last = self._messages[-1]
                 last_role = last.get("role")
