@@ -59,7 +59,7 @@
     },
     "status_change_reason": {
       "type": "string",
-      "description": "Short freeform reason for the current status, whenever one is worth recording — e.g. why it was canceled (\"tired\", \"conflict\", \"AiMe\"), why it was moved, or a note on how it went when completed. Most useful for cancellations and reschedules."
+      "description": "Short freeform reason for the current status, whenever one is worth recording — e.g. why it was canceled (\"tired\", \"conflict\", \"Aime\"), why it was moved, or a note on how it went when completed. Most useful for cancellations and reschedules."
     },
     "rescheduled_from": {
       "type": "string",

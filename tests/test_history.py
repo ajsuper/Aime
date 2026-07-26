@@ -171,3 +171,64 @@ def test_history_page_derives_started_at_from_real_id():
                          saved_at="2026-06-28T14:35:00")]
     page = web_app._build_history_page(infos, "", 5, _loader)
     assert page["sessions"][0]["started_at"]   # non-empty, tz-aware instant
+
+
+# --- in-memory replay backlog (bounded /stream replay + /backlog paging) -----
+
+def _hist(*kinds):
+    """Build a fake in-memory replay cache: one event per kind, `_seq` counting
+    from 1 in order (mirrors how _broadcast stamps them)."""
+    return [{"kind": k, "_seq": i + 1} for i, k in enumerate(kinds)]
+
+
+def test_normalize_backlog_keeps_only_self_contained_render_kinds():
+    events = _hist(
+        "session_divider", "user_message_shown", "assistant_text",
+        "assistant_html", "graphic", "proactive_message", "tool_call",
+        "notice", "error", "turn_routing", "assistant_thinking",
+    )
+    kept = [e["kind"] for e in web_app._normalize_backlog_events(events)]
+    assert kept == [
+        "session_divider", "user_message_shown", "assistant_html",
+        "graphic", "proactive_message", "tool_call",
+    ]
+
+
+def test_backlog_slice_returns_events_older_than_cursor_oldest_first():
+    # seqs 1..6, all renderable.
+    hist = _hist("user_message_shown", "assistant_html",
+                 "user_message_shown", "assistant_html",
+                 "user_message_shown", "assistant_html")
+    # Cursor at the 5th event → everything with _seq < 5, newest 2 of them.
+    page = web_app._backlog_slice(hist, before_seq=5, limit=2)
+    assert [e["_seq"] for e in page["events"]] == [3, 4]  # oldest-first
+    assert page["has_more"] is True                       # seqs 1,2 remain
+
+
+def test_backlog_slice_last_page_sets_has_more_false():
+    hist = _hist("user_message_shown", "assistant_html", "user_message_shown")
+    page = web_app._backlog_slice(hist, before_seq=3, limit=10)
+    assert [e["_seq"] for e in page["events"]] == [1, 2]
+    assert page["has_more"] is False
+
+
+def test_backlog_slice_excludes_the_cursor_event_itself():
+    hist = _hist("user_message_shown", "assistant_html")
+    page = web_app._backlog_slice(hist, before_seq=1, limit=10)
+    assert page["events"] == []            # nothing strictly older than seq 1
+    assert page["has_more"] is False
+
+
+def test_backlog_slice_counts_has_more_after_kind_filtering():
+    # Non-renderable events below the cursor must not inflate has_more.
+    hist = [
+        {"kind": "notice", "_seq": 1},
+        {"kind": "error", "_seq": 2},
+        {"kind": "user_message_shown", "_seq": 3},
+        {"kind": "assistant_html", "_seq": 4},
+        {"kind": "user_message_shown", "_seq": 5},
+    ]
+    page = web_app._backlog_slice(hist, before_seq=5, limit=2)
+    # Only 2 renderable events are older than seq 5 → they all fit, no more.
+    assert [e["_seq"] for e in page["events"]] == [3, 4]
+    assert page["has_more"] is False

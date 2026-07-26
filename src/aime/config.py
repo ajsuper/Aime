@@ -116,10 +116,10 @@ WEB_SEARCH_ENABLED = _env_flag("AIME_WEB_SEARCH", True)
 # Outbound messaging (see aime.messaging): the SendMessage tool and the agent
 # SubmitResult `message_to_user` field deliver short texts to the user's phone /
 # messaging app. AIME_MESSAGING=0 disables sending; AIME_MESSAGING_CHANNEL picks
-# the transport ("telegram" default, "email" to reuse SMTP). The SendMessage
-# tool schema is offered to every session/agent; the controller only acts on it
-# when a messenger is wired in, so disabling messaging makes the tool inert
-# rather than absent.
+# the transport ("telegram" default, "sms" for Twilio, "email" to reuse SMTP).
+# The SendMessage tool schema is offered to every session/agent; the controller
+# only acts on it when a messenger is wired in, so disabling messaging makes the
+# tool inert rather than absent.
 SEND_MESSAGE_SCHEMA = "../resources/tools/api_send_message_schema.json"
 
 # CreateGraphics is a client tool (handled in the controller like WebSearch /
@@ -240,6 +240,17 @@ STRIPE_TRIAL_DAYS = _env_int("AIME_STRIPE_TRIAL_DAYS", 30)
 # build the Stripe Checkout/Portal return URLs. Stripe requires absolute URLs;
 # http://localhost:<port> is accepted in test mode. No trailing slash.
 PUBLIC_BASE_URL = os.environ.get("AIME_PUBLIC_BASE_URL", "").strip().rstrip("/")
+
+# ---------------------------------------------------------------------------
+# Legal
+# ---------------------------------------------------------------------------
+# The revision of the Terms of Service / Privacy Policy currently served at
+# /terms and /privacy. It is recorded on each account at signup
+# (users.terms_accepted_at / terms_version), so an account's consent can be tied
+# to the exact text it was given. **Bump this whenever the documents change
+# materially** — otherwise old acceptances masquerade as agreement to new terms.
+# Keep it in step with the "Version" line inside resources/legal/*.html.
+TERMS_VERSION = os.environ.get("AIME_TERMS_VERSION", "").strip() or "2026-07-22"
 
 
 def stripe_price_for_tier(tier: str | None) -> str | None:

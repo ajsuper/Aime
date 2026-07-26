@@ -22,7 +22,7 @@ Citations: the native citation machinery (``encrypted_index``) is tied to this
 sub-call's request and can't be replayed into the caller's stream, so the
 caller won't get native citation blocks. But the *factual* citation data —
 source URL and title — is harvested in code from Haiku's response blocks and
-appended as a Sources list, so the caller can still attribute and link. AiMe
+appended as a Sources list, so the caller can still attribute and link. Aime
 renders its own chat, so it never depended on native citation rendering.
 
 Failure-tolerant: any error returns a short factual string the caller can
@@ -53,7 +53,7 @@ class WebSearchResult:
 
 
 _SYSTEM = (
-    "You are a web research assistant for AiMe, a personal assistant. The "
+    "You are a web research assistant for Aime, a personal assistant. The "
     "request below comes from another AI delegating research to you — it may "
     "bundle several items or sub-questions into one task (e.g. tuition for ten "
     "colleges, specs for five phones). Run as many web searches as you need to "

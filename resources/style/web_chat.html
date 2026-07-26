@@ -12,9 +12,8 @@
   <script src="https://js.stripe.com/v3/"></script>
   <!-- Typography: Fraunces (characterful display, for the wordmark & headings)
        paired with Hanken Grotesk (a warm, highly legible body face). -->
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=Hanken+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+  <link href="/fonts/fonts.css" rel="stylesheet">
   <style>
     :root { color-scheme: light;
             --font-body: "Hanken Grotesk", ui-sans-serif, system-ui, -apple-system, sans-serif;
@@ -214,6 +213,21 @@
     }
     * { box-sizing: border-box; }
     html, body { height: 100%; }
+    /* On mobile the software keyboard shrinks the *visual* viewport but leaves
+       the *layout* viewport full-height, so a plain `height: 100%` would hang
+       the composer behind the keyboard. The visualViewport controller (boot
+       script) mirrors the live visual-viewport height into `--app-h`; the app
+       adopts it on mobile so the whole column — composer at its foot — always
+       fits the space above the keyboard. Desktop keeps 100% (its two viewports
+       match, and pinch-zoom must not resize the app). `overflow: hidden` pins
+       the page so iOS can't scroll the composer out from under the keyboard
+       when an input focuses. */
+    html { overflow: hidden; }
+    /* Fixed to the layout viewport (not in flow) so iOS can't scroll the page
+       under the keyboard; the controller sizes it to the visual viewport and
+       translates it to track the visual viewport's offset. */
+    body.mobile { position: fixed; top: 0; left: 0; right: 0;
+                  height: var(--app-h, 100%); overflow: hidden; }
     body { font-family: var(--font-body);
            background: var(--bg); color: var(--text); margin: 0;
            display: flex; flex-direction: column;
@@ -2470,7 +2484,11 @@
          padding clears the home indicator / rounded display corners via
          the safe-area inset (viewport-fit=cover exposes it). */
       #log { padding: 0.75rem 0.6rem 0.5rem; }
-      form { padding: 0.6rem 0.5rem calc(0.6rem + env(safe-area-inset-bottom) * 0.5);
+      /* Tight top padding so the composer pill hugs the chat above it; the
+         generous bottom padding is the intentional device inset (home indicator
+         / rounded corners via safe-area). Keeping the top slack equal to the
+         bottom left an unwanted gap between the pill and the transcript. */
+      form { padding: 0.2rem 0.5rem calc(0.6rem + env(safe-area-inset-bottom) * 0.5);
              gap: 0.4rem; }
       .composer-row { gap: 0.4rem; }
       .msg.user { max-width: 88%; }
@@ -3365,13 +3383,12 @@
           </div>
           <div class="settings-section">
             <h3>Messaging</h3>
-            <p class="desc">Let Aime text you outside the chat — reminders, or
-              results from background tasks. Paste your Telegram chat ID (message
-              the bot, then open <code>/getUpdates</code> to find it). Leave
-              blank to turn off.</p>
+            <p class="desc" id="account-contact-desc">Let Aime text you outside
+              the chat — reminders, or results from background tasks. Leave blank
+              to turn off.</p>
             <div class="settings-row">
               <input id="account-contact-input" type="text" autocomplete="off"
-                     placeholder="Messaging contact (e.g. Telegram chat ID)"
+                     placeholder="Messaging contact"
                      style="flex:1;min-width:0;margin-right:0.5rem;background:var(--bg-input);
                             color:var(--text);border:1px solid var(--border);
                             border-radius:8px;padding:0.4rem 0.6rem;font-size:0.85rem">
@@ -3478,36 +3495,68 @@
                     Change plan
                   </button>
                 </div>
+                <!-- Two steps, like subscribe: pick the plan, then confirm the
+                     card that will carry it. A plan switch moves real money, so
+                     it gets the same card step as signing up rather than a bare
+                     button — and the card confirmed here becomes the new
+                     default, so it doubles as an update-card. -->
                 <div id="billing-change-panel" style="display:none;
                      border:1px solid var(--border);border-radius:12px;
                      padding:1rem;background:var(--bg-input)">
-                  <div class="settings-row">
-                    <span class="label">New plan</span>
-                    <select id="billing-change-select"
-                            style="background:var(--bg-input);color:var(--text);
-                                   border:1px solid var(--border);border-radius:8px;
-                                   padding:0.4rem 0.6rem;font-size:0.85rem">
-                      <option value="light">Light</option>
-                      <option value="power">Power</option>
-                    </select>
+                  <!-- Step 1: pick the plan -->
+                  <div id="billing-change-step1">
+                    <div class="settings-row">
+                      <span class="label">New plan</span>
+                      <select id="billing-change-select"
+                              style="background:var(--bg-input);color:var(--text);
+                                     border:1px solid var(--border);border-radius:8px;
+                                     padding:0.4rem 0.6rem;font-size:0.85rem">
+                        <option value="light">Light</option>
+                        <option value="power">Power</option>
+                      </select>
+                    </div>
+                    <p class="desc" id="billing-change-desc" style="margin:0.6rem 0 0">Switching takes effect
+                      right away. We'll prorate the difference on your next invoice —
+                      during a free trial nothing is charged.</p>
+                    <div style="display:flex;gap:0.5rem;margin-top:0.9rem;align-items:center">
+                      <button class="btn-primary" id="billing-change-continue"
+                              style="background:var(--accent);color:#fff;border:0;border-radius:8px;
+                                     padding:0.45rem 1rem;cursor:pointer;font-size:0.85rem">
+                        Continue
+                      </button>
+                      <button class="btn-secondary" id="billing-change-cancel"
+                              style="background:transparent;color:var(--muted);
+                                     border:1px solid var(--border);border-radius:8px;
+                                     padding:0.45rem 0.9rem;cursor:pointer;font-size:0.85rem">
+                        Cancel
+                      </button>
+                    </div>
                   </div>
-                  <p class="desc" id="billing-change-desc" style="margin:0.6rem 0 0">Switching takes effect
-                    right away. We'll prorate the difference on your next invoice —
-                    during a free trial nothing is charged.</p>
-                  <div style="display:flex;gap:0.5rem;margin-top:0.9rem;align-items:center">
-                    <button class="btn-primary" id="billing-change-confirm"
-                            style="background:var(--accent);color:#fff;border:0;border-radius:8px;
-                                   padding:0.45rem 1rem;cursor:pointer;font-size:0.85rem">
-                      Switch plan
-                    </button>
-                    <button class="btn-secondary" id="billing-change-cancel"
-                            style="background:transparent;color:var(--muted);
-                                   border:1px solid var(--border);border-radius:8px;
-                                   padding:0.45rem 0.9rem;cursor:pointer;font-size:0.85rem">
-                      Cancel
-                    </button>
-                    <span class="desc" id="billing-change-status" style="display:none"></span>
+                  <!-- Step 2: confirm the card -->
+                  <div id="billing-change-step2" style="display:none">
+                    <p class="label" id="billing-change-headline"
+                       style="margin:0 0 0.35rem;font-weight:600">Switching plan</p>
+                    <p class="desc" style="margin:0 0 0.75rem">Confirm your card to
+                      switch. It replaces the one on file and is used for your next
+                      charge. Your card is handled securely by Stripe — Aime never
+                      sees it.</p>
+                    <div id="billing-change-element"></div>
+                    <div style="display:flex;gap:0.5rem;margin-top:0.9rem;align-items:center">
+                      <button class="btn-primary" id="billing-change-confirm"
+                              style="background:var(--accent);color:#fff;border:0;border-radius:8px;
+                                     padding:0.45rem 1rem;cursor:pointer;font-size:0.85rem">
+                        Confirm &amp; switch
+                      </button>
+                      <button class="btn-secondary" id="billing-change-back"
+                              style="background:transparent;color:var(--muted);
+                                     border:1px solid var(--border);border-radius:8px;
+                                     padding:0.45rem 0.9rem;cursor:pointer;font-size:0.85rem">
+                        Back
+                      </button>
+                    </div>
                   </div>
+                  <span class="desc" id="billing-change-status"
+                        style="display:none;margin-top:0.6rem"></span>
                 </div>
 
                 <!-- Update card -->
@@ -3731,8 +3780,40 @@ function scrollToBottom(force) {
   updateScrollBtn();
 }
 
+// User-intent scroll tracking. The follow latch must only be *released* by a
+// scroll the user drove — not by a layout shift, and crucially on iOS not by the
+// software keyboard opening, which fires synthetic scroll events. We arm an
+// intent flag on a real gesture (wheel / touch / scrollbar drag) and let it
+// lapse shortly after the gesture and its momentum settle. Reaching the bottom
+// always re-follows regardless: being parked at the bottom *is* following.
+let userScrollIntent = false;
+let scrollIntentTimer = null;
+function armScrollIntent() {
+  userScrollIntent = true;
+  if (scrollIntentTimer) { clearTimeout(scrollIntentTimer); scrollIntentTimer = null; }
+}
+function lapseScrollIntent(ms) {
+  if (scrollIntentTimer) clearTimeout(scrollIntentTimer);
+  scrollIntentTimer = setTimeout(() => { userScrollIntent = false; }, ms);
+}
+// The only inputs that count as the user choosing where to scroll: wheel
+// (desktop), touch (mobile), and pointer-down on the scrollbar. Passive — we
+// only observe, never preventDefault. Momentum after a flick keeps firing scroll
+// events with no touch, so we hold intent a beat past touchend to cover it.
+log.addEventListener("wheel", () => { armScrollIntent(); lapseScrollIntent(500); }, {passive: true});
+log.addEventListener("touchstart", () => { armScrollIntent(); }, {passive: true});
+log.addEventListener("touchend", () => { lapseScrollIntent(800); }, {passive: true});
+log.addEventListener("pointerdown", () => { armScrollIntent(); });
+log.addEventListener("pointerup", () => { lapseScrollIntent(600); });
+log.addEventListener("pointercancel", () => { lapseScrollIntent(600); });
+
 log.addEventListener("scroll", () => {
-  chat.setFollowing(isAtBottom());
+  // At the bottom → follow. Away from the bottom → un-follow only if the user
+  // drove this scroll; a keyboard- or layout-induced scroll leaves the latch
+  // alone so the re-pin machinery (ResizeObserver / visualViewport) can snap us
+  // back to the newest message instead of stranding us mid-transcript.
+  if (isAtBottom()) chat.setFollowing(true);
+  else if (userScrollIntent) chat.setFollowing(false);
   updateScrollBtn();
   // Near the top → page in older sessions (one continuous scroll-back).
   if (log.scrollTop < 240) loadOlderHistory();
@@ -3761,6 +3842,54 @@ new ResizeObserver(() => {
     updateScrollBtn();
   }
 }).observe(logInner);
+
+// --- Visual viewport (iOS keyboard) ----------------------------------------
+// iOS Safari shrinks the *visual* viewport when the keyboard opens but leaves
+// the *layout* viewport full-height, so a plain-100% app hangs the composer
+// behind the keyboard. Mirror the live visual-viewport height into `--app-h`
+// (consumed by `body.mobile`) so the whole column — composer at its foot — fits
+// the space above the keyboard. Mobile only: on desktop the two viewports match
+// and pinch-zoom must not resize the app. The ResizeObserver above watches
+// #log-inner (content growth) and so never fires on a pure viewport shrink;
+// this is what re-pins the newest message when the keyboard opens.
+const vv = window.visualViewport;
+// `chat` is defined much further down; syncViewport runs once at boot (before
+// then) and again on later viewport events (after). Guard the re-pin so the boot
+// call never dereferences `chat` in its temporal dead zone — a `const` read
+// before its declaration throws and would abort the whole boot script (and, on
+// mobile where this branch runs, leave the app blank). `&&` short-circuits, so
+// `chat` is only touched once chatReady is set true (right after chat is built).
+let chatReady = false;
+function syncViewport() {
+  if (!vv) return;
+  if (mobileMQ.matches) {
+    document.documentElement.style.setProperty("--app-h", vv.height + "px");
+    // iOS anchors `position: fixed` to the *layout* viewport, so when it offsets
+    // the visual viewport (scrolling the focused input into view) our fixed app
+    // drifts up and the composer floats above the keyboard. Translate down by
+    // that offset to re-glue the app to the visible region — the composer then
+    // lands exactly on the keyboard rather than above it.
+    document.body.style.transform =
+      vv.offsetTop ? "translateY(" + vv.offsetTop + "px)" : "";
+    if (chatReady && chat.state.following) {
+      log.scrollTo({ top: log.scrollHeight, behavior: "instant" });
+      updateScrollBtn();
+    }
+  } else {
+    document.documentElement.style.removeProperty("--app-h");
+    document.body.style.transform = "";
+  }
+}
+if (vv) {
+  vv.addEventListener("resize", syncViewport);
+  // The visual viewport can also *scroll* (offset) as an input focuses — keep
+  // the height/pin in step with that too.
+  vv.addEventListener("scroll", syncViewport);
+  syncViewport();
+}
+// Apply or clear `--app-h` when crossing the mobile breakpoint (desktop resize
+// / rotate) so the two modes never leave a stale height behind.
+mobileMQ.addEventListener("change", syncViewport);
 
 scrollBottomBtn.addEventListener("click", () => scrollToBottom(true));
 const input = document.getElementById("i");
@@ -4444,6 +4573,8 @@ const chat = {
   // -- scroll ----------------------------------------------------------------
   setFollowing(v) { this.state.following = v; },
 };
+// `chat` now exists — let syncViewport's re-pin read it (see the guard above).
+chatReady = true;
 
 // -- Typewriter: progressively reveal characters of the server-rendered HTML.
 // One stream-in-flight at a time, since the controller serializes turns.
@@ -4599,13 +4730,21 @@ function appendNotice(text, severity) {
 // from /history — prepended above, with the scroll position preserved.
 
 let historyHasMore = true;     // are there older sessions still to page in?
-let historyLoading = false;    // a /history fetch is in flight
+let historyLoading = false;    // a /history OR /backlog fetch is in flight
 let historyRow = null;         // the transient "loading earlier…" row at the top
 let viewingDay = null;         // a past day being read read-only (null = live Today)
+// In-memory replay backlog: /stream replays only the trailing REPLAY_TAIL_EVENTS,
+// so the rest of the current thread pages in from /backlog on scroll-up before we
+// ever fall back to disk sessions. `backlogOldestSeq` is the `_seq` we page older
+// than (seeded from history_done); `backlogHasMore` is whether any remain.
+let backlogOldestSeq = null;
+let backlogHasMore = false;
 
 function resetHistoryState() {
   historyHasMore = true;
   historyLoading = false;
+  backlogOldestSeq = null;
+  backlogHasMore = false;
   if (historyRow) { historyRow.remove(); historyRow = null; }
 }
 
@@ -4682,6 +4821,22 @@ function buildHistoryNode(ev) {
     resolveGraphicTags(node._content);
     return node;
   }
+  if (ev.kind === "proactive_message") {
+    // A past out-of-band message, pre-rendered to HTML server-side. Quiet
+    // read-back: an ordinary (dim, already-seen) Aime bubble, never flagged New.
+    const node = makeMessageNode("aime", "aime", "");
+    node.classList.add("proactive", "seen");
+    node._content.innerHTML = ev.text || "";
+    resolveGraphicTags(node._content);
+    return node;
+  }
+  if (ev.kind === "graphic") {
+    // Detached card; hydratePendingGraphics renders it once it's in the DOM.
+    return buildGraphicCard(ev.payload || {});
+  }
+  if (ev.kind === "session_divider") {
+    return buildSessionDivider(ev.payload || {});
+  }
   if (ev.kind === "tool_call" && verbosity === "verbose") {
     const node = document.createElement("div");
     node.className = "msg notice info";
@@ -4711,16 +4866,68 @@ function buildHistoryFragment(sessions) {
 // current conversation leaves the user with no way to trigger scroll-back at all.
 // Self-limiting: it stops as soon as the content overflows or history runs out.
 function maybeFillViewport() {
-  if (historyHasMore && !historyLoading && !chat.replaying() && !viewingDay &&
+  if ((historyHasMore || backlogHasMore) && !historyLoading &&
+      !chat.replaying() && !viewingDay &&
       log.scrollHeight - log.clientHeight < 40) {
     loadOlderHistory();
+  }
+}
+
+// Page in the next slice of the in-memory replay backlog (older events of the
+// current thread that weren't in the inline replay tail). Prepended above with
+// the reading position held, mirroring loadOlderHistory — but message-granular
+// (keyed on `_seq`) rather than session-granular, since a single live session
+// can be far longer than the replay tail.
+async function loadBacklog() {
+  if (historyLoading || !backlogHasMore || backlogOldestSeq == null ||
+      chat.replaying() || viewingDay) return;
+  historyLoading = true;
+  const holdPosition = !chat.state.following;
+  if (holdPosition) {
+    historyRow = document.createElement("div");
+    historyRow.className = "history-loading";
+    historyRow.textContent = "loading earlier…";
+    logInner.insertBefore(historyRow, logInner.firstChild);
+  }
+  try {
+    const r = await fetch(
+      "/backlog?before_seq=" + encodeURIComponent(backlogOldestSeq) + "&limit=40");
+    const data = await r.json();
+    if (historyRow) { historyRow.remove(); historyRow = null; }
+    const events = data.events || [];
+    if (!events.length) { backlogHasMore = false; return; }
+    // The oldest event returned becomes the next page's cursor.
+    const first = events[0];
+    if (typeof first._seq === "number") backlogOldestSeq = first._seq;
+    backlogHasMore = data.has_more === true;
+    const prevHeight = log.scrollHeight;
+    const prevTop = log.scrollTop;
+    const frag = document.createDocumentFragment();
+    events.forEach(ev => { const node = buildHistoryNode(ev); if (node) frag.appendChild(node); });
+    logInner.insertBefore(frag, logInner.firstChild);
+    hydratePendingGraphics(logInner);   // render any historical graphics now in-DOM
+    if (holdPosition) {
+      log.scrollTo({
+        top: prevTop + (log.scrollHeight - prevHeight), behavior: "instant",
+      });
+    }
+  } catch (e) {
+    if (historyRow) { historyRow.remove(); historyRow = null; }
+    // Leave backlogHasMore as-is so a later scroll retries.
+  } finally {
+    historyLoading = false;
+    requestAnimationFrame(maybeFillViewport);
   }
 }
 
 async function loadOlderHistory() {
   // Scroll-back is a Today affordance only. A past day is a fixed, read-only
   // snapshot — never page other days into it.
-  if (historyLoading || !historyHasMore || chat.replaying() || viewingDay) return;
+  if (historyLoading || chat.replaying() || viewingDay) return;
+  // First exhaust the in-memory replay backlog (the rest of the current thread);
+  // only once it's drained do we fall back to paging older sessions from disk.
+  if (backlogHasMore) { await loadBacklog(); return; }
+  if (!historyHasMore) return;
   // Page from the oldest session currently shown (its divider is the topmost).
   const firstDivider = logInner.querySelector(".session-divider");
   const cursor = firstDivider ? (firstDivider.dataset.sessionId || "") : "";
@@ -5410,7 +5617,11 @@ function makeGraphicDownloadButton(body, baseName) {
   return btn;
 }
 
-function renderGraphic(payload) {
+// Build a graphic card *detached* (no append, no render kicked off). Renderers
+// like mermaid/vega need the node in the DOM to size themselves, so building and
+// rendering are split: callers append the card, then hydrate it. Refs needed for
+// hydration are stashed on the node.
+function buildGraphicCard(payload) {
   const card = document.createElement("div");
   card.className = "msg graphic";
   const inner = document.createElement("div");
@@ -5442,15 +5653,44 @@ function renderGraphic(payload) {
   }
   inner.appendChild(idBar);
   card.appendChild(inner);
-  logInner.appendChild(card);
-  scrollToBottom();
+  card._graphicBody = body;
+  card._graphicIdBar = idBar;
+  card._graphicPayload = payload;
+  card._graphicDisplay = display;
+  card.dataset.graphicPending = "1";   // hydrated after it lands in the DOM
+  return card;
+}
+
+// Render the graphic into an already-inserted card (idempotent: clears the
+// pending flag so it renders once). `onRender` fires after the render settles.
+function hydrateGraphicCard(card, onRender) {
+  if (!card || !card.dataset.graphicPending) return;
+  delete card.dataset.graphicPending;
+  const body = card._graphicBody;
+  const idBar = card._graphicIdBar;
+  const payload = card._graphicPayload || {};
+  const display = card._graphicDisplay || "";
   renderGraphicInto(body, payload.format, payload.source, () => {
-    scrollToBottom();
+    if (onRender) onRender();
     if (!idBar.querySelector(".id-dl-btn")) {
       idBar.appendChild(makeGraphicDownloadButton(
         body, display ? "graphic-" + display.replace(/:/g, "-") : "graphic"));
     }
   });
+}
+
+// Hydrate every not-yet-rendered graphic card under `root` (used after a
+// scroll-back backlog page prepends historical graphics).
+function hydratePendingGraphics(root) {
+  (root || logInner).querySelectorAll('.msg.graphic[data-graphic-pending]')
+    .forEach(card => hydrateGraphicCard(card));
+}
+
+function renderGraphic(payload) {
+  const card = buildGraphicCard(payload);
+  logInner.appendChild(card);
+  scrollToBottom();
+  hydrateGraphicCard(card, () => scrollToBottom());
 }
 
 // In-flight/lookup cache for `[graphic-N]` tag resolution, so the same id placed
@@ -5906,6 +6146,25 @@ const Link = {
   // half-closing proxy). This is that threshold.
   STALE_MS: 50000,
 
+  // ── Reconnect coordinator ───────────────────────────────────────────────
+  // Every "we need a fresh stream" signal (watchdog staleness, tab wake, a
+  // ping-head gap, a `_seq` gap, a server `resync`, a failed conversation
+  // switch) routes through scheduleReconnect rather than calling connect()
+  // directly. Two problems that fixes, both acute on a flaky phone connection:
+  //  • Stampede — a burst of triggers used to each tear down and rebuild the
+  //    stream (and replay the snapshot). One pending timer now coalesces a burst
+  //    into a single reconnect.
+  //  • Racing the browser — EventSource auto-reconnects on its own after a drop;
+  //    left alone, that runs alongside our reconnect. onError now closes the
+  //    socket (stopping the browser's retry) so the coordinator is the sole
+  //    owner, and backs off on repeated failures instead of hammering.
+  reconnectTimer: null,   // pending coalesced reconnect (null = none scheduled)
+  reconnectBackoff: 0,    // consecutive failed connects; drives the retry delay
+  RECONNECT_DEBOUNCE_MS: 300,   // coalesce window when the link is healthy
+  RECONNECT_BASE_MS: 500,       // first backoff step after a failure
+  RECONNECT_MAX_MS: 8000,       // backoff ceiling
+  BACKOFF_CAP: 6,               // cap the step count so the shift can't overflow
+
   start() {
     this.localDay = this.dayKey();
     this.connect();
@@ -5947,6 +6206,12 @@ const Link = {
   // (e.g. a conversation switch whose `session_restart` was missed on a zombie
   // stream).
   connect() {
+    // We're (re)connecting now — drop any pending scheduled attempt so it can't
+    // fire a second, redundant reconnect on top of this one.
+    if (this.reconnectTimer != null) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     if (this.es) { try { this.es.close(); } catch (_) {} }
     this.es = new EventSource("/stream");
     this.es.onopen = () => this.onOpen();
@@ -5954,9 +6219,23 @@ const Link = {
     this.es.onerror = () => this.onError();
     this.lastMsgAt = Date.now();
   },
-  reconnect() { this.connect(); },
+  // Coalesce a reconnect request. A burst of triggers within the window collapses
+  // to one connect; while the link is healthy that window is a short debounce,
+  // and after failures it grows (capped) so a dead network isn't hammered.
+  scheduleReconnect(reason) {
+    if (this.reconnectTimer != null) return;   // already pending — coalesce
+    const delay = this.reconnectBackoff === 0
+      ? this.RECONNECT_DEBOUNCE_MS
+      : Math.min(this.RECONNECT_MAX_MS,
+                 this.RECONNECT_BASE_MS * (1 << (this.reconnectBackoff - 1)));
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this.connect();
+    }, delay);
+  },
+  reconnect() { this.scheduleReconnect("manual"); },
   reconnectIfStale() {
-    if (Date.now() - this.lastMsgAt > this.STALE_MS) this.connect();
+    if (Date.now() - this.lastMsgAt > this.STALE_MS) this.scheduleReconnect("stale");
   },
 
   onOpen() {
@@ -5965,19 +6244,25 @@ const Link = {
     chat.linkOpen(this.connectedOnce);
     this.connectedOnce = true;
     this.lastMsgAt = Date.now();
+    this.reconnectBackoff = 0;   // a live connection resets the retry delay
     if (this.reconnectNotice) { this.reconnectNotice.remove(); this.reconnectNotice = null; }
   },
 
   onError() {
-    // Fires when the connection drops or fails to open. The browser will try to
-    // auto-reconnect on its own; we just surface a calm, deduped banner so a long
-    // outage isn't silent. A truly dead (half-open) socket that never errors is
-    // handled by the watchdog instead. State is reconciled authoritatively by the
-    // snapshot replay + history_done once a connection is re-established.
+    // Fires when the connection drops or fails to open. Take ownership: close the
+    // socket so the browser's built-in auto-reconnect can't run alongside ours,
+    // then schedule our own retry with a growing backoff so a real outage isn't
+    // hammered. A calm, deduped banner keeps a long outage from being silent; a
+    // half-open socket that never errors is caught by the watchdog instead. State
+    // is reconciled authoritatively by the snapshot replay + history_done once a
+    // connection is re-established.
+    if (this.es) { try { this.es.close(); } catch (_) {} }
     chat.linkDown();
     if (!this.reconnectNotice) {
       this.reconnectNotice = appendNotice("Connection lost — reconnecting…", "warning");
     }
+    this.reconnectBackoff = Math.min(this.reconnectBackoff + 1, this.BACKOFF_CAP);
+    this.scheduleReconnect("error");
   },
 
   onMessage(ev) {
@@ -5992,7 +6277,7 @@ const Link = {
       // expected rather than drift.
       if (!viewingDay && typeof e.head_seq === "number"
           && e.head_seq > this.appliedSeq) {
-        this.connect();
+        this.scheduleReconnect("ping-head");
       }
       return;
     }
@@ -6010,7 +6295,7 @@ const Link = {
     // connection (before history_done seeds the head) can't false-trigger.
     if (!e.from_replay && typeof e._seq === "number"
         && this.appliedSeq && e._seq > this.appliedSeq + 1) {
-      this.connect();
+      this.scheduleReconnect("seq-gap");
       return;
     }
     // Advance the sync cursor as history events (replayed or live) arrive.
@@ -6033,7 +6318,7 @@ const Link = {
     // transcript. A quick tab-flip stays on the healthy existing stream.
     const away = this.hiddenAt ? Date.now() - this.hiddenAt : 0;
     this.hiddenAt = 0;
-    if (away > this.STALE_MS) this.connect();
+    if (away > this.STALE_MS) this.scheduleReconnect("wake");
     else this.reconnectIfStale();
     this.maybeDayRoll();   // returning to the tab in a new day rolls to Today
     refreshActivePane(true);
@@ -6200,6 +6485,12 @@ function onStreamMessage(e) {
       // replayed covers everything up to here, so from now on a `ping` reporting
       // a higher head means we've missed a live event and should reconnect.
       if (typeof e.head_seq === "number") Link.appliedSeq = e.head_seq;
+      // Seed the in-memory backlog cursor: only the trailing window was replayed
+      // inline, so older events of this thread page in from /backlog on scroll-up
+      // (before we ever touch disk sessions). `oldest_seq` is the _seq of the
+      // oldest event just replayed; `has_backlog` whether older ones remain.
+      if (typeof e.oldest_seq === "number") backlogOldestSeq = e.oldest_seq;
+      backlogHasMore = e.has_backlog === true;
       // The snapshot (today, live) is fully rendered. Land on the latest message;
       // the ResizeObserver then holds it there through any late layout.
       // Background-fill earlier-today sessions above (out of view, since we stay
@@ -6235,8 +6526,13 @@ function onStreamMessage(e) {
         // That turn spent the last of today's budget. Sending is now locked
         // until the next daily top-up — refreshMe() flips __usageOver and
         // applyAccessState() disables the composer with the matching message.
-        appendNotice("Your Aime is empty for now. It tops up again with a fresh "
-          + "charge at the start of the next day — check back then.", "warning");
+        const hrs = Math.round((e.payload && e.payload.seconds_to_reset || 0) / 3600);
+        appendNotice(hrs > 0
+          ? "Your Aime is empty for now. It tops up again in "
+            + humanizeRecharge(hrs) + "."
+          : "Your Aime is empty for now. It tops up again with a fresh "
+            + "charge at the start of the next day — check back then.",
+          "warning");
       } else {
         appendNotice("Your Aime is running low. You'll get a fresh charge "
           + "at your next daily top-up.", "info");
@@ -6756,8 +7052,19 @@ async function sendText(text, images) {
   if (r.status === 402) {
     clearOptimisticUserMessage();
     chat.abortTurn();
-    appendNotice("Your Aime is empty for now. It tops up again with a fresh "
-      + "charge at the start of the next day — check back then.", "warning");
+    // Read the hours-until-reset from the response body for a concrete ETA.
+    r.json().then(body => {
+      const hrs = body && body.hours_until_reset;
+      appendNotice(hrs
+        ? "Your Aime is empty for now. It tops up again in "
+          + humanizeRecharge(hrs) + "."
+        : "Your Aime is empty for now. It tops up again with a fresh "
+          + "charge at the start of the next day — check back then.",
+        "warning");
+    }).catch(() => {
+      appendNotice("Your Aime is empty for now. It tops up again with a fresh "
+        + "charge at the start of the next day — check back then.", "warning");
+    });
     refreshMe();
     return false;
   }
@@ -8104,6 +8411,11 @@ const DEFAULT_DAY_START = 7;     // earliest hour visible if no events run earli
 const DEFAULT_DAY_END = 23;      // latest hour boundary visible if no events run later
 
 function computeHourWindow(events) {
+  // endHour caps at 25 (not 24) so events starting near midnight have one
+  // extra hour of visual space in the column. Without it, a 23:59 event
+  // with DEFAULT_EV_MIN duration would be clipped below the column bottom.
+  // buildDayColumn uses maxVisMin = Math.min(endHour, 24) * 60 for
+  // now-line and ladder-marker visibility (these never draw past midnight).
   let startHour = DEFAULT_DAY_START;
   let endHour = DEFAULT_DAY_END;
   events.forEach(ev => {
@@ -8115,7 +8427,7 @@ function computeHourWindow(events) {
     if (tail > endHour) endHour = tail;
   });
   startHour = Math.max(0, startHour);
-  endHour = Math.min(24, endHour);
+  endHour = Math.min(25, endHour);
   if (endHour <= startHour) endHour = startHour + 1;
   return { startHour, endHour };
 }
@@ -9412,6 +9724,7 @@ function buildDayColumn(date, events, multiDay, sched, allDayCol, hourPx, startH
     + `transparent ${hourPx - 1}px, var(--border) ${hourPx - 1}px, `
     + `var(--border) ${hourPx}px)`;
   const startMin = startHour * 60;
+  const maxVisMin = Math.min(endHour, 24) * 60;
   const dayEvents = (events[eventKey(date)] || []);
 
   // Split into timed vs all-day. All-day events become items in the all-day
@@ -9474,12 +9787,12 @@ function buildDayColumn(date, events, multiDay, sched, allDayCol, hourPx, startH
     if (startTime === null) return;            // all-day span: strip only, no clock anchor
     const sd = parseBackendDate(ev.date);
     const ed = parseBackendDate(ev.end_date);
-    if (sd && sd.getTime() === colMs && startTime >= startMin && startTime <= endHour * 60) {
+    if (sd && sd.getTime() === colMs && startTime >= startMin && startTime <= maxVisMin) {
       col.appendChild(buildLadderMarker(ev, "begin", startTime, startMin, hourPx));
     }
     const endTime = timeStrToMinutes(ev.end_time);
     if (endTime !== null && ed && ed.getTime() === colMs
-        && endTime >= startMin && endTime <= endHour * 60) {
+        && endTime >= startMin && endTime <= maxVisMin) {
       col.appendChild(buildLadderMarker(ev, "end", endTime, startMin, hourPx));
     }
   });
@@ -9488,7 +9801,7 @@ function buildDayColumn(date, events, multiDay, sched, allDayCol, hourPx, startH
   // shown window (no point pointing at an hour we've cropped out).
   if (sameYMD(date, now)) {
     const mins = now.getHours() * 60 + now.getMinutes();
-    if (mins >= startMin && mins <= endHour * 60) {
+    if (mins >= startMin && mins <= maxVisMin) {
       const line = document.createElement("div");
       line.className = "now-line";
       line.style.top = ((mins - startMin) / 60 * hourPx) + "px";
@@ -11242,6 +11555,10 @@ let __apiAccess = true;
 // composer like a missing api_access does, but temporarily — it clears on its
 // own at the next daily top-up (see aime.quota). Synced from /me's `usage`.
 let __usageOver = false;
+// Hours until the next daily top-up, derived from /me's
+// `usage.seconds_to_reset`. Used in the composer placeholder and notices to
+// give a concrete ETA instead of a vague "check back tomorrow".
+let __usageHoursToReset = 0;
 // Cheap billing snapshot from /me ({status, trial_end, has_subscription}) or
 // null outside billing mode. Drives nothing on its own — the Billing tab loads
 // live detail lazily — but kept for quick state checks. See aime.billing.
@@ -11256,6 +11573,41 @@ const redeemMsg = document.getElementById("account-redeem-msg");
 const contactInput = document.getElementById("account-contact-input");
 const contactBtn = document.getElementById("account-contact-btn");
 const contactMsg = document.getElementById("account-contact-msg");
+const contactDesc = document.getElementById("account-contact-desc");
+
+// What a messaging contact looks like depends on the transport the server is
+// configured for, so the field asks for the right thing instead of hardcoding
+// one channel's answer. Keys match MessageChannel.name; an unrecognised or
+// disabled channel falls back to generic wording.
+const CONTACT_HINTS = {
+  sms: {
+    placeholder: "Phone number (e.g. +15551234567)",
+    hint: "Enter your mobile number in international format, like " +
+          "+15551234567. Standard message rates apply.",
+  },
+  telegram: {
+    placeholder: "Telegram chat ID",
+    hint: "Paste your Telegram chat ID (message the bot, then open " +
+          "/getUpdates to find it).",
+  },
+  email: {
+    placeholder: "Email address",
+    hint: "Enter the email address these should go to.",
+  },
+};
+
+function applyContactHint(channel) {
+  const spec = CONTACT_HINTS[channel];
+  if (contactInput) {
+    contactInput.placeholder = spec ? spec.placeholder : "Messaging contact";
+  }
+  if (contactDesc) {
+    contactDesc.textContent =
+      "Let Aime text you outside the chat — reminders, or results from " +
+      "background tasks. " + (spec ? spec.hint + " " : "") +
+      "Leave blank to turn off.";
+  }
+}
 
 // Reflect access state into the composer and the Account modal. Sending is
 // locked only in "keys" mode for a user without api_access — login and all
@@ -11278,7 +11630,7 @@ function applyAccessState() {
     else if (billingLocked) input.placeholder = (__billing && __billing.trial_eligible === false)
       ? "View-only mode — subscribe in Billing settings to chat"
       : "View-only mode — start a free trial in Billing settings to chat";
-    else if (__usageOver) input.placeholder = "Out of Aime for now — it tops up with a fresh charge each day, so check back then";
+    else if (__usageOver) input.placeholder = "Out of Aime for now — it tops up again in " + humanizeRecharge(__usageHoursToReset) + ".";
     else if (input.placeholder.startsWith("Add invite key") || input.placeholder.startsWith("View-only mode") || input.placeholder.startsWith("Out of Aime")) input.placeholder = "Message Aime…";
   }
   if (sendBtn) sendBtn.disabled = locked;
@@ -11298,16 +11650,13 @@ function applyAccessState() {
   redeemRow.style.display = "";
 }
 
-// A refill duration in hours rendered as a calm, approximate phrase. Used for
-// the recharge ETA so the user gets a concrete "when" without seeing dollars.
+// A recharge duration in hours rendered as a direct number. Used for the ETA
+// so the user sees the exact countdown rather than a softened phrase.
 function humanizeRecharge(hours) {
-  if (hours <= 0) return "moments";
-  if (hours < 1) return "under an hour";
-  if (hours < 1.5) return "about an hour";
-  if (hours < 23.5) return "about " + Math.round(hours) + " hours";
-  const days = hours / 24;
-  if (days < 1.5) return "about a day";
-  return "about " + Math.round(days) + " days";
+  if (hours <= 0) return "less than 1 hour";
+  if (hours < 1) return "less than 1 hour";
+  if (hours < 2) return "1 hour";
+  return Math.round(hours) + " hours";
 }
 
 // Render the usage meter in the Account modal from /me's `usage`. The mechanic
@@ -11382,9 +11731,12 @@ async function refreshMe() {
     if (firstNameInput) firstNameInput.value = data.first_name || "";
     if (lastNameInput) lastNameInput.value = data.last_name || "";
     if (contactInput) contactInput.value = data.messaging_contact || "";
+    applyContactHint(data.messaging_channel);
     __accessMode = data.access_mode || "open";
     __apiAccess = !!data.api_access;
     __usageOver = !!(data.usage_limits_armed && data.usage && data.usage.over);
+    __usageHoursToReset = (data.usage && data.usage.seconds_to_reset)
+        ? Math.round(data.usage.seconds_to_reset / 3600) : 0;
     applyUsageMeter(data.usage_limits_armed, data.usage);
     // Show the Billing tab only in billing mode (CSS gates .billing-only on
     // this class). The cheap /me billing block drives the locked-composer copy;
@@ -11465,7 +11817,13 @@ const billingManageBox   = document.getElementById("billing-manage");
 const billingChangePlanBtn  = document.getElementById("billing-change-plan-btn");
 const billingChangePanel = document.getElementById("billing-change-panel");
 const billingChangeSelect= document.getElementById("billing-change-select");
+const billingChangeStep1   = document.getElementById("billing-change-step1");
+const billingChangeStep2   = document.getElementById("billing-change-step2");
+const billingChangeContinue= document.getElementById("billing-change-continue");
+const billingChangeElement = document.getElementById("billing-change-element");
+const billingChangeHeadline= document.getElementById("billing-change-headline");
 const billingChangeConfirm = document.getElementById("billing-change-confirm");
+const billingChangeBack    = document.getElementById("billing-change-back");
 const billingChangeCancel  = document.getElementById("billing-change-cancel");
 const billingChangeStatus  = document.getElementById("billing-change-status");
 const billingChangeDesc    = document.getElementById("billing-change-desc");
@@ -11748,7 +12106,7 @@ function closeBillingCardPanel() {
   __billingSetupId = null;
   billingStartBtn.disabled = false;
   billingPayBtn.disabled = false;
-  if (!__updateElements) setCardElementMounted(false);
+  if (!__updateElements && !__changeElements) setCardElementMounted(false);
 }
 
 // Step 1: ask the server for a SetupIntent, then mount the Payment Element.
@@ -11874,26 +12232,103 @@ function setBillingManageStatus(el, msg, isError) {
   el.style.display = "";
 }
 
-// --- Switch plan ---
+// --- Switch plan (two steps: pick the plan, then confirm the card) ---
+// Step 2 mounts a Payment Element exactly like subscribe/update-card: a plan
+// change is a real money decision, so it gets a real card step. The confirmed
+// card also becomes the new default, so this subsumes an update-card.
+let __changeElements = null;   // Elements group for the plan-change SetupIntent
+
+// Back to the plan picker, tearing down any mounted card field.
+function resetBillingChangeStep() {
+  if (__changeElements) { try { __changeElements.getElement("payment")?.unmount(); } catch {} }
+  __changeElements = null;
+  billingChangeStep1.style.display = "";
+  billingChangeStep2.style.display = "none";
+  billingChangeContinue.disabled = false;
+  billingChangeConfirm.disabled = false;
+  setBillingManageStatus(billingChangeStatus, "", false);
+  if (!__billingElements && !__updateElements) setCardElementMounted(false);
+}
 function closeBillingChangePanel() {
   billingChangePanel.style.display = "none";
-  setBillingManageStatus(billingChangeStatus, "", false);
-  billingChangeConfirm.disabled = false;
+  resetBillingChangeStep();
 }
 function toggleBillingChangePanel() {
   const open = billingChangePanel.style.display === "none";
   closeBillingUpdatePanel();
-  billingChangePanel.style.display = open ? "" : "none";
+  if (open) { resetBillingChangeStep(); billingChangePanel.style.display = ""; }
+  else closeBillingChangePanel();
 }
-async function confirmChangePlan() {
-  billingChangeConfirm.disabled = true;
-  setBillingManageStatus(billingChangeStatus, "Switching your plan…", false);
+
+// Step 1: ask the server for a SetupIntent stamped with the chosen tier, then
+// swap the picker out for the card field.
+async function startChangePlan() {
+  billingMsg.style.display = "none";
+  if (!window.Stripe) {
+    billingMsg.textContent = "Payment form failed to load — please refresh.";
+    billingMsg.style.color = "var(--error)";
+    billingMsg.style.display = "";
+    return;
+  }
+  const tier = billingChangeSelect.value;
+  billingChangeContinue.disabled = true;
+  setBillingManageStatus(billingChangeStatus, "", false);
   try {
     const r = await fetch("/billing/change-plan", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
       credentials: "same-origin",
-      body: JSON.stringify({tier: billingChangeSelect.value}),
+      body: JSON.stringify({tier}),
+    });
+    const data = await r.json();
+    if (!data.ok) {
+      setBillingManageStatus(billingChangeStatus,
+        data.message || "Something went wrong. Try again.", true);
+      billingChangeContinue.disabled = false;
+      return;
+    }
+    __stripe = __stripe || Stripe(data.publishable_key);
+    __changeElements = __stripe.elements({
+      clientSecret: data.client_secret,
+      appearance: billingAppearance(),
+    });
+    __changeElements.create("payment").mount(billingChangeElement);
+    setCardElementMounted(true);
+    // Name the plan being bought on the card step, so the amount is on screen
+    // at the moment the card is entered.
+    const name = tier.charAt(0).toUpperCase() + tier.slice(1);
+    const price = __billingPrices && __billingPrices[tier];
+    const money = price ? fmtTierPrice(price) : "";
+    billingChangeHeadline.textContent = money
+      ? ("Switching to " + name + " — " + money) : ("Switching to " + name);
+    billingChangeStep1.style.display = "none";
+    billingChangeStep2.style.display = "";
+  } catch {
+    setBillingManageStatus(billingChangeStatus, "Network error — try again.", true);
+    billingChangeContinue.disabled = false;
+  }
+}
+
+// Step 2: confirm the card, then have the server set it as default and switch.
+async function confirmChangePlan() {
+  if (!__stripe || !__changeElements) return;
+  billingChangeConfirm.disabled = true;
+  const setupId = await confirmStripeSetup(__changeElements, "changeplan",
+    (m, e) => setBillingManageStatus(billingChangeStatus, m, e));
+  if (!setupId) { billingChangeConfirm.disabled = false; return; }
+  await finalizeChangePlan(setupId);
+}
+
+// Tell the server the card is confirmed so it can switch the plan onto it.
+// Shared by the inline and 3-D Secure redirect-return paths.
+async function finalizeChangePlan(setupIntentId) {
+  setBillingManageStatus(billingChangeStatus, "Switching your plan…", false);
+  try {
+    const r = await fetch("/billing/change-plan/confirm", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      credentials: "same-origin",
+      body: JSON.stringify({setup_intent_id: setupIntentId}),
     });
     const data = await r.json();
     if (!data.ok) {
@@ -11908,6 +12343,9 @@ async function confirmChangePlan() {
     return;
   }
   closeBillingChangePanel();
+  billingMsg.textContent = "Your plan was switched.";
+  billingMsg.style.color = "var(--muted)";
+  billingMsg.style.display = "";
   if (typeof refreshMe === "function") { try { await refreshMe(); } catch {} }
   loadBillingSummary(true);
 }
@@ -11920,7 +12358,7 @@ function closeBillingUpdatePanel() {
   __updateElements = null;
   billingUpdateCardBtn.disabled = false;
   billingUpdateSave.disabled = false;
-  if (!__billingElements) setCardElementMounted(false);
+  if (!__billingElements && !__changeElements) setCardElementMounted(false);
 }
 async function startUpdateCard() {
   billingMsg.style.display = "none";
@@ -12047,6 +12485,7 @@ async function resumeBillingRedirect() {
       document.querySelector('.settings-tab-btn[data-tab="billing"]')?.click();
     } catch {}
     if (action === "updatecard") await finalizeUpdateCard(setupId);
+    else if (action === "changeplan") await finalizeChangePlan(setupId);
     else await finalizeSubscribe(setupId);
   }
 }
@@ -12060,7 +12499,9 @@ billingPayCancel.addEventListener("click", closeBillingCardPanel);
 // settings so the user drops back into Aime in view-only mode.
 billingSkipBtn.addEventListener("click", closeSettings);
 billingChangePlanBtn.addEventListener("click", toggleBillingChangePanel);
+billingChangeContinue.addEventListener("click", startChangePlan);
 billingChangeConfirm.addEventListener("click", confirmChangePlan);
+billingChangeBack.addEventListener("click", resetBillingChangeStep);
 billingChangeCancel.addEventListener("click", closeBillingChangePanel);
 billingUpdateCardBtn.addEventListener("click", startUpdateCard);
 billingUpdateSave.addEventListener("click", confirmUpdateCard);

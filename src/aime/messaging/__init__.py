@@ -6,9 +6,9 @@ Public surface:
   * ``messaging_enabled()`` — whether sending is configured at all.
 
 Everything above this package speaks only ``MessageChannel`` + a recipient
-string, so moving from Telegram (prototype) to a production SMS provider means
-adding one ``MessageChannel`` subclass and pointing ``AIME_MESSAGING_CHANNEL``
-at it — no caller changes. Recipient strings come from the account record
+string, so moving from Telegram (prototype) to Twilio SMS (production) is a
+matter of pointing ``AIME_MESSAGING_CHANNEL`` at another entry in the registry
+below — no caller changes. Recipient strings come from the account record
 (``UserRecord.messaging_contact``); this layer never reaches into account
 storage itself, which keeps the contact-storage decision easy to revisit.
 """
@@ -20,13 +20,17 @@ import os
 from .base import MessageChannel, MessageSendError
 from .email_channel import EmailChannel
 from .telegram import TelegramChannel
+from .twilio_sms import TwilioSMSChannel
 
 
-# Registry of available channels by their config name. Add a production SMS
-# channel here (e.g. "sms": TwilioChannel) and it becomes selectable via env.
+# Registry of available channels by their config name. Adding a transport means
+# adding a ``MessageChannel`` subclass and one line here.
 _CHANNELS: dict[str, type[MessageChannel]] = {
     "telegram": TelegramChannel,
     "email": EmailChannel,
+    "sms": TwilioSMSChannel,
+    # Alias, so naming the provider in config works as well as naming the medium.
+    "twilio": TwilioSMSChannel,
 }
 
 _DEFAULT_CHANNEL = "telegram"
@@ -51,9 +55,21 @@ def env_recipient() -> str | None:
 
     A fallback for single-user contexts with no accounts database (the local
     TUI). Multi-user frontends ignore this and pass each user's stored
-    ``messaging_contact`` instead. Channel-agnostic: a Telegram chat id today,
-    a phone number under a future SMS channel."""
+    ``messaging_contact`` instead. Channel-agnostic: a Telegram chat id, a
+    phone number under the SMS channel, an email address under email."""
     return (os.environ.get("AIME_MESSAGING_CONTACT") or "").strip() or None
+
+
+def active_channel_name() -> str | None:
+    """The configured channel's canonical name ("telegram", "sms", "email"), or
+    None when messaging is off or misconfigured.
+
+    For UI that has to ask the user for a contact: what a valid contact *looks
+    like* is the one channel-specific thing a frontend legitimately needs to
+    know. It returns the class's own ``name``, so config aliases (e.g. "twilio")
+    normalize to the canonical one."""
+    messenger = get_messenger()
+    return messenger.name if messenger is not None else None
 
 
 def get_messenger() -> MessageChannel | None:
@@ -73,5 +89,6 @@ __all__ = [
     "MessageSendError",
     "get_messenger",
     "messaging_enabled",
+    "active_channel_name",
     "env_recipient",
 ]

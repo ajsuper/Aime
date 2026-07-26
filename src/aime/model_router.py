@@ -27,7 +27,7 @@ from anthropic import Anthropic
 
 
 _CLASSIFIER_SYSTEM = (
-    "You are a routing classifier for AiMe, a personal-assistant chat that "
+    "You are a routing classifier for Aime, a personal-assistant chat that "
     "manages a user's calendar (events) and a knowledge base (topics organised "
     "into folders). Read the user's latest message and decide whether the "
     "next assistant turn is EASY or HARD. Output exactly one token: EASY or "

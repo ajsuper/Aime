@@ -2040,7 +2040,7 @@ class AnthropicMessagesBackend:
         merging `prev_summary` if a prior compaction left one. Raises on API
         failure (the caller treats that as "skip compaction this turn")."""
         instructions = (
-            "You are a conversation summarizer for AiMe, a personal assistant app.\n\n"
+            "You are a conversation summarizer for Aime, a personal assistant app.\n\n"
             "Your job is to compress the conversation history into a compact summary "
             "that preserves everything a future AI session would need to continue "
             "seamlessly.\n\n"
