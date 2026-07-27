@@ -16,6 +16,8 @@ import re
 import sys
 import json
 import queue
+import signal
+import faulthandler
 import shutil
 import base64
 import zipfile
@@ -1258,20 +1260,47 @@ class UserContext:
 # Lazy per-user context cache. Built on first request from that user.
 _user_contexts: dict[int, UserContext] = {}
 _user_contexts_lock = threading.Lock()
+# One build lock per user id. See _context_for — these exist so that building
+# one user's context never blocks another user's requests.
+_user_context_build_locks: dict[int, threading.Lock] = {}
 
 
 def _context_for(user_id: int) -> UserContext:
-    """Get (or build) the UserContext for the given user. Building includes
-    spinning up an agent backend session, so we serialize on the cache lock
-    to avoid two threads racing to construct the same one."""
+    """Get (or build) the UserContext for the given user.
+
+    Building one is slow and does real I/O: an agent backend session, the DEK,
+    decrypting and replaying the most recent conversation off disk, and several
+    tool-gateway round trips (each with a 10s timeout) for the onboarding check
+    and the special-topic bootstrap. Tens of seconds is possible when the data
+    backend is slow.
+
+    That work is serialized *per user*, never on the shared cache lock. Holding
+    the global lock across the build meant one user's first request blocked
+    every other user's /send and /stream for its full duration — invisible on a
+    single-user instance, and pathological on a multi-user one right after a
+    restart, when every client reconnects at once and each build queues behind
+    the last. The whole server looks hung ("stuck on Sending…", empty chats)
+    and then recovers on its own as the queue drains.
+
+    The global lock is still what makes the cache itself safe; it's just held
+    for dict operations only, never across construction.
+    """
     ctx = _user_contexts.get(user_id)
     if ctx is not None:
         return ctx
     with _user_contexts_lock:
+        build_lock = _user_context_build_locks.get(user_id)
+        if build_lock is None:
+            build_lock = threading.Lock()
+            _user_context_build_locks[user_id] = build_lock
+    # Per user: two threads racing for the *same* user still build exactly one
+    # context, while a request for any other user runs unimpeded.
+    with build_lock:
         ctx = _user_contexts.get(user_id)
         if ctx is None:
             ctx = UserContext(user_id, g.get("username"))
-            _user_contexts[user_id] = ctx
+            with _user_contexts_lock:
+                _user_contexts[user_id] = ctx
         return ctx
 
 
@@ -6126,6 +6155,17 @@ if __name__ == "__main__":
     # AIME_HTTPS=1 for the direct self-signed path.
     host = os.environ.get("AIME_BIND", "127.0.0.1")
     port = int(os.environ.get("AIME_PORT", "5000"))
+    # On-demand thread dump. `kill -USR1 <pid>` writes every thread's stack to
+    # stderr — i.e. straight into `docker compose logs`. This is the tool for a
+    # server that is up but not answering: it shows, at that instant, exactly
+    # what each waitress worker is blocked on (a lock, a socket, the model
+    # stream) instead of leaving it to be inferred from the outside. Costs
+    # nothing until the signal is sent, and exposes no new network surface.
+    #
+    #   docker compose exec aime kill -USR1 1
+    #   docker compose logs --tail=200 aime
+    if hasattr(signal, "SIGUSR1"):
+        faulthandler.register(signal.SIGUSR1, all_threads=True)
     # Start the background scheduler (scheduled agents + event reminders). Safe
     # here because the deployment is a single process — one loop, no
     # double-fire. Disabled with AIME_SCHEDULER=0.
