@@ -38,10 +38,14 @@ rule, or via a reverse proxy.
 
 If you put Flask behind a reverse proxy, two things need attention:
 
-- **`ProxyFix`**: install Werkzeug's `ProxyFix` middleware so
-  `request.remote_addr` reflects the real client IP. Without it, the
-  signup rate limiter sees every request as coming from the proxy and
-  caps all traffic together.
+- **`ProxyFix`**: already wired up — but **off by default**. It engages only
+  when `AIME_TRUSTED_PROXY_HOPS` is set above 0 (see `web_app.py:1314`). Set it
+  to the number of proxies in front of the app. Leaving it at 0 behind a proxy
+  has two consequences: the signup rate limiter sees every request as coming
+  from the proxy and caps all traffic together, and the IP recorded in
+  `auth_events` is the proxy's rather than the client's — which also makes the
+  Privacy Policy's statement that we log "the IP address it came from"
+  misleading. Treat this as a correctness item, not just a tuning knob.
 - **Trusted-header policy**: decide which forwarded headers to trust
   (`X-Forwarded-For`, `X-Forwarded-Proto`) before turning them on. An
   untrusted forwarded header is worse than none — it lets an attacker
@@ -84,9 +88,17 @@ older snapshot is fine — users will just have to log in again.
 
 ## 6. Logging and monitoring
 
-Currently the auth backend logs nothing on failure. For a public
-deployment, consider tailing Flask access logs into a tool that alerts on
-abnormal `/login` 401/429 rates or `/signup` 429s.
+The auth backend **does** log now: failed logins, lockouts, signup throttling,
+and password resets land in `auth_events` (with IP — see §3) and surface in the
+admin dashboard with 1h/24h summaries. Rows are pruned after 30 days.
+
+What is still missing is **alerting**. Nothing watches those counts for you, so
+a credential-stuffing run against a small deployment is only visible if someone
+opens the dashboard. For a public deployment, tail Flask access logs into
+something that alerts on abnormal `/login` 401/429 rates or `/signup` 429s.
+
+Also watch for the `warning` log line from a failed usage debit (§8) — it means
+cost control has silently stopped metering.
 
 ## 7. Account recovery
 
@@ -179,18 +191,25 @@ of operator facts and **a lawyer's review**.
   account accepted and when (from `/me`'s `terms` block; accounts with no
   recorded consent show no version rather than a fabricated one). Covered by
   `tests/test_terms.py`.
-- **Aime** is the product; **933 Consulting Group** (Texas LLC, PO Box 8243,
-  Midland, TX 79708) is the company that operates it and is named as the
-  contracting party and data controller. Contact throughout is
+- Naming: **Aime** is the product, **Prism** is the trade name, and
+  **933 Consulting Group LLC** (Texas, PO Box 8243, Midland, TX 79708) is the
+  legal entity — named as the contracting party and data controller, doing
+  business as Prism. A d/b/a is not a separate entity, which is why the LLC
+  signs and Prism only rides along. Contact throughout is
   andrew@933consulting.com. Governing law is Texas, venue Midland County.
-- Both still open with a **"Draft — not yet in force"** banner. Two things are
-  outstanding before it can come down:
-  1. **The entity's exact registered name.** It is written as "933 Consulting
-     Group"; as an LLC the registered name almost certainly carries an "LLC"
-     suffix. Check the Texas SOS filing and match it exactly in both files —
-     this was deliberately not guessed at, because an imprecisely named entity
-     is how a liability shield gets argued away.
-  2. **The email sending provider** — the last `[BRACKETED]` blank, in §5 of
+- Both still open with a **"Draft — not yet in force"** banner. Three things
+  are outstanding before it can come down:
+  1. **The entity's exact registered name.** Written as "933 Consulting Group
+     LLC"; check the Texas SOS filing and match the punctuation exactly (some
+     register as "…Group, LLC" or "L.L.C."). An imprecisely named entity is how
+     a liability shield gets argued away.
+  2. **The assumed-name filing for "Prism."** A Texas LLC must file an assumed
+     name certificate (SOS Form 503) before trading under a d/b/a. Confirm it
+     is on file — an unregistered d/b/a inside a binding agreement is a defect
+     that surfaces in exactly the dispute you'd least want it to. Worth a
+     trademark availability check too: "Prism" is a common word with heavy
+     existing use.
+  3. **The email sending provider** — the last `[BRACKETED]` blank, in §5 of
      the privacy policy. A transactional service (SendGrid / Postmark / Resend
      / SES) was chosen over a mailbox provider, but not yet picked.
 - Neither document has been reviewed by a lawyer, and neither is binding until
