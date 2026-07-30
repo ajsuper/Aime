@@ -165,20 +165,51 @@ not a soft degradation.
 ## 11. Terms of Service and Privacy Policy — **BLOCKING**
 
 Signup requires the user to tick a box agreeing to the Terms and Privacy
-Policy. The plumbing is done; **the documents themselves are placeholders and
-must be replaced before you open signups.**
+Policy. The plumbing is done and both documents are now **written in full** —
+US law, sole-proprietor operator, 18+, AWS-hosted. What remains is a short list
+of operator facts and **a lawyer's review**.
 
 - The text lives in `resources/legal/terms.html` and
   `resources/legal/privacy.html` (bodies only — `resources/style/legal.html`
   supplies the page shell). They are served at `/terms` and `/privacy`, public
   and unauthenticated, because the signup form links to them.
-- Both currently open with a **"Draft — not yet in force"** banner and are
-  peppered with `[BRACKETED]` blanks (entity name, jurisdiction, contact
-  addresses, retention periods, sub-processors). They have **not** been
-  reviewed by a lawyer and are not binding.
-- The privacy draft asserts things about how the code behaves — encryption at
-  rest, the 30-day deletion window, which third parties see your data. Check
-  each against *your* deployment before publishing it.
+- They must stay reachable *after* signup too, or a user can never re-read what
+  they agreed to nor find the contact address the documents name. The **Legal**
+  section of account settings links to both and shows which revision that
+  account accepted and when (from `/me`'s `terms` block; accounts with no
+  recorded consent show no version rather than a fabricated one). Covered by
+  `tests/test_terms.py`.
+- **Aime** is the product; **933 Consulting Group** (Texas LLC, PO Box 8243,
+  Midland, TX 79708) is the company that operates it and is named as the
+  contracting party and data controller. Contact throughout is
+  andrew@933consulting.com. Governing law is Texas, venue Midland County.
+- Both still open with a **"Draft — not yet in force"** banner. Two things are
+  outstanding before it can come down:
+  1. **The entity's exact registered name.** It is written as "933 Consulting
+     Group"; as an LLC the registered name almost certainly carries an "LLC"
+     suffix. Check the Texas SOS filing and match it exactly in both files —
+     this was deliberately not guessed at, because an imprecisely named entity
+     is how a liability shield gets argued away.
+  2. **The email sending provider** — the last `[BRACKETED]` blank, in §5 of
+     the privacy policy. A transactional service (SendGrid / Postmark / Resend
+     / SES) was chosen over a mailbox provider, but not yet picked.
+- Neither document has been reviewed by a lawyer, and neither is binding until
+  it is. Three things to raise with one: whether to add a binding
+  **arbitration clause and class-action waiver** (common in US consumer terms,
+  deliberately left out here because it waives user rights); whether the
+  **Texas Data Privacy and Security Act** applies to you and whether its
+  small-business exemption is available; and confirmation that naming the LLC
+  as operator sits correctly alongside the Stripe account it holds.
+- If the business later moves to a Prism entity, that is an assignment under
+  §17 of the Terms: it needs a `TERMS_VERSION` bump and notice to users, not a
+  quiet edit.
+- The privacy policy asserts things about how the code behaves — encryption at
+  rest, exactly what the auth log records and for how long, the 30-day
+  deletion window, that purge keeps no backup, and which third parties see
+  your data. These were verified against the code on 2026-07-29 and are
+  pinned by `tests/test_account_purge.py`; **re-verify them whenever that code
+  changes**, because a stale privacy policy is a liability, not just a stale
+  doc.
 - `AIME_TERMS_VERSION` (default: the date in `aime.config.TERMS_VERSION`)
   records *which* revision each account agreed to, stamped onto
   `users.terms_accepted_at` / `users.terms_version` at signup. **Bump it

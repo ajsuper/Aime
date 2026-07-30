@@ -10,6 +10,7 @@ import os
 import hashlib
 import threading
 import datetime
+import time
 import uuid
 import zoneinfo
 from dataclasses import dataclass
@@ -28,6 +29,25 @@ logger = logging.getLogger(__name__)
 # Suffix used for on-disk conversation files. Each is AES-GCM encrypted
 # under the owning user's DEK; the bytes are not JSON anymore.
 _CONV_SUFFIX = ".json.enc"
+
+# Exception type names that mean "the connection to the model API failed",
+# matched by name so this doesn't have to import httpx/httpcore internals (the
+# SDK wraps them several layers deep). See
+# AnthropicMessagesBackend._is_transient_connection_error.
+_TRANSIENT_ERROR_NAMES = frozenset({
+    "ReadError", "WriteError", "ConnectError", "CloseError",
+    "ReadTimeout", "WriteTimeout", "ConnectTimeout", "PoolTimeout",
+    "RemoteProtocolError", "ProtocolError", "NetworkError",
+    "APIConnectionError", "APITimeoutError",
+})
+
+# Turn events that put something on screen. A turn that dropped *before* any of
+# these can be retried invisibly; once one has been emitted a retry would
+# re-stream on top of a partial reply, so the failure is surfaced instead.
+_VISIBLE_TURN_EVENTS = frozenset({
+    "assistant_send_text", "assistant_text_delta", "assistant_text_end",
+    "assistant_thinking", "assistant_use_tool",
+})
 
 # Sentinel at the very start of a recovery-flattened message (see
 # AnthropicMessagesBackend._recover_history). Lets history replay render such
@@ -500,6 +520,22 @@ class AnthropicMessagesBackend:
     # Prefix that marks a message as a compaction summary (so later passes can
     # detect and merge it instead of re-summarizing from scratch).
     _SUMMARY_MARKER = "[Conversation summary so far]"
+
+    # --- transient-stream retry ---
+    # How many times to re-run a turn whose connection to the model API died
+    # before it produced anything. Cloud hosts reset long-lived outbound TLS
+    # streams routinely (NAT/firewall idle reapers), and the SDK's own retries
+    # don't apply once a stream has started, so without this a network blip
+    # costs the user their whole turn.
+    STREAM_RETRY_ATTEMPTS = 2
+    # Backoff before each retry, indexed by attempt. Short: the user is sitting
+    # in front of a composer waiting for a reply.
+    STREAM_RETRY_BACKOFF = (1.0, 3.0)
+
+    # How often an idle stream worker wakes to check whether its session has
+    # been swapped out from under it (see stream()). Purely a cleanup poll —
+    # a live worker is woken by the turn trigger, not by this.
+    STALE_WORKER_POLL_SECONDS = 5.0
 
     def __init__(
         self,
@@ -1217,7 +1253,23 @@ class AnthropicMessagesBackend:
         with self._lock:
             my_epoch = self._epoch
         while True:
-            self._turn_trigger.wait()
+            # Wait for a turn, but wake periodically to re-check whether this
+            # generation has been retired.
+            #
+            # Retirement works by bumping the epoch and pulsing the trigger —
+            # but the swap that follows (new_session / load_session) clears the
+            # trigger microseconds later, so unless this thread happens to be
+            # scheduled inside that window it never sees its own wake-up. It
+            # then parks here indefinitely: a leaked worker per session swap
+            # (idle rollover, day roll, /reset, conversation switch), all of
+            # them waking together on the next user message. Polling the epoch
+            # makes retirement reliable instead of a scheduling race.
+            while not self._turn_trigger.wait(timeout=self.STALE_WORKER_POLL_SECONDS):
+                with self._lock:
+                    retired = self._epoch != my_epoch
+                if retired:
+                    yield BackendEvent(kind="session_terminated")
+                    return
             # Check staleness/termination *before* clearing the trigger: a
             # stale loop must leave the trigger intact so the fresh loop still
             # sees the wake-up meant for it.
@@ -1265,26 +1317,68 @@ class AnthropicMessagesBackend:
             anticipate (an incompatible attachment, an orphan tool pair we
             didn't model), flattens, and retries the turn exactly once.
 
-        Anything that isn't a malformed-request 400 (network blips, 429s,
-        500s) is surfaced as a plain error — those are transient and must
-        not trigger a destructive history rewrite.
+        A third layer covers the network: a connection dropped mid-stream is
+        retried (see the loop below) rather than surfaced, because it says
+        nothing about the conversation. None of these paths rewrite history for
+        a transient failure — 429s and 500s still surface as plain errors.
         """
-        try:
-            yield from self._run_turn()
-            return
-        except Exception as exc:
-            if not self._is_malformed_history_error(exc):
-                self._discard_failed_assistant_placeholder()
-                yield BackendEvent(kind="error", error=str(exc),
-                                   error_meta=self._capture_error(exc))
-                yield BackendEvent(kind="turn_end", stop_reason="error")
+        malformed: Exception | None = None
+        for attempt in range(self.STREAM_RETRY_ATTEMPTS + 1):
+            produced_output = False
+            try:
+                for event in self._run_turn():
+                    if event.kind in _VISIBLE_TURN_EVENTS:
+                        produced_output = True
+                    yield event
                 return
-            # The API rejected the request itself as malformed. Flatten the
-            # history to a single valid message and retry the turn once.
-            self._discard_failed_assistant_placeholder()
-            reason = f"the conversation could not be processed ({exc})"
-            self._recover_history(reason)
-            yield BackendEvent(kind="history_recovered", text=reason)
+            except Exception as exc:
+                if self._is_malformed_history_error(exc):
+                    malformed = exc
+                    break   # handled below: flatten the history and retry once
+                # A dropped connection to the model API is a network event, not
+                # a conversation problem — and it is routine on a cloud host,
+                # where NAT/firewall idle reapers cut long-lived TLS streams
+                # (the classic "[Errno 104] Connection reset by peer" mid-turn).
+                # The SDK's own retries can't help once the stream has started,
+                # so failing here threw away a turn the user had already paid
+                # for and made them retype their message.
+                #
+                # Only safe to retry while nothing visible has streamed yet: a
+                # retry re-runs the turn from the start, and the frontend
+                # accumulates assistant text across deltas, so re-streaming on
+                # top of a partial reply would render it twice.
+                retriable = (
+                    self._is_transient_connection_error(exc)
+                    and not produced_output
+                    and not self._interrupted.is_set()
+                    and attempt < self.STREAM_RETRY_ATTEMPTS
+                )
+                if not retriable:
+                    self._discard_failed_assistant_placeholder()
+                    yield BackendEvent(kind="error", error=str(exc),
+                                       error_meta=self._capture_error(exc))
+                    yield BackendEvent(kind="turn_end", stop_reason="error")
+                    return
+                # Drop the reserved (empty) assistant slot before going again,
+                # or the retry would send a history ending in empty content.
+                self._discard_failed_assistant_placeholder()
+                delay = self.STREAM_RETRY_BACKOFF[
+                    min(attempt, len(self.STREAM_RETRY_BACKOFF) - 1)]
+                logger.warning(
+                    "turn stream dropped (%s); retrying in %.1fs (attempt %d/%d)",
+                    exc, delay, attempt + 1, self.STREAM_RETRY_ATTEMPTS)
+                time.sleep(delay)
+
+        if malformed is None:
+            # Defensive: the final attempt can't be retriable, so every other
+            # exit from the loop above has already returned.
+            return
+        # The API rejected the request itself as malformed. Flatten the
+        # history to a single valid message and retry the turn once.
+        self._discard_failed_assistant_placeholder()
+        reason = f"the conversation could not be processed ({malformed})"
+        self._recover_history(reason)
+        yield BackendEvent(kind="history_recovered", text=reason)
         try:
             yield from self._run_turn()
         except Exception as exc:
@@ -1310,6 +1404,29 @@ class AnthropicMessagesBackend:
         except Exception:  # never let diagnostics break the error path
             logger.debug("error sink failed", exc_info=True)
             return None
+
+    @staticmethod
+    def _is_transient_connection_error(exc: Exception) -> bool:
+        """True when `exc` is the connection to the model API failing, rather
+        than the API rejecting or failing the request itself.
+
+        Walks the `__cause__`/`__context__` chain because the failure arrives
+        heavily wrapped: the OS raises ConnectionResetError, httpcore wraps it,
+        httpx re-wraps that, and the SDK's streaming iterator re-raises it
+        again. Matching only the outermost type would miss every real case.
+        """
+        seen: set[int] = set()
+        current: BaseException | None = exc
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            # ConnectionResetError / ConnectionAborted / BrokenPipe / timeouts
+            # all land here; OSError is the shared base for socket failures.
+            if isinstance(current, (ConnectionError, TimeoutError, OSError)):
+                return True
+            if type(current).__name__ in _TRANSIENT_ERROR_NAMES:
+                return True
+            current = current.__cause__ or current.__context__
+        return False
 
     @staticmethod
     def _is_malformed_history_error(exc: Exception) -> bool:

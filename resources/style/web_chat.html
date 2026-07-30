@@ -3426,6 +3426,36 @@
             <p class="desc" id="account-import-msg"
                style="display:none;margin-top:0.4rem"></p>
           </div>
+          <!-- Legal. The signup form links to these too, but that is the only
+               other place they appear — without this section a user who has
+               already accepted them can never read them again, or find the
+               contact address they name. Same public routes, opened in a new
+               tab so an in-progress chat isn't navigated away from. -->
+          <div class="settings-section">
+            <h3>Legal</h3>
+            <p class="desc" id="account-terms-desc">The documents you agreed to
+              when you created your account.</p>
+            <div class="settings-row">
+              <span class="label">Terms of Service</span>
+              <a class="btn-neutral" href="/terms" target="_blank" rel="noopener"
+                 style="background:var(--bg-input);color:var(--text);
+                        border:1px solid var(--border);border-radius:8px;
+                        padding:0.4rem 0.9rem;cursor:pointer;font-size:0.85rem;
+                        text-decoration:none;display:inline-block">
+                Read
+              </a>
+            </div>
+            <div class="settings-row">
+              <span class="label">Privacy Policy</span>
+              <a class="btn-neutral" href="/privacy" target="_blank" rel="noopener"
+                 style="background:var(--bg-input);color:var(--text);
+                        border:1px solid var(--border);border-radius:8px;
+                        padding:0.4rem 0.9rem;cursor:pointer;font-size:0.85rem;
+                        text-decoration:none;display:inline-block">
+                Read
+              </a>
+            </div>
+          </div>
           <div class="settings-section">
             <h3>Session</h3>
             <div class="settings-row">
@@ -3437,7 +3467,8 @@
             <h3>Danger zone</h3>
             <p class="desc">Deleting conversations is permanent. Deleting your
               account deactivates it (recoverable by signing in again) and
-              permanently removes it after 30 days.</p>
+              erases it after 30 days — including every backup. We keep no
+              copy, so export your data first if you want to keep it.</p>
             <div class="settings-row">
               <span class="label" style="color: var(--error)">Delete all conversations</span>
               <button class="btn-danger" id="account-delete-all-btn">Delete all</button>
@@ -11579,6 +11610,7 @@ const keyInput = document.getElementById("account-key-input");
 const redeemBtn = document.getElementById("account-redeem-btn");
 const redeemMsg = document.getElementById("account-redeem-msg");
 const contactInput = document.getElementById("account-contact-input");
+const termsDescEl = document.getElementById("account-terms-desc");
 const contactBtn = document.getElementById("account-contact-btn");
 const contactMsg = document.getElementById("account-contact-msg");
 const contactDesc = document.getElementById("account-contact-desc");
@@ -11730,6 +11762,30 @@ function applyUsageMeter(armed, usage) {
     + "up again at the start of the next day.";
 }
 
+// Line above the Terms/Privacy links saying which revision this account
+// actually accepted, and when. Accounts made before consent was recorded
+// (admin/CLI-created, or pre-feature) have no version — they get the plain
+// description rather than a made-up one, since the point of showing this is
+// that it is accurate when someone disputes what they agreed to.
+function applyTermsInfo(terms) {
+  if (!termsDescEl) return;
+  const accepted = terms && terms.version && terms.accepted_at;
+  if (!accepted) {
+    termsDescEl.textContent =
+      "The Terms of Service and Privacy Policy for your account.";
+    return;
+  }
+  // accepted_at is a unix timestamp in seconds.
+  const when = new Date(terms.accepted_at * 1000).toLocaleDateString(
+    undefined, {year: "numeric", month: "long", day: "numeric"});
+  let text = `You accepted version ${terms.version} on ${when}.`;
+  if (terms.current && terms.current !== terms.version) {
+    text += ` These documents have since been updated to version `
+          + `${terms.current} — the current text is below.`;
+  }
+  termsDescEl.textContent = text;
+}
+
 async function refreshMe() {
   try {
     const r = await fetch("/me", {credentials: "same-origin"});
@@ -11740,6 +11796,7 @@ async function refreshMe() {
     if (lastNameInput) lastNameInput.value = data.last_name || "";
     if (contactInput) contactInput.value = data.messaging_contact || "";
     applyContactHint(data.messaging_channel);
+    applyTermsInfo(data.terms);
     __accessMode = data.access_mode || "open";
     __apiAccess = !!data.api_access;
     __usageOver = !!(data.usage_limits_armed && data.usage && data.usage.over);

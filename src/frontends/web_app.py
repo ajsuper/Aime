@@ -2933,6 +2933,18 @@ def me():
         "usage_limits_armed": _usage_limits_armed(),
         "usage": usage,
         "billing": billing,
+        # Which revision of the Terms this account actually agreed to, for the
+        # Legal section of account settings. `current` is what a new signup
+        # would accept today: when it differs from `version` the user is on an
+        # older revision, which is the thing you want to know when someone
+        # disputes what they agreed to. Both are NULL for accounts created
+        # before consent was recorded (CLI/admin-made, or pre-feature) — the
+        # frontend then just shows the documents without a version line.
+        "terms": {
+            "version": user.terms_version if user else None,
+            "accepted_at": user.terms_accepted_at if user else None,
+            "current": aime_config.TERMS_VERSION,
+        },
     })
 
 

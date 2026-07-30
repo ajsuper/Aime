@@ -6190,9 +6190,9 @@ def account_restore():
 def account_purge():
     results = _accounts.purge_expired(_auth_backend(), grace_days=_GRACE_DAYS)
     if results:
-        names = ", ".join(repr(p.user.username) for p, _ in results)
+        names = ", ".join(repr(p.user.username) for p in results)
         _flash("ok", f"Purged {len(results)} account(s): {names}. "
-                     f"A final backup was written for each.")
+                     f"Their data has been erased; this cannot be undone.")
     else:
         _flash("warn", "Nothing to purge — no account is past the grace period.")
     return redirect(url_for("index", tab="accounts"))
