@@ -5,13 +5,19 @@ and leaves the account's data directory completely untouched, so the account
 can be restored during a grace period. This module handles the other end:
 permanently purging accounts whose grace period has expired.
 
-A purge, per account, is three steps in a deliberate order:
+A purge, per account, is two steps in a deliberate order:
 
-1. take a final backup zip of the data directory (operator insurance against
-   a buggy purge — this is *not* a user-facing recovery path),
-2. hard-delete the ``users`` row (guarded by :meth:`auth.LocalAuthBackend.
+1. hard-delete the ``users`` row (guarded by :meth:`auth.LocalAuthBackend.
    hard_delete` so only already-soft-deleted rows can ever go), then
-3. remove the data directory.
+2. remove the data directory.
+
+Deliberately **no backup is taken on the way out**. An earlier version wrote a
+final archive as operator insurance against a buggy purge, but that left a
+copy of the data of someone who had asked to be forgotten sitting in backup
+storage, which is not what "delete my account" means and is awkward to defend
+to a regulator. The 30-day grace period before a purge is the recovery path;
+once it expires the data goes. The tradeoff is that a faulty purge is
+unrecoverable, so changes here want care and a test.
 
 Kept frontend-agnostic and free of CLI/argparse code so that
 ``scripts/manage_users.py`` is a thin wrapper over it.
@@ -116,24 +122,17 @@ def purge_user(
     user_id: int,
     *,
     database_dir: str | None = None,
-) -> str | None:
-    """Permanently purge one soft-deleted account.
+) -> None:
+    """Permanently and irreversibly purge one soft-deleted account.
 
-    Takes a final backup, hard-deletes the DB row, then removes the data
-    directory. Returns the path of the backup zip (or ``None`` if the account
-    had no data directory). Raises :class:`ValueError` if ``user_id`` is not a
-    soft-deleted account — a live account can never be purged through here.
+    Hard-deletes the DB row, then removes the data directory. Nothing is kept:
+    see the module docstring for why no backup is taken. Raises
+    :class:`ValueError` if ``user_id`` is not a soft-deleted account — a live
+    account can never be purged through here.
     """
     database_dir = database_dir or config.DATABASE_DIR
 
-    # 1. Final backup before anything is removed. Lands under
-    #    <database_dir>/backups/<id>/, which is outside the data directory, so
-    #    step 3 does not delete it.
-    backup_path = _backup.backup_user_data(
-        user_id, database_dir=database_dir, reason="purge"
-    )
-
-    # 2. Hard-delete the row. The guard inside hard_delete() means this is
+    # 1. Hard-delete the row. The guard inside hard_delete() means this is
     #    where a "not actually soft-deleted" account is rejected — before we
     #    touch its data directory.
     if not auth_backend.hard_delete(user_id):
@@ -141,16 +140,23 @@ def purge_user(
             f"user {user_id} is not a soft-deleted account; refusing to purge"
         )
 
-    # 3. Remove the data directory.
+    # 2. Remove the data directory.
     shutil.rmtree(_user_dir(user_id, database_dir), ignore_errors=True)
 
+    # 3. Remove any backup archives this account accumulated. These live under
+    #    <database_dir>/backups/<id>/, outside the data directory, so step 2
+    #    does not touch them — and each one is a full copy of the data the user
+    #    just asked us to erase (the /account/import safety net writes one, and
+    #    scheduled autobackup will write more). Purging the account has to take
+    #    them too, or "deleted" is a lie.
+    _backup.delete_all_backups(user_id, database_dir=database_dir)
+
     # 4. Drop any topic-sharing grants naming this user. These live outside the
-    #    data directory (a single store at the database root), so step 3 leaves
+    #    data directory (a single store at the database root), so step 2 leaves
     #    them behind; clean them up explicitly. A stale grant would never
     #    resolve to accessible content on its own, but leaving rows for a
     #    purged account around is needless cruft.
     _purge_shares(user_id, database_dir)
-    return backup_path
 
 
 def purge_expired(
@@ -159,22 +165,17 @@ def purge_expired(
     grace_days: int = DEFAULT_GRACE_DAYS,
     database_dir: str | None = None,
     dry_run: bool = False,
-) -> list[tuple[PendingPurge, str | None]]:
+) -> list[PendingPurge]:
     """Purge every soft-deleted account past the grace period.
 
-    Returns a list of ``(PendingPurge, backup_path)`` for the accounts acted
-    on. With ``dry_run=True`` nothing is removed and every ``backup_path`` is
-    ``None`` — the list just reports what *would* be purged.
+    Returns the accounts acted on. With ``dry_run=True`` nothing is removed —
+    the list just reports what *would* be purged.
     """
-    results: list[tuple[PendingPurge, str | None]] = []
+    results: list[PendingPurge] = []
     for item in list_pending(auth_backend, grace_days=grace_days):
         if not item.expired:
             continue
-        if dry_run:
-            results.append((item, None))
-        else:
-            backup_path = purge_user(
-                auth_backend, item.user.id, database_dir=database_dir
-            )
-            results.append((item, backup_path))
+        if not dry_run:
+            purge_user(auth_backend, item.user.id, database_dir=database_dir)
+        results.append(item)
     return results

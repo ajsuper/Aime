@@ -111,9 +111,18 @@ mind) is recoverable.
    admin can do it too.
 
 2. **Permanent purge.** After a grace period (default **30 days**) a
-   soft-deleted account becomes eligible for purge: a final backup zip is
-   written, the row is hard-deleted, and the data directory is removed. Purge
-   is an explicit admin action — it never happens automatically.
+   soft-deleted account becomes eligible for purge: the row is hard-deleted,
+   the data directory is removed, and so is the account's entire
+   `backups/<id>/` directory. Purge is an explicit admin action — it never
+   happens automatically.
+
+   **No backup is taken on the way out, by design.** An earlier version wrote
+   a final archive as insurance against a buggy purge, but that left a copy of
+   data belonging to someone who had asked to be forgotten, which is not what
+   "delete my account" means. The grace period is the recovery path; once it
+   expires the data is gone and nobody can get it back. The Privacy Policy
+   promises this, and `tests/test_account_purge.py` enforces it — so treat any
+   change here as a change to a published commitment.
 
 ### Recovery
 
@@ -239,8 +248,8 @@ loopback unless `AIME_USAGE_DASHBOARD_HOST` is set explicitly.
   `revoke_access_key`, `revoke_access_key_by_hash`, `list_users`,
   `soft_delete`, `restore`, `hard_delete`, `list_deleted_users`). The single
   source of truth.
-- `src/aime/accounts.py` — purge orchestration: final backup, hard-delete,
-  data-directory removal, and the grace-period bookkeeping.
+- `src/aime/accounts.py` — purge orchestration: hard-delete, data-directory
+  removal, backup-directory removal, and the grace-period bookkeeping.
 - `scripts/access_keys.py` — the access-control / invite-key admin CLI.
 - `scripts/manage_users.py` — the account-lifecycle admin CLI (delete /
   restore / purge).

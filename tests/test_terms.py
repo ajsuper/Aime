@@ -130,6 +130,58 @@ def test_signup_form_links_both_documents():
     assert "OK" in proc.stdout
 
 
+def test_me_reports_accepted_terms_version():
+    """The Legal section shows which revision you agreed to and when, so /me has
+    to carry it — alongside the current revision, which is what tells the user
+    (and us) that they are reading newer text than they accepted."""
+    proc = _run_snippet(
+        "import frontends.web_app as w\n"
+        "from aime import config\n"
+        "c = w.app.test_client()\n"
+        "r = c.post('/signup', data={'username':'owner','password':'" + _PW + "',"
+        "'password2':'" + _PW + "','accept_terms':'1'})\n"
+        "assert r.status_code in (200, 302), r.status_code\n"
+        "me = c.get('/me').get_json()\n"
+        "t = me['terms']\n"
+        "assert t['version'] == config.TERMS_VERSION, t\n"
+        "assert t['current'] == config.TERMS_VERSION, t\n"
+        "assert isinstance(t['accepted_at'], int) and t['accepted_at'] > 0, t\n"
+        "print('OK')\n"
+    )
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "OK" in proc.stdout
+
+
+def test_me_reports_no_consent_for_admin_made_account():
+    """An account created without consent (CLI/admin) must report nulls rather
+    than implying an agreement nobody gave."""
+    proc = _run_snippet(
+        "import frontends.web_app as w\n"
+        "u, _dek = w._auth_backend.create('owner', '" + _PW + "')\n"
+        "c = w.app.test_client()\n"
+        "r = c.post('/login', data={'username':'owner','password':'" + _PW + "'})\n"
+        "assert r.status_code in (200, 302), r.status_code\n"
+        "t = c.get('/me').get_json()['terms']\n"
+        "assert t['version'] is None, t\n"
+        "assert t['accepted_at'] is None, t\n"
+        "print('OK')\n"
+    )
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "OK" in proc.stdout
+
+
+def test_chat_ui_links_both_documents():
+    """Signup is not the only place these have to be reachable: someone who has
+    already accepted them still needs to re-read what they agreed to, and to
+    find the contact address the documents name. The account settings panel is
+    the one in-app route to them."""
+    chat_html = os.path.join(_REPO, "resources", "style", "web_chat.html")
+    with open(chat_html) as f:
+        markup = f.read()
+    assert 'href="/terms"' in markup
+    assert 'href="/privacy"' in markup
+
+
 # --- persistence ------------------------------------------------------------
 
 def test_direct_create_records_consent(backend):

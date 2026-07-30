@@ -138,16 +138,16 @@ def cmd_purge(args: argparse.Namespace) -> int:
 
     if not args.yes:
         reply = input(f"\nPermanently purge these {len(expired)} account(s)? "
-                       f"A final backup is written first. Type 'yes': ")
+                       f"This cannot be undone — no backup is kept. "
+                       f"Type 'yes': ")
         if reply.strip().lower() != "yes":
             print("Aborted.")
             return 1
 
     results = _accounts.purge_expired(backend, grace_days=args.days)
     print()
-    for p, backup_path in results:
-        where = backup_path if backup_path else "no data directory"
-        print(f"Purged #{p.user.id} {p.user.username!r} — backup: {where}")
+    for p in results:
+        print(f"Purged #{p.user.id} {p.user.username!r} — data erased.")
     print(f"\nPurged {len(results)} account(s).")
     return 0
 

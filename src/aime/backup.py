@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import datetime
 import os
+import shutil
 import sqlite3
 import tempfile
 import zipfile
@@ -127,3 +128,21 @@ def prune_backups(
         except OSError:
             pass
     return stale
+
+
+def delete_all_backups(
+    user_id: int,
+    *,
+    database_dir: str | None = None,
+) -> None:
+    """Remove a user's entire backup directory, archives and all.
+
+    For account purge (see :func:`aime.accounts.purge_user`): every archive
+    here is a full copy of the data the user asked us to erase, so erasing the
+    account has to erase these too. Irreversible by design, and safe to call
+    when the user never had a backup directory.
+    """
+    shutil.rmtree(
+        _backups_dir(user_id, database_dir or config.DATABASE_DIR),
+        ignore_errors=True,
+    )

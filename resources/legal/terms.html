@@ -4,34 +4,53 @@
   This file is injected into resources/style/legal.html (which supplies the
   page shell, fonts and styling), so it must contain no <html>/<head>/<body>.
 
-  ⚠  THIS IS UNREVIEWED PLACEHOLDER TEXT, NOT LEGAL ADVICE.  ⚠
-  Every <span class="blank">[LIKE THIS]</span> is a blank to fill in, and the
-  whole document needs a lawyer's pass before launch. When you replace it:
+  Drafted for: Texas law, 18+, AWS-hosted, operated by 933 Consulting Group.
+  Sub-processors named here are the ones the code actually uses (Anthropic for
+  inference and web search, Stripe for payments, SMTP for email, Twilio for
+  SMS) — re-check that list if you add or drop one.
+
+  BEFORE LAUNCH — the contracting party is written as "933 Consulting Group",
+  the name as supplied. It is an LLC, so the registered name almost certainly
+  carries an "LLC" suffix. Check the Texas Secretary of State filing and write
+  it EXACTLY as registered (suffix and punctuation), here and in privacy.html.
+  Naming the entity imprecisely is how a liability shield gets argued away —
+  this was deliberately not guessed at.
+
+  Note: "Aime" is the product; 933 Consulting Group is the company operating
+  it. If the business later moves to a Prism entity, that is an assignment
+  under section 17 and needs a TERMS_VERSION bump and notice to users.
+
+  ⚠  NOT LEGAL ADVICE, AND NOT YET REVIEWED BY A LAWYER.  ⚠
+  Each remaining highlighted blank (a span with the "blank" class, wrapping a
+  BRACKETED note) is a fact only the operator can supply. The launch check in
+  docs/production-checklist.md greps for those spans, so this comment
+  deliberately does not spell one out verbatim. When the last one is filled in:
     1. Delete the .draft-banner block below.
-    2. Update the "Version" line here AND aime.config.TERMS_VERSION — they are
-       what tie each account's recorded consent to the text it agreed to.
+    2. Bump aime.config.TERMS_VERSION — it is what ties each account's
+       recorded consent to the exact text it agreed to.
 -->
     <div class="draft-banner">
       <strong>Draft — not yet in force</strong>
-      This document is a placeholder skeleton. It has not been reviewed by a
-      lawyer and is not binding on anyone. Replace it with finalised terms
-      before opening signups to the public.
+      These Terms are complete but have not yet been reviewed by a lawyer, and
+      do not bind anyone until they are. Aime is not open for public signups
+      while this notice is here.
     </div>
 
     <h1>Terms of Service</h1>
-    <p class="meta">Version __TERMS_VERSION__ · Last updated
-      <span class="blank">[DATE]</span></p>
+    <p class="meta">Version __TERMS_VERSION__ (also the date these Terms take
+      effect)</p>
 
-    <p>These Terms govern your use of Aime, a personal assistant service
-      operated by <span class="blank">[LEGAL ENTITY NAME]</span>
-      (<span class="blank">[COMPANY NUMBER / REGISTERED ADDRESS]</span>)
-      (“we”, “us”). By creating an account you agree to them. If you do not
-      agree, do not create an account.</p>
+    <p>These Terms are a binding agreement between you and
+      <strong>933 Consulting Group</strong>, which operates the Aime service
+      (“Aime”, “we”, “us”). By ticking the box at signup and
+      creating an account, you agree to them. If you do not agree, do not
+      create an account.</p>
 
     <h2>1. Who may use Aime</h2>
-    <p>You must be at least <span class="blank">[MINIMUM AGE]</span> years old
-      and able to form a binding contract. You may not use Aime if we have
-      previously terminated your account.</p>
+    <p>You must be at least 18 years old and able to enter into a binding
+      contract. Aime is not intended for children, and we do not knowingly
+      allow anyone under 18 to create an account. You may not use Aime if we
+      have previously terminated your account.</p>
 
     <h2>2. Your account</h2>
     <ul>
@@ -40,8 +59,10 @@
       <li>Provide accurate signup details, and keep your email address current
         — it is how we reach you about your account and how account recovery
         works.</li>
-      <li>Tell us promptly at <span class="blank">[SECURITY CONTACT]</span> if
+      <li>Tell us promptly at <a href="mailto:andrew@933consulting.com">andrew@933consulting.com</a> if
         you believe your account has been accessed without your permission.</li>
+      <li>Accounts are personal. Do not share your credentials or let anyone
+        else use your account.</li>
     </ul>
 
     <h2>3. What Aime is — and is not</h2>
@@ -51,7 +72,8 @@
     <p>Aime does not provide medical, legal, financial, or other professional
       advice, and is not a substitute for a qualified professional. It is not
       an emergency service: never rely on it in a situation involving risk to
-      health, safety, or property.</p>
+      health, safety, or property. If you are in an emergency, contact your
+      local emergency services.</p>
 
     <h2>4. Acceptable use</h2>
     <p>Do not use Aime to:</p>
@@ -67,7 +89,10 @@
         automated means to place load on the service beyond normal personal
         use.</li>
     </ul>
-    <p>We may suspend or terminate accounts that breach this section.</p>
+    <p>You must also follow the usage policies of the AI providers behind Aime,
+      including <a href="https://www.anthropic.com/legal/aup" target="_blank"
+      rel="noopener">Anthropic's Usage Policy</a>. We may suspend or terminate
+      accounts that breach this section.</p>
 
     <h2>5. Plans, trials and payment</h2>
     <ul>
@@ -79,37 +104,48 @@
         before then. One trial per account.</li>
       <li>Changing plans takes effect immediately and the difference is
         prorated onto your next invoice.</li>
-      <li>You can cancel at any time. Cancellation takes effect at the end of
-        the period you have already paid for; you keep access until then.</li>
+      <li>You can cancel at any time from your account. Cancellation takes
+        effect at the end of the period you have already paid for; you keep
+        access until then.</li>
       <li>Except where the law requires otherwise, payments are
-        non-refundable. <span class="blank">[STATE YOUR REFUND POLICY, AND ANY
-        STATUTORY WITHDRAWAL RIGHTS THAT APPLY IN YOUR MARKETS]</span></li>
-      <li>We may change prices with at least
-        <span class="blank">[NOTICE PERIOD]</span> notice before they apply to
-        your next renewal.</li>
+        non-refundable, including for partial periods and for periods during
+        which you did not use the service. If we terminate your account without
+        cause, we will refund the unused portion of any prepaid period.</li>
+      <li>You are responsible for any sales or use taxes that apply to your
+        purchase, unless we are required to collect them.</li>
+      <li>We may change prices with at least 30 days' notice by email before
+        they apply to your next renewal. If you do not accept a price change,
+        cancel before it takes effect.</li>
+      <li>If a payment fails, we may retry it and may suspend access until it
+        succeeds.</li>
     </ul>
 
     <h2>6. Usage limits</h2>
     <p>Each plan carries a daily usage allowance. If you reach it, sending is
       paused until the allowance refreshes. Allowances exist to keep the
-      service sustainable and are not a guarantee of any particular volume.</p>
+      service sustainable and are not a guarantee of any particular volume. We
+      may adjust them, with notice where a change is materially adverse to
+      you.</p>
 
     <h2>7. Your content</h2>
     <p>The notes, messages, events, and files you put into Aime remain
       yours. You grant us only the licence needed to operate the service for
       you — to store your content, process it (including sending it to the AI
       providers that generate responses), and show it back to you and to anyone
-      you deliberately share it with.</p>
+      you deliberately share it with. This licence ends when you delete the
+      content or your account.</p>
     <p>You are responsible for having the right to submit what you submit. How
       we handle your data is described in our
       <a href="/privacy">Privacy Policy</a>.</p>
 
     <h2>8. Third-party services</h2>
-    <p>Aime depends on third parties — including
-      <span class="blank">[AI MODEL PROVIDER(S)]</span> for model inference,
-      Stripe for payments, and <span class="blank">[EMAIL / MESSAGING
-      PROVIDERS]</span> for delivery. Their availability affects ours, and
-      your content is processed by them as needed to run the service.</p>
+    <p>Aime depends on third parties — Anthropic for model inference and web
+      search, Stripe for payments,
+      <strong>Amazon Web Services</strong> for hosting, our email
+      provider for verification codes and account mail, and Twilio for SMS
+      where you have enabled message delivery. Their availability affects ours,
+      and your content is processed by them as needed to run the service. We
+      are not responsible for third-party services we do not control.</p>
 
     <h2>9. Availability and changes</h2>
     <p>We aim to keep Aime available but do not guarantee uninterrupted
@@ -120,7 +156,9 @@
     <h2>10. Ending your use</h2>
     <p>You may delete your account at any time from the app. Deletion
       deactivates the account immediately; it can be restored by signing in
-      again within 30 days, after which it is permanently removed.</p>
+      again within 30 days. After that it is erased along with every backup of
+      it, and we keep no copy — so <strong>export your data before you delete
+      if you want to keep it</strong>.</p>
     <p>We may suspend or terminate your account if you breach these Terms, if
       required by law, or if we discontinue the service. If we terminate
       without cause we will refund the unused portion of any prepaid period.</p>
@@ -128,33 +166,56 @@
     <h2>11. Disclaimers</h2>
     <p>To the fullest extent permitted by law, Aime is provided “as is” and
       “as available”, without warranties of any kind, express or implied,
-      including fitness for a particular purpose, accuracy, and
-      non-infringement. <span class="blank">[CONSUMER-LAW CARVE-OUT FOR YOUR
-      JURISDICTION — SOME WARRANTIES CANNOT BE EXCLUDED]</span></p>
+      including merchantability, fitness for a particular purpose, accuracy,
+      and non-infringement. Some states do not allow the exclusion of implied
+      warranties, so parts of this section may not apply to you; in that case
+      any implied warranty is limited to the shortest period the law allows.</p>
 
     <h2>12. Limitation of liability</h2>
     <p>To the fullest extent permitted by law, we are not liable for indirect,
       incidental, special, consequential, or punitive damages, or for lost
       profits, revenue, or data. Our total liability arising out of or relating
-      to the service is limited to
-      <span class="blank">[e.g. THE AMOUNT YOU PAID US IN THE 12 MONTHS BEFORE
-      THE CLAIM]</span>. Nothing here limits liability that cannot be limited
-      by law.</p>
+      to the service is limited to the greater of the amount you paid us in the
+      12 months before the claim, or US$50. Some states do not allow these
+      limits, so they may not apply to you. Nothing here limits liability for
+      fraud or for anything else that cannot be limited by law.</p>
 
-    <h2>13. Changes to these Terms</h2>
+    <h2>13. Indemnity</h2>
+    <p>You will indemnify us against claims, losses, and reasonable legal costs
+      arising from your content, your use of Aime, or your breach of these
+      Terms — except to the extent they arise from our own wrongdoing.</p>
+
+    <h2>14. Disputes</h2>
+    <p>If you have a problem, contact us first at
+      <a href="mailto:andrew@933consulting.com">andrew@933consulting.com</a>; most issues are resolved that
+      way. If we cannot resolve it informally within 30 days, either of us may
+      bring a claim in the courts identified in section 15. Nothing here stops
+      you from bringing a claim in small-claims court, or from reporting a
+      matter to a regulator.</p>
+
+    <h2>15. Governing law</h2>
+    <p>These Terms are governed by the laws of the State of
+      <strong>Texas</strong> and applicable United States federal
+      law, without regard to conflict-of-law rules. Any dispute will be brought
+      exclusively in the state or federal courts located in
+      <strong>Midland County, Texas</strong>, and we each consent to their
+      jurisdiction. If you live outside the United States, this does not remove
+      any mandatory protection you have under the law of your home country.</p>
+
+    <h2>16. Changes to these Terms</h2>
     <p>We may update these Terms. If a change is material we will notify you
-      at the email on your account and give you
-      <span class="blank">[NOTICE PERIOD]</span> before it takes effect.
+      at the email on your account at least 30 days before it takes effect.
       Continuing to use Aime after that means you accept the new Terms; if you
       don't, you may cancel and stop using the service.</p>
 
-    <h2>14. Governing law</h2>
-    <p>These Terms are governed by the laws of
-      <span class="blank">[JURISDICTION]</span>, and disputes will be resolved
-      in the courts of <span class="blank">[VENUE]</span>, without affecting
-      any mandatory rights you have where you live.</p>
+    <h2>17. General</h2>
+    <p>These Terms are the entire agreement between us about Aime. If a
+      provision is found unenforceable, the rest stays in force. Our not
+      enforcing a provision is not a waiver of it. You may not transfer your
+      rights under these Terms; we may transfer ours to a successor of the
+      business, with notice to you.</p>
 
-    <h2>15. Contact</h2>
+    <h2>18. Contact</h2>
     <p>Questions about these Terms:
-      <span class="blank">[SUPPORT EMAIL]</span><br>
-      Postal address: <span class="blank">[REGISTERED ADDRESS]</span></p>
+      <a href="mailto:andrew@933consulting.com">andrew@933consulting.com</a><br>
+      933 Consulting Group, PO Box 8243, Midland, TX 79708</p>
