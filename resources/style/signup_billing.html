@@ -33,12 +33,24 @@
         #DA9898 50% 66.66%, #A992CE 66.66% 83.33%, #8EAFD6 83.33% 100%);
     }
     * { box-sizing: border-box; }
-    html, body { height: 100%; margin: 0; }
-    body { background: var(--bg); color: var(--text);
+    html { height: 100%; }
+    body { margin: 0; background: var(--bg); color: var(--text);
            font-family: var(--font-body);
-           display: flex; align-items: center; justify-content: center;
-           padding: 1.5rem; -webkit-font-smoothing: antialiased; }
-    .card { position: relative; background: var(--bg-elev);
+           -webkit-font-smoothing: antialiased;
+           /* min-height, never a fixed height: this card is tall (the Payment
+              Element alone is ~200px) and must be free to grow past the
+              viewport on a short window. dvh so mobile browser chrome doesn't
+              force a phantom scroll; vh first as the fallback. */
+           min-height: 100vh; min-height: 100dvh;
+           display: flex; justify-content: center;
+           padding: 1.5rem; }
+    /* Centred with `margin:auto`, NOT `align-items:center`. Centring a flex
+       item that overflows its container pushes the overflow past the *start*
+       edge, where no scrolling can reach it — the card's top (wordmark,
+       heading, price) simply disappears off the top of the screen. Auto margins
+       centre while there's room and collapse to the start when there isn't, so
+       the whole card stays reachable. */
+    .card { position: relative; margin: auto; background: var(--bg-elev);
             border: 1px solid var(--border); border-radius: var(--r-lg);
             width: 100%; max-width: 440px;
             padding: 1.9rem; box-shadow: var(--shadow-2); }
@@ -120,41 +132,98 @@
                    text-underline-offset: 3px;
                    transition: color 0.15s, opacity 0.15s; }
     .skip button:hover { color: var(--text); opacity: 1; }
+
+    /* --- Widescreen: two columns ------------------------------------------
+       Below this the panes stack and everything stays centred (a phone reads
+       one column top to bottom). At and above it the card widens and splits:
+       the pitch on the left, the card form on the right, so a desktop isn't
+       looking at a tall narrow strip with the submit button below the fold.
+       The breakpoint is the width at which two ~360px columns plus the gutter
+       fit comfortably — not a device size. */
+    @media (min-width: 800px) {
+      .card { max-width: 840px; padding: 2.4rem;
+              display: grid; grid-template-columns: 1fr 1fr;
+              /* Panes stretch to the taller of the two (the grid default) so
+                 the divider below spans the full height instead of stopping
+                 wherever the shorter column's text happens to end. */
+              column-gap: 0; }
+      .pane-pitch { padding-right: 2.2rem; border-right: 1px solid var(--border); }
+      /* A column, so the skip link can be pinned to the bottom of the pane
+         (below) rather than floating just under whatever precedes it when the
+         pitch side happens to be the taller of the two. */
+      .pane-form  { padding-left: 2.2rem; display: flex; flex-direction: column; }
+      /* Centred text is a single-column idiom; in a column it reads as ragged.
+         Everything in the pitch goes flush left, including the wordmark. */
+      .pane-pitch .wordmark { margin-left: 0; margin-right: 0; }
+      .pane-pitch .eyebrow,
+      .pane-pitch h1,
+      .pane-pitch .lede,
+      .pane-pitch .charge-note,
+      .pane-pitch .charge-date { text-align: left; }
+      .pane-pitch .eyebrow { margin-top: 1.4rem; }
+      h1 { font-size: 1.5rem; }
+      /* The form pane starts at the top of the card, so its first label doesn't
+         need the vertical run-up it has when it follows the pitch. */
+      .pane-form .field-label { margin-top: 0; }
+      /* No divider needed once the skip link has a column of its own to sit at
+         the bottom of; `margin-top:auto` is what puts it there. */
+      .skip { border-top: 0; padding-top: 0; margin-top: auto;
+              padding-top: 1.25rem; }
+    }
+
+    /* Very short windows (a laptop with devtools open, a split screen): drop the
+       decorative breathing room so more of the form is reachable without
+       scrolling. The page still scrolls — this just reduces how much it has to. */
+    @media (max-height: 720px) {
+      body { padding: 1rem; }
+      .card { padding: 1.4rem; }
+      .wordmark { font-size: 2rem; }
+      .eyebrow { margin-top: 0.8rem; }
+    }
   </style>
 </head>
 <body>
+  <!-- Two panes: what you're getting, and where you pay for it. Stacked on a
+       phone (pitch first, so the price is read before the card is asked for);
+       side by side from 800px up, where a single column would otherwise be a
+       narrow ribbon down the middle of a large screen. -->
   <div class="card">
-    <div class="wordmark">Aime</div>
-    <p class="eyebrow">__GREETING__</p>
-    <h1>__HEADLINE__</h1>
-    <p class="lede">__LEDE__</p>
+    <div class="pane pane-pitch">
+      <div class="wordmark">Aime</div>
+      <p class="eyebrow">__GREETING__</p>
+      <h1>__HEADLINE__</h1>
+      <p class="lede">__LEDE__</p>
 
-    <div class="plan">
-      <span class="plan-name">__PLAN_NAME__</span>
-      <span class="plan-price">__PLAN_PRICE__</span>
+      <div class="plan">
+        <span class="plan-name">__PLAN_NAME__</span>
+        <span class="plan-price">__PLAN_PRICE__</span>
+      </div>
+      <p class="charge-note">__CHARGE_NOTE__</p>
+      <!-- The single most reassuring fact on a card-required trial: the date the
+           first charge would land. Stating it as a date (not "in 30 days") is
+           what answers "wait, am I being charged now?" without the user doing
+           sums. -->
+      <p class="charge-date">__CHARGE_DATE__</p>
     </div>
-    <p class="charge-note">__CHARGE_NOTE__</p>
-    <!-- The single most reassuring fact on a card-required trial: the date the
-         first charge would land. Stating it as a date (not "in 30 days") is what
-         answers "wait, am I being charged now?" without the user doing sums. -->
-    <p class="charge-date">__CHARGE_DATE__</p>
 
-    <p class="field-label">Card details</p>
-    <div id="payment-element"></div>
-    <p class="loading" id="loading">Loading secure card form…</p>
+    <div class="pane pane-form">
+      <p class="field-label">Card details</p>
+      <div id="payment-element"></div>
+      <p class="loading" id="loading">Loading secure card form…</p>
 
-    <button class="submit" id="submit-btn" type="button" disabled>__SUBMIT_LABEL__</button>
-    <!-- Every card error and progress message lands here, so it has to be
-         announced — a screen-reader user would otherwise press the button and
-         be told nothing at all. -->
-    <p class="status" id="status" role="status" aria-live="polite"></p>
-    <p class="secure">Payments are handled by Stripe. Aime never sees your card
-      number.</p>
+      <button class="submit" id="submit-btn" type="button" disabled>__SUBMIT_LABEL__</button>
+      <!-- Every card error and progress message lands here, so it has to be
+           announced — a screen-reader user would otherwise press the button and
+           be told nothing at all. -->
+      <p class="status" id="status" role="status" aria-live="polite"></p>
+      <p class="secure">Payments are handled by Stripe. Aime never sees your
+        card number.</p>
 
-    <div class="skip">
-      <form method="post" action="/signup/billing/skip">
-        <button type="submit">Not ready? Try view only</button>
-      </form>
+      <div class="skip">
+        <form method="post" action="/signup/billing/skip">
+          <button type="submit">Not ready? Try view only</button>
+        </form>
+      </div>
     </div>
   </div>
 
