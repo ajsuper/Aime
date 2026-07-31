@@ -100,11 +100,16 @@ def test_append_after_assistant_turn_inserts_trigger(backend):
     assert roles == ["user", "assistant", "user", "assistant"]
 
 
-def test_append_after_user_turn_needs_no_trigger(backend):
+def test_append_is_refused_after_an_unanswered_user_turn(backend):
+    """A trailing user message means a turn is owed. Writing the proactive echo
+    on top of it produces a history the stream worker refuses to answer, so the
+    turn the controller already claimed can never end — the chat freezes on
+    "Sending…" until the process restarts. Refusing is lossless: callers
+    re-stash and flush at the next turn_end."""
     backend._messages.append({"role": "user", "content": [{"type": "text", "text": "hi"}]})
-    backend.append_assistant_message("On it.")
-    roles = [m["role"] for m in backend.messages_snapshot()]
-    assert roles == ["user", "assistant"]
+
+    assert backend.append_assistant_message("On it.") is False
+    assert [m["role"] for m in backend.messages_snapshot()] == ["user"]
 
 
 def test_append_persists_to_disk(backend, tmp_path, dek):

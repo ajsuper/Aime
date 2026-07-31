@@ -182,6 +182,39 @@ def test_trial_used_migration_backfills_existing_only(backend):
     assert reopened.lookup(new_user.id).trial_used is False
 
 
+def test_billing_onboarded_defaults_false_for_new_account(backend):
+    """A new account still owes the plan step — that default is what puts a
+    billing-mode signup through it."""
+    user, _ = backend.create("alice", "Sufficiently-long-pw-1")
+    assert backend.lookup(user.id).billing_onboarded is False
+
+
+def test_set_billing_onboarded(backend):
+    user, _ = backend.create("alice", "Sufficiently-long-pw-1")
+    assert backend.set_billing_onboarded(user.id, True) is True
+    assert backend.lookup(user.id).billing_onboarded is True
+    assert backend.set_billing_onboarded(user.id, False) is True
+    assert backend.lookup(user.id).billing_onboarded is False
+    assert backend.set_billing_onboarded(9999, True) is False
+
+
+def test_billing_onboarded_migration_backfills_existing_only(backend):
+    """The cutover hinge, same shape as trial_used: accounts that existed before
+    the column are marked onboarded (an established user is never ambushed by a
+    paywall step at cutover), while accounts created after it still owe it."""
+    user, _ = backend.create("alice", "Sufficiently-long-pw-1")
+    path = backend._db_path
+    backend._conn.close()
+    conn = sqlite3.connect(path)
+    conn.execute("ALTER TABLE users DROP COLUMN billing_onboarded")
+    conn.commit()
+    conn.close()
+    reopened = LocalAuthBackend(path)
+    assert reopened.lookup(user.id).billing_onboarded is True
+    new_user, _ = reopened.create("bob", "Sufficiently-long-pw-1")
+    assert reopened.lookup(new_user.id).billing_onboarded is False
+
+
 def test_migration_adds_columns_on_old_db(backend):
     """Simulate a pre-billing database: drop the new columns + their index, then
     reopen — the migration must re-add them."""
@@ -1334,6 +1367,231 @@ def test_webhook_deleted_uses_embedded_object():
         "assert r.status_code == 200, r.status_code\n"
         "assert seen.get('id') == 'sub_9', seen\n"
         "assert 'retrieved' not in seen, seen\n"
+        "print('OK')\n",
+    )
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "OK" in proc.stdout
+
+
+# --- the signup plan+card step (billing mode) -------------------------------
+# Account creation isn't finished until this step is answered: /signup drops the
+# user on /signup/billing, and / keeps sending them back until they either start
+# a plan or take the quiet view-only exit. See _needs_billing_onboarding.
+
+_SIGNUP = ("c.post('/signup', data={'username':'owner',"
+           "'password':'Sufficiently-long-pw-1',"
+           "'password2':'Sufficiently-long-pw-1','accept_terms':'1'})\n")
+
+
+def test_signup_lands_on_the_plan_step():
+    """A fresh billing-mode account is sent to the plan step, not the app."""
+    proc = _run_snippet(
+        _BILLING_ENV,
+        "import frontends.web_app as w\n"
+        "c = w.app.test_client()\n"
+        + _SIGNUP +
+        "r = c.get('/')\n"
+        "assert r.status_code == 302, r.status_code\n"
+        "assert r.headers['Location'].endswith('/signup/billing'), r.headers['Location']\n"
+        "print('OK')\n",
+    )
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "OK" in proc.stdout
+
+
+def test_plan_step_renders_plan_and_the_view_only_exit():
+    """The step is a finished page on first paint: plan name + trial length are
+    server-rendered (no placeholders left), and the view-only exit is a plain
+    form POST so it survives a broken script."""
+    proc = _run_snippet(
+        _BILLING_ENV,
+        "import frontends.web_app as w\n"
+        "w._billing.tier_prices = lambda **k: "
+        "{'light': {'amount': 800, 'currency': 'usd', 'interval': 'month'}}\n"
+        "c = w.app.test_client()\n"
+        + _SIGNUP +
+        "r = c.get('/signup/billing')\n"
+        "assert r.status_code == 200, r.status_code\n"
+        "body = r.data.decode()\n"
+        "for tok in ('__GREETING__','__HEADLINE__','__LEDE__','__PLAN_NAME__',"
+        "            '__PLAN_PRICE__','__CHARGE_NOTE__','__SUBMIT_LABEL__'):\n"
+        "    assert tok not in body, tok\n"
+        "assert 'Light' in body and '$8.00/mo' in body, body[:600]\n"
+        "assert '30-day free trial' in body, body[:600]\n"
+        "assert 'Not ready? Try view only' in body\n"
+        "assert 'action=\"/signup/billing/skip\"' in body\n"
+        "print('OK')\n",
+    )
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "OK" in proc.stdout
+
+
+def test_plan_step_states_the_trial_and_when_billing_starts():
+    """The trial has to be unmissable, and "am I being charged now?" has to be
+    answered on the page: the free period, the price after it, and the dated
+    first charge — spelled as a month name so it can't be read as a D/M swap."""
+    proc = _run_snippet(
+        _BILLING_ENV,
+        "import datetime, html\n"
+        "import frontends.web_app as w\n"
+        "w._billing.tier_prices = lambda **k: "
+        "{'light': {'amount': 800, 'currency': 'usd', 'interval': 'month'}}\n"
+        "c = w.app.test_client()\n"
+        + _SIGNUP +
+        # Unescaped, so these assert on what the user reads, not on entities.
+        "body = html.unescape(c.get('/signup/billing').data.decode())\n"
+        "assert 'Start your 30-day free trial' in body, body[:900]\n"
+        "assert \"we won't charge you for 30 days\" in body, body[:900]\n"
+        "assert 'Free for 30 days, then $8.00/mo' in body, body[:900]\n"
+        "due = datetime.date.today() + datetime.timedelta(days=30)\n"
+        "expected = w._dateformat.render_date(due, 'MMM D, YYYY')\n"
+        "assert (\"You won't be charged until \" + expected) in body, "
+        "(expected, body[:900])\n"
+        "print('OK')\n",
+    )
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "OK" in proc.stdout
+
+
+def test_plan_step_says_it_charges_today_when_no_trial_is_offered():
+    """A trial-ineligible account must not be shown free-trial copy — it says
+    plainly that this one charges today, rather than leaving the difference to
+    be inferred from an absent line."""
+    proc = _run_snippet(
+        _BILLING_ENV,
+        "import frontends.web_app as w\n"
+        "w._billing.tier_prices = lambda **k: "
+        "{'light': {'amount': 800, 'currency': 'usd', 'interval': 'month'}}\n"
+        "c = w.app.test_client()\n"
+        + _SIGNUP +
+        "w._auth_backend.set_trial_used(1, True)\n"
+        # Only the visible markup — the script below it discusses the trial in
+        # comments, which is not copy the user ever reads.
+        "page = c.get('/signup/billing').data.decode()\n"
+        "body = page.split('<body>')[1].split('<script>')[0]\n"
+        "assert 'free trial' not in body.lower(), "
+        "[l for l in body.splitlines() if 'free trial' in l.lower()][:3]\n"
+        "assert 'Your first payment is today' in body, body[-800:]\n"
+        "assert 'Subscribe' in body\n"
+        "print('OK')\n",
+    )
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "OK" in proc.stdout
+
+
+def test_plan_step_survives_an_unreadable_price():
+    """A Stripe blip on the (cosmetic) price lookup must not break the step —
+    the card form doesn't depend on it."""
+    proc = _run_snippet(
+        _BILLING_ENV,
+        "import frontends.web_app as w\n"
+        "def boom(**k):\n"
+        "    raise RuntimeError('stripe down')\n"
+        "w._billing.tier_prices = boom\n"
+        "c = w.app.test_client()\n"
+        + _SIGNUP +
+        "r = c.get('/signup/billing')\n"
+        "assert r.status_code == 200, r.status_code\n"
+        "assert 'Light' in r.data.decode()\n"
+        "print('OK')\n",
+    )
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "OK" in proc.stdout
+
+
+def test_view_only_exit_answers_the_step_without_granting_access():
+    """"Not ready? Try view only" finishes signup and hands over the app — but
+    read-only. It records the decision (so the step doesn't come back) and grants
+    nothing: api_access stays off, exactly like an unanswered account."""
+    proc = _run_snippet(
+        _BILLING_ENV,
+        "import frontends.web_app as w\n"
+        "c = w.app.test_client()\n"
+        + _SIGNUP +
+        "r = c.post('/signup/billing/skip')\n"
+        "assert r.status_code == 302 and r.headers['Location'].endswith('/'), r.headers\n"
+        "u = w._auth_backend.lookup(1)\n"
+        "assert u.billing_onboarded is True and u.api_access is False, u\n"
+        # The app is reachable now, and the step redirects away instead of
+        # re-appearing.
+        "assert c.get('/').status_code == 200\n"
+        "r2 = c.get('/signup/billing')\n"
+        "assert r2.status_code == 302 and r2.headers['Location'].endswith('/'), r2.headers\n"
+        "print('OK')\n",
+    )
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "OK" in proc.stdout
+
+
+def test_starting_a_plan_answers_the_step():
+    """The other way out: once the subscription is created the step is done, so
+    the app opens and /signup/billing stops being reachable."""
+    proc = _run_snippet(
+        _BILLING_ENV,
+        "import frontends.web_app as w\n"
+        "c = w.app.test_client()\n"
+        + _SIGNUP +
+        "w._auth_backend.set_stripe_customer(1, 'cus_1')\n"
+        "w._billing.saved_payment_method = lambda sid, cid: ('pm_1', 'light')\n"
+        "w._billing.subscription_state = lambda cid: {'has_active': False, 'used_trial': False}\n"
+        "w._billing.create_subscription = lambda **k: 'sub_1'\n"
+        "w._billing.reconcile_customer = lambda ab, cid: (ab.set_api_access(1, True) or True)\n"
+        "r = c.post('/billing/subscribe/confirm', json={'setup_intent_id':'seti_1'})\n"
+        "assert r.status_code == 200, (r.status_code, r.get_json())\n"
+        "assert w._auth_backend.lookup(1).billing_onboarded is True\n"
+        "assert c.get('/').status_code == 200\n"
+        "print('OK')\n",
+    )
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "OK" in proc.stdout
+
+
+def test_comped_account_skips_the_step():
+    """An admin-comped account has nothing to pay, so it must never be held at
+    the plan step."""
+    proc = _run_snippet(
+        _BILLING_ENV,
+        "import frontends.web_app as w\n"
+        "c = w.app.test_client()\n"
+        + _SIGNUP +
+        "w._auth_backend.set_comp_access(1, True)\n"
+        "assert c.get('/').status_code == 200\n"
+        "r = c.get('/signup/billing')\n"
+        "assert r.status_code == 302, r.status_code\n"
+        "print('OK')\n",
+    )
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "OK" in proc.stdout
+
+
+def test_no_plan_step_outside_billing_mode():
+    """keys mode has no plan to sell: signup goes straight into the app, and the
+    step redirects away rather than 404ing someone who bookmarked it."""
+    proc = _run_snippet(
+        {"AIME_ACCESS_MODE": "keys"},
+        "import frontends.web_app as w\n"
+        "c = w.app.test_client()\n"
+        + _SIGNUP +
+        "assert c.get('/').status_code == 200\n"
+        "r = c.get('/signup/billing')\n"
+        "assert r.status_code == 302 and r.headers['Location'].endswith('/'), r.headers\n"
+        "print('OK')\n",
+    )
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "OK" in proc.stdout
+
+
+def test_plan_step_requires_login():
+    """It's an account-creation step for *this* account — no session, no step."""
+    proc = _run_snippet(
+        _BILLING_ENV,
+        "import frontends.web_app as w\n"
+        "c = w.app.test_client()\n"
+        "r = c.get('/signup/billing')\n"
+        "assert r.status_code in (302, 401), r.status_code\n"
+        "assert '/login' in r.headers.get('Location', '/login'), r.headers\n"
+        "r2 = c.post('/signup/billing/skip')\n"
+        "assert r2.status_code in (302, 401), r2.status_code\n"
         "print('OK')\n",
     )
     assert proc.returncode == 0, proc.stderr + proc.stdout

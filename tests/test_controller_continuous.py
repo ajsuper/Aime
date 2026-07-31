@@ -75,6 +75,11 @@ def test_idle_gap_rolls_to_fresh_session_silently(monkeypatch):
     c, backend, events = _controller(messages=[{"role": "user", "content": []}])
     # Last activity was two hours ago → the next message should roll over first.
     c._last_activity = time.time() - 7200
+    # Pin the calendar day so only the *idle* gap can trigger the roll. Run
+    # within two hours after midnight, that two-hour-old timestamp falls on
+    # yesterday and a day roll fires too — which clears the transcript and made
+    # this test fail once a day, purely on wall-clock time.
+    monkeypatch.setattr(c, "_local_date", lambda epoch: datetime.date(2026, 1, 1))
     events.clear()
 
     c.dispatch_input("you still there?")

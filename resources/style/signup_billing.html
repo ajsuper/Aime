@@ -1,0 +1,336 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Start your plan — Aime</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+  <link href="/fonts/fonts.css" rel="stylesheet">
+  <!-- Stripe.js for the Payment Element below. The card fields are rendered by
+       Stripe inside its own iframe — Aime never sees or handles the number. -->
+  <script src="https://js.stripe.com/v3/"></script>
+  <style>
+    :root {
+      color-scheme: dark;
+      --font-body: "Hanken Grotesk", ui-sans-serif, system-ui, -apple-system, sans-serif;
+      --font-display: "Fraunces", Georgia, "Times New Roman", serif;
+      --r-xs: 6px; --r-sm: 10px; --r-md: 14px; --r-lg: 20px;
+      --bg: #1E1C18;
+      --bg-elev: #28251F;
+      --bg-input: #302C25;
+      --border: #3B362D;
+      --text: #EDE8DD;
+      --muted: #998F7E;
+      --accent: #E0AAB4;
+      --cta: #DC6076;
+      --cta-hover: #E67288;
+      --error: #EC9090;
+      --shadow-1: 0 1px 2px rgba(0,0,0,0.35), 0 4px 14px rgba(0,0,0,0.32);
+      --shadow-2: 0 8px 24px rgba(0,0,0,0.5), 0 28px 60px rgba(0,0,0,0.6);
+      --edge-light: rgba(255,255,255,0.07);
+      --rainbow: linear-gradient(90deg,
+        #8CC09C 0 16.66%, #DBCA7C 16.66% 33.33%, #DEB07E 33.33% 50%,
+        #DA9898 50% 66.66%, #A992CE 66.66% 83.33%, #8EAFD6 83.33% 100%);
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; }
+    body { background: var(--bg); color: var(--text);
+           font-family: var(--font-body);
+           display: flex; align-items: center; justify-content: center;
+           padding: 1.5rem; -webkit-font-smoothing: antialiased; }
+    .card { position: relative; background: var(--bg-elev);
+            border: 1px solid var(--border); border-radius: var(--r-lg);
+            width: 100%; max-width: 440px;
+            padding: 1.9rem; box-shadow: var(--shadow-2); }
+    .card::before { content: ""; position: absolute; inset: 0;
+                    border-radius: inherit; pointer-events: none;
+                    box-shadow: inset 0 1px 0 var(--edge-light); }
+    .wordmark { font-family: var(--font-display); font-weight: 600;
+                font-size: 2.4rem; line-height: 1.1; color: var(--text);
+                width: fit-content; margin: 0.1rem auto 0.2rem;
+                letter-spacing: -0.01em; }
+    .wordmark::after { content: ""; display: block; height: 3px;
+                       margin-top: 0.3rem; border-radius: 2px;
+                       background: var(--rainbow); }
+    /* Where you are in signup. Small and quiet — it orients, it doesn't shout. */
+    .eyebrow { font-family: var(--font-display); font-size: 0.78rem;
+               letter-spacing: 0.08em; text-transform: uppercase;
+               color: var(--muted); text-align: center;
+               margin: 1.2rem 0 0.25rem; }
+    h1 { font-family: var(--font-display); margin: 0 0 0.45rem;
+         font-size: 1.35rem; font-weight: 600; text-align: center; }
+    .lede { color: var(--muted); font-size: 0.93rem; margin: 0 0 1.25rem;
+            line-height: 1.5; text-align: center; }
+
+    /* The plan being started. One line, stated plainly: what it is, what it
+       costs, when that starts. No picker — every trial begins on the default
+       plan and moving up is a control inside the app. */
+    .plan { display: flex; align-items: baseline; justify-content: space-between;
+            gap: 0.75rem; background: var(--bg-input);
+            border: 1px solid var(--border); border-radius: var(--r-md);
+            padding: 0.8rem 0.95rem; }
+    .plan-name { font-family: var(--font-display); font-weight: 600;
+                 font-size: 1.02rem; }
+    .plan-price { font-family: var(--font-display); font-size: 0.95rem;
+                  color: var(--muted); }
+    .plan-price:empty { display: none; }
+    .charge-note { color: var(--muted); font-size: 0.83rem; line-height: 1.45;
+                   margin: 0.55rem 0 0; text-align: center; }
+    /* Given weight the surrounding fine print doesn't have: it's the fact that
+       decides whether the card field feels safe to fill in. */
+    .charge-date { color: var(--text); font-size: 0.88rem; line-height: 1.45;
+                   margin: 0.3rem 0 0; text-align: center; font-weight: 500; }
+    .charge-date:empty { display: none; }
+
+    .field-label { font-family: var(--font-display); font-weight: 500;
+                   font-size: 0.85rem; color: var(--muted);
+                   margin: 1.25rem 0 0.5rem; }
+    /* Stripe mounts its iframe here; it arrives with its own height, so this
+       only needs to reserve space while it loads (avoids the button jumping). */
+    #payment-element { min-height: 44px; }
+    .loading { color: var(--muted); font-size: 0.88rem; margin: 0.5rem 0 0; }
+    .loading:empty { display: none; }
+
+    button.submit { width: 100%; background: var(--cta); color: #fff; border: 0;
+                    border-radius: var(--r-sm); padding: 0.7rem 0.8rem;
+                    font-family: var(--font-display); font-weight: 600;
+                    font-size: 0.98rem; cursor: pointer; margin-top: 1.1rem;
+                    box-shadow: var(--shadow-1);
+                    transition: background 0.15s, transform 0.05s; }
+    button.submit:hover:not(:disabled) { background: var(--cta-hover); }
+    button.submit:active:not(:disabled) { transform: translateY(1px); }
+    button.submit:disabled { opacity: 0.55; cursor: default; }
+    .status { font-size: 0.86rem; margin: 0.6rem 0 0; text-align: center;
+              line-height: 1.45; min-height: 1.1rem; }
+    .status.err { color: var(--error); }
+    .status.ok { color: var(--muted); }
+    .secure { color: var(--muted); font-size: 0.78rem; text-align: center;
+              margin: 0.75rem 0 0; line-height: 1.45; }
+
+    /* The way past this step without paying. Deliberately quiet — a small muted
+       link under a divider at the very bottom, not a second button competing
+       with the trial. It's there for whoever needs it and stays out of the way
+       for everyone else. It's a plain form POST, so it still works if the
+       script above failed to load. */
+    .skip { margin-top: 1.5rem; padding-top: 1rem;
+            border-top: 1px solid var(--border); text-align: center; }
+    .skip button { background: none; border: 0; padding: 0.2rem; font: inherit;
+                   font-size: 0.8rem; color: var(--muted); opacity: 0.8;
+                   cursor: pointer; text-decoration: underline;
+                   text-underline-offset: 3px;
+                   transition: color 0.15s, opacity 0.15s; }
+    .skip button:hover { color: var(--text); opacity: 1; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="wordmark">Aime</div>
+    <p class="eyebrow">__GREETING__</p>
+    <h1>__HEADLINE__</h1>
+    <p class="lede">__LEDE__</p>
+
+    <div class="plan">
+      <span class="plan-name">__PLAN_NAME__</span>
+      <span class="plan-price">__PLAN_PRICE__</span>
+    </div>
+    <p class="charge-note">__CHARGE_NOTE__</p>
+    <!-- The single most reassuring fact on a card-required trial: the date the
+         first charge would land. Stating it as a date (not "in 30 days") is what
+         answers "wait, am I being charged now?" without the user doing sums. -->
+    <p class="charge-date">__CHARGE_DATE__</p>
+
+    <p class="field-label">Card details</p>
+    <div id="payment-element"></div>
+    <p class="loading" id="loading">Loading secure card form…</p>
+
+    <button class="submit" id="submit-btn" type="button" disabled>__SUBMIT_LABEL__</button>
+    <!-- Every card error and progress message lands here, so it has to be
+         announced — a screen-reader user would otherwise press the button and
+         be told nothing at all. -->
+    <p class="status" id="status" role="status" aria-live="polite"></p>
+    <p class="secure">Payments are handled by Stripe. Aime never sees your card
+      number.</p>
+
+    <div class="skip">
+      <form method="post" action="/signup/billing/skip">
+        <button type="submit">Not ready? Try view only</button>
+      </form>
+    </div>
+  </div>
+
+  <script>
+  // Plan + card, the last step of signup in billing mode. Same two-step Stripe
+  // flow the Billing tab uses (and the same endpoints): POST /billing/subscribe
+  // mints a SetupIntent to collect and save the card — no subscription, no trial
+  // spent — and POST /billing/subscribe/confirm creates the subscription on that
+  // saved card once it's confirmed. Splitting it that way is what stops an
+  // abandoned card form from consuming the user's one free trial. On success the
+  // server has already granted access, so we just hand over to the app.
+  // See src/aime/billing.py + docs/billing.md.
+  const submitBtn = document.getElementById("submit-btn");
+  const statusEl  = document.getElementById("status");
+  const loadingEl = document.getElementById("loading");
+  let stripe = null;
+  let elements = null;
+  // Set once the card is confirmed; from then on the button resumes at step 2
+  // rather than re-confirming a spent SetupIntent (see onSubmit).
+  let confirmedIntentId = null;
+
+  function setStatus(msg, isError) {
+    statusEl.textContent = msg || "";
+    statusEl.className = "status" + (msg ? (isError ? " err" : " ok") : "");
+  }
+
+  // Theme Stripe's own fields off this page's variables so the card sits in the
+  // card, rather than looking like a form borrowed from somewhere else.
+  function appearance() {
+    const css = getComputedStyle(document.documentElement);
+    const v = (n, fallback) => (css.getPropertyValue(n).trim() || fallback);
+    return {
+      theme: "night",
+      variables: {
+        colorPrimary:    v("--accent", "#E0AAB4"),
+        colorBackground: v("--bg-input", "#302C25"),
+        colorText:       v("--text", "#EDE8DD"),
+        colorDanger:     v("--error", "#EC9090"),
+        fontFamily:      v("--font-body", "sans-serif"),
+        borderRadius:    "10px",
+      },
+    };
+  }
+
+  // Mount the card field. Any failure here leaves the step readable and the
+  // view-only exit working — the user is never stuck on a dead page.
+  async function mountCard() {
+    if (!window.Stripe) {
+      loadingEl.textContent = "";
+      setStatus("The payment form couldn't load. Please refresh to try again.",
+                true);
+      return;
+    }
+    try {
+      // No tier in the body: the plan is forced server-side (there's no picker
+      // at signup), and it rides the SetupIntent's metadata into step 2.
+      const r = await fetch("/billing/subscribe", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        credentials: "same-origin",
+        body: JSON.stringify({}),
+      });
+      const data = await r.json();
+      if (!data.ok) {
+        // Already subscribed (a double submit, a webhook that landed first):
+        // there's nothing to do here, so finish the step and go in.
+        if (data.code === "already_subscribed") { window.location.href = "/"; return; }
+        loadingEl.textContent = "";
+        setStatus(data.message || "We couldn't start checkout just now. "
+                                + "Please refresh to try again.", true);
+        return;
+      }
+      stripe = Stripe(data.publishable_key);
+      elements = stripe.elements({
+        clientSecret: data.client_secret,
+        appearance: appearance(),
+      });
+      elements.create("payment").mount("#payment-element");
+      loadingEl.textContent = "";
+      submitBtn.disabled = false;
+    } catch {
+      loadingEl.textContent = "";
+      setStatus("Network error — please refresh to try again.", true);
+    }
+  }
+
+  // Confirm the card with Stripe, then have the server create the subscription.
+  // redirect:"if_required" keeps cards that don't need 3-D Secure inline; ones
+  // that do leave for the bank and come back to this same step (see below).
+  async function startPlan() {
+    if (!stripe || !elements) return;
+    submitBtn.disabled = true;
+    setStatus("Confirming your card…", false);
+    const submitted = await elements.submit();
+    if (submitted.error) {
+      setStatus(submitted.error.message || "Please check your card details.", true);
+      submitBtn.disabled = false;
+      return;
+    }
+    const result = await stripe.confirmSetup({
+      elements,
+      confirmParams: {
+        return_url: window.location.origin + "/signup/billing?billing_return=1",
+      },
+      redirect: "if_required",
+    });
+    if (result.error) {
+      setStatus(result.error.message || "We couldn't confirm your card.", true);
+      submitBtn.disabled = false;
+      return;
+    }
+    confirmedIntentId = result.setupIntent.id;
+    await finalize(confirmedIntentId);
+  }
+
+  // Once the card is confirmed the SetupIntent is spent: re-confirming it would
+  // fail with something the user can't act on. So if creating the subscription
+  // is what failed (a Stripe blip — "please try again in a moment"), the retry
+  // has to resume from step 2 with the card we already have, not ask for it
+  // again. This is what makes the button's second press actually work.
+  function onSubmit() {
+    if (confirmedIntentId) finalize(confirmedIntentId);
+    else startPlan();
+  }
+
+  // Step 2: the card is saved, so the server can create the subscription. It
+  // grants access in the same request, so the app is ready by the time we land.
+  async function finalize(setupIntentId) {
+    setStatus("Setting up your account…", false);
+    submitBtn.disabled = true;
+    try {
+      const r = await fetch("/billing/subscribe/confirm", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        credentials: "same-origin",
+        body: JSON.stringify({setup_intent_id: setupIntentId}),
+      });
+      const data = await r.json();
+      if (!data.ok) {
+        // already_subscribed means the plan exists — the step is done either way.
+        if (data.code === "already_subscribed") { window.location.href = "/"; return; }
+        setStatus(data.message || "Something went wrong. Please try again.", true);
+        submitBtn.disabled = false;
+        return;
+      }
+    } catch {
+      setStatus("Network error — please try again.", true);
+      submitBtn.disabled = false;
+      return;
+    }
+    window.location.href = "/";
+  }
+
+  submitBtn.addEventListener("click", onSubmit);
+
+  // Coming back from a 3-D Secure challenge: Stripe returns to this step with
+  // the SetupIntent on the URL. The card is confirmed but no subscription exists
+  // yet, so pick the flow up where it left off instead of asking for the card
+  // again. Anything other than a clean success falls through to a fresh mount.
+  const params = new URLSearchParams(window.location.search);
+  const returnedIntent = params.get("setup_intent");
+  if (params.get("billing_return") && returnedIntent
+      && params.get("redirect_status") === "succeeded") {
+    // Clean the query so a refresh doesn't replay this.
+    history.replaceState(null, "", window.location.pathname);
+    loadingEl.textContent = "";
+    // No Payment Element is mounted on this path — the card was confirmed
+    // before we left — so the retry button must resume from step 2 too.
+    confirmedIntentId = returnedIntent;
+    finalize(confirmedIntentId);
+  } else {
+    if (params.get("billing_return")) {
+      history.replaceState(null, "", window.location.pathname);
+    }
+    mountCard();
+  }
+  </script>
+</body>
+</html>

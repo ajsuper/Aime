@@ -2186,6 +2186,19 @@
        /me's access_mode). Hidden everywhere else so keys/open never see it. */
     body:not(.show-billing)    .billing-only { display: none !important; }
 
+    /* The view-only way past the plan. Deliberately quiet — a small
+       muted link under a divider at the very bottom, not a second button
+       competing with "Start free trial". It's there for anyone who wants it,
+       and it doesn't advertise itself to everyone else. */
+    .billing-skip { margin-top: 1.25rem; padding-top: 0.9rem;
+                    border-top: 1px solid var(--border); text-align: center; }
+    .billing-skip button { background: none; border: 0; padding: 0.2rem;
+                           color: var(--muted); font: inherit; font-size: 0.78rem;
+                           opacity: 0.75; cursor: pointer;
+                           text-decoration: underline; text-underline-offset: 3px;
+                           transition: color 0.15s, opacity 0.15s; }
+    .billing-skip button:hover { color: var(--text); opacity: 1; }
+
     /* Display-detail control: a Simple/Full/Custom segment group plus the
        per-axis rows it presets. Rows lock (greyed, non-interactive) unless
        Custom is selected. */
@@ -3660,22 +3673,6 @@
                   Start 30-day free trial
                 </button>
               </div>
-              <!-- Skip path: you don't have to pay to look around. Browsing and
-                   viewing anything shared with you work without a subscription;
-                   only sending messages needs one. This makes that explicit. -->
-              <p class="desc" id="billing-skip-note" style="margin-top:0.6rem">
-                Not ready? You can keep using Aime in <strong>view-only
-                mode</strong> — browse and view anything shared with you, free.
-                Start a plan whenever you want to chat.</p>
-              <div class="settings-row">
-                <span class="label">Just looking around</span>
-                <button class="btn-secondary" id="billing-skip-btn"
-                        style="background:transparent;color:var(--text);
-                               border:1px solid var(--border);border-radius:8px;
-                               padding:0.4rem 0.9rem;cursor:pointer;font-size:0.85rem">
-                  Continue without subscribing
-                </button>
-              </div>
               <!-- Inline card panel: revealed when "Start trial" is clicked. The
                    Stripe Payment Element mounts into #billing-payment-element;
                    the surrounding card uses Aime's own variables so it matches
@@ -3703,6 +3700,15 @@
                   <span class="desc" id="billing-pay-status"
                         style="display:none"></span>
                 </div>
+              </div>
+              <!-- The same quiet exit the signup plan step carries, for the user
+                   who opens this tab later and decides not to. You never *have*
+                   to subscribe to look around — browsing and viewing anything
+                   shared with you are free; only sending needs a plan — so it
+                   stays offered here, just sitting at the bottom rather than
+                   competing with the trial CTA. -->
+              <div class="billing-skip">
+                <button id="billing-skip-btn" type="button">Not ready? Try view only</button>
               </div>
             </div>
             <p class="desc" id="billing-loading">Loading your billing details…</p>
@@ -4873,6 +4879,15 @@ function buildHistoryNode(ev) {
     const node = document.createElement("div");
     node.className = "msg notice info";
     node.textContent = "· " + (ev.tool_name || "tool");
+    return node;
+  }
+  // Only the compaction notice reaches history (see _session_render_events):
+  // it accounts for messages that are genuinely gone from the stored thread,
+  // so it belongs wherever that gap is visible.
+  if (ev.kind === "notice" && (ev.text || "").trim()) {
+    const node = document.createElement("div");
+    node.className = "msg notice info";
+    node.textContent = ev.text;
     return node;
   }
   return null;
@@ -6720,6 +6735,17 @@ function onStreamMessage(e) {
           appendNotice("Picked up this conversation where you left off.",
                        "info");
         }
+        break;
+      }
+      // A long conversation had its oldest messages folded into a summary to
+      // save context. Worth a line — those messages are genuinely gone from the
+      // stored thread, so without it the conversation looks like it starts
+      // mid-sentence — but a calm one: nothing went wrong and Aime still knows
+      // what was said.
+      if (e.severity === "compacted") {
+        appendNotice(verbosity === "verbose"
+          ? "Earlier messages were summarized to save space — Aime still has the gist."
+          : "Earlier messages in this conversation were summarized.", "info");
         break;
       }
       // Errors are collapsed to a calm generic line outside Verbose; the
@@ -11903,7 +11929,6 @@ const billingCancelBtn   = document.getElementById("billing-cancel-btn");
 const billingResumeBtn   = document.getElementById("billing-resume-btn");
 const billingStartBtn    = document.getElementById("billing-start-btn");
 const billingStartLabel  = document.getElementById("billing-start-label");
-const billingSkipNote    = document.getElementById("billing-skip-note");
 const billingSkipBtn     = document.getElementById("billing-skip-btn");
 const billingCardCopy    = document.getElementById("billing-card-copy");
 const billingCardPanel   = document.getElementById("billing-card-panel");
@@ -12250,9 +12275,17 @@ async function confirmStripeSetup(elements, action, statusFn) {
 async function confirmInlineSubscribe() {
   if (!__stripe || !__billingElements) return;
   billingPayBtn.disabled = true;
+  // If a previous attempt already confirmed the card and it was the *server*
+  // step that failed ("we saved your card but couldn't start your plan"), the
+  // SetupIntent is spent: re-confirming it errors with something the user can't
+  // act on. Resume at step 2 with the card we have, so pressing the button
+  // again does what its message just told them to do. Cleared when the panel
+  // closes, so a fresh start always collects a fresh card.
+  if (__billingSetupId) { await finalizeSubscribe(__billingSetupId); return; }
   const setupId = await confirmStripeSetup(__billingElements, "subscribe",
                                            setBillingPayStatus);
   if (!setupId) { billingPayBtn.disabled = false; return; }
+  __billingSetupId = setupId;
   await finalizeSubscribe(setupId);
 }
 
@@ -12559,9 +12592,11 @@ resumeBillingRedirect();
 billingStartBtn.addEventListener("click", startInlineSubscribe);
 billingPayBtn.addEventListener("click", confirmInlineSubscribe);
 billingPayCancel.addEventListener("click", closeBillingCardPanel);
-// "Continue without subscribing" — there's no wall to dismiss (browsing and
-// viewing shared content already work without a subscription); this just closes
-// settings so the user drops back into Aime in view-only mode.
+// "Not ready? Try view only" — the same quiet exit the signup billing step
+// carries (resources/style/signup_billing.html), kept here for the user who
+// opens the tab, thinks about it, and decides not to. There's no wall to
+// dismiss at this point (browsing and viewing shared content already work
+// without a plan; only sending needs one), so it just closes settings.
 billingSkipBtn.addEventListener("click", closeSettings);
 billingChangePlanBtn.addEventListener("click", toggleBillingChangePanel);
 billingChangeContinue.addEventListener("click", startChangePlan);

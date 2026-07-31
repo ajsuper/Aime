@@ -105,6 +105,77 @@ def test_event_handler_failure_does_not_retire_the_worker():
     assert c.is_idle is True
 
 
+def test_a_stream_that_raises_releases_the_turn():
+    """The per-event guard above only covers events that arrive. If the stream
+    generator itself raises, the worker is gone — and only a deliberate swap
+    spawns a replacement, so nothing is left to emit turn_end."""
+    c, backend, events = _controller()
+
+    class _Exploding:
+        def stream(self):
+            yield BackendEvent(kind="assistant_send_text", text="hi")
+            raise RuntimeError("generator blew up")
+
+        def submit(self, event):
+            pass
+
+        def reset(self):
+            pass
+
+    c._backend = _Exploding()
+    c.dispatch_input("hello")
+    assert c.is_idle is False
+
+    c.run_stream_loop()
+
+    assert c.is_idle is True
+
+
+def test_a_stream_that_ends_quietly_releases_the_turn():
+    """Same gap, quieter: the generator returns without session_terminated."""
+    c, backend, events = _controller()
+
+    class _Silent:
+        def stream(self):
+            return iter(())
+
+        def submit(self, event):
+            pass
+
+        def reset(self):
+            pass
+
+    c._backend = _Silent()
+    c.dispatch_input("hello")
+    assert c.is_idle is False
+
+    c.run_stream_loop()
+
+    assert c.is_idle is True
+
+
+def test_a_clean_retirement_does_not_touch_the_turn_state():
+    """A deliberate swap retires the worker while the controller is idle; that
+    must not synthesise a turn_end (the replacement worker owns the next turn)."""
+    c, backend, events = _controller()
+
+    class _Retiring:
+        def stream(self):
+            yield BackendEvent(kind="session_terminated")
+
+        def submit(self, event):
+            pass
+
+        def reset(self):
+            pass
+
+    c._backend = _Retiring()
+    c.run_stream_loop()
+
+    assert c.is_idle is True
+    assert "turn_end" not in [e.kind for e in events]
+
+
 # --- a failed send must release the claim ----------------------------------
 
 def test_submit_failure_releases_the_turn():

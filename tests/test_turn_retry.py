@@ -66,7 +66,7 @@ def test_turn_retries_after_a_dropped_connection(backend, monkeypatch):
         yield BackendEvent(kind="turn_end", stop_reason="end_turn")
 
     monkeypatch.setattr(backend, "_run_turn", fake_run_turn)
-    events = list(backend._turn_with_recovery())
+    events = list(backend._turn_with_recovery(backend._epoch))
 
     assert len(calls) == 2                                  # retried once
     assert [e.kind for e in events] == ["assistant_send_text", "turn_end"]
@@ -79,7 +79,7 @@ def test_retry_gives_up_and_reports_after_the_attempt_budget(backend, monkeypatc
         yield  # pragma: no cover - generator marker
 
     monkeypatch.setattr(backend, "_run_turn", always_drops)
-    kinds = [e.kind for e in backend._turn_with_recovery()]
+    kinds = [e.kind for e in backend._turn_with_recovery(backend._epoch)]
 
     # Still ends the turn, so the composer never wedges waiting for a turn_end.
     assert kinds == ["error", "turn_end"]
@@ -97,7 +97,7 @@ def test_no_retry_once_the_reply_has_started_streaming(backend, monkeypatch):
         raise _reset_error()
 
     monkeypatch.setattr(backend, "_run_turn", drops_midway)
-    kinds = [e.kind for e in backend._turn_with_recovery()]
+    kinds = [e.kind for e in backend._turn_with_recovery(backend._epoch)]
 
     assert len(calls) == 1                                  # not retried
     assert kinds == ["assistant_text_delta", "error", "turn_end"]
@@ -110,9 +110,54 @@ def test_interrupt_during_the_gap_is_not_retried(backend, monkeypatch):
 
     monkeypatch.setattr(backend, "_run_turn", drops)
     backend._interrupted.set()
-    kinds = [e.kind for e in backend._turn_with_recovery()]
+    kinds = [e.kind for e in backend._turn_with_recovery(backend._epoch)]
 
     assert kinds == ["error", "turn_end"]
+
+
+def test_a_swapped_session_is_not_retried_into(backend, monkeypatch):
+    """A hung stream can outlive its session. stop_model() only waits a few
+    seconds and its interrupt flag is read when the next stream event arrives —
+    never, for a dead connection — so the read timeout can land after the
+    conversation was already swapped. Retrying then would re-run the turn
+    against the *new* session's history and stream a ghost reply into it."""
+    calls = []
+
+    def drops_then_would_answer():
+        calls.append(1)
+        if len(calls) == 1:
+            # The swap lands while this attempt is failing.
+            backend._terminate_active_stream()
+            backend.new_session()
+            raise _reset_error()
+        yield BackendEvent(kind="assistant_send_text", text="ghost reply")
+
+    monkeypatch.setattr(backend, "_run_turn", drops_then_would_answer)
+    kinds = [e.kind for e in backend._turn_with_recovery(0)]
+
+    assert len(calls) == 1                       # never retried into the new session
+    assert kinds == ["session_terminated"]
+
+
+def test_a_swapped_session_is_not_history_recovered(backend, monkeypatch):
+    """The malformed-history path *rewrites* the message list, so running it
+    after a swap would flatten the conversation we just moved to on the strength
+    of a 400 the previous one earned."""
+    def malformed():
+        raise ValueError("messages: unexpected `tool_use` without `tool_result`")
+        yield  # pragma: no cover - generator marker
+
+    monkeypatch.setattr(backend, "_run_turn", malformed)
+    monkeypatch.setattr(backend, "_is_malformed_history_error", lambda exc: True)
+    recovered = []
+    monkeypatch.setattr(backend, "_recover_history", lambda r: recovered.append(r))
+
+    backend._terminate_active_stream()
+    backend.new_session()
+    kinds = [e.kind for e in backend._turn_with_recovery(0)]
+
+    assert recovered == []                       # the fresh session was left alone
+    assert kinds == ["session_terminated"]
 
 
 def test_a_non_transient_failure_is_reported_immediately(backend, monkeypatch):
@@ -124,7 +169,7 @@ def test_a_non_transient_failure_is_reported_immediately(backend, monkeypatch):
         yield  # pragma: no cover - generator marker
 
     monkeypatch.setattr(backend, "_run_turn", boom)
-    kinds = [e.kind for e in backend._turn_with_recovery()]
+    kinds = [e.kind for e in backend._turn_with_recovery(backend._epoch)]
 
     assert len(calls) == 1                                  # no pointless retries
     assert kinds == ["error", "turn_end"]
