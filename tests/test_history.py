@@ -115,6 +115,40 @@ def test_render_events_skips_proactive_trigger():
     assert [e["kind"] for e in events] == ["assistant_html"]
 
 
+def test_render_events_skips_system_authored_turns():
+    """Scroll-back goes through the same replay as /load, so the onboarding
+    kickoff (and any other `[system: ...]` turn) must not surface as a user
+    bubble here either — this is the view a returning user scrolls into."""
+    from provider_backend import SYSTEM_TURN_MARKER
+
+    msgs = [
+        {"role": "user", "content": [{"type": "text",
+            "text": f"{SYSTEM_TURN_MARKER} This is the user's very first "
+                    "conversation with you...]"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "Hi! I'm Aime."}]},
+    ]
+    events = web_app._session_render_events(msgs)
+    assert [e["kind"] for e in events] == ["assistant_html"]
+
+
+def test_render_events_explains_a_compacted_session():
+    """Compaction rewrites the stored history, so scroll-back would otherwise
+    show a thread that starts mid-conversation with no explanation. The summary
+    itself is never rendered — only a short line in its place."""
+    from provider_backend import SUMMARY_MARKER
+
+    msgs = [
+        {"role": "user", "content": [{"type": "text",
+            "text": f"{SUMMARY_MARKER}\nThey are planning a trip to Lisbon."}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "Lisbon flights?"}]},
+    ]
+    events = web_app._session_render_events(msgs)
+    assert [e["kind"] for e in events] == ["notice", "assistant_html"]
+    assert events[0]["severity"] == "compacted"
+    assert events[0]["text"].strip()          # non-empty, or the client drops it
+    assert "Lisbon" not in events[0]["text"]  # the summary body never leaks
+
+
 # --- _build_history_page (pagination) --------------------------------------
 
 def _infos(*ids):

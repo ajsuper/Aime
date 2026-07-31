@@ -98,6 +98,7 @@ from aime import email_send as _email_send
 from aime import topic_shares as _topic_shares
 from aime import quota as _quota
 from aime import billing as _billing
+from aime import dateformat as _dateformat
 from aime import feedback as _feedback
 from aime import errors as _errors
 from aime import health as _health
@@ -1442,6 +1443,10 @@ _VERIFY_PAGE_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "resources", "style", "verify_code.html",
 )
+_SIGNUP_BILLING_PAGE_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "resources", "style", "signup_billing.html",
+)
 _ADD_EMAIL_PAGE_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "resources", "style", "add_email.html",
@@ -1590,6 +1595,26 @@ def _billing_self_heal(user):
     return _auth_backend.lookup(user.id) or user
 
 
+def _needs_billing_onboarding(user) -> bool:
+    """True when this account still owes the last step of signup: the plan +
+    card step (`/signup/billing`), which in billing mode sits between creating
+    the account and reaching the app.
+
+    This is the "card up front" funnel. It's a step in account creation, not a
+    settings screen the new user is expected to go find: `/` sends them back to
+    it until it's answered, so a reload or a re-login can't skip it. It is a
+    *funnel*, not a security boundary — the step carries a quiet way past it
+    into view-only, and the real send gate is api_access either way. One-time:
+    anyone who has subscribed, been comped, or taken the view-only exit is past
+    it for good, and the migration marks every pre-existing account as already
+    onboarded so an established user is never ambushed by it at cutover. Always
+    False in keys/open mode."""
+    if not _billing_armed() or user is None:
+        return False
+    return not (user.billing_onboarded or user.comp_access
+                or user.api_access or user.stripe_subscription_id)
+
+
 def _usage_limits_armed() -> bool:
     """True when the per-user usage budget (aime.quota) is metered and notified.
     Mirrors the send gate: armed in "keys"/"billing", off in "open". The single
@@ -1710,6 +1735,67 @@ def _load_login_page(
         .replace("__EMAIL_VERIFICATION_DISABLED_STYLE__",
                  "" if _DO_EMAIL_VERIFICATION else _EMAIL_VERIFICATION_DISABLED_STYLE)
         .replace("__EMAIL_REQUIRED__", "required" if _DO_EMAIL_VERIFICATION else "")
+    )
+
+
+def _load_signup_billing_page(
+    *,
+    tier: str,
+    price: str,
+    trial_days: int,
+    trial_eligible: bool,
+    first_name: str = "",
+) -> str:
+    """Render the plan + card step of signup (see /signup/billing). The plan
+    name, its price and the trial length are baked in server-side so the step
+    reads as a finished page on first paint — the only thing the client fetches
+    is the SetupIntent behind the card field."""
+    with open(_SIGNUP_BILLING_PAGE_PATH) as f:
+        html = f.read()
+    # "Hi Ada — one last step." when we know the name, plain otherwise.
+    greeting = f"Hi {first_name} — one last step" if first_name \
+        else "One last step"
+    # Every phrase that differs between "you get a free trial" and "you're
+    # subscribing today" is resolved here, so the page holds no branch logic.
+    if trial_eligible:
+        # The date the first charge would land. Stripe computes the real one
+        # from the moment the subscription is created — minutes from now — so
+        # this matches. Written as "Aug 30, 2026" rather than a numeric date:
+        # this is the one line that must not be misread as 8 March.
+        first_charge = _dateformat.render_date(
+            datetime.date.today() + datetime.timedelta(days=trial_days),
+            "MMM D, YYYY",
+        )
+        headline = f"Start your {trial_days}-day free trial"
+        lede = (f"Your account is ready. Add a card to start your free trial — "
+                f"we won't charge you for {trial_days} days, and you can cancel "
+                f"any time before then.")
+        charge_note = (f"Free for {trial_days} days"
+                       + (f", then {price}. Cancel any time." if price
+                          else ". Cancel any time."))
+        charge_date = f"You won't be charged until {first_charge}."
+        submit = "Start free trial"
+    else:
+        headline = "Choose your plan"
+        lede = ("Your account is ready. Add a card to start your subscription — "
+                "you can cancel any time.")
+        charge_note = ((f"{price}, billed monthly. " if price else "")
+                       + "Cancel any time.")
+        # No trial to explain: say plainly that this one *does* charge today,
+        # rather than leaving the difference to be inferred from a missing line.
+        charge_date = ("Your first payment is today, then monthly."
+                       if price else "Your first payment is today.")
+        submit = "Subscribe"
+    return (
+        html
+        .replace("__GREETING__", _h(greeting))
+        .replace("__HEADLINE__", _h(headline))
+        .replace("__LEDE__", _h(lede))
+        .replace("__PLAN_NAME__", _h(tier.capitalize()))
+        .replace("__PLAN_PRICE__", _h(price))
+        .replace("__CHARGE_NOTE__", _h(charge_note))
+        .replace("__CHARGE_DATE__", _h(charge_date))
+        .replace("__SUBMIT_LABEL__", _h(submit))
     )
 
 
@@ -2819,6 +2905,80 @@ def signup_verify_cancel():
     return redirect(url_for("login_page"))
 
 
+# --- Signup step: plan & card (billing mode) --------------------------------
+# The last step of account creation when AIME_ACCESS_MODE=billing. The account
+# exists and is logged in by now, but signup isn't *finished*: the user picks up
+# their trial and enters a card here before they reach the app. `/` bounces back
+# here until the step is answered, so it can't be skipped by reloading. The
+# quiet "Not ready?" exit at the bottom answers it the other way — view-only.
+
+
+def _fmt_price(price: dict | None) -> str:
+    """"$8.00/mo" from a tier_prices entry, or "" when the Price couldn't be
+    read. Mirrors fmtTierPrice in web_chat.html; kept simple (a symbol table,
+    not locale machinery) because the amount is rendered server-side here."""
+    if not price or price.get("amount") is None:
+        return ""
+    symbols = {"usd": "$", "eur": "€", "gbp": "£", "cad": "CA$", "aud": "A$"}
+    currency = (price.get("currency") or "usd").lower()
+    amount = f"{price['amount'] / 100:,.2f}"
+    money = (symbols[currency] + amount if currency in symbols
+             else f"{amount} {currency.upper()}")
+    per = {"year": "/yr", "week": "/wk", "day": "/day"}.get(
+        price.get("interval"), "/mo")
+    return money + per
+
+
+@app.route("/signup/billing", methods=["GET"])
+@login_required
+def signup_billing_page():
+    """The plan + card step. Redirects into the app once it's been answered, so
+    a back-button or a stale bookmark can't resurrect it after the fact."""
+    user = _auth_backend.lookup(g.user_id)
+    if not _needs_billing_onboarding(user):
+        return redirect("/")
+    tier = _default_billing_tier()
+    # Live price, but never at the cost of the step: tier_prices is memoized and
+    # already omits anything it can't read, and a total failure here just means
+    # the plan renders by name. The card form itself doesn't depend on this.
+    try:
+        price = _billing.tier_prices().get(tier)
+    except Exception:  # noqa: BLE001 - cosmetic; the step must still render
+        app.logger.warning("billing: price lookup failed for the signup step",
+                            exc_info=True)
+        price = None
+    # Same trial-eligibility rule the confirm route enforces, so the copy can't
+    # promise a free trial the server would then charge for. The Stripe side of
+    # it (has this customer trialed before?) can't be known without a round-trip
+    # and is re-checked at confirm time; a brand-new signup has no Stripe
+    # history, which is the case this page is written for.
+    trial_eligible = user is not None and not user.trial_used
+    return Response(
+        _load_signup_billing_page(
+            tier=tier, price=_fmt_price(price),
+            trial_days=aime_config.STRIPE_TRIAL_DAYS,
+            trial_eligible=trial_eligible,
+            first_name=(user.first_name if user else "") or "",
+        ),
+        mimetype="text/html",
+    )
+
+
+@app.route("/signup/billing/skip", methods=["POST"])
+@login_required
+def signup_billing_skip():
+    """The view-only way past the plan step — the "Not ready?" link at the
+    bottom of it. Records the decision so the step is done and doesn't come
+    back, and nothing else: the account keeps api_access=0 and lands in the app
+    read-only (browsing and viewing shared topics work; sending doesn't).
+    Subscribing later is the ordinary Billing-tab flow.
+
+    A plain form POST, so the escape hatch works with JS broken — the one path
+    on this page that must never be able to strand someone."""
+    _auth_backend.set_billing_onboarded(g.user_id, True)
+    return redirect("/")
+
+
 @app.route("/logout", methods=["POST"])
 def logout():
     # POST-only so a stray <img src="/logout"> or prefetched link can't
@@ -3154,6 +3314,9 @@ def billing_subscribe_confirm():
         # future resubscribe). Harmless if it was already set.
         if trial_eligible:
             _auth_backend.set_trial_used(user.id, True)
+        # The subscribe-or-not decision is made, so signup's plan step is
+        # finished for good — however the subscription itself later goes.
+        _auth_backend.set_billing_onboarded(user.id, True)
     except Exception:
         app.logger.warning("billing: subscription create failed for user %s",
                             g.user_id, exc_info=True)
@@ -3788,6 +3951,12 @@ def account_delete():
 @app.route("/")
 @login_required
 def index():
+    # Signup isn't finished until the plan step is answered (billing mode only —
+    # see _needs_billing_onboarding). Enforced here rather than only at the end
+    # of /signup so a reload, a bookmark, or a fresh login all land back on the
+    # step instead of slipping past it into the app.
+    if _needs_billing_onboarding(_auth_backend.lookup(g.user_id)):
+        return redirect(url_for("signup_billing_page"))
     return Response(_load_page(), mimetype="text/html")
 
 
@@ -4178,7 +4347,14 @@ def _session_render_events(messages: list[dict]) -> list[dict]:
             })
         elif ev.kind == "tool_call":
             out.append({"kind": "tool_call", "tool_name": ev.tool_name})
-        # Notices (e.g. recovery) and other live-only events are dropped from the
+        elif ev.kind == "notice" and ev.severity == "compacted":
+            # The one notice worth keeping in a read-back: it explains *missing
+            # content* in this very session (compaction rewrote the stored
+            # history), so without it scrolling back looks like data loss.
+            out.append({"kind": "notice", "severity": "compacted",
+                        "text": "Earlier messages in this conversation "
+                                "were summarized."})
+        # Other notices (e.g. recovery) and live-only events are dropped from the
         # historical view — it's a quiet read-back, not a re-run.
     return out
 

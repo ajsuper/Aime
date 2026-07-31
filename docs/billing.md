@@ -29,11 +29,13 @@ misconfigured) webhook. Both paths funnel through the same idempotent
   the cost cap lives in config.
 - **Card at signup, then a 30-day free trial.** A new billing-mode account is
   created with `api_access=0` (no send access), exactly like a `keys`-mode
-  account before it redeems a key. The user opens the **Billing** tab, starts a
-  trial (always on the **default tier** — there's no plan picker at signup; see
-  *Subscribing*), and enters a card in the inline Payment Element (card required
-  up front even though the trial is free — see *Subscribing* below for why this
-  is a two-step flow). The subscription goes `trialing`, which flips `api_access=1` —
+  account before it redeems a key — and account creation isn't over yet: the
+  **plan step** (`/signup/billing`, see *Onboarding* below) is the last screen of
+  signup, where the user picks up the trial (always on the **default tier** —
+  there's no plan picker at signup; see *Subscribing*) and enters a card in the
+  Payment Element (card required up front even though the trial is free — see
+  *Subscribing* below for why this is a two-step flow). The subscription goes
+  `trialing`, which flips `api_access=1` —
   granted immediately by the confirm route's reconcile and re-confirmed by the
   `customer.subscription.created` webhook. After 30
   days Stripe auto-charges; on success the subscription goes `active` and access
@@ -47,9 +49,10 @@ misconfigured) webhook. Both paths funnel through the same idempotent
 
 ```
 signup (billing mode)            account created, api_access=0
-   └─ Billing tab "Start trial" ─► POST /billing/subscribe ──► SetupIntent (client secret)
+   └─ GET /signup/billing (the plan step; the Billing tab is the same flow later)
+        └────────────────────────► POST /billing/subscribe ──► SetupIntent (client secret)
                                           │
-              inline Payment Element confirms the card (stripe.confirmSetup)
+                 Payment Element confirms the card (stripe.confirmSetup)
                                           │
         POST /billing/subscribe/confirm ─► create subscription on saved card (trial 30d)
                                                                    │
@@ -63,6 +66,9 @@ signup (billing mode)            account created, api_access=0
    Cancel / resume ─► POST /billing/{cancel,resume} ──► cancel_at_period_end on/off
         (all four reconcile immediately off a live read; the webhook re-confirms)
    Invoices / receipts / tax ─► POST /billing/portal ─► Stripe Customer Portal (hosted)
+
+   Not ready? ──► POST /signup/billing/skip ──► billing_onboarded=1, api_access
+                                                stays 0 (view-only), on to the app
 ```
 
 The subscribe flow is **two steps on purpose.** A free-trial subscription
@@ -77,6 +83,56 @@ guards run in step 2 (the request that actually creates the subscription). For a
 returning customer who already used their trial, the first invoice is charged
 immediately off-session (`error_if_incomplete`, so a decline surfaces as an
 error instead of a stuck `incomplete` subscription).
+
+**Retrying resumes at step 2.** Being two steps means the two can fail
+separately, and once the card is confirmed its SetupIntent is *spent* — a retry
+that re-confirms it fails with a Stripe error the user can't act on. So both
+front-ends (the signup step and the Billing tab) remember the confirmed intent
+id and, if it was step 2 that failed (the "we saved your card but couldn't start
+your plan — please try again" case, or a lost connection), send the button
+straight back to `/billing/subscribe/confirm` with the card already on file
+instead of asking for it again. The id is cleared when the card panel closes, so
+a fresh start always collects a fresh card. This also covers the 3-D Secure
+return path, where no Payment Element is mounted at all.
+
+## Onboarding: the plan step
+
+In billing mode the plan and the card are **part of account creation**, not
+something the new user is expected to go find in settings. `/signup` finishes by
+handing over to **`GET /signup/billing`**: a full page in the signup chrome
+(same card, wordmark and type as the login and verify-your-email screens) that
+states the plan and its price, mounts the Payment Element, and starts the trial.
+
+It can't be walked around by reloading or re-logging-in: **`/` redirects back to
+the step** while `_needs_billing_onboarding(user)` holds, which it does until the
+account has *answered* it. Two answers finish it, both recorded on the user row
+as `billing_onboarded`:
+
+| Answer | Route | Effect |
+|--------|-------|--------|
+| Start the plan | `POST /billing/subscribe/confirm` (the ordinary step 2) | subscription created, `api_access=1` via reconcile |
+| **Not ready? Try view only** | `POST /signup/billing/skip` | nothing granted — `api_access` stays `0`, the app opens read-only |
+
+The view-only exit is deliberately quiet: a small underlined link under a
+divider at the bottom of the step, not a second button next to the trial CTA. It
+exists because looking around has never required paying — browsing, and viewing
+anything shared with you, work at `api_access=0`; only **sending** needs a plan —
+so the step should not be able to trap someone who isn't ready. It's a **plain
+form POST**, so it still works if the page's script failed to load: the one path
+here that must never be able to strand a user. The same link sits at the bottom
+of the Billing settings tab for the user who opens it later and decides not to;
+there it has no wall to dismiss, so it just closes settings.
+
+`billing_onboarded` is a *funnel* marker, not a permission — nothing reads it as
+access. The send gate is `api_access` either way, so a user who skipped the step
+and one who never finished it are in exactly the same position.
+
+**Existing accounts are never ambushed by it.** The column defaults `0` (owes the
+step) but the migration backfills every **pre-existing** row to `1`, the same
+cutover shape as `trial_used`: a deployment that switches to billing puts its new
+signups through the step and leaves its established users where they were.
+Comped accounts, and anyone who already has a subscription or `api_access`, skip
+it outright.
 
 Status → access mapping (`aime.billing.reconcile_subscription`):
 
@@ -339,11 +395,11 @@ conversations, and **viewing anything shared to the account by others** are
 behind `login_required` only, so an account with no subscription already lands in
 the app and can view everything shared with it; just the composer is locked.
 
-The Billing tab makes this explicit rather than leaving a silently-disabled
-composer: alongside *Start your free trial* it offers **Continue without
-subscribing**, with copy that browsing and viewing shared content are free and a
-plan is only needed to chat. The button just closes settings (there's no wall to
-dismiss). The locked composer's placeholder reads *"View-only mode — start a free
+Both places that sell a plan make this explicit rather than leaving a
+silently-disabled composer: the signup plan step and the Billing tab each carry
+**Not ready? Try view only** at the bottom (see *Onboarding* — on the step it
+answers the step; in settings there's no wall to dismiss, so it just closes).
+The locked composer's placeholder reads *"View-only mode — start a free
 trial …"* (or *"… subscribe …"* for a trial-ineligible account, keyed off
 `/me`'s `billing.trial_eligible`). There is no separate "view-only" account
 state — it's simply `api_access=0`, which the send gate already handles.
@@ -409,7 +465,8 @@ of record. Plan/payment changes happen in Stripe or the user's own portal.
   `set_stripe_customer`, `set_subscription`, the `comp_access` flag +
   `set_comp_access` (sets comp + `api_access` together), and the `trial_used`
   flag (migration backfills pre-existing rows to 1) + `set_trial_used` /
-  `set_trial_used_by_username` / `mark_all_trial_used`.
+  `set_trial_used_by_username` / `mark_all_trial_used`, and the
+  `billing_onboarded` flag (same backfill shape) + `set_billing_onboarded`.
 - `src/frontends/web_app.py` — `_billing_armed()`, the fail-closed startup
   check, the `/billing/{subscribe,subscribe/confirm,update-card,
   update-card/confirm,change-plan,change-plan/confirm,cancel,resume,portal,
@@ -419,7 +476,13 @@ of record. Plan/payment changes happen in Stripe or the user's own portal.
   `_billing_reconcile_quiet`; the webhook 500s on unexpected errors so Stripe
   retries), the `/me` billing block (incl. `trial_eligible`), the
   `api_access_required` gate that leaves view-only access open, cancel-on-delete,
-  and the recovery resume+reconcile.
+  and the recovery resume+reconcile. Plus the signup plan step:
+  `_needs_billing_onboarding`, the `/` redirect that enforces it,
+  `GET /signup/billing` + `_load_signup_billing_page` / `_fmt_price`, and
+  `POST /signup/billing/skip` (the view-only answer).
+- `resources/style/signup_billing.html` — the plan step itself: the signup-chrome
+  page, its Payment Element (same two-step endpoints as the Billing tab, plus the
+  3-D Secure return path), and the quiet **Not ready? Try view only** form.
 - `src/aime/billing.py` helpers — `create_setup_intent` /
   `saved_payment_method` / `create_subscription` (the two-step inline subscribe),
   `create_card_update_intent` / `update_payment_method` (inline card swap),
@@ -430,8 +493,9 @@ of record. Plan/payment changes happen in Stripe or the user's own portal.
   cancel/resume *and* account delete/recover), `_current_live_subscription`.
 - `resources/style/web_chat.html` — the Billing settings tab (incl. the inline
   Payment Element + its Appearance theming), the trial-vs-subscribe copy
-  (`applyTrialCopy`, off `/me`'s `trial_eligible`), the **Continue without
-  subscribing** (view-only) affordance, and the billing-mode composer-lock copy.
+  (`applyTrialCopy`, off `/me`'s `trial_eligible`), the same quiet **Not ready?
+  Try view only** link at the bottom of the tab, and the billing-mode
+  composer-lock copy.
 - `src/frontends/usage_dashboard.py` — the read-only Billing tab, and the
   Accounts-tab **Grant/Remove full access** (comp) control + `/accounts/comp`
   route, the **Deny/Allow free trial** per-row control + `/accounts/trial` route,

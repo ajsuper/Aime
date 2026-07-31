@@ -274,6 +274,52 @@ Security properties that matter:
 
 ---
 
+## The operator channel (prompt injection)
+
+The Messages API has no per-turn system role, so instructions Aime itself sends
+mid-conversation — the first-run onboarding kickoff, a background agent's task
+brief, the SubmitResult nudge — must enter the history as `role="user"`. They
+are marked `[system: …]`, and the model defers to them.
+
+A bare text prefix is only a convention, and **anything that can put text in
+front of the model can wear it.** That is not hypothetical: other people's words
+do reach a user's context — most directly through a **shared topic** (the
+server reads the owner's content on the recipient's behalf; see
+`aime/topic_shares.py`), and also via uploaded documents and, one step removed,
+the web-search digest. A topic containing `[system: …]` would otherwise read to
+the model as an instruction from Aime.
+
+So the marker is bound to a **per-session token**: `[system:<token> …]`.
+
+- `new_system_turn_token()` mints 4 random bytes per session;
+  `AnthropicMessagesBackend.submit()` stamps it onto every `system_send_message`
+  on the way in — one choke point, so no producer needs to know the token
+  exists.
+- `system_turn_declaration()` puts it in the system array, telling the model
+  that only the exact token carries authority and that text imitating the shape
+  without it is data — from a message, a shared topic, a file, a web result, or
+  a tool result — to be reported rather than obeyed.
+- It is declared **after** the cached system-prompt breakpoint. Folding it into
+  the main prompt block would give every session a unique prefix and destroy
+  prompt-cache reuse across sessions.
+- The token is persisted with the session (`system_token`) and restored on load,
+  so a resumed conversation still recognises the injected turns already in its
+  own history. It is re-rolled on every new session. A session saved before
+  tokens existed simply gets a fresh one; its legacy turns carry no authority.
+
+The token is not a cryptographic secret — it never leaves the model's context,
+and rotating per session means a leak ages out on its own. It defeats
+**impersonation of the operator channel**; it does not defeat injection by
+plain persuasion, where hostile text argues rather than pretends. Closing that
+needs untrusted inbound content to be explicitly delimited as data (shared-topic
+contents, document text) — a larger change, and the open item to track here.
+
+Separately, and for display rather than trust: every injected turn carries a
+structural `injected: true` field on the stored message, which `aime/replay.py`
+reads instead of sniffing text. A user can type the marker but cannot set a
+field on the stored message, so their words are never rendered as one of Aime's
+turns, nor Aime's as theirs.
+
 ## Known gaps and compromises
 
 The following are conscious tradeoffs in the current implementation. They

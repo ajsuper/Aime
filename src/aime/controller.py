@@ -1155,6 +1155,22 @@ class ConversationController:
         except Exception as exc:
             self._emit_error(exc, source="controller_stream",
                              label="stream error")
+        # Falling out here means the worker is gone without a retirement: the
+        # generator raised, or it ended without `session_terminated`. Only a
+        # deliberate swap (reset / load / rollover) spawns a replacement, so
+        # nothing is left to end an in-flight turn. Release the claim on the way
+        # out — the same reasoning as the per-event guard above, one level up.
+        self._release_turn_if_claimed()
+
+    def _release_turn_if_claimed(self) -> None:
+        """Free a turn that no longer has anything running behind it, draining
+        the queue exactly as a real turn_end would. No-op when already idle."""
+        with self._state_lock:
+            if self._is_idle:
+                return
+        logger.warning("stream worker exited mid-turn; releasing the turn")
+        self._handle_backend_event(
+            BackendEvent(kind="turn_end", stop_reason="error"))
 
     def _handle_backend_event(self, event: BackendEvent) -> None:
         kind = event.kind

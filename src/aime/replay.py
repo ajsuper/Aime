@@ -11,7 +11,12 @@ block, not a separate display event).
 import re
 from typing import Iterator
 
-from provider_backend import RECOVERY_MARKER, PROACTIVE_TRIGGER_MARKER
+from provider_backend import (
+    RECOVERY_MARKER,
+    PROACTIVE_TRIGGER_MARKER,
+    SYSTEM_TURN_MARKER,
+    SUMMARY_MARKER,
+)
 
 from .controller import CoreEvent
 
@@ -47,6 +52,15 @@ def replay_messages(messages: list[dict]) -> Iterator[CoreEvent]:
     # turn as a `proactive_message` — preserving its identity so the frontend can
     # decide whether it's still "New" — rather than as an ordinary `assistant_text`.
     prev_proactive_trigger = False
+    # Sessions written before the `injected` field existed can only be read by
+    # sniffing for the `[system:` opener — which can't tell one of our turns from
+    # a user who typed the same thing. Once any turn carries the field, this
+    # session came from code that marks them properly, so the sniffing is dead
+    # weight and gets switched off: a user typing "[system: ...]" then renders as
+    # the ordinary message it is. Legacy sessions keep it and keep the fix.
+    sniff_legacy = not any(
+        m.get("injected") for m in messages if isinstance(m, dict)
+    )
     for msg in messages:
         role = msg.get("role")
         content = msg.get("content")
@@ -54,6 +68,14 @@ def replay_messages(messages: list[dict]) -> Iterator[CoreEvent]:
             prev_proactive_trigger = False
             continue
         if role == "user":
+            # Structural marker set by the backend on every machine-authored
+            # turn (see submit()). Checked before any text sniffing, and
+            # unforgeable — a user can type the marker but can't set a field on
+            # the stored message — so their own words are never mistaken for
+            # one of ours, nor ours for theirs.
+            if msg.get("injected"):
+                prev_proactive_trigger = False
+                continue
             # A recovery-flattened message holds a condensed transcript meant
             # for the model, not for display — surface it as a short recovery
             # notice rather than a giant verbatim bubble.
@@ -76,6 +98,23 @@ def replay_messages(messages: list[dict]) -> Iterator[CoreEvent]:
                 prev_proactive_trigger = True
                 continue
             prev_proactive_trigger = False
+            # Same thing in a session written before the `injected` field
+            # existed: a machine-authored instruction (the onboarding kickoff, a
+            # background agent's brief, the SubmitResult nudge) recognisable
+            # only by its opener. Nothing to show in its place — what it
+            # produced is the assistant turn right after it.
+            if sniff_legacy and first_text.startswith(SYSTEM_TURN_MARKER):
+                continue
+            # The compaction summary that replaced the oldest slice of a long
+            # history. Also not the user's words — but unlike the others it
+            # stands where real messages used to be (compaction rewrites the
+            # stored history), so say so rather than letting the thread appear
+            # to start mid-conversation.
+            if first_text.startswith(SUMMARY_MARKER):
+                yield CoreEvent(
+                    kind="notice", severity="compacted", from_replay=True,
+                )
+                continue
             # A user message can mix one or more text blocks with image blocks.
             # Collapse them into a single user_message_shown event so the
             # frontend can render attachments in the same bubble as the text.

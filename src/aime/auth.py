@@ -61,7 +61,7 @@ _USER_PROJECTION = (
     "first_name, last_name, tz, date_format, time_format, tier, "
     "stripe_customer_id, stripe_subscription_id, subscription_status, "
     "trial_end, comp_access, billing_synced_at, trial_used, "
-    "terms_accepted_at, terms_version"
+    "terms_accepted_at, terms_version, billing_onboarded"
 )
 
 
@@ -180,6 +180,14 @@ class UserRecord:
     # this user actually saw. NULL on accounts created before terms existed.
     terms_accepted_at: int | None = None
     terms_version: str | None = None
+    # Billing mode: has this account made its subscribe-or-not decision yet?
+    # False on a fresh signup, which is what holds the new user at the plan +
+    # card step (`/signup/billing`) — the last step of account creation, before
+    # they reach the app. Flipped True when they either start a plan or take the
+    # step's view-only exit, so it's answered once and never nags again. The
+    # billing migration backfills every pre-existing account to True. Inert in
+    # keys/open mode. See docs/billing.md, "Onboarding: the plan step".
+    billing_onboarded: bool = False
 
     @property
     def display_name(self) -> str:
@@ -327,6 +335,10 @@ class AuthBackend(Protocol):
     def set_trial_used(self, user_id: int, used: bool) -> bool: ...
     def set_trial_used_by_username(self, username: str, used: bool) -> bool: ...
     def mark_all_trial_used(self) -> int: ...
+    # Signup's plan + card step (billing mode): flipped True once the account
+    # has either subscribed or taken the step's view-only exit, so signup is
+    # finished and the step stops showing. See docs/billing.md.
+    def set_billing_onboarded(self, user_id: int, on: bool) -> bool: ...
     def redeem_key(self, user_id: int, key: str) -> bool: ...
     def generate_access_key(self, note: str = "") -> str: ...
     def list_access_keys(self) -> list[AccessKeyRecord]: ...
@@ -663,6 +675,22 @@ class LocalAuthBackend:
                 self._conn.execute("UPDATE users SET trial_used = 1")
             # END trial-used MIGRATION
 
+            # billing-onboarded MIGRATION — billing mode: has this account made
+            # its subscribe-or-not decision? The column defaults 0, so accounts
+            # created after this point go through signup's plan + card step
+            # (card up front, with a quiet view-only way past it); every
+            # PRE-EXISTING row is backfilled to 1 so a deployment switching to
+            # billing doesn't ambush its established users with a paywall step
+            # they never signed up through. Set on subscribe or on the step's
+            # view-only exit. Inert in keys/open mode. See docs/billing.md.
+            if "billing_onboarded" not in existing_cols:
+                self._conn.execute(
+                    "ALTER TABLE users ADD COLUMN billing_onboarded "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+                self._conn.execute("UPDATE users SET billing_onboarded = 1")
+            # END billing-onboarded MIGRATION
+
             # terms-acceptance MIGRATION — when the user agreed to the Terms of
             # Service, and which revision they saw. Both stay NULL on accounts
             # created before terms existed: we record only acceptances we
@@ -984,6 +1012,7 @@ class LocalAuthBackend:
             comp_access=bool(row[15]), billing_synced_at=row[16],
             trial_used=bool(row[17]),
             terms_accepted_at=row[18], terms_version=row[19],
+            billing_onboarded=bool(row[20]),
         )
 
     def lookup_by_username(self, username: str) -> UserRecord | None:
@@ -1365,6 +1394,20 @@ class LocalAuthBackend:
             )
             self._conn.commit()
         return cur.rowcount
+
+    def set_billing_onboarded(self, user_id: int, on: bool) -> bool:
+        """Record that this account has made its subscribe-or-not decision, so
+        signup's plan + card step is finished and stops showing. Set when a
+        subscription is created, and when the user takes the step's view-only
+        exit. Returns False if no such user."""
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE users SET billing_onboarded = ? "
+                "WHERE id = ? AND deleted_at IS NULL",
+                (1 if on else 0, user_id),
+            )
+            self._conn.commit()
+        return cur.rowcount > 0
 
     def generate_access_key(self, note: str = "") -> str:
         """Mint a new single-use invite key, store its hash, and return the
