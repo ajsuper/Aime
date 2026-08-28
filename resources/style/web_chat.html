@@ -1573,18 +1573,27 @@
     /* An `[event-N]` reference resolved inside a topic body. Sits in flowing
        prose, so it's an inline-block chip rather than a block card — it has to
        read as part of the sentence it's in ("the party is <chip>"), not
-       interrupt it. Borrows the category hue bar and state classes from the
-       calendar so an event looks the same wherever it appears. */
+       interrupt it. Category comes through as a small dot; the calendar's own
+       3px edge bar belongs on a block that has an edge to sit against, and
+       reads as heavy furniture at this size. State classes are shared with the
+       calendar so an event looks the same wherever it appears.
+
+       No horizontal margin: the chip is inline, so the surrounding text's own
+       spaces separate it, and a margin would push trailing punctuation off it
+       ("… 19:00 ." instead of "… 19:00."). */
     .event-ref { display: inline-flex; align-items: baseline; gap: 0.4rem;
-                 padding: 0.1rem 0.5rem; margin: 0 0.1rem;
+                 padding: 0.1rem 0.55rem;
                  border: 1px solid var(--border); border-radius: 999px;
                  background: var(--bg-elev); font-size: 0.88em;
                  line-height: 1.5; cursor: pointer; vertical-align: baseline;
-                 box-shadow: inset 3px 0 0 var(--cat-color, var(--accent));
                  transition: background 0.1s, box-shadow 0.1s; }
+    /* Centred rather than baseline-aligned: the dot has no text in it, so a
+       baseline would sit it on the descender line instead of beside the words. */
+    .event-ref::before { content: ""; flex: 0 0 auto; align-self: center;
+                         width: 0.5em; height: 0.5em; border-radius: 50%;
+                         background: var(--cat-color, var(--accent)); }
     .event-ref:hover { background: var(--bg-input);
-                       box-shadow: inset 3px 0 0 var(--cat-color, var(--accent)),
-                                   0 1px 3px rgba(0, 0, 0, 0.12); }
+                       box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12); }
     .event-ref .event-ref-title { font-weight: 600; }
     .event-ref .event-ref-when { color: var(--muted); font-size: 0.92em; }
     .event-ref .event-ref-status { color: var(--muted); font-size: 0.82em;
@@ -1595,11 +1604,18 @@
     .event-ref.is-loading, .event-ref.is-missing, .event-ref.is-inert {
         cursor: default; color: var(--muted); font-style: italic;
         box-shadow: none; }
+    /* No event, no category — an accent-coloured dot would imply one. */
+    .event-ref.is-loading::before, .event-ref.is-missing::before,
+    .event-ref.is-inert::before { background: var(--border); }
     .event-ref.is-missing { border-style: dashed; }
     .event-ref.is-inert { border-style: dashed; background: transparent; }
-    /* A canceled event must not read as still happening. */
+    /* A canceled event must not read as still happening — the dot goes
+       hollow so it's distinguishable without relying on the strikethrough
+       alone (or on colour). */
     .event-ref.canceled .event-ref-title { text-decoration: line-through;
                                            color: var(--muted); }
+    .event-ref.canceled::before { background: transparent;
+                                  box-shadow: inset 0 0 0 1.5px var(--cat-color, var(--muted)); }
     .event-ref.completed { opacity: 0.75; }
     .event-ref.archived { opacity: 0.6; }
 
