@@ -136,6 +136,47 @@ def system_turn_declaration(token: str) -> str:
 # replay surfaces it as a short "earlier messages were summarized" notice.
 SUMMARY_MARKER = "[Conversation summary so far]"
 
+# Weekday abbreviations for the <clock> strip, indexed to date.weekday().
+_STRIP_DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+_STRIP_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                 "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+
+def _weekday_strip(today) -> str:
+    """A dated two-week weekday strip for the <clock> block.
+
+    e.g. "Weekdays — this week: Mon 24, Tue 25, Wed 26 (today), Thu 27, Fri 28,
+    Sat 29, Sun 30 Aug; next week: Mon 31 Aug, Tue 1, Wed 2, Thu 3, Fri 4,
+    Sat 5, Sun 6 Sep."
+
+    Weeks run Monday–Sunday, and "this week" is the one containing `today`, so
+    days earlier in the current week are included even though they are past —
+    the model needs them to resolve "last Thursday" as readily as "next
+    Tuesday", and their being in the past is evident from the (today) marker.
+
+    The month is printed only where it would otherwise be ambiguous — on the
+    first entry of a week and on any day that crosses into a new month — which
+    keeps the strip compact without ever leaving a bare number unqualified.
+    Every date is spelled with its weekday so no lookup requires counting."""
+    monday = today - datetime.timedelta(days=today.weekday())
+    parts = []
+    for week, label in ((0, "this week"), (1, "next week")):
+        entries = []
+        prev_month = None
+        for i in range(7):
+            d = monday + datetime.timedelta(days=week * 7 + i)
+            # Qualify the first entry of each week, and any month rollover.
+            show_month = prev_month is None or d.month != prev_month
+            text = f"{_STRIP_DAYS[d.weekday()]} {d.day}"
+            if show_month:
+                text += f" {_STRIP_MONTHS[d.month - 1]}"
+            if d == today:
+                text += " (today)"
+            entries.append(text)
+            prev_month = d.month
+        parts.append(f"{label}: {', '.join(entries)}")
+    return "Weekdays — " + "; ".join(parts) + "."
+
 
 def _jsonable(obj):
     """Recursively coerce `obj` into something json.dump can handle.
@@ -894,7 +935,17 @@ class AnthropicMessagesBackend:
         and has a worked example to copy when it writes dates/times back to the
         user. The system prompt teaches what to *do* with all this (write dates
         in the user's format, keep tool fields in DD/MM/YYYY, never acknowledge
-        the tag), keeping that explainer in the cached prefix."""
+        the tag), keeping that explainer in the cached prefix.
+
+        It also carries a dated two-week weekday strip. A bare instant makes
+        "next Tuesday" an arithmetic problem the model has to solve unaided —
+        and it gets it wrong, writing a well-formed but incorrect date to the
+        calendar. The strip turns that into a lookup. Two weeks because "next
+        Tuesday" is itself ambiguous near a week boundary: showing both
+        candidates lets the model see the ambiguity and ask, instead of
+        silently picking one. Paired with the `weekday` checksum on the event
+        write schemas (see aime.weekday_check), which catches the slip when it
+        still happens."""
         tz = self._client_tz
         now = None
         if tz:
@@ -920,12 +971,13 @@ class AnthropicMessagesBackend:
             f"{dateformat.render_time(now.time(), time_fmt)}"
         )
         time_label = "12-hour" if time_fmt == "12" else "24-hour"
+        strip = _weekday_strip(now.date())
         return {
             "type": "text",
             "text": (
-                f"<clock silent>{anchor}. This user reads dates as {date_fmt} "
-                f"and times as {time_label} — now is \"{example}\" in their "
-                "format. System info, don't repeat to user</clock>"
+                f"<clock silent>{anchor}. {strip} This user reads dates as "
+                f"{date_fmt} and times as {time_label} — now is \"{example}\" "
+                "in their format. System info, don't repeat to user</clock>"
             ),
         }
 

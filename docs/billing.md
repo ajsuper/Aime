@@ -330,6 +330,19 @@ charge for the rest of the period on the new one), so **switching up then back
 before the next invoice only bills for the time actually spent on each plan**, and
 during a trial nothing is charged at all.
 
+**Card only.** All three SetupIntents (`create_setup_intent`,
+`create_card_update_intent`, `create_plan_change_intent`) pass
+`payment_method_types=["card"]` rather than `automatic_payment_methods`. With
+automatic methods, Stripe adds whatever is enabled on the account — in practice
+a Link enrolment block ("Save my information for faster checkout" plus a
+phone-number field), which is a lot of vertical space on a form whose whole job
+is one card, and worst on the signup step where it competes with the plan and
+trial copy. The tradeoff is deliberate: returning Link users lose one-tap
+checkout, and no non-card method can be offered until this changes. Wallets
+(Apple Pay / Google Pay) are unaffected — they issue card payment methods and
+still appear where the browser supports them. Enabling Link in the Stripe
+Dashboard will *not* bring it back; the type list is the authority.
+
 A UI note: while a Stripe Payment Element (an iframe) is mounted, the Billing tab
 drops the settings backdrop's live `backdrop-filter` blur (`#settings-backdrop.no-blur`).
 The iframe composites over that blur, so without this every keystroke forced the

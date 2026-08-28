@@ -94,6 +94,7 @@ from aime.graphics_store import (
     GraphicStore, parse_graphic_id, make_graphic_id, tag_handle_scope,
 )
 from aime import graphics as _graphics
+from aime import topic_refs as _topic_refs
 from aime import email_send as _email_send
 from aime import topic_shares as _topic_shares
 from aime import quota as _quota
@@ -5354,6 +5355,40 @@ def _foreign_graphic_tag(contents: str, owner_id: int,
     return None
 
 
+def _foreign_event_tag(contents: str, owner_id: int) -> str | None:
+    """Return the first `[event-N]` tag in `contents` that the topic's owner
+    can't resolve, or None if every reference is theirs.
+
+    `[event-N]` is a bare integer with no owner namespace, unlike a graphic id.
+    In a topic shared between two people that makes it ambiguous at best and a
+    leak at worst: a recipient could add a reference to one of *their* event
+    ids, which would then resolve against the owner's calendar and surface an
+    unrelated event of the owner's under a label the recipient chose. Requiring
+    every reference to exist on the owner's calendar — the one it will actually
+    resolve against — closes that.
+
+    Best-effort: if the calendar can't be read we allow the save rather than
+    block the user's work over a check we couldn't run. A bad reference then
+    renders as "not found", which is the same calm degradation a stale tag gets.
+    """
+    ids = _topic_refs.event_ids(contents)
+    if not ids:
+        return None
+    try:
+        known = {
+            str(ev.get("id"))
+            for ev in _context_for(owner_id).calendar_service.events_in_range(
+                "01/01/1970", "31/12/9999", include_archived=True)
+            if isinstance(ev, dict)
+        }
+    except Exception:
+        return None
+    for n in ids:
+        if str(n) not in known:
+            return f"event-{n}"
+    return None
+
+
 def _make_graphic_store_provider(user_id: int):
     """Build the graphic-store provider for `user_id`: a closure that maps a
     topic handle ("0" personal, "T" own, "O:T" shared) to the scoped GraphicStore
@@ -5788,6 +5823,42 @@ def topics():
     return jsonify({"topics": items})
 
 
+@app.route("/events/<int:event_id>")
+@login_required
+def event_ref(event_id: int):
+    """Return one event — what an `[event-N]` tag in a topic body resolves to
+    when the page renders its card.
+
+    **Only the viewer's own events.** Unlike a graphic id, which is namespaced
+    by topic handle and so carries its own authorization, `[event-42]` is a bare
+    integer: in a topic shared with someone else it would otherwise resolve
+    against the *owner's* calendar and hand them events that were never shared.
+    Events have no sharing model, so the rule is simply that a reference
+    resolves for its owner and nobody else; the client renders an inert
+    placeholder for everyone else.
+
+    Anything that doesn't resolve — unknown id, archived away, someone else's
+    event — collapses to the same 404 as a missing graphic, so a stale tag
+    degrades to a calm 'couldn't load' card and existence is never leaked."""
+    try:
+        ev = _context_for(g.user_id).calendar_service.event_by_id(event_id)
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    if not ev:
+        return jsonify({"ok": False, "error": "not found"}), 404
+    return jsonify({
+        "id": ev.get("id"),
+        "title": ev.get("title") or "",
+        "date": ev.get("date") or "",
+        "time": ev.get("time") or "",
+        "end_date": ev.get("end_date") or "",
+        "end_time": ev.get("end_time") or "",
+        "category": ev.get("category") or "",
+        "status": ev.get("status") or "scheduled",
+        "archived": bool(ev.get("archived")),
+    })
+
+
 @app.route("/graphics/<graphic_id>")
 @login_required
 def graphic_asset(graphic_id: str):
@@ -6071,6 +6142,13 @@ def topic_contents_save(topic_id: str):
     if bad is not None:
         return jsonify(
             {"ok": False, "error": _graphics.foreign_graphic_tag_message(bad)}), 400
+    # Same idea for `[event-N]`: a reference resolves against the topic owner's
+    # calendar, so one pointing anywhere else can't be saved here.
+    bad_event = _foreign_event_tag(contents, owner_id)
+    if bad_event is not None:
+        return jsonify({"ok": False, "error": (
+            f"This topic can't reference [{bad_event}]: an event reference has "
+            "to be an event on the topic owner's calendar.")}), 400
     # Edits always land in the owner's silo (owner_id == g.user_id for own
     # topics; the topic owner for a shared one).
     ctx = _context_for(owner_id)

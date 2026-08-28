@@ -1570,6 +1570,39 @@
     .day-detail .ev-summary { color: var(--muted); font-size: 0.85rem;
                               margin-top: 0.2rem; }
 
+    /* An `[event-N]` reference resolved inside a topic body. Sits in flowing
+       prose, so it's an inline-block chip rather than a block card — it has to
+       read as part of the sentence it's in ("the party is <chip>"), not
+       interrupt it. Borrows the category hue bar and state classes from the
+       calendar so an event looks the same wherever it appears. */
+    .event-ref { display: inline-flex; align-items: baseline; gap: 0.4rem;
+                 padding: 0.1rem 0.5rem; margin: 0 0.1rem;
+                 border: 1px solid var(--border); border-radius: 999px;
+                 background: var(--bg-elev); font-size: 0.88em;
+                 line-height: 1.5; cursor: pointer; vertical-align: baseline;
+                 box-shadow: inset 3px 0 0 var(--cat-color, var(--accent));
+                 transition: background 0.1s, box-shadow 0.1s; }
+    .event-ref:hover { background: var(--bg-input);
+                       box-shadow: inset 3px 0 0 var(--cat-color, var(--accent)),
+                                   0 1px 3px rgba(0, 0, 0, 0.12); }
+    .event-ref .event-ref-title { font-weight: 600; }
+    .event-ref .event-ref-when { color: var(--muted); font-size: 0.92em; }
+    .event-ref .event-ref-status { color: var(--muted); font-size: 0.82em;
+                                   text-transform: uppercase;
+                                   letter-spacing: 0.03em; }
+    /* Not yet resolved, gone, or someone else's — none of these are clickable,
+       so none of them should look it. */
+    .event-ref.is-loading, .event-ref.is-missing, .event-ref.is-inert {
+        cursor: default; color: var(--muted); font-style: italic;
+        box-shadow: none; }
+    .event-ref.is-missing { border-style: dashed; }
+    .event-ref.is-inert { border-style: dashed; background: transparent; }
+    /* A canceled event must not read as still happening. */
+    .event-ref.canceled .event-ref-title { text-decoration: line-through;
+                                           color: var(--muted); }
+    .event-ref.completed { opacity: 0.75; }
+    .event-ref.archived { opacity: 0.6; }
+
     /* Topics */
     .topics-search { padding: 0.5rem 0.75rem; border-bottom: 1px solid var(--border);
                      flex-shrink: 0; display: flex; gap: 0.4rem; align-items: center; }
@@ -5774,6 +5807,142 @@ function normalizeGraphicId(id, ownerId) {
     return "graphic-" + ownerId + ":" + rest;
   }
   return id;
+}
+
+// --- [event-N] tags ---------------------------------------------------------
+// A topic body can reference one of the user's events by id instead of writing
+// its date out, so the topic can't go stale: move the event and the reference
+// follows. Same resolution shape as [graphic-N] — walk text nodes only, never
+// re-parse HTML — but resolving to a small live event card.
+//
+// ONLY the viewer's own events resolve. A graphic id is namespaced by topic
+// handle and so carries its own authorization; `[event-42]` is a bare integer,
+// which in someone else's shared topic would otherwise resolve against the
+// OWNER's calendar and show events that were never shared. Events have no
+// sharing model, so in a shared topic (ownerId set and not us) we render an
+// inert placeholder and never call the endpoint at all.
+const _EVENT_TAG_RE = /\[event-(\d+)\]/g;
+const _EVENT_TAG_TEST = /\[event-\d+\]/;  // non-global; see resolveGraphicTags
+
+const _eventRefCache = new Map();
+
+function fetchEventRef(id) {
+  if (!_eventRefCache.has(id)) {
+    _eventRefCache.set(
+      id,
+      fetch("/events/" + encodeURIComponent(id)).then((r) => {
+        if (!r.ok) throw new Error("not found");
+        return r.json();
+      }),
+    );
+  }
+  return _eventRefCache.get(id);
+}
+
+// Drop a cached reference so the next render re-reads it. Called whenever an
+// event changes, so a card in an open topic doesn't keep showing the old date.
+function invalidateEventRef(id) {
+  if (id == null) _eventRefCache.clear();
+  else _eventRefCache.delete(String(id));
+}
+
+function makeEventMount(id, foreign) {
+  const card = document.createElement("span");
+  card.className = "event-ref";
+  if (foreign) {
+    // Someone else's topic: acknowledge the reference, reveal nothing.
+    card.classList.add("is-inert");
+    card.textContent = "an event on the owner's calendar";
+    return card;
+  }
+  card.classList.add("is-loading");
+  card.textContent = "event " + id;
+  fetchEventRef(id)
+    .then((ev) => {
+      card.classList.remove("is-loading");
+      card.className = "event-ref" + eventStateClasses(ev);
+      applyCategoryColor(card, ev.category);
+      card.textContent = "";
+
+      const title = document.createElement("span");
+      title.className = "event-ref-title";
+      title.textContent = ev.title || "(untitled)";
+      card.appendChild(title);
+
+      const when = document.createElement("span");
+      when.className = "event-ref-when";
+      const d = parseBackendDate(ev.date);
+      const bits = [];
+      if (d) {
+        bits.push(formatDateParts(d.getDate(), d.getMonth() + 1, d.getFullYear()));
+        const rel = relativeDayLabel(d);
+        if (rel) bits.push(rel);
+      } else if (ev.date) {
+        bits.push(ev.date);
+      }
+      if (ev.time) bits.splice(1, 0, formatBackendTime(ev.time));
+      when.textContent = bits.join(" · ");
+      card.appendChild(when);
+
+      const status = (ev.status || "scheduled").toLowerCase();
+      if (status !== "scheduled" || ev.archived) {
+        const tag = document.createElement("span");
+        tag.className = "event-ref-status";
+        tag.textContent = ev.archived ? "archived" : status;
+        card.appendChild(tag);
+      }
+
+      card.title = "Open this event";
+      card.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        openEventModal(ev);
+      });
+    })
+    .catch(() => {
+      card.classList.remove("is-loading");
+      card.classList.add("is-missing");
+      // A deleted event, or one that was never ours. Say so plainly rather
+      // than leaving a bare id the reader can't act on.
+      card.textContent = "event " + id + " — not found";
+    });
+  return card;
+}
+
+function resolveEventTags(root, ownerId) {
+  if (!root) return;
+  // topicHandleOwner gives null for the user's own topics and an owner id
+  // only for a shared `O:T` handle — and a topic shared *with* us is by
+  // definition owned by someone else. So non-null is exactly "not ours".
+  const foreign = ownerId != null;
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+    acceptNode: (n) =>
+      _EVENT_TAG_TEST.test(n.nodeValue)
+        ? NodeFilter.FILTER_ACCEPT
+        : NodeFilter.FILTER_REJECT,
+  });
+  const hits = [];
+  let n;
+  while ((n = walker.nextNode())) hits.push(n);
+
+  hits.forEach((node) => {
+    const frag = document.createDocumentFragment();
+    let last = 0;
+    const text = node.nodeValue;
+    _EVENT_TAG_RE.lastIndex = 0;
+    let m;
+    while ((m = _EVENT_TAG_RE.exec(text))) {
+      if (m.index > last) {
+        frag.appendChild(document.createTextNode(text.slice(last, m.index)));
+      }
+      frag.appendChild(makeEventMount(m[1], foreign));
+      last = m.index + m[0].length;
+    }
+    if (last < text.length) {
+      frag.appendChild(document.createTextNode(text.slice(last)));
+    }
+    node.parentNode.replaceChild(frag, node);
+  });
 }
 
 function resolveGraphicTags(root, ownerId) {
@@ -10268,6 +10437,41 @@ async function buildTopicMarkdownWithGraphics() {
   return md;
 }
 
+// Replace every `[event-N]` in `md` with the event written out. Unlike a
+// graphic tag, which at least names itself, a bare `[event-42]` is meaningless
+// outside the app — so this runs for EVERY export format, plain text included.
+// A reference that can't be resolved is left as-is rather than blanked, so
+// nothing silently vanishes from the user's document.
+async function substituteEventTags(md) {
+  const ids = [];
+  const seen = new Set();
+  _EVENT_TAG_RE.lastIndex = 0;
+  let m;
+  while ((m = _EVENT_TAG_RE.exec(md))) {
+    if (!seen.has(m[1])) { seen.add(m[1]); ids.push(m[1]); }
+  }
+  if (!ids.length) return md;
+  // Someone else's topic: the references aren't ours to resolve (see
+  // resolveEventTags), so leave them alone.
+  if (topicHandleOwner(selectedTopicId) != null) return md;
+  for (const id of ids) {
+    let ev;
+    try { ev = await fetchEventRef(id); }
+    catch (_) { continue; }
+    const bits = [];
+    const d = parseBackendDate(ev.date);
+    if (d) bits.push(formatDateParts(d.getDate(), d.getMonth() + 1, d.getFullYear()));
+    else if (ev.date) bits.push(ev.date);
+    if (ev.time) bits.push(formatBackendTime(ev.time));
+    const status = (ev.status || "scheduled").toLowerCase();
+    if (status !== "scheduled") bits.push(status);
+    const title = (ev.title || "(untitled)").replace(/[\[\]\r\n]+/g, " ").trim();
+    const text = bits.length ? `**${title}** (${bits.join(", ")})` : `**${title}**`;
+    md = md.split("[event-" + id + "]").join(text);
+  }
+  return md;
+}
+
 async function exportTopic(fmt) {
   if (!selectedTopicId) return;
   // Image-capable formats embed graphics as PNGs; fall back to the plain
@@ -10277,6 +10481,20 @@ async function exportTopic(fmt) {
     try { postMarkdown = await buildTopicMarkdownWithGraphics(); }
     catch (_) { postMarkdown = null; }
   }
+  // Event references are written out for every format. When the graphics pass
+  // above produced nothing we fetch the raw body here, so a topic whose only
+  // tags are event references still exports them resolved.
+  try {
+    if (postMarkdown == null) {
+      const r0 = await fetch("/topics/" + encodeURIComponent(selectedTopicId));
+      const d0 = await r0.json();
+      const raw = d0.contents || "";
+      const sub = await substituteEventTags(raw);
+      if (sub !== raw) postMarkdown = sub;
+    } else {
+      postMarkdown = await substituteEventTags(postMarkdown);
+    }
+  } catch (_) { /* leave the tags in rather than lose the export */ }
   const exportUrl = "/topics/" + encodeURIComponent(selectedTopicId)
     + "/export?format=" + encodeURIComponent(fmt);
   try {
@@ -10760,6 +10978,13 @@ function renderTopicMarkdown(md) {
   // context's owner (the topic's owner for a shared `O:T` handle, else self)
   // lets a bare `graphic-T:n` written by the owner resolve cross-account.
   resolveGraphicTags(topicBodyEl, topicHandleOwner(selectedTopicId));
+  // Same treatment for `[event-N]` references: resolved live off the
+  // calendar, so a topic never restates a date that has since moved. The
+  // reference cache is dropped first — it exists to dedupe repeats within one
+  // render, and holding it across renders would let a card keep showing a date
+  // the user has since changed, which is the whole thing references prevent.
+  invalidateEventRef();
+  resolveEventTags(topicBodyEl, topicHandleOwner(selectedTopicId));
 }
 
 // The owner id encoded in a topic handle: `O` for a shared `"O:T"` handle, or

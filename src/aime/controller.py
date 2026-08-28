@@ -43,6 +43,7 @@ from .tool_formatting import (
     format_tool_details,
     format_tool_response,
     format_tool_result_for_model,
+    format_event_write_echo,
 )
 from .onboarding import (
     bootstrap_special_topics,
@@ -1649,6 +1650,12 @@ class ConversationController:
         # every subsequent turn. Other tools (and the UI summary above) keep
         # the raw result. A string result is forwarded verbatim by the backend.
         model_result = format_tool_result_for_model(tool_name, result)
+        # An event write returns only {ok, id}, leaving the model to describe
+        # what it stored from memory. Echo the stored date back — spelled out
+        # with its weekday — so its confirmation to the user is grounded in the
+        # calendar rather than in what it meant to write.
+        if model_result is None:
+            model_result = format_event_write_echo(tool_name, tool_input, result)
         # Auto-attach commitment history for any returned events that belong to
         # a commitment, so the model already has the pattern context instead of
         # firing a follow-up GetCommitmentHistory per id (slow back-and-forth).

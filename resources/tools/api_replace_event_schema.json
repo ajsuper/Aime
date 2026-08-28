@@ -4,12 +4,33 @@
   "description": "Replace an existing event. ALL fields required — repeat unchanged ones as-is.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["id", "date", "title", "summary", "category", "archived"],
+  "required": [
+    "id",
+    "date",
+    "weekday",
+    "title",
+    "summary",
+    "category",
+    "archived"
+  ],
   "properties": {
     "date": {
       "type": "string",
       "pattern": "^\\d{2}/\\d{2}/\\d{4}$",
       "description": "DD/MM/YYYY start date. For a multi-day event, set end_date (or duration) for the end."
+    },
+    "weekday": {
+      "type": "string",
+      "enum": [
+        "monday",
+        "tuesday",
+        "wednesday",
+        "thursday",
+        "friday",
+        "saturday",
+        "sunday"
+      ],
+      "description": "Day of the week `date` falls on, lowercase (e.g. \"tuesday\"). REQUIRED, and verified against `date` before the event is saved — if they disagree the write is rejected and you must correct it. This is a checksum on your own date arithmetic, not extra data: work out the weekday from the `<clock>` block's dated weekday strip rather than restating what you assumed, so a slip in \"next Tuesday\" shows up here instead of silently landing in the calendar. If you cannot tell which date the user meant, ask them."
     },
     "time": {
       "type": "string",
@@ -59,7 +80,12 @@
     },
     "status": {
       "type": "string",
-      "enum": ["scheduled", "completed", "canceled", "unknown"],
+      "enum": [
+        "scheduled",
+        "completed",
+        "canceled",
+        "unknown"
+      ],
       "description": "Lifecycle state. Set 'completed' when it happened, 'canceled' (with status_change_reason) when dropped. To move an event, change its date and set rescheduled_from to the old date — leave the status 'scheduled'. 'unknown' is set automatically by the system for past events you never resolved; don't set it yourself. Omit to keep the existing value."
     },
     "status_change_reason": {

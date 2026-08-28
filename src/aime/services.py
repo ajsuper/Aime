@@ -56,6 +56,19 @@ class CalendarService:
         )
         return _events_from(data)
 
+    def event_by_id(self, event_id) -> dict | None:
+        """One event by id, or None if this user has no such event.
+
+        The backend has no id filter, so this reads and scans — the same
+        approach the active-events snapshot takes. Archived events are included
+        deliberately: a topic can reference one, and a card reading "archived"
+        is more useful than one reading "couldn't load"."""
+        data = self._gw.call("get_events", archived="all")
+        for ev in _events_from(data):
+            if isinstance(ev, dict) and str(ev.get("id")) == str(event_id):
+                return ev
+        return None
+
     def events_in_range(self, start_date: str, end_date: str, *, include_archived: bool = False) -> list[dict]:
         """Every event with a date in ``[start_date, end_date]`` (both
         ``DD/MM/YYYY``), ascending. Used by the scheduler to arm event reminders
@@ -136,6 +149,20 @@ class TopicService:
         if isinstance(resp, dict):
             return resp.get("contents", "") or ""
         return ""
+
+    def get_topic_contents_annotated(self, topic_id) -> tuple[str, str]:
+        """`(contents, annotations)` for a topic.
+
+        The gateway attaches freshness/date annotations to every topic read
+        under a private key; `get_topic_contents` drops them because most
+        callers render the body for the user. Callers building *model* context
+        want them — the annotations are the whole reason stored prose stops
+        being read as though it were written today."""
+        resp = self._gw.call("get_topic_contents", id=topic_id)
+        if isinstance(resp, dict):
+            return (resp.get("contents", "") or "",
+                    resp.get("_annotations", "") or "")
+        return "", ""
 
     def replace_topic_contents(self, topic_id, contents: str):
         return self._gw.call("replace_topic_contents", id=topic_id, contents=contents)
