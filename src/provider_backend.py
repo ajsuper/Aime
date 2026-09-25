@@ -434,6 +434,17 @@ class AgentBackend(Protocol):
         would corrupt the in-flight assistant message / tool_result ordering."""
         return False
 
+    @property
+    def agent_reply_pending(self) -> bool:
+        """True while this session is held open for a reply to a background
+        agent's message, which suppresses idle/day rollover until the user
+        answers. Backends without persistent history never hold."""
+        return False
+
+    def set_agent_reply_pending(self, pending: bool) -> None:
+        """Arm or release the reply hold. No-op for backends that don't roll."""
+        return
+
     def delete_session(self, session_id: str) -> None:
         """Delete a saved session by id. No-op for backends without enumerable
         history. If the deleted session is currently active, also resets to a
@@ -507,6 +518,7 @@ def read_session_messages(
 
 def append_proactive_message_offline(
     conversations_dir: str, dek: bytes, text: str, tz_name: str = "",
+    *, pin_reply: bool = False,
 ) -> bool:
     """Append an out-of-band assistant message to a user's *current-day* session
     *without* a live backend in memory — used when the user is offline so a
@@ -514,6 +526,13 @@ def append_proactive_message_offline(
     next time they open Today. Mirrors ``append_assistant_message`` / ``_persist``
     exactly (same hidden-trigger guard, same encryption + atomic write, AAD =
     session id) so the live and offline paths produce identical files.
+
+    ``pin_reply`` marks the target session as awaiting a reply to an agent
+    message, so when the user next opens it the thread is held open for their
+    answer instead of idle-/day-rolling onto a fresh one (see
+    ``AnthropicMessagesBackend._agent_reply_pending``). This is the offline half
+    of that hold: an agent that finishes while the user is away is exactly the
+    case where the reply arrives long after the message.
 
     Targets today's session (in the user's ``tz_name``) so the message lands in
     Today, not a past day's bucket — creating a fresh today session if the most
@@ -591,6 +610,8 @@ def append_proactive_message_offline(
     })
     target_data["messages"] = messages
     target_data["id"] = target_id
+    if pin_reply:
+        target_data["agent_reply_pending"] = True
     target_data["saved_at"] = datetime.datetime.now().isoformat(timespec="seconds")
     if not target_data.get("summary"):
         target_data["summary"] = "none"
@@ -669,6 +690,7 @@ class AnthropicMessagesBackend:
         usage_source: str = "interactive",
         quota=None,
         error_sink=None,
+        headless: bool = False,
     ):
         self._client = Anthropic(max_retries=3, timeout=_API_TIMEOUT)
         # Optional diagnostics capture. Called as
@@ -755,6 +777,11 @@ class AnthropicMessagesBackend:
         # they never litter the user's saved-conversation list; their audit
         # trail is the separate run record (see aime.agents.store).
         self._persist_enabled = persist_enabled
+        # True for a background-agent run: no human is reading the output, so
+        # the turn loop is the *only* consumer of context. Drives the per-turn
+        # clock onto tool_result turns too (see _cacheable_messages), which a
+        # conversational session deliberately skips.
+        self._headless = headless
         # Runtime persistence suspend for a Temporary Chat: the session lives only
         # in memory and is discarded on exit, even though this backend is normally
         # persistence-capable. Separate from _persist_enabled (the static
@@ -775,6 +802,18 @@ class AnthropicMessagesBackend:
         # per-turn date block so the model sees the *user's* local time
         # rather than the server's. Empty => fall back to server-local time.
         self._client_tz: str = ""
+        # True while this session is holding open for a reply to a *background
+        # agent's* message. An agent's output is a report the user is expected
+        # to answer whenever they get to it, so while this is set the session
+        # never idle- or day-rolls out from under them (see
+        # ConversationController._maybe_roll_session) — their reply lands in the
+        # same thread, with the agent's message still in context, however long
+        # they take. Cleared by that reply. Persisted with the session so the
+        # hold survives a restart or an offline delivery. A *normal* proactive
+        # message (a scheduler reminder, the interactive SendMessage tool) does
+        # NOT set this: those keep the ordinary rollover, which is what makes a
+        # returning user land on a fresh Today.
+        self._agent_reply_pending: bool = False
         # The user's date/time *display* preferences (see aime.dateformat),
         # refreshed from each /send alongside the timezone. They tell the model
         # which format to write dates/times in (the per-turn date block carries
@@ -877,6 +916,22 @@ class AnthropicMessagesBackend:
         timezone is a property of the client, not of any one conversation."""
         with self._lock:
             self._client_tz = tz or ""
+
+    @property
+    def agent_reply_pending(self) -> bool:
+        """True while this session is held open for a reply to an agent message."""
+        with self._lock:
+            return self._agent_reply_pending
+
+    def set_agent_reply_pending(self, pending: bool) -> None:
+        """Arm (or release) the reply hold — see ``_agent_reply_pending``. Armed
+        when an agent's message is threaded in, released when the user answers.
+        Persisted, so the hold outlives a restart."""
+        with self._lock:
+            if self._agent_reply_pending == bool(pending):
+                return
+            self._agent_reply_pending = bool(pending)
+        self._persist()
 
     def set_client_date_prefs(
         self, date_format: str | None, time_format: str | None
@@ -992,6 +1047,8 @@ class AnthropicMessagesBackend:
             self._session_context = ""
             self._current_turn_model = None
             self._current_turn_label = None
+            # A fresh session is nobody's pending reply.
+            self._agent_reply_pending = False
             # Fresh conversation, fresh operator token — so one session's token
             # is never worth anything in the next.
             self._system_token = new_system_turn_token()
@@ -1092,6 +1149,10 @@ class AnthropicMessagesBackend:
             self._system_token = (
                 data.get("system_token") or new_system_turn_token()
             )
+            # Restore any reply hold, so resuming a thread that an agent wrote
+            # into still waits for the user's answer instead of rolling. Absent
+            # on sessions saved before the flag existed => False.
+            self._agent_reply_pending = bool(data.get("agent_reply_pending"))
             # Returning to a real (persisted) session — e.g. exiting a Temporary
             # Chat back to the main thread — resumes normal persistence.
             self._persist_suspended = False
@@ -1156,6 +1217,11 @@ class AnthropicMessagesBackend:
                         # Rides with the history it authenticates, so resuming
                         # this conversation keeps the same operator token.
                         "system_token": self._system_token,
+                        # Whether this session is held open for a reply to an
+                        # agent message. Persisted so a restart — or a delivery
+                        # made while the user was offline — doesn't drop the
+                        # hold and roll the thread they were going to answer.
+                        "agent_reply_pending": self._agent_reply_pending,
                     }
                 tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
                 plaintext = json.dumps(snapshot, default=_jsonable).encode("utf-8")
@@ -2126,13 +2192,24 @@ class AnthropicMessagesBackend:
                 **new_content[-1],
                 "cache_control": {"type": "ephemeral", "ttl": "5m"},
             }
-            # Only attach the clock to fresh user-text turns. On tool_result
-            # turns the trailing <clock> block becomes the sole "textual" thing
-            # the model sees the user say, which makes it narrate as if the
-            # user's message was empty (and tempts Haiku to echo the tag back).
-            if last.get("role") == "user" and not any(
-                isinstance(b, dict) and b.get("type") == "tool_result"
-                for b in content
+            # In a chat, only fresh user-text turns get the clock. On a
+            # tool_result turn the trailing <clock> block becomes the sole
+            # "textual" thing the model sees the user say, which makes it
+            # narrate as if the user's message was empty (and tempts Haiku to
+            # echo the tag back).
+            #
+            # A headless run is the opposite case: its only user-text turn is
+            # the kickoff, so that rule left the worker date-blind for every
+            # turn after its first — the whole run, in other words, including
+            # every event read and the final summary — and it fell back on
+            # training-data priors for "now". There is no one to narrate to
+            # here, so the objection above doesn't apply and the clock rides
+            # on every turn.
+            if last.get("role") == "user" and (
+                self._headless or not any(
+                    isinstance(b, dict) and b.get("type") == "tool_result"
+                    for b in content
+                )
             ):
                 new_content.append(self._date_block())
             out[-1] = {**last, "content": new_content}

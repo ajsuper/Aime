@@ -376,7 +376,11 @@ class ConversationController:
         # assistant/tool_result ordering), so it's stashed here and flushed as an
         # inline assistant turn when the turn ends — so an interactive send shows
         # in the thread just like a scheduler/agent one. Guarded by _state_lock.
-        self._pending_proactive: list[str] = []
+        # Each entry is (text, source): "agent" for a background agent's
+        # message, "assistant" for anything Aime sends in its own voice. The
+        # source decides whether threading it in holds the session open for a
+        # reply (see record_proactive_message).
+        self._pending_proactive: list[tuple[str, str]] = []
         # Two locks keep input dispatch race-free across the waitress request
         # threads and the stream-worker thread:
         #   * _dispatch_lock (reentrant) serializes a whole dispatch_input /
@@ -657,6 +661,11 @@ class ConversationController:
         # reads) can fail too.
         try:
             self._last_activity = time.time()
+            # The user is answering. Release any agent-reply hold so this thread
+            # goes back to rolling normally from here — the hold exists only to
+            # keep the session waiting for exactly this message.
+            if self._awaiting_agent_reply():
+                self._set_agent_reply_pending(False)
             attachments: list[dict] = []
             for img in (images or []):
                 mt = img.get("media_type")
@@ -900,6 +909,22 @@ class ConversationController:
         temporary — same as the dispatch-time check it shares."""
         self._maybe_roll_session()
 
+    def _set_agent_reply_pending(self, pending: bool) -> None:
+        """Arm or release the agent-reply hold on the live session. Best-effort:
+        a backend that doesn't roll (or doesn't persist) simply has no hold."""
+        setter = getattr(self._backend, "set_agent_reply_pending", None)
+        if setter is None:
+            return
+        try:
+            setter(pending)
+        except Exception:
+            # Never let a persistence hiccup take down a delivery or a /send.
+            logger.exception("could not %s the agent-reply hold",
+                             "arm" if pending else "release")
+
+    def _awaiting_agent_reply(self) -> bool:
+        return bool(getattr(self._backend, "agent_reply_pending", False))
+
     def _maybe_roll_session(self) -> None:
         """Roll onto a new backend session when either (a) the thread has been quiet
         past IDLE_ROLLOVER_SECONDS (a cost boundary), or (b) the user's local day has
@@ -919,8 +944,19 @@ class ConversationController:
         crosses midnight isn't wiped mid-sentence: the clear waits until the user
         has actually been away, not merely until the clock ticks over.
 
+        Both rolls are suppressed while the session is holding open for a reply
+        to a background agent's message: an agent's report is something the user
+        answers when they get to it, and rolling would drop the report out of the
+        model's context (idle roll) or off the screen entirely (day roll) before
+        they could. The hold is released by their reply — see
+        ``_dispatch_user_message`` — after which normal rolling resumes. A normal
+        proactive message from Aime sets no hold, so a reminder the user never
+        answers still gives them a fresh Today when they come back.
+
         Skipped in headless runs, temporary chats, and on an already-empty session."""
         if self._headless or self._temporary:
+            return
+        if self._awaiting_agent_reply():
             return
         with self._dispatch_lock:
             with self._state_lock:
@@ -1307,9 +1343,11 @@ class ConversationController:
         if self._headless:
             return  # headless run with no sink wired — nothing to thread into
         with self._state_lock:
-            self._pending_proactive.append(body)
+            # Aime speaking in its own voice mid-turn — a normal message, so it
+            # does not hold the session open.
+            self._pending_proactive.append((body, "assistant"))
 
-    def record_proactive_message(self, text: str) -> bool:
+    def record_proactive_message(self, text: str, *, source: str = "assistant") -> bool:
         """Make an out-of-band message that was sent to the user (a scheduler
         reminder, a background-agent notification) appear inline in *this* live
         session: append it as an assistant turn so the model has coherent context
@@ -1320,7 +1358,14 @@ class ConversationController:
         record (appending mid-turn would corrupt the in-flight history) — the user
         still got the message out of band, it just won't thread into this exact
         moment. Intended for the interactive user's own controller; background
-        agents route here via their owning user's live context, not their run."""
+        agents route here via their owning user's live context, not their run.
+
+        ``source="agent"`` marks this as a background agent's report and holds
+        the session open for the user's reply — no idle or day rollover until
+        they answer, however long that takes, so the reply lands in this thread
+        with the agent's message still in context. Any other source is a normal
+        Aime message and keeps the ordinary rollover: a reminder the user never
+        answers should still give them a fresh Today when they come back."""
         body = (text or "").strip()
         if not body:
             return False
@@ -1337,19 +1382,24 @@ class ConversationController:
         # session that just received an out-of-band message still looks "last
         # touched yesterday" and a later open day-rolls it into History.
         self._last_activity = time.time()
+        if source == "agent":
+            self._set_agent_reply_pending(True)
         # A dedicated event (not assistant_text): the frontend renders it as a
         # standalone Aime bubble instantly, with no dependence on turn/typewriter
         # state — which is what kept proactive messages from showing in the chat.
         self._emit(CoreEvent(kind="proactive_message", text=body, pid=pid))
         return True
 
-    def deliver_inline_proactive(self, text: str) -> bool:
+    def deliver_inline_proactive(self, text: str, *, source: str = "assistant") -> bool:
         """Thread an out-of-band message (scheduler reminder, agent notification)
         into *this* live session as an inline assistant turn. If idle, record and
         surface it now; if a turn is in flight, stash it to flush on turn_end —
         never write mid-turn, which the turn's own persist would clobber. Returns
         True when the live session has taken ownership (recorded or queued), so the
-        caller knows not to also write it to disk."""
+        caller knows not to also write it to disk.
+
+        ``source`` is passed through to record_proactive_message: "agent" holds
+        the session open for the user's reply, anything else doesn't."""
         body = (text or "").strip()
         if not body:
             return False
@@ -1367,14 +1417,14 @@ class ConversationController:
         self._maybe_roll_session()
         with self._state_lock:
             if not self._is_idle:
-                self._pending_proactive.append(body)
+                self._pending_proactive.append((body, source))
                 return True
-        if self.record_proactive_message(body):
+        if self.record_proactive_message(body, source=source):
             return True
         # Lost the idle race between the check and the record — stash it so the
         # next turn_end flushes it rather than dropping (or racing) the write.
         with self._state_lock:
-            self._pending_proactive.append(body)
+            self._pending_proactive.append((body, source))
         return True
 
     def _flush_pending_proactive(self) -> None:
@@ -1384,14 +1434,14 @@ class ConversationController:
         with self._state_lock:
             pending = self._pending_proactive
             self._pending_proactive = []
-        for text in pending:
+        for text, source in pending:
             try:
-                if not self.record_proactive_message(text):
+                if not self.record_proactive_message(text, source=source):
                     # A racing /send claimed the turn between the idle flip and
                     # here; re-stash so the next turn_end flushes it rather than
                     # dropping the inline echo (the phone already has it).
                     with self._state_lock:
-                        self._pending_proactive.append(text)
+                        self._pending_proactive.append((text, source))
             except Exception as exc:
                 self._emit_error(exc, source="proactive_flush",
                                  label="inline message failed")

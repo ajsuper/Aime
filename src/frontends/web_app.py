@@ -4602,7 +4602,9 @@ def _scheduler_run_agent(agent_id: str, user_id: int, tz: str | None) -> None:
     _launch_agent_run(definition_to_spec(record), user_id, tz, agent_id=agent_id)
 
 
-def _record_proactive_in_user_thread(user_id: int, text: str) -> None:
+def _record_proactive_in_user_thread(
+    user_id: int, text: str, *, source: str = "assistant",
+) -> None:
     """Make an out-of-band message Aime sent (a scheduler reminder, a
     background-agent notification) appear inline in the user's conversation, so
     it reads as a text Aime sent in-thread and a reply lands with context.
@@ -4610,6 +4612,13 @@ def _record_proactive_in_user_thread(user_id: int, text: str) -> None:
     Routes to the live session when the user is connected (records the assistant
     turn and pushes it to their open chat immediately); otherwise writes straight
     to their most recent persisted session, visible the next time they open it.
+    ``source="agent"`` marks the message as a background agent's report, which
+    holds the user's thread open for their reply — no idle or day rollover until
+    they answer, so a reply hours or days later still lands in the same
+    conversation with the agent's output in context. Everything Aime sends in its
+    own voice (a scheduler reminder, an interactive SendMessage) leaves the
+    default and keeps the normal rollover.
+
     Always best-effort — recording is additive to the out-of-band delivery, so any
     failure is logged and swallowed rather than affecting the send."""
     body = (text or "").strip()
@@ -4617,7 +4626,9 @@ def _record_proactive_in_user_thread(user_id: int, text: str) -> None:
         return
     try:
         ctx = _user_contexts.get(user_id)
-        if ctx is not None and ctx.controller.deliver_inline_proactive(body):
+        if ctx is not None and ctx.controller.deliver_inline_proactive(
+            body, source=source
+        ):
             # A live (non-temporary) session owns it: recorded now if idle (and
             # pushed to the open chat as a proactive_message), or queued to flush
             # on turn_end if busy. Don't also write to disk.
@@ -4631,6 +4642,10 @@ def _record_proactive_in_user_thread(user_id: int, text: str) -> None:
         append_proactive_message_offline(
             _conversations_dir(user_id), _auth_backend.get_dek(user_id), body,
             _user_tz(user_id),
+            # An agent that finished while the user was away is the main case
+            # for the hold: mark the session now so opening it later waits for
+            # their reply instead of rolling the message away.
+            pin_reply=(source == "agent"),
         )
         # This wrote straight to disk, bypassing the live broadcast path, so the
         # in-memory replay cache doesn't know about it. Flag it for a rebuild on
@@ -4799,6 +4814,12 @@ def _launch_agent_run(
     # for a user who isn't in the server's zone.
     if not client_tz and _rec is not None:
         client_tz = _rec.tz
+    # The user's date/time *display* preferences, so a message this run sends
+    # back is written in the format they read — the same prefs an interactive
+    # session seeds. Without these the run's clock block advertises the
+    # tz-derived default and 24-hour times regardless of what they picked.
+    date_format = _rec.date_format if _rec is not None else None
+    time_format = _rec.time_format if _rec is not None else None
 
     token = base64.b16encode(os.urandom(8)).decode().lower()
     descriptor = {
@@ -4819,6 +4840,8 @@ def _launch_agent_run(
                 runs_dir=runs_dir,
                 usage_label=username,
                 client_tz=client_tz,
+                date_format=date_format,
+                time_format=time_format,
                 messaging_contact=messaging_contact,
                 # Every message this run sends — a SendMessage tool call *or* its
                 # SubmitResult message_to_user — flows through the controller's
@@ -4826,7 +4849,8 @@ def _launch_agent_run(
                 # into the owning user's transcript + live UI. So agent messages
                 # appear in the chat exactly like interactive ones (the gap that
                 # made agent/reminder messages reach Telegram but not the UI).
-                message_sink=lambda t: _record_proactive_in_user_thread(user_id, t),
+                message_sink=lambda t: _record_proactive_in_user_thread(
+                    user_id, t, source="agent"),
                 api_url=aime_config.API_URL,
                 agent_id=agent_id,
                 # Debit this run's real cost against the user's budget (None when

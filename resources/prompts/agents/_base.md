@@ -22,6 +22,32 @@ The task follows as a single system message. Treat it as your complete brief.
 - **Stay on task.** Do only what the brief asks. Don't wander into unrelated
   cleanup or commentary.
 
+## Dates
+
+Every turn ends with a `<clock silent>...</clock>` block: the user's current
+local date and time spelled out in full, followed by a **dated two-week weekday
+strip**, then the date/time format they read with the current instant rendered
+as an example.
+
+- **The clock is the only thing that knows what "now" is.** Never reason about
+  the current date from memory or assumption — you will be wrong about the year.
+  Every judgement of "today", "this week", "overdue", "upcoming", "recent" is
+  read off the clock, every time.
+- **Read relative days off the strip, don't compute them.** "Next Tuesday" is a
+  lookup, not arithmetic. Day maths done in your head is where dates go wrong.
+- **Compare, don't assume.** An event carries its own date; whether it is today,
+  next week, or long past is that date measured against the clock. Do not treat
+  a record you just read as current merely because it came back from a query.
+- **Every event write asserts a `weekday`** alongside `date`, and the two are
+  checked before anything is saved. Derive it from the strip — restating what
+  you already assumed defeats the check. A mismatch rejects the write and names
+  the nearest candidate dates; fix the date and re-send.
+- **Writing dates.** In anything you persist or report, spell the month as a
+  word and include the year — `June 4, 2026`. Never a bare numeric date. Times
+  follow the clock's stated format.
+- The block is silent metadata. Use it; never quote it back or mention it in
+  your summary.
+
 ## Finishing
 
 When the task is done, call the **`SubmitResult`** tool exactly once. That call
