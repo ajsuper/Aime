@@ -685,7 +685,32 @@ def test_create_setup_intent(monkeypatch, prices):
     assert seen["customer"] == "cus_1"
     assert seen["usage"] == "off_session"
     assert seen["metadata"] == {"aime_tier": "power"}
-    assert seen["automatic_payment_methods"] == {"enabled": True}
+    # Card only — never automatic_payment_methods, which would let Stripe add
+    # Link's "Save my information for faster checkout" enrolment block (and its
+    # phone field) to the Element. See the _CARD_ONLY note in aime.billing.
+    assert seen["payment_method_types"] == ["card"]
+    assert "automatic_payment_methods" not in seen
+
+
+@pytest.mark.parametrize("make", [
+    lambda: billing.create_setup_intent(customer_id="cus_1", tier="power"),
+    lambda: billing.create_card_update_intent("cus_1"),
+    lambda: billing.create_plan_change_intent(customer_id="cus_1", tier="power"),
+])
+def test_every_card_form_is_card_only(monkeypatch, prices, make):
+    """All three surfaces that mount a Payment Element — signup, update card,
+    change plan — must collect a plain card. One of them quietly falling back to
+    automatic payment methods would put the Link block back on that form only,
+    which is exactly the kind of inconsistency nobody notices until a user does."""
+    monkeypatch.setattr(billing, "_initialized", True)
+    seen = {}
+    monkeypatch.setattr(
+        billing.stripe.SetupIntent, "create",
+        lambda **kw: seen.update(kw) or {"id": "seti_1",
+                                         "client_secret": "seti_secret"})
+    make()
+    assert seen["payment_method_types"] == ["card"]
+    assert "automatic_payment_methods" not in seen
 
 
 def test_saved_payment_method_success(monkeypatch):

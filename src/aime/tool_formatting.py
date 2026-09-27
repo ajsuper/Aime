@@ -10,6 +10,8 @@ lives here too — it's domain knowledge about how the model's tool schemas
 relate to the local tool server, not presentation.
 """
 
+import datetime
+
 TOOL_NAME_MAP = {
     "FilterUsersEvents": "get_events",
     "EditEvent": "replace_event",
@@ -44,6 +46,77 @@ def format_event_when(ev: dict) -> str:
     else:
         end = end_time or end_date
     return f"{start} → {end}" if end else start
+
+
+_ECHO_DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday",
+              "Friday", "Saturday", "Sunday"]
+_ECHO_MONTHS = ["January", "February", "March", "April", "May", "June",
+                "July", "August", "September", "October", "November",
+                "December"]
+
+
+def _spell_date(raw: str) -> str:
+    """A DD/MM/YYYY date spelled out with its weekday — "Saturday, August 22,
+    2026". Returns the input unchanged if it isn't a well-formed date, so a
+    malformed value is shown as-is rather than swallowed."""
+    try:
+        d = datetime.datetime.strptime((raw or "").strip(), "%d/%m/%Y").date()
+    except ValueError:
+        return raw or "?"
+    return (f"{_ECHO_DAYS[d.weekday()]}, {_ECHO_MONTHS[d.month - 1]} "
+            f"{d.day}, {d.year}")
+
+
+def format_event_write_echo(name: str, inp: dict, result) -> str | None:
+    """The confirmation an event write hands back to the model, echoing the
+    date that was actually stored — spelled out, with its weekday.
+
+    The backend returns only `{ok, id}`, so after a successful write the model
+    has nothing to check itself against and describes the event to the user
+    from its own recollection of what it *meant* to store. That is exactly
+    where a date slip becomes a confident wrong statement to the user. Echoing
+    the stored date back closes the loop: the model's sentence is grounded in
+    what the calendar now holds.
+
+    The weekday is spelled because it is the part the user can instantly
+    sanity-check — "Saturday the 22nd" is checkable in a way "22/08" is not.
+    Complements the pre-write `weekday` checksum (aime.weekday_check): that one
+    catches a slip the model can detect itself, this one surfaces anything that
+    got through to the one party who knows what they actually meant.
+
+    Returns None for non-event-write tools and for failed writes, signalling
+    the caller to forward the raw result unchanged.
+    """
+    if name not in ("CreateEvent", "EditEvent"):
+        return None
+    if not isinstance(result, dict) or "error" in result or not result.get("ok"):
+        return None
+
+    eid = result.get("id", inp.get("id", "?"))
+    title = (inp.get("title") or "").strip() or "(untitled)"
+    verb = "Created" if name == "CreateEvent" else "Updated"
+
+    when = _spell_date(inp.get("date"))
+    time_ = (inp.get("time") or "").strip()
+    if time_:
+        when += f" at {time_}"
+
+    end_date = (inp.get("end_date") or "").strip()
+    end_time = (inp.get("end_time") or "").strip()
+    duration = str(inp.get("duration") or "").strip()
+    if end_date and end_date != (inp.get("date") or "").strip():
+        end = _spell_date(end_date)
+        if end_time:
+            end += f" at {end_time}"
+        when += f" \u2192 {end}"
+    elif end_time:
+        when += f" \u2192 {end_time}"
+    elif duration:
+        when += f" (for {duration})"
+
+    status = (inp.get("status") or "").strip()
+    tail = f" [{status}]" if status and status != "scheduled" else ""
+    return f'{verb} event #{eid} "{title}" \u2014 {when}.{tail}'
 
 
 def _truncate_for_log(value, limit: int = 60) -> str:
@@ -178,6 +251,18 @@ def format_tool_details(name: str, inp: dict) -> str:
     return ", ".join(parts)
 
 
+def _short_stamp(raw) -> str:
+    """The date part of a backend ISO timestamp (`2026-08-19T09:12:00Z`), or ''
+    if it isn't one. Date granularity only — the time would cost tokens on
+    every event line for precision nothing here needs."""
+    if not isinstance(raw, str) or len(raw) < 10:
+        return ""
+    head = raw[:10]
+    if head[4] != "-" or head[7] != "-" or not head[:4].isdigit():
+        return ""
+    return head
+
+
 def _render_events(events: list) -> str:
     n = len(events)
     if n == 0:
@@ -202,6 +287,13 @@ def _render_events(events: list) -> str:
             head += f" | {status}"
         if ev.get("archived"):
             head += " | [archived]"
+        # The backend stamps these server-side and already ships them in the
+        # JSON; the compact render used to drop them. An event's summary is
+        # free-form prose that can say "moved this back a week", and without a
+        # written-at date there is no way to tell whether that note is current.
+        edited = _short_stamp(ev.get("last_modified_at") or ev.get("created_at"))
+        if edited:
+            head += f" | edited {edited}"
         lines.append(head)
         summary = (ev.get("summary") or "").strip()
         for sline in summary.splitlines():
@@ -242,6 +334,27 @@ def _render_topics(topics: list) -> str:
     return "\n".join(lines)
 
 
+def _render_topic_contents(result) -> str | None:
+    """A topic read as the model should see it: the stored body, then whatever
+    annotations the gateway attached.
+
+    The body comes first and verbatim. That ordering is not cosmetic — the
+    model builds `EditTopicContents` find-strings out of what it reads here, so
+    anything interleaved into the body would make those patches miss. The
+    annotations are appended, clearly delimited, and stripped back out on write.
+
+    Plain text rather than the raw JSON dict for the same reason the event and
+    topic listings are: JSON escapes every markdown newline in a topic body as a
+    literal \\n, and that overhead is paid again on every cached turn after."""
+    if isinstance(result, dict) and "error" in result:
+        return f"Error: {result.get('error')}"
+    if not isinstance(result, dict) or not isinstance(result.get("contents"), str):
+        return None
+    body = result["contents"].rstrip()
+    annotations = (result.get("_annotations") or "").strip()
+    return f"{body}\n\n{annotations}" if annotations else body
+
+
 def format_tool_result_for_model(name: str, result):
     """Render get-events / get-topics results as a compact text view for the
     model instead of raw JSON. Returns None for every other tool, signalling
@@ -256,6 +369,8 @@ def format_tool_result_for_model(name: str, result):
     summary as a literal `\\n`. A flat text layout keeps every field the model
     needs to act on — crucially the id — while shedding that syntactic
     overhead, which is the bulk of the cached-context cost on read turns."""
+    if name == "GetTopicContents":
+        return _render_topic_contents(result)
     if name not in ("FilterUsersEvents", "FilterTopics"):
         return None
     if isinstance(result, dict) and "error" in result:

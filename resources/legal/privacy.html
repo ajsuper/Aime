@@ -4,44 +4,34 @@
   This file is injected into resources/style/legal.html (which supplies the
   page shell, fonts and styling), so it must contain no <html>/<head>/<body>.
 
-  Drafted for: Texas law, AWS-hosted, operated by 933 Consulting Group LLC
-  d/b/a Prism, which is named as the data controller. See the note in
-  terms.html about confirming the exact registered name and the assumed-name
-  filing — both must match here too.
+  Drafted for: Texas law, AWS-hosted, operated by 933 Consulting Group, LLC
+  d/b/a Prism (exact registered name, comma included), which is named as the
+  data controller. Must match terms.html.
 
   The factual sections were checked against the code on 2026-07-29:
-    - auth_events (auth.py:445) stores ts/kind/username/ip/detail and is pruned
+    - auth_events (auth.py) stores ts/kind/username/ip/detail and is pruned
       at _AUTH_EVENT_TTL = 30 days. It records FAILURES and password resets
       only — successful sign-ins are NOT logged. Don't claim otherwise.
-    - trusted_devices (auth.py:464) stores a token hash, user agent, and
-      expiry.
+    - trusted_devices (auth.py) stores a token hash, user agent, and expiry.
     - accounts.purge_user() keeps NOTHING: it removes the row, the data
       directory, and the user's whole backups/<id>/ directory. Section 7
       promises exactly that, and tests/test_account_purge.py enforces it. If
       you ever reintroduce a parting backup, section 7 must change with it.
-    - Sub-processors below are the ones the code actually calls.
+    - Sub-processors below are the ones the code actually calls. Email goes
+      out over SMTP through Amazon SES (aime.email_send).
   Re-verify these if the code changes — a stale privacy policy is a liability.
 
-  ⚠  NOT LEGAL ADVICE, AND NOT YET REVIEWED BY A LAWYER.  ⚠
-  Each remaining highlighted blank (a span with the "blank" class, wrapping a
-  BRACKETED note) is a fact only the operator can supply. The launch check in
-  docs/production-checklist.md greps for those spans, so this comment
-  deliberately does not spell one out verbatim. When the last one is filled in,
-  delete the .draft-banner block below and bump aime.config.TERMS_VERSION.
+  This policy has not been reviewed by a lawyer. Any material change to the
+  text needs a bump to aime.config.TERMS_VERSION; keep the "Version" line
+  below in step with it.
 -->
-    <div class="draft-banner">
-      <strong>Draft — not yet in force</strong>
-      This policy is complete but has not yet been reviewed by a lawyer, and
-      one detail (our email provider) is still to be named. Aime is not open
-      for public signups while this notice is here.
-    </div>
 
     <h1>Privacy Policy</h1>
     <p class="meta">Version __TERMS_VERSION__ (also the date this policy takes
       effect)</p>
 
     <p>This policy explains what Aime collects, why, and what you can do about
-      it. Aime is operated by <strong>933 Consulting Group LLC</strong>, doing
+      it. Aime is operated by <strong>933 Consulting Group, LLC</strong>, doing
       business as <strong>Prism</strong>, which is the controller of your
       personal data, at PO Box 8243, Midland, TX 79708.
       For any privacy question, contact
@@ -121,9 +111,8 @@
         when you use it.</li>
       <li><strong>Stripe</strong> — payments and subscription management.</li>
       <li><strong>Amazon Web Services</strong> (United States) — hosting and
-        infrastructure.</li>
-      <li><span class="blank">[EMAIL PROVIDER]</span> — verification codes and
-        account email.</li>
+        infrastructure, and sending verification codes and account email
+        through Amazon SES.</li>
       <li><strong>Twilio</strong> — sending SMS messages, and only if you
         have set up message delivery and only for the messages you asked Aime
         to send you.</li>
@@ -197,5 +186,5 @@
 
     <h2>13. Contact</h2>
     <p><a href="mailto:andrew@933consulting.com">andrew@933consulting.com</a><br>
-      933 Consulting Group LLC, d/b/a Prism<br>
+      933 Consulting Group, LLC, d/b/a Prism<br>
       PO Box 8243, Midland, TX 79708</p>

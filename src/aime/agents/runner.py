@@ -73,6 +73,8 @@ class BackgroundAgentRunner:
         runs_dir: str,
         usage_label: str | None = None,
         client_tz: str | None = None,
+        date_format: str | None = None,
+        time_format: str | None = None,
         messaging_contact: str | None = None,
         message_sink=None,
         api_url: str = config.API_URL,
@@ -84,6 +86,12 @@ class BackgroundAgentRunner:
         ``runs_dir`` is the user's agent-runs directory (where the encrypted run
         record is written); ``dek`` is the user's data key, used both for that
         record and as the backend's (unused, since persistence is off) key.
+
+        ``client_tz`` plus ``date_format``/``time_format`` are the user's
+        timezone and date/time *display* preferences. They drive the per-turn
+        clock block, so a run stamps "now" in the user's zone and any message it
+        sends back is written in the format they read — matching an interactive
+        turn rather than falling back to server-local time and defaults.
 
         ``messaging_contact`` is the user's outbound-message destination
         (``UserRecord.messaging_contact``); when set, the worker can reach the
@@ -104,6 +112,7 @@ class BackgroundAgentRunner:
         backend, controller, collector = self._build(
             spec, user_id=user_id, dek=dek, runs_dir=runs_dir,
             usage_label=usage_label, api_url=api_url, client_tz=client_tz,
+            date_format=date_format, time_format=time_format,
             messaging_contact=messaging_contact, message_sink=message_sink,
             quota=quota,
         )
@@ -150,6 +159,7 @@ class BackgroundAgentRunner:
 
     def _build(
         self, spec, *, user_id, dek, runs_dir, usage_label, api_url, client_tz,
+        date_format=None, time_format=None,
         messaging_contact=None, message_sink=None, quota=None,
     ):
         web_search_agent = None
@@ -192,6 +202,10 @@ class BackgroundAgentRunner:
             # it). The run is never blocked on the budget here — see the run()
             # docstring — but its spend is accounted.
             quota=quota,
+            # No human reads this run's turns, so the per-turn clock rides on
+            # tool_result turns too. Without it the worker only ever sees the
+            # date on its kickoff turn and is date-blind for the rest of the run.
+            headless=True,
         )
         backend.new_session()
 
@@ -223,6 +237,8 @@ class BackgroundAgentRunner:
         )
         if client_tz:
             controller.set_client_timezone(client_tz)
+        if date_format or time_format:
+            controller.set_client_date_prefs(date_format, time_format)
 
         collector = ResultCollector()
         controller.subscribe(collector)

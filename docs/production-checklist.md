@@ -174,12 +174,13 @@ silently disables every email flow, and because the login second factor
 fails *closed*, that turns into users being refused at login (HTTP 502),
 not a soft degradation.
 
-## 11. Terms of Service and Privacy Policy — **BLOCKING**
+## 11. Terms of Service and Privacy Policy
 
 Signup requires the user to tick a box agreeing to the Terms and Privacy
-Policy. The plumbing is done and both documents are now **written in full** —
-US law, sole-proprietor operator, 18+, AWS-hosted. What remains is a short list
-of operator facts and **a lawyer's review**.
+Policy. The plumbing is done and both documents are **written in full and in
+force as of version 2026-09-22** — Texas law, LLC operator, 18+, AWS-hosted.
+Every operator blank is filled and the draft banners are gone. They have
+**not been reviewed by a lawyer**; see the open questions below.
 
 - The text lives in `resources/legal/terms.html` and
   `resources/legal/privacy.html` (bodies only — `resources/style/legal.html`
@@ -191,34 +192,24 @@ of operator facts and **a lawyer's review**.
   account accepted and when (from `/me`'s `terms` block; accounts with no
   recorded consent show no version rather than a fabricated one). Covered by
   `tests/test_terms.py`.
-- Naming: **Aime** is the product, **Prism** is the trade name, and
-  **933 Consulting Group LLC** (Texas, PO Box 8243, Midland, TX 79708) is the
-  legal entity — named as the contracting party and data controller, doing
-  business as Prism. A d/b/a is not a separate entity, which is why the LLC
-  signs and Prism only rides along. Contact throughout is
-  andrew@933consulting.com. Governing law is Texas, venue Midland County.
-- Both still open with a **"Draft — not yet in force"** banner. Three things
-  are outstanding before it can come down:
-  1. **The entity's exact registered name.** Written as "933 Consulting Group
-     LLC"; check the Texas SOS filing and match the punctuation exactly (some
-     register as "…Group, LLC" or "L.L.C."). An imprecisely named entity is how
-     a liability shield gets argued away.
-  2. **The assumed-name filing for "Prism."** A Texas LLC must file an assumed
-     name certificate (SOS Form 503) before trading under a d/b/a. Confirm it
-     is on file — an unregistered d/b/a inside a binding agreement is a defect
-     that surfaces in exactly the dispute you'd least want it to. Worth a
-     trademark availability check too: "Prism" is a common word with heavy
-     existing use.
-  3. **The email sending provider** — the last `[BRACKETED]` blank, in §5 of
-     the privacy policy. A transactional service (SendGrid / Postmark / Resend
-     / SES) was chosen over a mailbox provider, but not yet picked.
-- Neither document has been reviewed by a lawyer, and neither is binding until
-  it is. Three things to raise with one: whether to add a binding
-  **arbitration clause and class-action waiver** (common in US consumer terms,
-  deliberately left out here because it waives user rights); whether the
-  **Texas Data Privacy and Security Act** applies to you and whether its
-  small-business exemption is available; and confirmation that naming the LLC
-  as operator sits correctly alongside the Stripe account it holds.
+- Naming: **Aime** is the product, **Prism** is the assumed name, and
+  **933 Consulting Group, LLC** (exact registered name, comma included; Texas,
+  PO Box 8243, Midland, TX 79708) is the legal entity — named as the
+  contracting party and data controller, doing business as Prism. A d/b/a is
+  not a separate entity, which is why the LLC signs and Prism only rides
+  along. Contact throughout is andrew@933consulting.com. Governing law is
+  Texas, venue Midland County.
+- Sub-processors named in both documents: Anthropic (inference, web search),
+  Stripe (payments), Amazon Web Services (hosting, and email via Amazon SES
+  over SMTP), Twilio (SMS). Re-check the list if you add or drop one.
+- Worth raising with a lawyer when one reviews the text: whether to add a
+  binding **arbitration clause and class-action waiver** (common in US
+  consumer terms, deliberately left out here because it waives user rights);
+  whether the **Texas Data Privacy and Security Act** applies and whether its
+  small-business exemption is available; confirmation that naming the LLC
+  as operator sits correctly alongside the Stripe account it holds; and a
+  trademark availability check on "Prism", a common word with heavy existing
+  use.
 - If the business later moves to a Prism entity, that is an assignment under
   §17 of the Terms: it needs a `TERMS_VERSION` bump and notice to users, not a
   quiet edit.
@@ -241,7 +232,7 @@ of operator facts and **a lawyer's review**.
   is outstanding.
 
 ```bash
-# No draft banner and no unfilled blanks should survive to launch
+# No draft banner and no unfilled blanks should ever reappear
 curl -s https://your-domain/terms   | grep -c 'draft-banner\|class="blank"'   # expect 0
 curl -s https://your-domain/privacy | grep -c 'draft-banner\|class="blank"'   # expect 0
 ```

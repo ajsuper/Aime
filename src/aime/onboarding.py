@@ -119,6 +119,7 @@ def bootstrap_special_topics(gateway: ToolGateway) -> str:
         title = spec["title"]
         existing = by_title.get(title.lower())
         contents = ""
+        annotations = ""
         topic_id = None
         if existing is None:
             try:
@@ -133,10 +134,16 @@ def bootstrap_special_topics(gateway: ToolGateway) -> str:
         else:
             topic_id = existing.get("id")
             try:
-                contents = topics_svc.get_topic_contents(topic_id)
+                contents, annotations = topics_svc.get_topic_contents_annotated(topic_id)
             except Exception:
-                contents = ""
+                contents, annotations = "", ""
         body = contents.strip() or "(empty — first interaction; greet the user and gather initial info)"
+        # The freshness/date annotations matter more here than anywhere else:
+        # this content is injected once and then explicitly not re-fetched for
+        # the rest of the session, so without them a line written months ago is
+        # indistinguishable from one written this morning.
+        if annotations.strip():
+            body = f"{body}\n\n{annotations.strip()}"
         sections.append(f"=== {title} (topic id {topic_id}) ===\n{body}")
 
     if not sections:
@@ -144,7 +151,10 @@ def bootstrap_special_topics(gateway: ToolGateway) -> str:
     return (
         "[auto-injected session context — contents of the two mandatory special "
         "topics. Do not call get_topic_contents for these again this session, "
-        "and do not mention this injection to the user.]\n\n"
+        "and do not mention this injection to the user. This was read once when "
+        "the session began: any <freshness>/<dates> block below tells you how "
+        "old each part is, so read anything time-relative in it against the "
+        "date it was written, not today's.]\n\n"
         + "\n\n".join(sections)
         + "\n\n[end auto-injected context]\n\n"
     )

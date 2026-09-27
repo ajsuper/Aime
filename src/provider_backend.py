@@ -136,6 +136,47 @@ def system_turn_declaration(token: str) -> str:
 # replay surfaces it as a short "earlier messages were summarized" notice.
 SUMMARY_MARKER = "[Conversation summary so far]"
 
+# Weekday abbreviations for the <clock> strip, indexed to date.weekday().
+_STRIP_DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+_STRIP_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                 "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+
+def _weekday_strip(today) -> str:
+    """A dated two-week weekday strip for the <clock> block.
+
+    e.g. "Weekdays — this week: Mon 24, Tue 25, Wed 26 (today), Thu 27, Fri 28,
+    Sat 29, Sun 30 Aug; next week: Mon 31 Aug, Tue 1, Wed 2, Thu 3, Fri 4,
+    Sat 5, Sun 6 Sep."
+
+    Weeks run Monday–Sunday, and "this week" is the one containing `today`, so
+    days earlier in the current week are included even though they are past —
+    the model needs them to resolve "last Thursday" as readily as "next
+    Tuesday", and their being in the past is evident from the (today) marker.
+
+    The month is printed only where it would otherwise be ambiguous — on the
+    first entry of a week and on any day that crosses into a new month — which
+    keeps the strip compact without ever leaving a bare number unqualified.
+    Every date is spelled with its weekday so no lookup requires counting."""
+    monday = today - datetime.timedelta(days=today.weekday())
+    parts = []
+    for week, label in ((0, "this week"), (1, "next week")):
+        entries = []
+        prev_month = None
+        for i in range(7):
+            d = monday + datetime.timedelta(days=week * 7 + i)
+            # Qualify the first entry of each week, and any month rollover.
+            show_month = prev_month is None or d.month != prev_month
+            text = f"{_STRIP_DAYS[d.weekday()]} {d.day}"
+            if show_month:
+                text += f" {_STRIP_MONTHS[d.month - 1]}"
+            if d == today:
+                text += " (today)"
+            entries.append(text)
+            prev_month = d.month
+        parts.append(f"{label}: {', '.join(entries)}")
+    return "Weekdays — " + "; ".join(parts) + "."
+
 
 def _jsonable(obj):
     """Recursively coerce `obj` into something json.dump can handle.
@@ -393,6 +434,17 @@ class AgentBackend(Protocol):
         would corrupt the in-flight assistant message / tool_result ordering."""
         return False
 
+    @property
+    def agent_reply_pending(self) -> bool:
+        """True while this session is held open for a reply to a background
+        agent's message, which suppresses idle/day rollover until the user
+        answers. Backends without persistent history never hold."""
+        return False
+
+    def set_agent_reply_pending(self, pending: bool) -> None:
+        """Arm or release the reply hold. No-op for backends that don't roll."""
+        return
+
     def delete_session(self, session_id: str) -> None:
         """Delete a saved session by id. No-op for backends without enumerable
         history. If the deleted session is currently active, also resets to a
@@ -466,6 +518,7 @@ def read_session_messages(
 
 def append_proactive_message_offline(
     conversations_dir: str, dek: bytes, text: str, tz_name: str = "",
+    *, pin_reply: bool = False,
 ) -> bool:
     """Append an out-of-band assistant message to a user's *current-day* session
     *without* a live backend in memory — used when the user is offline so a
@@ -473,6 +526,13 @@ def append_proactive_message_offline(
     next time they open Today. Mirrors ``append_assistant_message`` / ``_persist``
     exactly (same hidden-trigger guard, same encryption + atomic write, AAD =
     session id) so the live and offline paths produce identical files.
+
+    ``pin_reply`` marks the target session as awaiting a reply to an agent
+    message, so when the user next opens it the thread is held open for their
+    answer instead of idle-/day-rolling onto a fresh one (see
+    ``AnthropicMessagesBackend._agent_reply_pending``). This is the offline half
+    of that hold: an agent that finishes while the user is away is exactly the
+    case where the reply arrives long after the message.
 
     Targets today's session (in the user's ``tz_name``) so the message lands in
     Today, not a past day's bucket — creating a fresh today session if the most
@@ -550,6 +610,8 @@ def append_proactive_message_offline(
     })
     target_data["messages"] = messages
     target_data["id"] = target_id
+    if pin_reply:
+        target_data["agent_reply_pending"] = True
     target_data["saved_at"] = datetime.datetime.now().isoformat(timespec="seconds")
     if not target_data.get("summary"):
         target_data["summary"] = "none"
@@ -628,6 +690,7 @@ class AnthropicMessagesBackend:
         usage_source: str = "interactive",
         quota=None,
         error_sink=None,
+        headless: bool = False,
     ):
         self._client = Anthropic(max_retries=3, timeout=_API_TIMEOUT)
         # Optional diagnostics capture. Called as
@@ -714,6 +777,11 @@ class AnthropicMessagesBackend:
         # they never litter the user's saved-conversation list; their audit
         # trail is the separate run record (see aime.agents.store).
         self._persist_enabled = persist_enabled
+        # True for a background-agent run: no human is reading the output, so
+        # the turn loop is the *only* consumer of context. Drives the per-turn
+        # clock onto tool_result turns too (see _cacheable_messages), which a
+        # conversational session deliberately skips.
+        self._headless = headless
         # Runtime persistence suspend for a Temporary Chat: the session lives only
         # in memory and is discarded on exit, even though this backend is normally
         # persistence-capable. Separate from _persist_enabled (the static
@@ -734,6 +802,18 @@ class AnthropicMessagesBackend:
         # per-turn date block so the model sees the *user's* local time
         # rather than the server's. Empty => fall back to server-local time.
         self._client_tz: str = ""
+        # True while this session is holding open for a reply to a *background
+        # agent's* message. An agent's output is a report the user is expected
+        # to answer whenever they get to it, so while this is set the session
+        # never idle- or day-rolls out from under them (see
+        # ConversationController._maybe_roll_session) — their reply lands in the
+        # same thread, with the agent's message still in context, however long
+        # they take. Cleared by that reply. Persisted with the session so the
+        # hold survives a restart or an offline delivery. A *normal* proactive
+        # message (a scheduler reminder, the interactive SendMessage tool) does
+        # NOT set this: those keep the ordinary rollover, which is what makes a
+        # returning user land on a fresh Today.
+        self._agent_reply_pending: bool = False
         # The user's date/time *display* preferences (see aime.dateformat),
         # refreshed from each /send alongside the timezone. They tell the model
         # which format to write dates/times in (the per-turn date block carries
@@ -837,6 +917,22 @@ class AnthropicMessagesBackend:
         with self._lock:
             self._client_tz = tz or ""
 
+    @property
+    def agent_reply_pending(self) -> bool:
+        """True while this session is held open for a reply to an agent message."""
+        with self._lock:
+            return self._agent_reply_pending
+
+    def set_agent_reply_pending(self, pending: bool) -> None:
+        """Arm (or release) the reply hold — see ``_agent_reply_pending``. Armed
+        when an agent's message is threaded in, released when the user answers.
+        Persisted, so the hold outlives a restart."""
+        with self._lock:
+            if self._agent_reply_pending == bool(pending):
+                return
+            self._agent_reply_pending = bool(pending)
+        self._persist()
+
     def set_client_date_prefs(
         self, date_format: str | None, time_format: str | None
     ) -> None:
@@ -894,7 +990,17 @@ class AnthropicMessagesBackend:
         and has a worked example to copy when it writes dates/times back to the
         user. The system prompt teaches what to *do* with all this (write dates
         in the user's format, keep tool fields in DD/MM/YYYY, never acknowledge
-        the tag), keeping that explainer in the cached prefix."""
+        the tag), keeping that explainer in the cached prefix.
+
+        It also carries a dated two-week weekday strip. A bare instant makes
+        "next Tuesday" an arithmetic problem the model has to solve unaided —
+        and it gets it wrong, writing a well-formed but incorrect date to the
+        calendar. The strip turns that into a lookup. Two weeks because "next
+        Tuesday" is itself ambiguous near a week boundary: showing both
+        candidates lets the model see the ambiguity and ask, instead of
+        silently picking one. Paired with the `weekday` checksum on the event
+        write schemas (see aime.weekday_check), which catches the slip when it
+        still happens."""
         tz = self._client_tz
         now = None
         if tz:
@@ -920,12 +1026,13 @@ class AnthropicMessagesBackend:
             f"{dateformat.render_time(now.time(), time_fmt)}"
         )
         time_label = "12-hour" if time_fmt == "12" else "24-hour"
+        strip = _weekday_strip(now.date())
         return {
             "type": "text",
             "text": (
-                f"<clock silent>{anchor}. This user reads dates as {date_fmt} "
-                f"and times as {time_label} — now is \"{example}\" in their "
-                "format. System info, don't repeat to user</clock>"
+                f"<clock silent>{anchor}. {strip} This user reads dates as "
+                f"{date_fmt} and times as {time_label} — now is \"{example}\" "
+                "in their format. System info, don't repeat to user</clock>"
             ),
         }
 
@@ -940,6 +1047,8 @@ class AnthropicMessagesBackend:
             self._session_context = ""
             self._current_turn_model = None
             self._current_turn_label = None
+            # A fresh session is nobody's pending reply.
+            self._agent_reply_pending = False
             # Fresh conversation, fresh operator token — so one session's token
             # is never worth anything in the next.
             self._system_token = new_system_turn_token()
@@ -1040,6 +1149,10 @@ class AnthropicMessagesBackend:
             self._system_token = (
                 data.get("system_token") or new_system_turn_token()
             )
+            # Restore any reply hold, so resuming a thread that an agent wrote
+            # into still waits for the user's answer instead of rolling. Absent
+            # on sessions saved before the flag existed => False.
+            self._agent_reply_pending = bool(data.get("agent_reply_pending"))
             # Returning to a real (persisted) session — e.g. exiting a Temporary
             # Chat back to the main thread — resumes normal persistence.
             self._persist_suspended = False
@@ -1104,6 +1217,11 @@ class AnthropicMessagesBackend:
                         # Rides with the history it authenticates, so resuming
                         # this conversation keeps the same operator token.
                         "system_token": self._system_token,
+                        # Whether this session is held open for a reply to an
+                        # agent message. Persisted so a restart — or a delivery
+                        # made while the user was offline — doesn't drop the
+                        # hold and roll the thread they were going to answer.
+                        "agent_reply_pending": self._agent_reply_pending,
                     }
                 tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
                 plaintext = json.dumps(snapshot, default=_jsonable).encode("utf-8")
@@ -2074,13 +2192,24 @@ class AnthropicMessagesBackend:
                 **new_content[-1],
                 "cache_control": {"type": "ephemeral", "ttl": "5m"},
             }
-            # Only attach the clock to fresh user-text turns. On tool_result
-            # turns the trailing <clock> block becomes the sole "textual" thing
-            # the model sees the user say, which makes it narrate as if the
-            # user's message was empty (and tempts Haiku to echo the tag back).
-            if last.get("role") == "user" and not any(
-                isinstance(b, dict) and b.get("type") == "tool_result"
-                for b in content
+            # In a chat, only fresh user-text turns get the clock. On a
+            # tool_result turn the trailing <clock> block becomes the sole
+            # "textual" thing the model sees the user say, which makes it
+            # narrate as if the user's message was empty (and tempts Haiku to
+            # echo the tag back).
+            #
+            # A headless run is the opposite case: its only user-text turn is
+            # the kickoff, so that rule left the worker date-blind for every
+            # turn after its first — the whole run, in other words, including
+            # every event read and the final summary — and it fell back on
+            # training-data priors for "now". There is no one to narrate to
+            # here, so the objection above doesn't apply and the clock rides
+            # on every turn.
+            if last.get("role") == "user" and (
+                self._headless or not any(
+                    isinstance(b, dict) and b.get("type") == "tool_result"
+                    for b in content
+                )
             ):
                 new_content.append(self._date_block())
             out[-1] = {**last, "content": new_content}

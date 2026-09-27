@@ -912,7 +912,195 @@ std::string getTopicContents(sqlite3* database, int user_id, int topicID) {
     return content;
 }
 
-void replaceTopicContents(sqlite3* database, int user_id, int topicID, const std::string& newContent) {
+// --- Per-section freshness stamps -------------------------------------------
+// Mirrors src/aime/freshness.py; see that module for the full rationale. In
+// short: topic prose has no timestamps, so "Party in 3 days" read a week later
+// is announced as upcoming. We record when each section was last written and
+// hand that back on every read.
+//
+// The stamps live in ONE block at the end of the file, never inline. Inline
+// markers would break `edit_topic_contents`: the model builds its `find` string
+// out of the text it just read, so anything rendered into a heading that isn't
+// in the file makes every patch spanning that heading miss.
+//
+// This side does no date math — `stampDate` arrives from the Python layer as a
+// ready-made YYYY-MM-DD in the *user's* timezone. Same division of labour as
+// event lengths: calendar arithmetic stays out of C++.
+
+// The user-local YYYY-MM-DD a write should be stamped with, supplied by the
+// Python layer (which owns the user's timezone). Absent or malformed, we stamp
+// nothing rather than guess with the server's UTC clock — the same rule
+// get_events follows for its own "now".
+static std::string stampDateFrom(const crow::json::rvalue& jsonData) {
+    if (!jsonData.has("stamp_date")) return "";
+    std::string v = std::string(jsonData["stamp_date"].s());
+    if (v.size() != 10 || v[4] != '-' || v[7] != '-') return "";
+    return v;
+}
+
+static std::string trimWhitespace(const std::string& s);  // defined below
+
+static const std::string kStampOpen  = "<!--aime:updated v1";
+static const std::string kStampClose = "-->";
+static const std::string kPreambleKey = "~preamble";
+
+// Split stored content into its body and its recorded stamps, in file order.
+// A malformed line is skipped rather than treated as an error: the stamps are
+// an annotation, and a corrupt block must never make a topic unreadable.
+static void parseStamps(const std::string& content, std::string& body,
+                        std::vector<std::pair<std::string, std::string>>& stamps) {
+    body = content;
+    stamps.clear();
+    size_t open = content.find(kStampOpen);
+    if (open == std::string::npos) return;
+    size_t lineEnd = content.find('\n', open);
+    if (lineEnd == std::string::npos) return;
+    size_t close = content.find(kStampClose, lineEnd);
+    if (close == std::string::npos) return;
+
+    std::string inner = content.substr(lineEnd + 1, close - lineEnd - 1);
+    std::istringstream iss(inner);
+    std::string line;
+    while (std::getline(iss, line)) {
+        size_t eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        std::string key = trimWhitespace(line.substr(0, eq));
+        std::string val = trimWhitespace(line.substr(eq + 1));
+        // Shape check only (YYYY-MM-DD); the value came from our own layer.
+        if (key.empty() || val.size() != 10 || val[4] != '-' || val[7] != '-') continue;
+        stamps.push_back({key, val});
+    }
+
+    // Swallow the newlines that separated the block from the body, so a
+    // read/write round-trip doesn't accumulate blank lines at the end.
+    size_t cut = open;
+    while (cut > 0 && content[cut - 1] == '\n') --cut;
+    size_t after = close + kStampClose.size();
+    while (after < content.size() && (content[after] == ' ' || content[after] == '\t')) ++after;
+    if (after < content.size() && content[after] == '\n') ++after;
+    body = content.substr(0, cut) + content.substr(after);
+}
+
+// True when `body[pos]` begins a markdown ATX heading line (`# x` … `###### x`).
+static bool headingAt(const std::string& body, size_t pos, std::string& text) {
+    size_t i = pos;
+    int hashes = 0;
+    while (i < body.size() && body[i] == '#' && hashes < 7) { ++i; ++hashes; }
+    if (hashes < 1 || hashes > 6) return false;
+    if (i >= body.size() || (body[i] != ' ' && body[i] != '\t')) return false;
+    size_t lineEnd = body.find('\n', i);
+    if (lineEnd == std::string::npos) lineEnd = body.size();
+    text = trimWhitespace(body.substr(i, lineEnd - i));
+    return true;
+}
+
+// A stable key for a heading. '=' and newlines are removed because they
+// delimit the stored block; a repeated heading gets a ~2, ~3 … suffix so two
+// sections of the same name stay distinguishable.
+static std::string sectionKey(const std::string& headingText,
+                              std::unordered_map<std::string, int>& seen) {
+    std::string base;
+    for (char c : headingText) {
+        if (c != '=' && c != '\n') base += c;
+    }
+    base = trimWhitespace(base);
+    if (base.empty()) base = "~untitled";
+    int n = ++seen[base];
+    if (n == 1) return base;
+    return base + "~" + std::to_string(n);
+}
+
+struct SectionSpan {
+    std::string key;
+    size_t start;
+    size_t end;
+};
+
+// Sections in order. A section runs from its heading line to just before the
+// next heading; anything before the first heading is the preamble.
+static std::vector<SectionSpan> splitSections(const std::string& body) {
+    std::vector<SectionSpan> out;
+    std::unordered_map<std::string, int> seen;
+    std::vector<std::pair<size_t, std::string>> heads;
+
+    size_t pos = 0;
+    while (pos <= body.size()) {
+        std::string text;
+        if (headingAt(body, pos, text)) heads.push_back({pos, text});
+        size_t nl = body.find('\n', pos);
+        if (nl == std::string::npos) break;
+        pos = nl + 1;
+    }
+
+    if (heads.empty()) {
+        if (!trimWhitespace(body).empty()) out.push_back({kPreambleKey, 0, body.size()});
+        return out;
+    }
+    if (!trimWhitespace(body.substr(0, heads[0].first)).empty()) {
+        out.push_back({kPreambleKey, 0, heads[0].first});
+    }
+    for (size_t i = 0; i < heads.size(); ++i) {
+        size_t end = (i + 1 < heads.size()) ? heads[i + 1].first : body.size();
+        out.push_back({sectionKey(heads[i].second, seen), heads[i].first, end});
+    }
+    return out;
+}
+
+// `newContent` with its stamp block rebuilt: a section whose text changed is
+// stamped `stampDate`, the rest keep the date they had.
+//
+// Stamping only what changed is the point. Editing one line must not make the
+// whole topic look freshly written — that is the unsafe direction, where old
+// text starts reading as new and the staleness this exists to surface goes
+// back into hiding.
+static std::string restampSections(const std::string& oldContent,
+                                   const std::string& newContent,
+                                   const std::string& stampDate) {
+    if (stampDate.empty()) return newContent;  // no trustworthy date — leave it alone
+
+    std::string oldBody, newBody;
+    std::vector<std::pair<std::string, std::string>> oldStamps, carried;
+    parseStamps(oldContent, oldBody, oldStamps);
+    parseStamps(newContent, newBody, carried);
+
+    // Compared with surrounding whitespace normalized away: a blank line
+    // gained or lost at a boundary is cosmetic, and restamping on it would
+    // report a write that never happened.
+    std::unordered_map<std::string, std::string> oldText;
+    for (const SectionSpan& s : splitSections(oldBody)) {
+        oldText[s.key] = trimWhitespace(oldBody.substr(s.start, s.end - s.start));
+    }
+    std::unordered_map<std::string, std::string> priorDate;
+    for (const auto& kv : oldStamps) priorDate[kv.first] = kv.second;
+    // A stamp inside the incoming content is not authoritative — the model may
+    // have echoed one back — so it is only a fallback for what was stored.
+    for (const auto& kv : carried) {
+        if (priorDate.find(kv.first) == priorDate.end()) priorDate[kv.first] = kv.second;
+    }
+
+    std::string lines;
+    for (const SectionSpan& s : splitSections(newBody)) {
+        std::string text = trimWhitespace(newBody.substr(s.start, s.end - s.start));
+        std::string date = stampDate;
+        auto prevIt = oldText.find(s.key);
+        if (prevIt != oldText.end() && prevIt->second == text) {
+            auto d = priorDate.find(s.key);
+            if (d != priorDate.end()) date = d->second;
+        }
+        lines += s.key + "=" + date + "\n";
+    }
+
+    // Trailing whitespace is normalized so the block always sits one blank
+    // line below the body, however the writer spaced things.
+    size_t end = newBody.size();
+    while (end > 0 && std::isspace(static_cast<unsigned char>(newBody[end - 1]))) --end;
+    std::string body = newBody.substr(0, end);
+    if (lines.empty()) return body + "\n";
+    return body + "\n\n" + kStampOpen + "\n" + lines + kStampClose + "\n";
+}
+
+void replaceTopicContents(sqlite3* database, int user_id, int topicID, const std::string& newContent,
+                          const std::string& stampDate) {
     Topic topic;
     sqlite3_stmt* stmt;
     const std::string sql = "SELECT * FROM TOPIC WHERE ID=?";
@@ -935,17 +1123,32 @@ void replaceTopicContents(sqlite3* database, int user_id, int topicID, const std
     sqlite3_finalize(stmt);
 
     std::string fileName = userTopicsDir(user_id) + "/" + std::to_string(topic.id) + "_" + sanitizeFileName(topic.topicTitle) + ".md";
+
+    // Read what's there first: a whole-body rewrite that leaves a section's
+    // text untouched must not restamp it, or unchanged prose starts reading as
+    // newly written.
+    std::string previous;
+    {
+        std::ifstream existing(fileName);
+        if (existing.is_open()) {
+            previous.assign((std::istreambuf_iterator<char>(existing)),
+                            std::istreambuf_iterator<char>());
+        }
+    }
+
     std::ofstream topicFile(fileName);
     if (!topicFile.is_open()) {
         std::cout << "Failed to open topic file for writing: " << fileName << std::endl;
         return;
     }
 
-    topicFile << newContent;
+    topicFile << restampSections(previous, newContent, stampDate);
     topicFile.close();
 }
 
-EditResult editTopicContents(sqlite3* database, int user_id, int topicID, const std::vector<EditPatch>& patches) {
+EditResult editTopicContents(sqlite3* database, int user_id, int topicID,
+                            const std::vector<EditPatch>& patches,
+                            const std::string& stampDate) {
     EditResult result;
     Topic topic;
     sqlite3_stmt* stmt;
@@ -977,6 +1180,9 @@ EditResult editTopicContents(sqlite3* database, int user_id, int topicID, const 
     }
     std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
     in.close();
+    // Kept so the restamp below can tell which sections a patch actually
+    // changed, rather than marking the whole topic freshly written.
+    const std::string previous = content;
 
     for (size_t i = 0; i < patches.size(); ++i) {
         const EditPatch& p = patches[i];
@@ -1030,7 +1236,7 @@ EditResult editTopicContents(sqlite3* database, int user_id, int topicID, const 
         result.error = "Failed to open topic file for writing: " + fileName;
         return result;
     }
-    out << content;
+    out << restampSections(previous, content, stampDate);
     out.close();
 
     return result;
@@ -1655,7 +1861,8 @@ int main(int argc, char* argv[]) {
             int topicID = static_cast<int>(jsonData["id"].i());
             std::string newContents = std::string(jsonData["contents"].s());
 
-            replaceTopicContents(database, user_id, topicID, newContents);
+            replaceTopicContents(database, user_id, topicID, newContents,
+                                 stampDateFrom(jsonData));
 
             crow::json::wvalue response;
             response["ok"] = true;
@@ -1746,7 +1953,8 @@ int main(int argc, char* argv[]) {
                 patches.push_back(p);
             }
 
-            EditResult er = editTopicContents(database, user_id, topicID, patches);
+            EditResult er = editTopicContents(database, user_id, topicID, patches,
+                                              stampDateFrom(jsonData));
 
             crow::json::wvalue response;
             response["ok"] = er.ok;

@@ -4,51 +4,32 @@
   This file is injected into resources/style/legal.html (which supplies the
   page shell, fonts and styling), so it must contain no <html>/<head>/<body>.
 
-  Drafted for: Texas law, 18+, AWS-hosted, operated by 933 Consulting Group
-  LLC d/b/a Prism.
+  Drafted for: Texas law, 18+, AWS-hosted, operated by 933 Consulting Group,
+  LLC d/b/a Prism. The LLC (exact registered name, comma included) is the
+  contracting party; "Prism" is its assumed name, not a second entity, and
+  rides along only as the d/b/a. "Aime" is the product.
+
   Sub-processors named here are the ones the code actually uses (Anthropic for
-  inference and web search, Stripe for payments, SMTP for email, Twilio for
-  SMS) — re-check that list if you add or drop one.
+  inference and web search, Stripe for payments, Amazon Web Services for
+  hosting and, via Amazon SES over SMTP, for email, Twilio for SMS). Re-check
+  that list if you add or drop one.
 
-  BEFORE LAUNCH — two entity items:
+  If the business later moves to a separate Prism entity, that is an
+  assignment under section 17 and needs a TERMS_VERSION bump and notice to
+  users, not a quiet edit.
 
-  1. The contracting party is written "933 Consulting Group LLC". Check the
-     Texas SOS filing and match the punctuation exactly (some register as
-     "933 Consulting Group, LLC" or "L.L.C."). Naming the entity imprecisely
-     is how a liability shield gets argued away.
-  2. "Prism" is an ASSUMED NAME, not a second entity — which is why the LLC is
-     named as the contracting party and Prism only rides along as the d/b/a.
-     A Texas LLC must FILE an assumed name certificate (SOS Form 503) before
-     trading under it. Confirm that is filed; using an unregistered d/b/a in a
-     binding agreement is the kind of defect that gets noticed in a dispute.
-
-  Naming, for reference: "Aime" is the product, "Prism" is the trade name,
-  933 Consulting Group LLC is the legal entity. If the business later moves to
-  a separate Prism entity, that is an assignment under section 17 and needs a
-  TERMS_VERSION bump and notice to users — not a quiet edit.
-
-  ⚠  NOT LEGAL ADVICE, AND NOT YET REVIEWED BY A LAWYER.  ⚠
-  Each remaining highlighted blank (a span with the "blank" class, wrapping a
-  BRACKETED note) is a fact only the operator can supply. The launch check in
-  docs/production-checklist.md greps for those spans, so this comment
-  deliberately does not spell one out verbatim. When the last one is filled in:
-    1. Delete the .draft-banner block below.
-    2. Bump aime.config.TERMS_VERSION — it is what ties each account's
-       recorded consent to the exact text it agreed to.
+  These Terms have not been reviewed by a lawyer. Any material change to the
+  text needs a bump to aime.config.TERMS_VERSION, which ties each account's
+  recorded consent to the exact text it agreed to; keep the "Version" line
+  below in step with it.
 -->
-    <div class="draft-banner">
-      <strong>Draft — not yet in force</strong>
-      These Terms are complete but have not yet been reviewed by a lawyer, and
-      do not bind anyone until they are. Aime is not open for public signups
-      while this notice is here.
-    </div>
 
     <h1>Terms of Service</h1>
     <p class="meta">Version __TERMS_VERSION__ (also the date these Terms take
       effect)</p>
 
     <p>These Terms are a binding agreement between you and
-      <strong>933 Consulting Group LLC</strong>, a Texas limited liability
+      <strong>933 Consulting Group, LLC</strong>, a Texas limited liability
       company doing business as <strong>Prism</strong> (“we”, “us”), which
       operates the Aime service (“Aime”). By ticking the box at signup and
       creating an account, you agree to them. If you do not agree, do not
@@ -149,8 +130,8 @@
     <h2>8. Third-party services</h2>
     <p>Aime depends on third parties — Anthropic for model inference and web
       search, Stripe for payments,
-      <strong>Amazon Web Services</strong> for hosting, our email
-      provider for verification codes and account mail, and Twilio for SMS
+      <strong>Amazon Web Services</strong> for hosting and for sending
+      verification codes and account mail (Amazon SES), and Twilio for SMS
       where you have enabled message delivery. Their availability affects ours,
       and your content is processed by them as needed to run the service. We
       are not responsible for third-party services we do not control.</p>
@@ -226,5 +207,5 @@
     <h2>18. Contact</h2>
     <p>Questions about these Terms:
       <a href="mailto:andrew@933consulting.com">andrew@933consulting.com</a><br>
-      933 Consulting Group LLC, d/b/a Prism<br>
+      933 Consulting Group, LLC, d/b/a Prism<br>
       PO Box 8243, Midland, TX 79708</p>

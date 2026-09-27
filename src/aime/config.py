@@ -250,7 +250,7 @@ PUBLIC_BASE_URL = os.environ.get("AIME_PUBLIC_BASE_URL", "").strip().rstrip("/")
 # to the exact text it was given. **Bump this whenever the documents change
 # materially** — otherwise old acceptances masquerade as agreement to new terms.
 # Keep it in step with the "Version" line inside resources/legal/*.html.
-TERMS_VERSION = os.environ.get("AIME_TERMS_VERSION", "").strip() or "2026-07-22"
+TERMS_VERSION = os.environ.get("AIME_TERMS_VERSION", "").strip() or "2026-09-22"
 
 
 def stripe_price_for_tier(tier: str | None) -> str | None:

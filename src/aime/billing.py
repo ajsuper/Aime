@@ -166,6 +166,24 @@ def ensure_customer(auth_backend, user) -> str:
 #
 # The web route runs its double-subscription / one-trial guards between the two.
 
+# Every card we collect is collected as a plain card, and nothing else.
+#
+# The alternative — `automatic_payment_methods={"enabled": True}` — lets Stripe
+# add whatever is enabled on the account, which in practice means the Payment
+# Element grows a Link enrolment block ("Save my information for faster
+# checkout", plus a phone-number field). That is a large piece of vertical space
+# on a form whose whole job is one card, and it is the single most crowded
+# surface we have: the signup step, where the form competes with the plan and
+# the trial copy for a first-time user's attention.
+#
+# Pinning the type to "card" keeps the Element to number / expiry / CVC. The
+# tradeoff is deliberate and worth naming: returning Link users lose one-tap
+# checkout, and no non-card method can be offered until this is revisited.
+# Wallets (Apple Pay / Google Pay) are unaffected — they issue card payment
+# methods and still appear where the browser supports them.
+_CARD_ONLY = ["card"]
+
+
 def create_setup_intent(*, customer_id: str, tier: str) -> dict:
     """Create a SetupIntent to collect + save a card inline (Payment Element),
     with no subscription yet. Returns ``{client_secret, setup_intent_id}``. The
@@ -175,7 +193,7 @@ def create_setup_intent(*, customer_id: str, tier: str) -> dict:
     intent = stripe.SetupIntent.create(
         customer=customer_id,
         usage="off_session",
-        automatic_payment_methods={"enabled": True},
+        payment_method_types=_CARD_ONLY,
         metadata={"aime_tier": tier},
     )
     return {
@@ -342,7 +360,7 @@ def create_card_update_intent(customer_id: str) -> dict:
     intent = stripe.SetupIntent.create(
         customer=customer_id,
         usage="off_session",
-        automatic_payment_methods={"enabled": True},
+        payment_method_types=_CARD_ONLY,
     )
     return {
         "client_secret": _get(intent, "client_secret"),
@@ -380,7 +398,7 @@ def create_plan_change_intent(*, customer_id: str, tier: str) -> dict:
     intent = stripe.SetupIntent.create(
         customer=customer_id,
         usage="off_session",
-        automatic_payment_methods={"enabled": True},
+        payment_method_types=_CARD_ONLY,
         metadata={"aime_tier": tier},
     )
     return {

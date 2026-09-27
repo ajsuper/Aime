@@ -38,6 +38,13 @@ class _FakeBackend:
     def messages_snapshot(self):
         return list(self._messages)
 
+    # Mirrors the real backend's persisted reply hold (see
+    # AnthropicMessagesBackend._agent_reply_pending).
+    agent_reply_pending = False
+
+    def set_agent_reply_pending(self, pending):
+        self.agent_reply_pending = bool(pending)
+
     def append_assistant_message(self, text, pid=""):
         self._messages.append({"role": "assistant",
                                "content": [{"type": "text", "text": text}],
@@ -309,7 +316,8 @@ def test_interactive_send_stashes_for_flush():
     sent = []
     _wire_messenger(c, sent)
     c._deliver_message("Texting you this")
-    assert c._pending_proactive == ["Texting you this"]
+    # Stashed with its source: Aime in its own voice, so no agent-reply hold.
+    assert c._pending_proactive == [("Texting you this", "assistant")]
 
 
 def test_headless_without_sink_records_nothing():
