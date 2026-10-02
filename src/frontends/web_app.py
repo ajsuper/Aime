@@ -1682,6 +1682,12 @@ _SIGNUP_DISABLED_STYLE = (
     '<style>[data-tab="signup"],form[data-form="signup"]{display:none!important}</style>'
 )
 
+# Under any channel but SMS, hide the signup form's optional phone number and
+# its SMS consent box (Settings still takes a Telegram id / email there).
+_SMS_SIGNUP_DISABLED_STYLE = (
+    '<style>[data-sms-signup]{display:none!important}</style>'
+)
+
 # When email verification is off, also hide the Email input + its label + its
 # helper hint on the signup form. The field stays in the DOM (so the POST still
 # carries an empty value, which the server ignores in that mode) but is
@@ -1709,6 +1715,7 @@ def _load_login_page(
     signup_email: str = "",
     signup_first_name: str = "",
     signup_last_name: str = "",
+    signup_phone: str = "",
 ) -> str:
     """Render the login page.
 
@@ -1717,8 +1724,11 @@ def _load_login_page(
     account-recovery prompt for that account. `login_username` pre-fills the
     sign-in username field; `signup_username` / `signup_email` /
     `signup_first_name` / `signup_last_name` pre-fill the signup form after a
-    validation error so the user doesn't retype them.
+    validation error so the user doesn't retype them, as does `signup_phone`
+    (the SMS consent box is never re-ticked for them — consent is only ever
+    the user's own fresh tick).
     """
+    from aime import messaging as _aime_messaging
     with open(_LOGIN_PAGE_PATH) as f:
         html = f.read()
     return (
@@ -1732,6 +1742,11 @@ def _load_login_page(
         .replace("__SIGNUP_EMAIL__", _h(signup_email))
         .replace("__SIGNUP_FIRST_NAME__", _h(signup_first_name))
         .replace("__SIGNUP_LAST_NAME__", _h(signup_last_name))
+        .replace("__SIGNUP_PHONE__", _h(signup_phone))
+        # The phone + SMS consent block only makes sense when texts go by SMS.
+        .replace("__SMS_SIGNUP_DISABLED_STYLE__",
+                 "" if _aime_messaging.active_channel_name() == "sms"
+                 else _SMS_SIGNUP_DISABLED_STYLE)
         .replace("__SIGNUP_DISABLED_STYLE__", "" if _ALLOW_SIGNUP else _SIGNUP_DISABLED_STYLE)
         .replace("__EMAIL_VERIFICATION_DISABLED_STYLE__",
                  "" if _DO_EMAIL_VERIFICATION else _EMAIL_VERIFICATION_DISABLED_STYLE)
@@ -2644,6 +2659,22 @@ def add_email_verify_cancel():
     return redirect(url_for("login_page"))
 
 
+def _send_sms_opt_in_confirmation(contact: str | None) -> str | None:
+    """Send the one-off SMS opt-in confirmation (carrier rules want the first
+    text to carry the brand, HELP and STOP). Best-effort: returns the friendly
+    error on failure, None on success or when there's nothing to send."""
+    from aime import messaging as _aime_messaging
+    messenger = _aime_messaging.get_messenger()
+    if not contact or messenger is None or messenger.name != "sms":
+        return None
+    try:
+        messenger.send(contact, aime_config.SMS_OPT_IN_CONFIRMATION)
+    except _aime_messaging.MessageSendError as e:
+        app.logger.warning("SMS opt-in confirmation failed: %s", e)
+        return str(e)
+    return None
+
+
 @app.route("/signup", methods=["POST"])
 def signup_submit():
     # Account creation must be explicitly enabled (AIME_ALLOW_SIGNUP=1).
@@ -2672,6 +2703,12 @@ def signup_submit():
     # the immutable identity that keys everything.
     first_name = (request.form.get("first_name") or "").strip()
     last_name = (request.form.get("last_name") or "").strip()
+    # Optional phone number + SMS opt-in (10DLC): only read under the SMS
+    # channel, where the form shows them.
+    from aime import messaging as _aime_messaging
+    from aime.messaging.aws_sms import e164_or_none
+    sms_signup = _aime_messaging.active_channel_name() == "sms"
+    phone = (request.form.get("phone") or "").strip() if sms_signup else ""
 
     def _signup_err(msg: str, status: int = 400):
         _auth_backend.log_event(
@@ -2685,12 +2722,31 @@ def signup_submit():
                 signup_email=email,
                 signup_first_name=first_name,
                 signup_last_name=last_name,
+                signup_phone=phone,
             ),
             mimetype="text/html", status=status,
         )
 
     if password != password2:
         return _signup_err("Passwords do not match.")
+
+    # The phone number is optional, but one is only taken with its own,
+    # separately ticked SMS consent box — never inferred from the Terms box.
+    messaging_contact = None
+    sms_consent_version = None
+    if phone:
+        messaging_contact = e164_or_none(phone)
+        if messaging_contact is None:
+            return _signup_err(
+                "Enter your mobile number in international format, like "
+                "+15551234567 — or leave it blank."
+            )
+        if (request.form.get("sms_consent") or "") != "1":
+            return _signup_err(
+                "Tick the box to agree to text messages, or leave the phone "
+                "number blank."
+            )
+        sms_consent_version = aime_config.SMS_CONSENT_VERSION
 
     # Terms consent. The checkbox is `required` on the form, but that's only a
     # browser convenience — a direct POST skips it, so the real gate is here. No
@@ -2713,6 +2769,8 @@ def signup_submit():
                 first_name=first_name, last_name=last_name,
                 tier=aime_config.USAGE_DEFAULT_TIER,
                 terms_version=terms_version,
+                messaging_contact=messaging_contact,
+                sms_consent_version=sms_consent_version,
             )
         except _auth.UsernameTaken:
             return _signup_err("That username is already taken.", status=409)
@@ -2722,6 +2780,7 @@ def signup_submit():
             return _signup_err(str(e))
         except _auth.InvalidName as e:
             return _signup_err(str(e))
+        _send_sms_opt_in_confirmation(user.messaging_contact)
         session.clear()
         session["user_id"] = user.id
         session.permanent = True
@@ -2733,6 +2792,8 @@ def signup_submit():
             api_access=(_ACCESS_MODE == "open"),
             first_name=first_name, last_name=last_name,
             terms_version=terms_version,
+            messaging_contact=messaging_contact,
+            sms_consent_version=sms_consent_version,
         )
     except _auth.UsernameTaken:
         return _signup_err("That username is already taken.", status=409)
@@ -2832,6 +2893,9 @@ def signup_verify_submit():
     # non-default AIME_USAGE_DEFAULT_TIER is honored on this path too.
     if aime_config.USAGE_DEFAULT_TIER != "light":
         _auth_backend.set_tier(user.id, aime_config.USAGE_DEFAULT_TIER)
+    # A number given (with consent) on the signup form lands on the account
+    # only now; the opt-in confirmation goes out once it's really there.
+    _send_sms_opt_in_confirmation(user.messaging_contact)
 
     # Promote: clear the pending state, log the new account in.
     session.clear()
@@ -3086,6 +3150,9 @@ def me():
         # right *kind* of contact (a phone number under SMS, a chat id under
         # Telegram). The value is opaque to the server either way.
         "messaging_channel": _aime_messaging.active_channel_name(),
+        # When the number on file was opted in to texts (unix seconds), so the
+        # settings UI can say so instead of showing a pre-ticked consent box.
+        "sms_consent_at": user.sms_consent_at if user else None,
         "first_name": user.first_name if user else None,
         "last_name": user.last_name if user else None,
         "access_mode": _ACCESS_MODE,
@@ -3137,17 +3204,53 @@ def messaging_contact():
     destination — the chat id / number Aime and background agents text via
     aime.messaging. An advanced-settings convenience; the value is opaque to the
     server and just stored. Takes effect on the user's next session (the live
-    controller reads its recipient at construction)."""
+    controller reads its recipient at construction).
+
+    Under the SMS channel a number is only accepted with explicit consent
+    (``sms_consent: true``) — the checkbox in the UI is a convenience, this is
+    the gate carrier (10DLC) rules actually require. Each opt-in is recorded
+    on the account (time + disclosure version) as proof of consent, and is
+    answered with a one-off confirmation text carrying the HELP/STOP
+    disclosures. Re-saving the number already on file keeps its consent."""
+    from aime import messaging as _aime_messaging
     data = request.get_json(silent=True) or {}
     contact = (data.get("contact") or "").strip() or None
-    _auth_backend.set_messaging_contact(g.user_id, contact)
+    is_sms = _aime_messaging.active_channel_name() == "sms"
+    if contact and is_sms:
+        from aime.messaging.aws_sms import e164_or_none
+        contact = e164_or_none(contact)
+        if contact is None:
+            return jsonify({"ok": False, "error": "invalid",
+                            "message": "Enter your mobile number in "
+                                       "international format, like "
+                                       "+15551234567."}), 400
+    user = _auth_backend.lookup(g.user_id)
+    unchanged = (user is not None and contact is not None
+                 and contact == user.messaging_contact
+                 and user.sms_consent_at is not None)
+    new_opt_in = bool(contact and is_sms and not unchanged)
+    if new_opt_in and data.get("sms_consent") is not True:
+        return jsonify({"ok": False, "error": "consent_required",
+                        "message": "Please agree to receive text messages "
+                                   "before adding a phone number."}), 400
+    if unchanged:
+        return jsonify({"ok": True, "messaging_contact": contact,
+                        "sms_consent_at": user.sms_consent_at})
+    _auth_backend.set_messaging_contact(
+        g.user_id, contact,
+        sms_consent_version=aime_config.SMS_CONSENT_VERSION if new_opt_in else None,
+    )
+    messenger = _aime_messaging.get_messenger()
     # Push it into the live session too (if one is cached) so it works right
     # away rather than only after the next login rebuilds the controller.
     ctx = _user_contexts.get(g.user_id)
     if ctx is not None:
-        from aime import messaging as _aime_messaging
-        ctx.controller.set_messaging_target(_aime_messaging.get_messenger(), contact)
-    return jsonify({"ok": True, "messaging_contact": contact})
+        ctx.controller.set_messaging_target(messenger, contact)
+    warning = _send_sms_opt_in_confirmation(contact) if new_opt_in else None
+    stored = _auth_backend.lookup(g.user_id)
+    return jsonify({"ok": True, "messaging_contact": contact,
+                    "sms_consent_at": stored.sms_consent_at if stored else None,
+                    "warning": warning})
 
 
 @app.route("/feedback", methods=["POST"])

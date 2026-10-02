@@ -61,7 +61,8 @@ _USER_PROJECTION = (
     "first_name, last_name, tz, date_format, time_format, tier, "
     "stripe_customer_id, stripe_subscription_id, subscription_status, "
     "trial_end, comp_access, billing_synced_at, trial_used, "
-    "terms_accepted_at, terms_version, billing_onboarded"
+    "terms_accepted_at, terms_version, billing_onboarded, "
+    "sms_consent_at, sms_consent_version"
 )
 
 
@@ -188,6 +189,13 @@ class UserRecord:
     # billing migration backfills every pre-existing account to True. Inert in
     # keys/open mode. See docs/billing.md, "Onboarding: the plan step".
     billing_onboarded: bool = False
+    # SMS opt-in (10DLC proof of consent): when the user ticked the text message
+    # consent box for the number now in `messaging_contact`, and which revision
+    # of the disclosure they saw (config.SMS_CONSENT_VERSION). Both NULL when no
+    # number is on file or it was saved under a non-SMS channel; cleared along
+    # with the number, and replaced whenever a new number is consented to.
+    sms_consent_at: int | None = None
+    sms_consent_version: str | None = None
 
     @property
     def display_name(self) -> str:
@@ -282,6 +290,8 @@ class AuthBackend(Protocol):
         self, username: str, password: str, api_access: bool = True,
         *, first_name: str | None = None, last_name: str | None = None,
         tier: str = "light", terms_version: str | None = None,
+        messaging_contact: str | None = None,
+        sms_consent_version: str | None = None,
     ) -> tuple[UserRecord, bytes]: ...
     # Update the display-only first/last name on an existing account. The
     # username is never touched here — it's the immutable identity.
@@ -703,6 +713,17 @@ class LocalAuthBackend:
                     )
             # END terms-acceptance MIGRATION
 
+            # sms-consent MIGRATION — proof of SMS opt-in for 10DLC (see
+            # UserRecord.sms_consent_at). NULL on existing rows: we record only
+            # consent we actually witnessed.
+            for col in ("sms_consent_at", "sms_consent_version"):
+                if col not in existing_cols:
+                    decl = "INTEGER" if col.endswith("_at") else "TEXT"
+                    self._conn.execute(
+                        f"ALTER TABLE users ADD COLUMN {col} {decl}"
+                    )
+            # END sms-consent MIGRATION
+
             # Pending email-verification rows. Used for three flows:
             #   purpose='signup'    — username/password are being held until
             #                         the 6-digit code mailed to `email` is
@@ -763,6 +784,15 @@ class LocalAuthBackend:
                     "ALTER TABLE email_verifications ADD COLUMN terms_version TEXT"
                 )
             # END terms-acceptance MIGRATION (email_verifications)
+            # sms-consent MIGRATION (email_verifications) — an optional phone
+            # number and SMS opt-in given on the signup form wait here, like
+            # terms_version, until the account exists.
+            for col in ("messaging_contact", "sms_consent_version"):
+                if col not in ev_cols:
+                    self._conn.execute(
+                        f"ALTER TABLE email_verifications ADD COLUMN {col} TEXT"
+                    )
+            # END sms-consent MIGRATION (email_verifications)
             self._conn.commit()
 
     # ---- AuthBackend interface --------------------------------------------
@@ -771,6 +801,8 @@ class LocalAuthBackend:
         self, username: str, password: str, api_access: bool = True,
         *, first_name: str | None = None, last_name: str | None = None,
         tier: str = "light", terms_version: str | None = None,
+        messaging_contact: str | None = None,
+        sms_consent_version: str | None = None,
     ) -> tuple[UserRecord, bytes]:
         """Create a new account. `api_access` is the value stamped into the
         new row: callers pass True for AIME_ACCESS_MODE=open and False for
@@ -785,7 +817,11 @@ class LocalAuthBackend:
         `terms_version` is the Terms revision the user ticked the box for; when
         given it's recorded with the acceptance timestamp. The web layer is what
         *requires* consent — passing None here creates an account with no
-        recorded acceptance (admin/CLI-created accounts, tests)."""
+        recorded acceptance (admin/CLI-created accounts, tests).
+
+        `messaging_contact` / `sms_consent_version` carry an optional phone
+        number and SMS opt-in from the signup form (see set_messaging_contact);
+        the consent is only recorded alongside a number."""
         self._validate_username(username)
         self._validate_password(password, username=username)
         first_name = self._validate_name(first_name)
@@ -804,6 +840,8 @@ class LocalAuthBackend:
         wrapped = _enc.wrap_dek(kek, dek)
 
         accepted_at = int(time.time()) if terms_version else None
+        messaging_contact, sms_consent_at, sms_consent_version = (
+            self._signup_sms_fields(messaging_contact, sms_consent_version))
 
         with self._lock:
             try:
@@ -811,11 +849,14 @@ class LocalAuthBackend:
                     "INSERT INTO users "
                     "(username, password_hash, salt_dek, wrapped_dek_v2, "
                     "enc_version, api_access, first_name, last_name, tier, "
-                    "terms_accepted_at, terms_version) "
-                    f"VALUES (?, ?, ?, ?, {_ENC_VERSION_CURRENT}, ?, ?, ?, ?, ?, ?)",
+                    "terms_accepted_at, terms_version, messaging_contact, "
+                    "sms_consent_at, sms_consent_version) "
+                    f"VALUES (?, ?, ?, ?, {_ENC_VERSION_CURRENT}, "
+                    "?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (username, pw_hash, salt_dek, wrapped,
                      1 if api_access else 0, first_name, last_name, tier,
-                     accepted_at, terms_version),
+                     accepted_at, terms_version, messaging_contact,
+                     sms_consent_at, sms_consent_version),
                 )
                 self._conn.commit()
             except sqlite3.IntegrityError as e:
@@ -825,6 +866,9 @@ class LocalAuthBackend:
                     id=cur.lastrowid, username=username, api_access=api_access,
                     first_name=first_name, last_name=last_name, tier=tier,
                     terms_accepted_at=accepted_at, terms_version=terms_version,
+                    messaging_contact=messaging_contact,
+                    sms_consent_at=sms_consent_at,
+                    sms_consent_version=sms_consent_version,
                 ),
                 dek,
             )
@@ -1013,6 +1057,7 @@ class LocalAuthBackend:
             trial_used=bool(row[17]),
             terms_accepted_at=row[18], terms_version=row[19],
             billing_onboarded=bool(row[20]),
+            sms_consent_at=row[21], sms_consent_version=row[22],
         )
 
     def lookup_by_username(self, username: str) -> UserRecord | None:
@@ -1096,16 +1141,24 @@ class LocalAuthBackend:
             self._conn.commit()
         return cur.rowcount > 0
 
-    def set_messaging_contact(self, user_id: int, contact: str | None) -> bool:
+    def set_messaging_contact(self, user_id: int, contact: str | None,
+                              *, sms_consent_version: str | None = None) -> bool:
         """Connect (or, with None, clear) the account's outbound-messaging
         destination — see aime.messaging and UserRecord.messaging_contact.
+
+        ``sms_consent_version`` records an SMS opt-in for this number (stamped
+        with the current time); without it any previous consent is cleared, so
+        a stored consent always belongs to the number stored beside it.
         Returns False if there's no matching active account."""
         normalized = (contact or "").strip() or None
+        consent_version = sms_consent_version if normalized else None
+        consent_at = int(time.time()) if consent_version else None
         with self._lock:
             cur = self._conn.execute(
-                "UPDATE users SET messaging_contact = ? "
+                "UPDATE users SET messaging_contact = ?, "
+                "sms_consent_at = ?, sms_consent_version = ? "
                 "WHERE id = ? AND deleted_at IS NULL",
-                (normalized, user_id),
+                (normalized, consent_at, consent_version, user_id),
             )
             self._conn.commit()
         return cur.rowcount > 0
@@ -1620,10 +1673,25 @@ class LocalAuthBackend:
             ).fetchone()
         return row is not None
 
+    @staticmethod
+    def _signup_sms_fields(
+        contact: str | None, consent_version: str | None,
+    ) -> tuple[str | None, int | None, str | None]:
+        """(messaging_contact, sms_consent_at, sms_consent_version) for a new
+        account. A consent with no number, or a number with no consent, is
+        dropped rather than half-recorded — the web layer refuses the latter
+        before it gets here."""
+        contact = (contact or "").strip() or None
+        if not contact or not consent_version:
+            return None, None, None
+        return contact, int(time.time()), consent_version
+
     def start_signup_verification(
         self, username: str, password: str, email: str, api_access: bool = True,
         *, first_name: str | None = None, last_name: str | None = None,
         terms_version: str | None = None,
+        messaging_contact: str | None = None,
+        sms_consent_version: str | None = None,
     ) -> tuple[str, str, str]:
         """Begin a signup. Validates everything, stashes a pending row, and
         returns (token, code, normalized_email). The caller mails the code;
@@ -1634,7 +1702,8 @@ class LocalAuthBackend:
         on the signup form before we ever send mail. The optional
         first_name/last_name are held with the pending row and written onto the
         account when the code is confirmed — as is `terms_version`, the Terms
-        revision the user accepted on the form.
+        revision the user accepted on the form, and the optional phone number +
+        SMS opt-in (`messaging_contact` / `sms_consent_version`).
         """
         self._validate_username(username)
         self._validate_password(password, username=username)
@@ -1674,11 +1743,12 @@ class LocalAuthBackend:
                 "INSERT INTO email_verifications "
                 "(token, purpose, username, password_hash, email, code_hash, "
                 "api_access, created_at, expires_at, first_name, last_name, "
-                "terms_version) "
-                "VALUES (?, 'signup', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "terms_version, messaging_contact, sms_consent_version) "
+                "VALUES (?, 'signup', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (token, username, pw_hash, email_norm, code_hash,
                  1 if api_access else 0, now, expires_at,
-                 first_name, last_name, terms_version),
+                 first_name, last_name, terms_version,
+                 messaging_contact, sms_consent_version),
             )
             self._conn.commit()
         return token, code, email_norm
@@ -2023,7 +2093,8 @@ class LocalAuthBackend:
             row = self._conn.execute(
                 "SELECT token, purpose, user_id, username, password_hash, "
                 "email, code_hash, api_access, attempts, expires_at, "
-                "first_name, last_name, terms_version "
+                "first_name, last_name, terms_version, messaging_contact, "
+                "sms_consent_version "
                 "FROM email_verifications WHERE token = ?",
                 (token,),
             ).fetchone()
@@ -2032,7 +2103,7 @@ class LocalAuthBackend:
                     "this verification has expired — please start over"
                 )
             (_t, purpose, _uid, _user, _pwh, _email, stored_hash,
-             _api, attempts, expires_at, _fn, _ln, _terms) = row
+             _api, attempts, expires_at, _fn, _ln, _terms, _mc, _sms) = row
             if purpose != expected_purpose or expires_at < now:
                 self._conn.execute(
                     "DELETE FROM email_verifications WHERE token = ?", (token,)
@@ -2076,12 +2147,14 @@ class LocalAuthBackend:
         row = self._consume_verification(token, code, expected_purpose="signup")
         (_t, _purpose, _uid, username, pw_hash, email, _code_hash,
          api_access, _attempts, _exp, first_name, last_name,
-         terms_version) = row
+         terms_version, messaging_contact, sms_consent_version) = row
 
         # Terms acceptance was given on the signup form and held on the pending
         # row; stamp the time here, where the account first exists. That's within
         # the verification TTL of the actual tick, close enough to be the record.
         accepted_at = int(time.time()) if terms_version else None
+        messaging_contact, sms_consent_at, sms_consent_version = (
+            self._signup_sms_fields(messaging_contact, sms_consent_version))
 
         # Re-check uniqueness right before the INSERT — a different signup may
         # have completed for the same username in the interval the code was
@@ -2096,11 +2169,14 @@ class LocalAuthBackend:
                     "INSERT INTO users "
                     "(username, password_hash, email, salt_dek, wrapped_dek_v2, "
                     "enc_version, api_access, first_name, last_name, "
-                    "terms_accepted_at, terms_version) "
-                    f"VALUES (?, ?, ?, ?, ?, {_ENC_VERSION_CURRENT}, ?, ?, ?, ?, ?)",
+                    "terms_accepted_at, terms_version, messaging_contact, "
+                    "sms_consent_at, sms_consent_version) "
+                    f"VALUES (?, ?, ?, ?, ?, {_ENC_VERSION_CURRENT}, "
+                    "?, ?, ?, ?, ?, ?, ?, ?)",
                     (username, pw_hash, email, salt_dek, wrapped,
                      int(api_access), first_name, last_name,
-                     accepted_at, terms_version),
+                     accepted_at, terms_version, messaging_contact,
+                     sms_consent_at, sms_consent_version),
                 )
                 self._conn.commit()
             except sqlite3.IntegrityError as e:
@@ -2113,6 +2189,9 @@ class LocalAuthBackend:
                 api_access=bool(api_access), email=email,
                 first_name=first_name, last_name=last_name,
                 terms_accepted_at=accepted_at, terms_version=terms_version,
+                messaging_contact=messaging_contact,
+                sms_consent_at=sms_consent_at,
+                sms_consent_version=sms_consent_version,
             ),
             dek,
         )
@@ -2124,7 +2203,7 @@ class LocalAuthBackend:
         the new email onto the existing user row. Returns the updated record."""
         row = self._consume_verification(token, code, expected_purpose="add_email")
         (_t, _purpose, user_id, _username, _pwh, email, _code_hash,
-         _api, _attempts, _exp, _fn, _ln, _terms) = row
+         _api, _attempts, _exp, _fn, _ln, _terms, _mc, _sms) = row
         with self._lock:
             self._conn.execute(
                 "UPDATE users SET email = ? WHERE id = ?",

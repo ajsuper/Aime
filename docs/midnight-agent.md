@@ -50,7 +50,7 @@ And prompts in `resources/prompts/midnight/` (`morning_brief.md`,
 `pre_event.md`, ...).
 
 Touchpoints in existing code:
-- `web_app.py` — boot `MidnightService`, expose `/midnight/twilio` webhook,
+- `web_app.py` — boot `MidnightService`, expose `/midnight/sms` webhook,
   route inbound replies into the foreground controller.
 - `aime/__init__.py` — lazy-export `MidnightService`.
 - `aime/controller.py` — no change; already headless-capable.
@@ -94,15 +94,18 @@ waits for `turn_end`, tears the session down.
 ### Channel
 
 Outbound transport. One method, `deliver(user_id, text, reply_token)`.
-`SMSChannel` (Twilio), `PushChannel`, `EmailChannel`, plus an `InboxChannel`
+`SMSChannel` (AWS End User Messaging), `PushChannel`, `EmailChannel`, plus an `InboxChannel`
 that writes to a file for tests.
 
 ### Inbound reply path
 
 The reason the design earns its keep: when the user replies to an SMS,
-Twilio webhooks `/midnight/twilio` on `web_app`. The handler:
+AWS End User Messaging (two-way SMS on the number) publishes it to an SNS
+topic, whose HTTPS subscription posts to `/midnight/sms` on `web_app`. The
+handler:
 
-1. Resolves `From` → `user_id`.
+0. Verifies the SNS message signature and topic ARN before trusting anything.
+1. Resolves `originationNumber` → `user_id`.
 2. Looks up the cached foreground `UserContext` (constructing it if needed
    — see encryption section for how the DEK is available here).
 3. Posts the SMS body as a regular `user_send_message` into the controller.
@@ -117,7 +120,7 @@ No new agent code path — `dispatch_input` was already the seam.
 
 **Phase 1 (recommended starting point):** in-process. `MidnightService` is a
 singleton owned by `web_app.py`, started at boot. Shares `_user_contexts`,
-posts directly into existing controllers, Twilio webhooks are Flask routes.
+posts directly into existing controllers, SNS webhooks are Flask routes.
 Simple ops, easy testing.
 
 **Phase 2 (later, if needed):** out-of-process daemon. `python -m

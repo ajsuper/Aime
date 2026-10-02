@@ -162,7 +162,7 @@ the login second factor, add-email, and password reset all send mail through
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `SMTP_HOST` | `smtp.gmail.com` | Submission server hostname. |
+| `SMTP_HOST` | `smtp.gmail.com` | Submission server hostname. **Production must use the Amazon SES endpoint** (e.g. `email-smtp.us-east-1.amazonaws.com`) — the Terms and Privacy Policy name SES as the email provider. |
 | `SMTP_PORT` | `587` | Submission port (STARTTLS). |
 | `SMTP_USERNAME` | `EMAIL_ADDRESS` | Login username. |
 | `SMTP_PASSWORD` | `EMAIL_PASSWORD` | Login password / app password. |
@@ -178,7 +178,8 @@ not a soft degradation.
 
 Signup requires the user to tick a box agreeing to the Terms and Privacy
 Policy. The plumbing is done and both documents are **written in full and in
-force as of version 2026-09-22** — Texas law, LLC operator, 18+, AWS-hosted.
+force as of version 2026-09-29** — Texas law, LLC operator, 18+, AWS-hosted,
+with an SMS program section (§8) for 10DLC.
 Every operator blank is filled and the draft banners are gone. They have
 **not been reviewed by a lawyer**; see the open questions below.
 
@@ -201,7 +202,8 @@ Every operator blank is filled and the draft banners are gone. They have
   Texas, venue Midland County.
 - Sub-processors named in both documents: Anthropic (inference, web search),
   Stripe (payments), Amazon Web Services (hosting, and email via Amazon SES
-  over SMTP), Twilio (SMS). Re-check the list if you add or drop one.
+  over SMTP, and SMS via AWS End User Messaging), Telegram (message delivery,
+  when that channel is used). Re-check the list if you add or drop one.
 - Worth raising with a lawyer when one reviews the text: whether to add a
   binding **arbitration clause and class-action waiver** (common in US
   consumer terms, deliberately left out here because it waives user rights);
@@ -211,7 +213,7 @@ Every operator blank is filled and the draft banners are gone. They have
   trademark availability check on "Prism", a common word with heavy existing
   use.
 - If the business later moves to a Prism entity, that is an assignment under
-  §17 of the Terms: it needs a `TERMS_VERSION` bump and notice to users, not a
+  §18 of the Terms: it needs a `TERMS_VERSION` bump and notice to users, not a
   quiet edit.
 - The privacy policy asserts things about how the code behaves — encryption at
   rest, exactly what the auth log records and for how long, the 30-day
@@ -230,6 +232,31 @@ Every operator blank is filled and the draft banners are gone. They have
   consent actually witnessed rather than backfilling one nobody gave. If you
   need existing users on the new terms, prompt them — the columns tell you who
   is outstanding.
+
+### SMS (10DLC) registration
+
+The app side of carrier opt-in rules is pinned by `tests/test_terms.py`: the
+SMS consent box (on the signup form beside an optional phone number, and in
+Settings) is separate from the Terms checkbox, never pre-ticked, and names the brand
+with frequency, rates, STOP/HELP and not-a-condition-of-purchase language. Each
+opt-in is stored on `users.sms_consent_at` / `sms_consent_version` (bump
+`aime.config.SMS_CONSENT_VERSION` whenever the checkbox text changes) and is
+answered with `SMS_OPT_IN_CONFIRMATION`. Terms §8 describes the program;
+Privacy §5 carries the "no mobile information shared for marketing" statement.
+
+For the AWS End User Messaging campaign form:
+- **Brand** must match the legal entity exactly: 933 Consulting Group, LLC
+  (DBA Prism), with the same EIN and address as the Terms.
+- **Opt-in description**: users enter an optional number on the signup form
+  at https://app.heyaime.org (or later under Settings → Account → Messaging)
+  and tick an unticked consent box beside it. The signup form is public, so
+  reviewers can see it directly; also attach a screenshot. Link
+  https://app.heyaime.org/terms and /privacy (both public without logging in).
+- **Sample messages** should start with "Aime:" and look like real reminders
+  and task results. Include the opt-in confirmation text.
+- **Keywords**: set HELP and STOP auto-replies on the phone number/pool in AWS.
+  HELP should name Aime/Prism and give the support email. Leave STOP
+  self-managed opt-out on so AWS enforces it.
 
 ```bash
 # No draft banner and no unfilled blanks should ever reappear

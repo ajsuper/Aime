@@ -218,3 +218,219 @@ def test_consent_survives_email_verification(backend):
 def test_terms_version_is_configured(backend):
     """A blank version would record consent to nothing identifiable."""
     assert config.TERMS_VERSION
+
+
+# --- SMS consent (10DLC) ----------------------------------------------------
+
+_SIGNUP_AND_SAVE = (
+    "import frontends.web_app as w\n"
+    "c = w.app.test_client()\n"
+    "c.post('/signup', data={'username':'owner','password':'" + _PW + "',"
+    "'password2':'" + _PW + "','accept_terms':'1'})\n"
+    "def save(**body):\n"
+    "    return c.post('/messaging-contact', json=body)\n"
+    "def stored():\n"
+    "    return w._auth_backend.lookup_by_username('owner').messaging_contact\n"
+)
+
+
+def test_sms_number_without_consent_is_refused():
+    """The checkbox can't be skipped by posting directly: under the SMS channel
+    a number without explicit consent is rejected and nothing is stored."""
+    proc = _run_snippet(_SIGNUP_AND_SAVE +
+        "r = save(contact='+15551234567')\n"
+        "assert r.status_code == 400, r.status_code\n"
+        "assert r.get_json()['error'] == 'consent_required'\n"
+        "r = save(contact='+15551234567', sms_consent='yes')\n"
+        "assert r.status_code == 400, r.status_code\n"
+        "assert stored() is None, stored()\n"
+        "print('OK')\n",
+        {"AIME_MESSAGING_CHANNEL": "sms"},
+    )
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "OK" in proc.stdout
+
+
+def test_sms_number_with_consent_is_saved_and_clearing_needs_none():
+    proc = _run_snippet(_SIGNUP_AND_SAVE +
+        "r = save(contact='+15551234567', sms_consent=True)\n"
+        "assert r.status_code == 200, r.status_code\n"
+        "assert stored() == '+15551234567', stored()\n"
+        "r = save(contact='')\n"
+        "assert r.status_code == 200, r.status_code\n"
+        "assert stored() is None, stored()\n"
+        "print('OK')\n",
+        {"AIME_MESSAGING_CHANNEL": "sms"},
+    )
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "OK" in proc.stdout
+
+
+def test_non_sms_channels_need_no_sms_consent():
+    proc = _run_snippet(_SIGNUP_AND_SAVE +
+        "r = save(contact='12345')\n"
+        "assert r.status_code == 200, r.status_code\n"
+        "assert stored() == '12345', stored()\n"
+        "print('OK')\n",
+        {"AIME_MESSAGING_CHANNEL": "telegram"},
+    )
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "OK" in proc.stdout
+
+
+def test_sms_consent_is_recorded_and_tied_to_the_number():
+    """Proof of opt-in: consent is stamped with a time and disclosure version,
+    re-saving the same number needs no re-tick, a different number does, and
+    clearing the number clears its consent."""
+    proc = _run_snippet(_SIGNUP_AND_SAVE +
+        "from aime import config\n"
+        "u = lambda: w._auth_backend.lookup_by_username('owner')\n"
+        "r = save(contact='+15551234567', sms_consent=True)\n"
+        "assert r.status_code == 200, r.status_code\n"
+        "assert u().sms_consent_at, u()\n"
+        "assert u().sms_consent_version == config.SMS_CONSENT_VERSION\n"
+        "assert r.get_json()['sms_consent_at'] == u().sms_consent_at\n"
+        "r = save(contact='+15551234567')\n"
+        "assert r.status_code == 200, r.status_code\n"
+        "r = save(contact='+15559876543')\n"
+        "assert r.status_code == 400, r.status_code\n"
+        "assert stored() == '+15551234567', stored()\n"
+        "r = save(contact='')\n"
+        "assert r.status_code == 200\n"
+        "assert u().sms_consent_at is None and u().sms_consent_version is None\n"
+        "print('OK')\n",
+        {"AIME_MESSAGING_CHANNEL": "sms"},
+    )
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "OK" in proc.stdout
+
+
+def _read(rel):
+    with open(os.path.join(_REPO, rel), encoding="utf-8") as f:
+        return f.read()
+
+
+def test_sms_consent_checkbox_carries_the_10dlc_disclosures():
+    """Guards the common 10DLC rejection reasons: the SMS box is its own
+    unticked, optional checkbox, naming the brand and carrying frequency,
+    rates, STOP/HELP and not-a-condition-of-purchase language."""
+    import re
+    html = _read("resources/style/web_chat.html")
+    row = re.search(r'<label id="account-sms-consent-row".*?</label>', html, re.S)
+    assert row, "SMS consent checkbox missing"
+    text = " ".join(row.group(0).split())
+    box = re.search(r'<input type="checkbox" id="account-sms-consent"[^>]*>', text)
+    assert box and "checked" not in box.group(0) and "required" not in box.group(0)
+    for phrase in ("Aime", "Prism", "Message frequency varies",
+                   "Message and data rates may apply", "STOP", "HELP",
+                   "not a condition of purchase", "/terms", "/privacy"):
+        assert phrase in text, phrase
+
+
+def test_signup_sms_consent_is_separate_optional_and_unticked():
+    """On signup the phone number is optional and its SMS consent box is its
+    own checkbox: not the Terms box, not pre-ticked, not required, and carrying
+    the same disclosures as the Settings box."""
+    import re
+    html = _read("resources/style/login.html")
+    phone = re.search(r'<input id="signup-phone"[^>]*>', html, re.S).group(0)
+    assert "required" not in phone
+    box = re.search(r'<input id="signup-sms-consent"[^>]*>', html, re.S).group(0)
+    assert "checked" not in box and "required" not in box
+    assert 'name="sms_consent"' in box
+    terms = re.search(r'<input id="signup-terms"[^>]*>', html, re.S).group(0)
+    assert 'name="accept_terms"' in terms
+    row = re.search(r'<label class="consent" for="signup-sms-consent">.*?</label>',
+                    html, re.S)
+    text = " ".join(row.group(0).split())
+    for phrase in ("Aime", "Prism", "Message frequency varies",
+                   "Message and data rates may apply", "STOP", "HELP",
+                   "not a condition of purchase", "/terms", "/privacy"):
+        assert phrase in text, phrase
+    # The Terms box's own wording says nothing about texts.
+    terms_row = re.search(r'<label class="consent" for="signup-terms">.*?</label>',
+                          html, re.S).group(0).lower()
+    assert "text" not in terms_row and "sms" not in terms_row
+
+
+_SIGNUP_WITH_PHONE = (
+    "import frontends.web_app as w\n"
+    "c = w.app.test_client()\n"
+    "def signup(**extra):\n"
+    "    data = {'username':'owner','password':'" + _PW + "',"
+    "'password2':'" + _PW + "','accept_terms':'1'}\n"
+    "    data.update(extra)\n"
+    "    return c.post('/signup', data=data)\n"
+    "u = lambda: w._auth_backend.lookup_by_username('owner')\n"
+)
+
+
+def test_signup_phone_needs_its_own_consent_and_a_valid_number():
+    proc = _run_snippet(_SIGNUP_WITH_PHONE +
+        "r = signup(phone='+15551234567')\n"
+        "assert r.status_code == 400, r.status_code\n"
+        "assert u() is None\n"
+        "r = signup(phone='555-1234', sms_consent='1')\n"
+        "assert r.status_code == 400, r.status_code\n"
+        "assert u() is None\n"
+        "r = signup(phone='+1 (555) 123-4567', sms_consent='1')\n"
+        "assert r.status_code == 302, r.status_code\n"
+        "from aime import config\n"
+        "assert u().messaging_contact == '+15551234567', u()\n"
+        "assert u().sms_consent_at and u().sms_consent_version == config.SMS_CONSENT_VERSION\n"
+        "print('OK')\n",
+        {"AIME_MESSAGING_CHANNEL": "sms"},
+    )
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "OK" in proc.stdout
+
+
+def test_signup_without_phone_records_no_sms_consent():
+    """Leaving the number blank is fine, and a stray tick with no number
+    records nothing."""
+    proc = _run_snippet(_SIGNUP_WITH_PHONE +
+        "r = signup(sms_consent='1')\n"
+        "assert r.status_code == 302, r.status_code\n"
+        "assert u().messaging_contact is None and u().sms_consent_at is None\n"
+        "print('OK')\n",
+        {"AIME_MESSAGING_CHANNEL": "sms"},
+    )
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "OK" in proc.stdout
+
+
+def test_signup_phone_waits_through_email_verification(backend):
+    """With email verification on, the number + consent ride the pending row
+    and land on the account when the code is confirmed."""
+    token, code, _ = backend.start_signup_verification(
+        "owner", _PW, "owner@example.com", terms_version="v1",
+        messaging_contact="+15551234567", sms_consent_version="s1",
+    )
+    user, _dek = backend.complete_signup_verification(token, code)
+    stored = backend.lookup(user.id)
+    assert stored.messaging_contact == "+15551234567"
+    assert stored.sms_consent_version == "s1" and stored.sms_consent_at
+
+
+def test_sms_signup_block_hidden_under_other_channels():
+    proc = _run_snippet(
+        "import frontends.web_app as w\n"
+        "html = w.app.test_client().get('/login').get_data(as_text=True)\n"
+        "assert '[data-sms-signup]{display:none' in html\n"
+        "print('OK')\n",
+        {"AIME_MESSAGING_CHANNEL": "telegram"},
+    )
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "OK" in proc.stdout
+
+
+def test_legal_documents_describe_the_sms_program():
+    terms = " ".join(_read("resources/legal/terms.html").split()).lower()
+    for phrase in ("Text messages (SMS)", "message frequency varies",
+                   "message and data rates may apply", "STOP", "HELP",
+                   "not a condition of any purchase",
+                   "Carriers are not liable"):
+        assert phrase.lower() in terms, phrase
+    privacy = " ".join(_read("resources/legal/privacy.html").split())
+    assert ("No mobile information will be shared with third parties or "
+            "affiliates for marketing or promotional purposes") in privacy

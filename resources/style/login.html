@@ -6,6 +6,7 @@
   <title>Sign in — Aime</title>
   __SIGNUP_DISABLED_STYLE__
   __EMAIL_VERIFICATION_DISABLED_STYLE__
+  __SMS_SIGNUP_DISABLED_STYLE__
   <link rel="icon" type="image/svg+xml" href="/favicon.svg">
   <link href="/fonts/fonts.css" rel="stylesheet">
   <style>
@@ -126,6 +127,12 @@
                      accent-color: var(--cta); cursor: pointer; }
     .consent a { color: var(--accent); text-decoration: none; }
     .consent a:hover { text-decoration: underline; }
+    /* Optional phone + SMS consent. `contents` keeps its children in the
+       form's own flex column (so the usual gap applies); the SMS-off style
+       hides the whole block with display:none. */
+    .sms-signup { display: contents; }
+    .sms-why { color: var(--muted); font-size: 0.82rem; line-height: 1.45;
+               margin: -0.2rem 0 0; }
   </style>
 </head>
 <body>
@@ -180,6 +187,37 @@
       <label for="signup-password2">Confirm password</label>
       <input id="signup-password2" name="password2" type="password"
              autocomplete="new-password" minlength="8" required>
+      <!-- Optional mobile number + SMS consent (10DLC). Shown only under the
+           SMS channel (web_app._SMS_SIGNUP_DISABLED_STYLE hides it otherwise). The
+           number is optional; the consent box is its own checkbox, separate
+           from the Terms box below, never pre-ticked and never `required` on
+           its own — the server takes a number only with it ticked. Its text
+           matches the Settings box; changing it means bumping
+           aime.config.SMS_CONSENT_VERSION. -->
+      <div class="sms-signup" data-sms-signup>
+        <label for="signup-phone">Mobile number <span class="optional">(optional,
+          recommended)</span></label>
+        <input id="signup-phone" name="phone" type="tel" autocomplete="tel"
+               inputmode="tel" placeholder="+15551234567" maxlength="24"
+               value="__SIGNUP_PHONE__">
+        <p class="sms-why">Aime works best when it can reach you outside the
+          chat: it can text you reminders for your events and let you know when
+          a task you asked for is done, so nothing waits on you having the app
+          open. You can add, change, or remove your number anytime in
+          Settings.</p>
+        <label class="consent" for="signup-sms-consent">
+          <input id="signup-sms-consent" name="sms_consent" type="checkbox"
+                 value="1">
+          <span>I agree to receive text messages from Aime (933 Consulting
+            Group, LLC d/b/a Prism) at this number: reminders and results of
+            tasks I ask for. Message frequency varies. Message and data rates
+            may apply. Reply STOP to opt out, HELP for help. Consent is not a
+            condition of purchase. See our
+            <a href="/terms" target="_blank" rel="noopener">Terms</a> and
+            <a href="/privacy" target="_blank" rel="noopener">Privacy
+            Policy</a>.</span>
+        </label>
+      </div>
       <!-- Terms consent. `required` gives the browser's own blocking prompt;
            the server re-checks it (never trust the form) and records which
            revision was agreed to. Links open in a new tab so a half-filled
@@ -230,6 +268,17 @@
         e.preventDefault();
         const err = signupForm.querySelector('.error');
         err.textContent = "Passwords do not match.";
+        return;
+      }
+      // A phone number needs its own SMS consent tick (the server enforces
+      // this too). Blank number = no texts, no tick needed.
+      const phone = signupForm.querySelector('input[name="phone"]');
+      const sms = signupForm.querySelector('input[name="sms_consent"]');
+      if (phone && phone.offsetParent !== null && phone.value.trim()
+          && sms && !sms.checked) {
+        e.preventDefault();
+        signupForm.querySelector('.error').textContent =
+          "Tick the box to agree to text messages, or leave the phone number blank.";
       }
     });
     let tabFromError = false;
