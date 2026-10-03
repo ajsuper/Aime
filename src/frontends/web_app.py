@@ -1467,6 +1467,7 @@ _LEGAL_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "resources", "legal",
 )
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
 # Self-hosted webfonts (Fraunces + Hanken Grotesk) and the stylesheet that
 # declares them. Served from our own origin: the CSP allows neither
 # fonts.googleapis.com nor fonts.gstatic.com, so the old Google Fonts <link>
@@ -1683,10 +1684,24 @@ _SIGNUP_DISABLED_STYLE = (
 )
 
 # Under any channel but SMS, hide the signup form's optional phone number and
-# its SMS consent box (Settings still takes a Telegram id / email there).
+# its SMS consent box (Settings still takes a Telegram id / email there)...
 _SMS_SIGNUP_DISABLED_STYLE = (
     '<style>[data-sms-signup]{display:none!important}</style>'
 )
+# ...unless AIME_SMS_OPT_IN=1, which collects the number + SMS consent at
+# signup while delivery still runs on another channel. That's the state a 10DLC
+# campaign is reviewed in: carriers want to see the live opt-in form before the
+# number is approved, and switching AIME_MESSAGING_CHANNEL to sms early would
+# cut off existing Telegram users. Numbers taken this way are stored as the
+# account's messaging contact (with consent), ready for the switch to SMS.
+_SMS_OPT_IN = _env_bool("AIME_SMS_OPT_IN", "0")
+
+
+def _sms_signup_enabled() -> bool:
+    """Whether the signup form shows, and the server accepts, a phone number
+    with its SMS consent box."""
+    from aime import messaging as _aime_messaging
+    return _SMS_OPT_IN or _aime_messaging.active_channel_name() == "sms"
 
 # When email verification is off, also hide the Email input + its label + its
 # helper hint on the signup form. The field stays in the DOM (so the POST still
@@ -1728,7 +1743,6 @@ def _load_login_page(
     (the SMS consent box is never re-ticked for them — consent is only ever
     the user's own fresh tick).
     """
-    from aime import messaging as _aime_messaging
     with open(_LOGIN_PAGE_PATH) as f:
         html = f.read()
     return (
@@ -1743,10 +1757,10 @@ def _load_login_page(
         .replace("__SIGNUP_FIRST_NAME__", _h(signup_first_name))
         .replace("__SIGNUP_LAST_NAME__", _h(signup_last_name))
         .replace("__SIGNUP_PHONE__", _h(signup_phone))
-        # The phone + SMS consent block only makes sense when texts go by SMS.
+        # The phone + SMS consent block only makes sense when texts go by SMS
+        # (or SMS opt-in is being collected ahead of it; see _SMS_OPT_IN).
         .replace("__SMS_SIGNUP_DISABLED_STYLE__",
-                 "" if _aime_messaging.active_channel_name() == "sms"
-                 else _SMS_SIGNUP_DISABLED_STYLE)
+                 "" if _sms_signup_enabled() else _SMS_SIGNUP_DISABLED_STYLE)
         .replace("__SIGNUP_DISABLED_STYLE__", "" if _ALLOW_SIGNUP else _SIGNUP_DISABLED_STYLE)
         .replace("__EMAIL_VERIFICATION_DISABLED_STYLE__",
                  "" if _DO_EMAIL_VERIFICATION else _EMAIL_VERIFICATION_DISABLED_STYLE)
@@ -1823,6 +1837,10 @@ def _load_legal_page(slug: str, title: str) -> str:
         shell = f.read()
     with open(os.path.join(_LEGAL_DIR, f"{slug}.html")) as f:
         body = f.read()
+    # The body files open with maintainer notes in an HTML comment (sub-processor
+    # list, lawyer-review status, versioning rules). They're for whoever edits
+    # the text, not the public, so they never reach the served page.
+    body = _HTML_COMMENT_RE.sub("", body)
     # The body is trusted first-party markup (it's a checked-in document, not
     # user content), so it is substituted as-is; only the version string, which
     # is configurable, gets escaped.
@@ -2703,11 +2721,10 @@ def signup_submit():
     # the immutable identity that keys everything.
     first_name = (request.form.get("first_name") or "").strip()
     last_name = (request.form.get("last_name") or "").strip()
-    # Optional phone number + SMS opt-in (10DLC): only read under the SMS
-    # channel, where the form shows them.
-    from aime import messaging as _aime_messaging
+    # Optional phone number + SMS opt-in (10DLC): only read when the form
+    # shows them (the SMS channel, or AIME_SMS_OPT_IN).
     from aime.messaging.aws_sms import e164_or_none
-    sms_signup = _aime_messaging.active_channel_name() == "sms"
+    sms_signup = _sms_signup_enabled()
     phone = (request.form.get("phone") or "").strip() if sms_signup else ""
 
     def _signup_err(msg: str, status: int = 400):

@@ -268,6 +268,22 @@ SMS_OPT_IN_CONFIRMATION = (
     "Reply HELP for help, STOP to opt out."
 )
 
+# Keyword auto-replies. AWS sends these itself (the app never sees inbound
+# texts); scripts/sms_keywords.py pushes them onto the origination number, and
+# the 10DLC campaign form must quote the same text. Keep each within one
+# 160-character GSM-7 segment (plain ASCII — a curly apostrophe drops the limit
+# to 70). HELP needs the brand, a support contact and how to opt out; STOP
+# confirms the opt-out and how to undo it (Terms section 8 promises START).
+SMS_HELP_REPLY = (
+    "Aime (Prism): For help, email andrew@933consulting.com or visit "
+    "app.heyaime.org. Msg frequency varies. Msg & data rates may apply. "
+    "Reply STOP to opt out."
+)
+SMS_STOP_REPLY = (
+    "Aime (Prism): You are unsubscribed and will receive no further texts. "
+    "Reply START to resubscribe."
+)
+
 
 def stripe_price_for_tier(tier: str | None) -> str | None:
     """The Stripe Price ID for a tier, or None if unset/unknown."""

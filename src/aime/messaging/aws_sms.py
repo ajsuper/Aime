@@ -14,7 +14,8 @@ the number lives outside the default region. Recipients are stored per account
 as the messaging contact and should be in E.164 form (``+15551234567``).
 
 STOP/HELP keyword replies and the opt-out list are handled by AWS on the
-number itself; a send to an opted-out recipient is refused and surfaces here
+number itself (their text is config.SMS_HELP_REPLY / SMS_STOP_REPLY, set there
+by scripts/sms_keywords.py); a send to an opted-out recipient is refused and surfaces here
 as a friendly error rather than a silent drop.
 
 Two things SMS imposes that the other channels don't, both handled here so no

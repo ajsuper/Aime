@@ -424,6 +424,58 @@ def test_sms_signup_block_hidden_under_other_channels():
     assert "OK" in proc.stdout
 
 
+def test_sms_opt_in_flag_collects_signup_consent_under_other_channels():
+    """AIME_SMS_OPT_IN shows the phone + consent box and stores both while
+    delivery stays on Telegram — the state a 10DLC campaign is reviewed in.
+    The consent rules are the same as under the SMS channel."""
+    proc = _run_snippet(_SIGNUP_WITH_PHONE +
+        "html = c.get('/login').get_data(as_text=True)\n"
+        "assert '[data-sms-signup]{display:none' not in html\n"
+        "assert 'name=\"sms_consent\"' in html\n"
+        "r = signup(phone='+15551234567')\n"
+        "assert r.status_code == 400, r.status_code\n"
+        "assert u() is None\n"
+        "r = signup(phone='+15551234567', sms_consent='1')\n"
+        "assert r.status_code == 302, r.status_code\n"
+        "assert u().messaging_contact == '+15551234567', u()\n"
+        "assert u().sms_consent_at is not None\n"
+        "print('OK')\n",
+        {"AIME_MESSAGING_CHANNEL": "telegram", "AIME_SMS_OPT_IN": "1"},
+    )
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "OK" in proc.stdout
+
+
+def test_signup_ignores_phone_when_sms_signup_is_off():
+    """Without the SMS channel or AIME_SMS_OPT_IN, a posted number is dropped
+    rather than stored as a contact nobody consented to texts for."""
+    proc = _run_snippet(_SIGNUP_WITH_PHONE +
+        "r = signup(phone='+15551234567', sms_consent='1')\n"
+        "assert r.status_code == 302, r.status_code\n"
+        "assert u().messaging_contact is None and u().sms_consent_at is None\n"
+        "print('OK')\n",
+        {"AIME_MESSAGING_CHANNEL": "telegram", "AIME_SMS_OPT_IN": "0"},
+    )
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "OK" in proc.stdout
+
+
+@pytest.mark.parametrize("path", ["/terms", "/privacy"])
+def test_legal_pages_do_not_serve_maintainer_comments(path):
+    """The body files' editing notes (lawyer-review status etc.) stay in the
+    repo; the public page carries no HTML comments."""
+    assert "<!--" in _read("resources/legal" + path + ".html")
+    proc = _run_snippet(
+        "import frontends.web_app as w\n"
+        f"html = w.app.test_client().get({path!r}).get_data(as_text=True)\n"
+        "assert '<!--' not in html\n"
+        "assert 'reviewed by a lawyer' not in html\n"
+        "print('OK')\n"
+    )
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "OK" in proc.stdout
+
+
 def test_legal_documents_describe_the_sms_program():
     terms = " ".join(_read("resources/legal/terms.html").split()).lower()
     for phrase in ("Text messages (SMS)", "message frequency varies",
@@ -434,3 +486,23 @@ def test_legal_documents_describe_the_sms_program():
     privacy = " ".join(_read("resources/legal/privacy.html").split())
     assert ("No mobile information will be shared with third parties or "
             "affiliates for marketing or promotional purposes") in privacy
+
+
+def test_sms_carrier_messages_fit_one_segment_and_carry_disclosures():
+    """The opt-in confirmation and the HELP/STOP keyword replies each name the
+    brand and fit one plain GSM-7 segment (160 chars, ASCII only)."""
+    messages = {
+        "confirmation": config.SMS_OPT_IN_CONFIRMATION,
+        "help": config.SMS_HELP_REPLY,
+        "stop": config.SMS_STOP_REPLY,
+    }
+    for name, text in messages.items():
+        assert text.startswith("Aime (Prism):"), name
+        assert text.isascii(), name
+        assert len(text) <= 160 or name == "confirmation", (name, len(text))
+    help_text = config.SMS_HELP_REPLY
+    for phrase in ("@933consulting.com", "app.heyaime.org", "STOP",
+                   "Msg frequency varies", "Msg & data rates may apply"):
+        assert phrase in help_text, phrase
+    assert "unsubscribed" in config.SMS_STOP_REPLY
+    assert "START" in config.SMS_STOP_REPLY

@@ -244,6 +244,16 @@ opt-in is stored on `users.sms_consent_at` / `sms_consent_version` (bump
 answered with `SMS_OPT_IN_CONFIRMATION`. Terms §8 describes the program;
 Privacy §5 carries the "no mobile information shared for marketing" statement.
 
+The signup phone + consent box shows under `AIME_MESSAGING_CHANNEL=sms`, or
+under any channel with `AIME_SMS_OPT_IN=1`. Use the latter while the campaign
+is in review: carriers want to see the live opt-in form before the number is
+approved, and switching the channel to `sms` early would cut off existing
+Telegram users. Numbers collected this way are stored with their consent as
+the account's messaging contact, but no confirmation text goes out until the
+channel is `sms` — send `SMS_OPT_IN_CONFIRMATION` to those accounts at
+cutover. Settings keeps following the channel, so it offers the SMS box only
+once the channel is `sms`.
+
 For the AWS End User Messaging campaign form:
 - **Brand** must match the legal entity exactly: 933 Consulting Group, LLC
   (DBA Prism), with the same EIN and address as the Terms.
@@ -252,16 +262,23 @@ For the AWS End User Messaging campaign form:
   and tick an unticked consent box beside it. The signup form is public, so
   reviewers can see it directly; also attach a screenshot. Link
   https://app.heyaime.org/terms and /privacy (both public without logging in).
-- **Sample messages** should start with "Aime:" and look like real reminders
+- **Sample messages** should start with "Aime (Prism):", like the opt-in
+  confirmation and keyword replies, and look like real reminders
   and task results. Include the opt-in confirmation text.
-- **Keywords**: set HELP and STOP auto-replies on the phone number/pool in AWS.
-  HELP should name Aime/Prism and give the support email. Leave STOP
-  self-managed opt-out on so AWS enforces it.
+- **Keywords**: HELP and STOP auto-replies are `SMS_HELP_REPLY` /
+  `SMS_STOP_REPLY` in `aime.config`. Run `./scripts/sms_keywords.py` to see
+  them and `./scripts/sms_keywords.py --apply` to set them on
+  `AWS_SMS_ORIGINATION_IDENTITY` (needs `sms-voice:PutKeyword`). Paste the
+  same text into the campaign form's HELP/STOP message fields, and leave
+  self-managed opt-outs off so AWS enforces STOP.
 
 ```bash
-# No draft banner and no unfilled blanks should ever reappear
-curl -s https://your-domain/terms   | grep -c 'draft-banner\|class="blank"'   # expect 0
-curl -s https://your-domain/privacy | grep -c 'draft-banner\|class="blank"'   # expect 0
+# No draft banner and no unfilled blanks should ever reappear. Match the
+# markup, not the bare class names: the page shell's CSS defines both.
+curl -s https://your-domain/terms   | grep -c 'class="draft-banner"\|class="blank"'   # expect 0
+curl -s https://your-domain/privacy | grep -c 'class="draft-banner"\|class="blank"'   # expect 0
+# Maintainer notes in the body files' HTML comments are stripped when served
+curl -s https://your-domain/terms   | grep -c '<!--'   # expect 0
 ```
 
 ## Quick verification before launch
