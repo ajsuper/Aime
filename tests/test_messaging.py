@@ -6,7 +6,8 @@ surface as a ``MessageSendError`` carrying a calm, user-facing message, while
 the noisy provider detail (status codes, response bodies) stays on the
 exception chain for logs — never in the message a user or the model sees.
 
-No live network is used: ``requests.post`` and the SMTP sender are stubbed.
+No live network is used: ``requests.post``, the SMTP sender and the AWS SMS
+client are stubbed.
 """
 
 import pytest
@@ -20,9 +21,9 @@ from aime.messaging import (
 )
 from aime.messaging.telegram import TelegramChannel
 from aime.messaging.email_channel import EmailChannel
-from aime.messaging.twilio_sms import TwilioSMSChannel, _MAX_BODY_CHARS
+from aime.messaging.aws_sms import AwsSMSChannel, _MAX_BODY_CHARS
 from aime.messaging import telegram as telegram_mod
-from aime.messaging import twilio_sms as twilio_mod
+from botocore.exceptions import ClientError, NoCredentialsError
 
 
 # --------------------------------------------------------------------------- #
@@ -61,23 +62,31 @@ def patched_post(monkeypatch):
     return _install
 
 
-@pytest.fixture
-def patched_twilio_post(monkeypatch):
-    """The same recording fake, over the Twilio channel's ``requests.post``."""
-    def _install(response=None, raises=None):
-        fake = _RecordingPost(response=response, raises=raises)
-        monkeypatch.setattr(twilio_mod.requests, "post", fake)
-        return fake
-    return _install
+class _FakeSMSClient:
+    """Stand-in for the boto3 ``pinpoint-sms-voice-v2`` client."""
+
+    def __init__(self, raises=None):
+        self._raises = raises
+        self.calls = []
+
+    def send_text_message(self, **kwargs):
+        self.calls.append(kwargs)
+        if self._raises is not None:
+            raise self._raises
+        return {"MessageId": "m-1"}
 
 
-def _twilio(**kwargs):
-    """A fully-credentialed SMS channel; individual tests override one field."""
-    defaults = dict(
-        account_sid="AC123", auth_token="secret",
-        from_number="+15550000000", messaging_service_sid="",
-    )
-    return TwilioSMSChannel(**{**defaults, **kwargs})
+def _client_error(code, reason=None, message="provider detail"):
+    response = {"Error": {"Code": code, "Message": message}}
+    if reason:
+        response["Reason"] = reason
+    return ClientError(response, "SendTextMessage")
+
+
+def _aws(client=None, **kwargs):
+    """A fully-configured SMS channel; individual tests override one field."""
+    defaults = dict(origination_identity="+15550000000", configuration_set="")
+    return AwsSMSChannel(**{**defaults, **kwargs}, client=client or _FakeSMSClient())
 
 
 # --------------------------------------------------------------------------- #
@@ -158,142 +167,115 @@ def test_telegram_subject_is_folded_into_body(patched_post):
 
 
 # --------------------------------------------------------------------------- #
-# TwilioSMSChannel — guard rails (no network reached)
+# AwsSMSChannel — guard rails (no network reached)
 # --------------------------------------------------------------------------- #
-def test_twilio_missing_credentials_is_friendly_and_never_calls_network(
-    patched_twilio_post,
-):
-    fake = patched_twilio_post()
+def test_aws_sms_missing_origination_is_friendly_and_never_calls_network():
+    client = _FakeSMSClient()
     with pytest.raises(MessageSendError) as exc:
-        _twilio(auth_token="").send("+15551234567", "hi")
-    assert "TWILIO_ACCOUNT_SID" in str(exc.value)
-    assert fake.calls == []
+        _aws(client, origination_identity="").send("+15551234567", "hi")
+    assert "AWS_SMS_ORIGINATION_IDENTITY" in str(exc.value)
+    assert client.calls == []
 
 
-def test_twilio_missing_sender_is_friendly_and_never_calls_network(
-    patched_twilio_post,
-):
-    fake = patched_twilio_post()
-    with pytest.raises(MessageSendError) as exc:
-        _twilio(from_number="").send("+15551234567", "hi")
-    # Credentials are fine here; it's the From half that's unconfigured.
-    assert "TWILIO_FROM_NUMBER" in str(exc.value)
-    assert fake.calls == []
-
-
-def test_twilio_empty_recipient_raises_before_network(patched_twilio_post):
-    fake = patched_twilio_post()
+def test_aws_sms_empty_recipient_raises_before_network():
+    client = _FakeSMSClient()
     with pytest.raises(MessageSendError):
-        _twilio().send("  ", "hi")
-    assert fake.calls == []
+        _aws(client).send("  ", "hi")
+    assert client.calls == []
 
 
 # --------------------------------------------------------------------------- #
-# TwilioSMSChannel — transport failures surface calmly, detail stays on the chain
+# AwsSMSChannel — transport failures surface calmly, detail stays on the chain
 # --------------------------------------------------------------------------- #
-def test_twilio_request_exception_becomes_friendly_error(patched_twilio_post):
-    boom = twilio_mod.requests.RequestException("connection reset")
-    patched_twilio_post(raises=boom)
+def test_aws_sms_botocore_error_becomes_friendly_error():
+    boom = NoCredentialsError()
     with pytest.raises(MessageSendError) as exc:
-        _twilio().send("+15551234567", "hi")
+        _aws(_FakeSMSClient(raises=boom)).send("+15551234567", "hi")
     assert "try again" in str(exc.value).lower()
     assert exc.value.__cause__ is boom
-    assert "connection reset" not in str(exc.value)
+    assert "credentials" not in str(exc.value).lower()
 
 
-def test_twilio_error_response_does_not_leak_provider_body(patched_twilio_post):
-    patched_twilio_post(response=_FakeResponse(
-        ok=False, status_code=500,
-        text='{"code":20500,"message":"Internal server error"}',
-    ))
+def test_aws_sms_error_response_does_not_leak_provider_detail():
+    boom = _client_error("InternalServerException", message="shard 7 on fire")
     with pytest.raises(MessageSendError) as exc:
-        _twilio().send("+15551234567", "hi")
-    user_msg = str(exc.value)
-    assert "20500" not in user_msg
-    assert "500" not in user_msg
+        _aws(_FakeSMSClient(raises=boom)).send("+15551234567", "hi")
+    assert "shard 7" not in str(exc.value)
+    assert "InternalServerException" not in str(exc.value)
     # ...but the provider detail is on the chain for the logs.
-    assert "20500" in str(exc.value.__cause__)
+    assert exc.value.__cause__ is boom
 
 
-def test_twilio_bad_number_gets_an_actionable_hint(patched_twilio_post):
-    patched_twilio_post(response=_FakeResponse(
-        ok=False, status_code=400,
-        text='{"code":21211,"message":"Invalid \'To\' Phone Number"}',
-    ))
+def test_aws_sms_bad_number_gets_an_actionable_hint():
+    boom = _client_error("ValidationException", reason="INVALID_PARAMETER")
     with pytest.raises(MessageSendError) as exc:
-        _twilio().send("5551234567", "hi")
-    # A 400 is nearly always the recipient, so the user gets something to act on
-    # without seeing Twilio's own error code.
+        _aws(_FakeSMSClient(raises=boom)).send("5551234567", "hi")
     assert "international format" in str(exc.value)
-    assert "21211" not in str(exc.value)
+    assert "ValidationException" not in str(exc.value)
+
+
+def test_aws_sms_opted_out_recipient_is_explained():
+    """A user who replied STOP is refused by AWS; they should learn why rather
+    than being told to retry something that will never succeed."""
+    boom = _client_error("ConflictException", reason="DESTINATION_PHONE_NUMBER_OPTED_OUT")
+    with pytest.raises(MessageSendError) as exc:
+        _aws(_FakeSMSClient(raises=boom)).send("+15551234567", "hi")
+    assert "opted out" in str(exc.value)
+    assert "try again" not in str(exc.value).lower()
 
 
 # --------------------------------------------------------------------------- #
-# TwilioSMSChannel — happy path shape
+# AwsSMSChannel — happy path shape
 # --------------------------------------------------------------------------- #
-def test_twilio_send_posts_expected_payload(patched_twilio_post):
-    fake = patched_twilio_post()
-    _twilio(timeout=9.0).send(" (555) 123-4567 ", "the body")
-    assert len(fake.calls) == 1
-    call = fake.calls[0]
-    assert call["url"] == "https://api.twilio.com/2010-04-01/Accounts/AC123/Messages.json"
-    # Form-encoded, not JSON — Twilio's REST API takes POST form params.
-    assert call["data"]["To"] == "5551234567"       # separators stripped...
-    assert call["data"]["Body"] == "the body"
-    assert call["data"]["From"] == "+15550000000"
-    assert call["auth"] == ("AC123", "secret")       # basic auth, sid + token
-    assert call["timeout"] == 9.0
+def test_aws_sms_send_passes_expected_params():
+    client = _FakeSMSClient()
+    _aws(client).send(" (555) 123-4567 ", "the body")
+    assert client.calls == [{
+        "DestinationPhoneNumber": "5551234567",   # separators stripped...
+        "OriginationIdentity": "+15550000000",
+        "MessageBody": "the body",
+        "MessageType": "TRANSACTIONAL",
+    }]
 
 
-def test_twilio_never_invents_a_country_code(patched_twilio_post):
+def test_aws_sms_never_invents_a_country_code():
     """Guessing a country code silently texts a stranger; a bare number is
-    passed through unchanged for Twilio to validate."""
-    fake = patched_twilio_post()
-    _twilio().send("5551234567", "hi")
-    assert fake.calls[0]["data"]["To"] == "5551234567"
+    passed through unchanged for AWS to validate."""
+    client = _FakeSMSClient()
+    _aws(client).send("5551234567", "hi")
+    assert client.calls[0]["DestinationPhoneNumber"] == "5551234567"
 
 
-def test_twilio_messaging_service_wins_over_from_number(patched_twilio_post):
-    fake = patched_twilio_post()
-    _twilio(messaging_service_sid="MG999").send("+15551234567", "hi")
-    data = fake.calls[0]["data"]
-    assert data["MessagingServiceSid"] == "MG999"
-    assert "From" not in data  # exactly one sender field, never both
+def test_aws_sms_configuration_set_is_sent_only_when_set():
+    client = _FakeSMSClient()
+    _aws(client, configuration_set="aime-events").send("+15551234567", "hi")
+    assert client.calls[0]["ConfigurationSetName"] == "aime-events"
 
 
-def test_twilio_messaging_service_alone_is_sufficient(patched_twilio_post):
-    fake = patched_twilio_post()
-    _twilio(from_number="", messaging_service_sid="MG999").send("+1555", "hi")
-    assert fake.calls[0]["data"]["MessagingServiceSid"] == "MG999"
-
-
-def test_twilio_subject_is_folded_into_body(patched_twilio_post):
-    fake = patched_twilio_post()
-    _twilio().send("+15551234567", "line two", subject="Heads up")
-    body = fake.calls[0]["data"]["Body"]
+def test_aws_sms_subject_is_folded_into_body():
+    client = _FakeSMSClient()
+    _aws(client).send("+15551234567", "line two", subject="Heads up")
+    body = client.calls[0]["MessageBody"]
     assert body.startswith("Heads up")
     assert "line two" in body
 
 
-def test_twilio_long_body_is_trimmed_not_rejected(patched_twilio_post):
-    """Twilio hard-rejects over 1600 chars; a clipped reminder beats none."""
-    fake = patched_twilio_post()
-    _twilio().send("+15551234567", "x" * 5000)
-    body = fake.calls[0]["data"]["Body"]
+def test_aws_sms_long_body_is_trimmed_not_rejected():
+    """AWS hard-rejects over 1600 chars; a clipped reminder beats none."""
+    client = _FakeSMSClient()
+    _aws(client).send("+15551234567", "x" * 5000)
+    body = client.calls[0]["MessageBody"]
     assert len(body) <= _MAX_BODY_CHARS
     assert body.endswith("…")
 
 
-def test_twilio_reads_credentials_from_environment(monkeypatch, patched_twilio_post):
-    fake = patched_twilio_post()
-    monkeypatch.setenv("TWILIO_ACCOUNT_SID", "ACenv")
-    monkeypatch.setenv("TWILIO_AUTH_TOKEN", "tokenv")
-    monkeypatch.setenv("TWILIO_FROM_NUMBER", "+15551110000")
-    monkeypatch.delenv("TWILIO_MESSAGING_SERVICE_SID", raising=False)
-    TwilioSMSChannel().send("+15551234567", "hi")
-    call = fake.calls[0]
-    assert call["auth"] == ("ACenv", "tokenv")
-    assert call["data"]["From"] == "+15551110000"
+def test_aws_sms_reads_config_from_environment(monkeypatch):
+    monkeypatch.setenv("AWS_SMS_ORIGINATION_IDENTITY", "pool-abc")
+    monkeypatch.setenv("AWS_SMS_CONFIGURATION_SET", "cs-env")
+    client = _FakeSMSClient()
+    AwsSMSChannel(client=client).send("+15551234567", "hi")
+    assert client.calls[0]["OriginationIdentity"] == "pool-abc"
+    assert client.calls[0]["ConfigurationSetName"] == "cs-env"
 
 
 # --------------------------------------------------------------------------- #
@@ -363,20 +345,20 @@ def test_get_messenger_selects_email(monkeypatch):
     assert isinstance(get_messenger(), EmailChannel)
 
 
-@pytest.mark.parametrize("name", ["sms", "SMS", " twilio ", "Twilio"])
-def test_get_messenger_selects_twilio_sms(monkeypatch, name):
+@pytest.mark.parametrize("name", ["sms", "SMS", " aws ", "AWS"])
+def test_get_messenger_selects_aws_sms(monkeypatch, name):
     """Switching the backend is meant to be a one-variable change, under either
     the medium's name or the provider's."""
     monkeypatch.delenv("AIME_MESSAGING", raising=False)
     monkeypatch.setenv("AIME_MESSAGING_CHANNEL", name)
-    assert isinstance(get_messenger(), TwilioSMSChannel)
+    assert isinstance(get_messenger(), AwsSMSChannel)
 
 
 def test_active_channel_name_normalizes_aliases(monkeypatch):
     """The frontend labels its contact field from this, so an alias must report
     the canonical name rather than whatever was typed into config."""
     monkeypatch.delenv("AIME_MESSAGING", raising=False)
-    monkeypatch.setenv("AIME_MESSAGING_CHANNEL", "twilio")
+    monkeypatch.setenv("AIME_MESSAGING_CHANNEL", "aws")
     assert messaging.active_channel_name() == "sms"
     monkeypatch.setenv("AIME_MESSAGING_CHANNEL", "telegram")
     assert messaging.active_channel_name() == "telegram"

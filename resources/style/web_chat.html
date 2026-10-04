@@ -3460,6 +3460,22 @@
                 Save
               </button>
             </div>
+            <!-- SMS consent (10DLC): shown only under the sms channel, never
+                 pre-ticked, separate from the Terms checkbox, and enforced again
+                 server-side in /messaging-contact. Changing this text means
+                 bumping aime.config.SMS_CONSENT_VERSION. -->
+            <p class="desc" id="account-sms-consent-status" style="display:none;margin-top:0.5rem"></p>
+            <label id="account-sms-consent-row" class="desc"
+                   style="display:none;margin-top:0.5rem;gap:0.5rem;align-items:flex-start;cursor:pointer">
+              <input type="checkbox" id="account-sms-consent" style="margin-top:0.2rem;flex:none">
+              <span>I agree to receive text messages from Aime (933 Consulting
+                Group, LLC d/b/a Prism) at this number: reminders and results of
+                tasks I ask for. Message frequency varies. Message and data rates
+                may apply. Reply STOP to opt out, HELP for help. Consent is not a
+                condition of purchase. See our
+                <a href="/terms" target="_blank" rel="noopener">Terms</a> and
+                <a href="/privacy" target="_blank" rel="noopener">Privacy Policy</a>.</span>
+            </label>
             <p class="desc" id="account-contact-msg" style="display:none;margin-top:0.4rem"></p>
           </div>
           <div class="settings-section">
@@ -11881,6 +11897,33 @@ const termsDescEl = document.getElementById("account-terms-desc");
 const contactBtn = document.getElementById("account-contact-btn");
 const contactMsg = document.getElementById("account-contact-msg");
 const contactDesc = document.getElementById("account-contact-desc");
+const smsConsentRow = document.getElementById("account-sms-consent-row");
+const smsConsent = document.getElementById("account-sms-consent");
+const smsConsentStatus = document.getElementById("account-sms-consent-status");
+let __messagingChannel = null;
+// The number on file and when it was opted in to texts (unix seconds), or null.
+let __savedContact = "";
+let __smsConsentAt = null;
+
+// Under SMS, a number already opted in shows *when* consent was given instead
+// of a ticked box; typing a different number brings back the (always unticked)
+// consent checkbox, since consent belongs to one number.
+function syncSmsConsentUi() {
+  const isSms = __messagingChannel === "sms";
+  const value = contactInput ? contactInput.value.trim() : "";
+  const consented = isSms && __smsConsentAt && value && value === __savedContact;
+  if (smsConsentRow) smsConsentRow.style.display = isSms && !consented ? "flex" : "none";
+  if (smsConsentStatus) {
+    smsConsentStatus.style.display = consented ? "" : "none";
+    if (consented) {
+      const when = new Date(__smsConsentAt * 1000).toLocaleDateString(
+        undefined, {year: "numeric", month: "long", day: "numeric"});
+      smsConsentStatus.textContent =
+        `You agreed to receive texts at this number on ${when}. ` +
+        "Reply STOP to any message, or clear the number, to opt out.";
+    }
+  }
+}
 
 // What a messaging contact looks like depends on the transport the server is
 // configured for, so the field asks for the right thing instead of hardcoding
@@ -11890,7 +11933,7 @@ const CONTACT_HINTS = {
   sms: {
     placeholder: "Phone number (e.g. +15551234567)",
     hint: "Enter your mobile number in international format, like " +
-          "+15551234567. Standard message rates apply.",
+          "+15551234567.",
   },
   telegram: {
     placeholder: "Telegram chat ID",
@@ -11904,7 +11947,9 @@ const CONTACT_HINTS = {
 };
 
 function applyContactHint(channel) {
+  __messagingChannel = channel;
   const spec = CONTACT_HINTS[channel];
+  syncSmsConsentUi();
   if (contactInput) {
     contactInput.placeholder = spec ? spec.placeholder : "Messaging contact";
   }
@@ -12062,6 +12107,10 @@ async function refreshMe() {
     if (firstNameInput) firstNameInput.value = data.first_name || "";
     if (lastNameInput) lastNameInput.value = data.last_name || "";
     if (contactInput) contactInput.value = data.messaging_contact || "";
+    // Never pre-ticked: existing consent is shown as a dated line instead.
+    if (smsConsent) smsConsent.checked = false;
+    __savedContact = data.messaging_contact || "";
+    __smsConsentAt = data.sms_consent_at || null;
     applyContactHint(data.messaging_channel);
     applyTermsInfo(data.terms);
     __accessMode = data.access_mode || "open";
@@ -12857,21 +12906,40 @@ billingPortalBtn.addEventListener("click", () =>
 // Save (or clear, when blank) the account's outbound-messaging contact.
 contactBtn.addEventListener("click", async () => {
   contactMsg.style.display = "none";
+  const value = contactInput.value.trim();
+  const alreadyConsented = __smsConsentAt && value === __savedContact;
+  if (__messagingChannel === "sms" && value && !alreadyConsented && !smsConsent.checked) {
+    contactMsg.textContent = "Tick the box to agree to receive text messages first.";
+    contactMsg.style.color = "var(--error)";
+    contactMsg.style.display = "";
+    return;
+  }
   contactBtn.disabled = true;
   try {
     const r = await fetch("/messaging-contact", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
       credentials: "same-origin",
-      body: JSON.stringify({contact: contactInput.value.trim()}),
+      body: JSON.stringify({contact: contactInput.value.trim(),
+                            sms_consent: !!(smsConsent && smsConsent.checked)}),
     });
     const data = await r.json();
     if (data.ok) {
       contactInput.value = data.messaging_contact || "";
-      contactMsg.textContent = data.messaging_contact
-        ? "Saved — Aime can now text you here."
-        : "Cleared — Aime won't text you.";
-      contactMsg.style.color = "var(--muted)";
+      __savedContact = data.messaging_contact || "";
+      __smsConsentAt = data.sms_consent_at || null;
+      if (smsConsent) smsConsent.checked = false;
+      syncSmsConsentUi();
+      if (data.warning) {
+        contactMsg.textContent = "Saved, but we couldn't send the confirmation text: "
+          + data.warning;
+        contactMsg.style.color = "var(--error)";
+      } else {
+        contactMsg.textContent = data.messaging_contact
+          ? "Saved — Aime can now text you here."
+          : "Cleared — Aime won't text you.";
+        contactMsg.style.color = "var(--muted)";
+      }
     } else {
       contactMsg.textContent = data.message || "Couldn't save that.";
       contactMsg.style.color = "var(--error)";
@@ -12883,6 +12951,7 @@ contactBtn.addEventListener("click", async () => {
   contactMsg.style.display = "";
   contactBtn.disabled = false;
 });
+contactInput.addEventListener("input", syncSmsConsentUi);
 contactInput.addEventListener("keydown", (e) => {
   if (e.key === "Enter") { e.preventDefault(); contactBtn.click(); }
 });

@@ -18,7 +18,10 @@
       promises exactly that, and tests/test_account_purge.py enforces it. If
       you ever reintroduce a parting backup, section 7 must change with it.
     - Sub-processors below are the ones the code actually calls. Email goes
-      out over SMTP through Amazon SES (aime.email_send).
+      out over SMTP through Amazon SES (aime.email_send). Message delivery goes
+      through AWS End User Messaging SMS or Telegram (aime.messaging).
+    - Web-search source chips load favicons from icons.duckduckgo.com in the
+      user's browser (see the CSP img-src in web_app.py). Section 3 says so.
   Re-verify these if the code changes — a stale privacy policy is a liability.
 
   This policy has not been reviewed by a lawyer. Any material change to the
@@ -43,6 +46,9 @@
         Argon2 hash, never in readable form), optional name, email address, time
         zone and display preferences, and the date and version of the terms you
         accepted.</li>
+      <li><strong>Messaging data</strong> — if you turn on text messages, your
+        mobile number and the date and version of the text message consent you
+        gave. If you use Telegram delivery instead, your Telegram chat ID.</li>
       <li><strong>Your content</strong> — the conversations, notes, topics,
         events, files and images you put into Aime.</li>
       <li><strong>Billing data</strong> — your subscription status, plan, and
@@ -91,6 +97,10 @@
       submits it through Anthropic's server-side web search tool, which queries
       an external search provider on our behalf. Send only what you are content
       to have searched.</p>
+    <p>When a response cites web sources, your browser loads each source's
+      site icon from DuckDuckGo's icon service. That request reveals the
+      source's domain and your IP address to DuckDuckGo; it does not include
+      your conversation.</p>
 
     <h2>4. Encryption at rest</h2>
     <p>Your conversations and notes are encrypted on our servers under a key
@@ -111,12 +121,20 @@
         when you use it.</li>
       <li><strong>Stripe</strong> — payments and subscription management.</li>
       <li><strong>Amazon Web Services</strong> (United States) — hosting and
-        infrastructure, and sending verification codes and account email
-        through Amazon SES.</li>
-      <li><strong>Twilio</strong> — sending SMS messages, and only if you
-        have set up message delivery and only for the messages you asked Aime
-        to send you.</li>
+        infrastructure, sending verification codes and account email
+        through Amazon SES, and sending SMS messages through AWS End User
+        Messaging (only if you have set up text message delivery).</li>
+      <li><strong>Telegram</strong> — delivering messages to the chat ID you
+        provide, only if you have set up Telegram message delivery and only for
+        the messages you asked Aime to send you.</li>
     </ul>
+    <p><strong>Text messaging.</strong> No mobile information will be shared
+      with third parties or affiliates for marketing or promotional purposes.
+      Your mobile number and text message opt-in data and consent are never
+      sold, rented, or shared with any third party, except with AWS End User
+      Messaging solely to deliver the messages you asked for. All other sharing
+      described in this policy excludes text message originator opt-in data and
+      consent.</p>
     <p>We may also disclose data where legally required, or to protect our
       rights, our users, or the security of the service. If the business
       changes hands, your data may transfer with it, subject to this policy.</p>

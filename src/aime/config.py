@@ -116,7 +116,8 @@ WEB_SEARCH_ENABLED = _env_flag("AIME_WEB_SEARCH", True)
 # Outbound messaging (see aime.messaging): the SendMessage tool and the agent
 # SubmitResult `message_to_user` field deliver short texts to the user's phone /
 # messaging app. AIME_MESSAGING=0 disables sending; AIME_MESSAGING_CHANNEL picks
-# the transport ("telegram" default, "sms" for Twilio, "email" to reuse SMTP).
+# the transport ("telegram" default, "sms" for AWS End User Messaging, "email"
+# to reuse SMTP).
 # The SendMessage tool schema is offered to every session/agent; the controller
 # only acts on it when a messenger is wired in, so disabling messaging makes the
 # tool inert rather than absent.
@@ -250,7 +251,38 @@ PUBLIC_BASE_URL = os.environ.get("AIME_PUBLIC_BASE_URL", "").strip().rstrip("/")
 # to the exact text it was given. **Bump this whenever the documents change
 # materially** — otherwise old acceptances masquerade as agreement to new terms.
 # Keep it in step with the "Version" line inside resources/legal/*.html.
-TERMS_VERSION = os.environ.get("AIME_TERMS_VERSION", "").strip() or "2026-09-22"
+TERMS_VERSION = os.environ.get("AIME_TERMS_VERSION", "").strip() or "2026-09-29"
+
+# Revision of the SMS consent disclosure shown beside the phone-number field
+# (#account-sms-consent-row in resources/style/web_chat.html). Recorded on the
+# account with each SMS opt-in (users.sms_consent_version) as 10DLC proof of
+# consent, so **bump it whenever that checkbox text changes**.
+SMS_CONSENT_VERSION = "2026-09-29"
+
+# The opt-in confirmation text sent once when a number is consented to. Carriers
+# expect the first message to name the brand, say what's sent, and carry the
+# frequency, rates, HELP and STOP disclosures.
+SMS_OPT_IN_CONFIRMATION = (
+    "Aime (Prism): You're signed up for texts with your reminders and task "
+    "results. Msg frequency varies. Msg & data rates may apply. "
+    "Reply HELP for help, STOP to opt out."
+)
+
+# Keyword auto-replies. AWS sends these itself (the app never sees inbound
+# texts); scripts/sms_keywords.py pushes them onto the origination number, and
+# the 10DLC campaign form must quote the same text. Keep each within one
+# 160-character GSM-7 segment (plain ASCII — a curly apostrophe drops the limit
+# to 70). HELP needs the brand, a support contact and how to opt out; STOP
+# confirms the opt-out and how to undo it (Terms section 8 promises START).
+SMS_HELP_REPLY = (
+    "Aime (Prism): For help, email andrew@933consulting.com or visit "
+    "app.heyaime.org. Msg frequency varies. Msg & data rates may apply. "
+    "Reply STOP to opt out."
+)
+SMS_STOP_REPLY = (
+    "Aime (Prism): You are unsubscribed and will receive no further texts. "
+    "Reply START to resubscribe."
+)
 
 
 def stripe_price_for_tier(tier: str | None) -> str | None:

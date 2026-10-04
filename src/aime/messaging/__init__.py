@@ -6,7 +6,7 @@ Public surface:
   * ``messaging_enabled()`` — whether sending is configured at all.
 
 Everything above this package speaks only ``MessageChannel`` + a recipient
-string, so moving from Telegram (prototype) to Twilio SMS (production) is a
+string, so moving from Telegram (prototype) to AWS SMS (production) is a
 matter of pointing ``AIME_MESSAGING_CHANNEL`` at another entry in the registry
 below — no caller changes. Recipient strings come from the account record
 (``UserRecord.messaging_contact``); this layer never reaches into account
@@ -18,9 +18,9 @@ from __future__ import annotations
 import os
 
 from .base import MessageChannel, MessageSendError
+from .aws_sms import AwsSMSChannel
 from .email_channel import EmailChannel
 from .telegram import TelegramChannel
-from .twilio_sms import TwilioSMSChannel
 
 
 # Registry of available channels by their config name. Adding a transport means
@@ -28,9 +28,9 @@ from .twilio_sms import TwilioSMSChannel
 _CHANNELS: dict[str, type[MessageChannel]] = {
     "telegram": TelegramChannel,
     "email": EmailChannel,
-    "sms": TwilioSMSChannel,
+    "sms": AwsSMSChannel,
     # Alias, so naming the provider in config works as well as naming the medium.
-    "twilio": TwilioSMSChannel,
+    "aws": AwsSMSChannel,
 }
 
 _DEFAULT_CHANNEL = "telegram"
@@ -66,7 +66,7 @@ def active_channel_name() -> str | None:
 
     For UI that has to ask the user for a contact: what a valid contact *looks
     like* is the one channel-specific thing a frontend legitimately needs to
-    know. It returns the class's own ``name``, so config aliases (e.g. "twilio")
+    know. It returns the class's own ``name``, so config aliases (e.g. "aws")
     normalize to the canonical one."""
     messenger = get_messenger()
     return messenger.name if messenger is not None else None
