@@ -85,3 +85,17 @@ def test_same_user_races_build_exactly_one_context(monkeypatch):
     assert built == [7], f"context built more than once: {built}"
     assert len({id(v) for v in results.values()}) == 1
     _clear_caches()
+
+
+def test_build_outside_a_request_looks_up_the_username(monkeypatch):
+    """The scheduler fires saved agents from its own thread, with no Flask app
+    context. Reading `g` there raised "Working outside of application context",
+    so every scheduled agent run failed before it started (and retried forever)."""
+    monkeypatch.setattr(web_app, "UserContext", _SlowContext)
+    monkeypatch.setattr(web_app, "_username_of", lambda uid: f"user{uid}")
+    _clear_caches()
+
+    ctx = web_app._context_for(3)  # deliberately no test_request_context()
+    assert ctx.user_id == 3
+    assert ctx.username == "user3"
+    _clear_caches()

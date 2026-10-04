@@ -48,7 +48,7 @@ except Exception:  # noqa: BLE001 - image conversion is best-effort
 
 from flask import (
     Flask, Response, request, jsonify, session, redirect, g, url_for, abort,
-    send_from_directory
+    send_from_directory, has_app_context
 )
 from rich.console import Console
 from rich.markup import Tag, _parse
@@ -1300,7 +1300,10 @@ def _context_for(user_id: int) -> UserContext:
     with build_lock:
         ctx = _user_contexts.get(user_id)
         if ctx is None:
-            ctx = UserContext(user_id, g.get("username"))
+            # The scheduler builds contexts from its own thread, where `g`
+            # doesn't exist — fall back to the auth store for the username.
+            username = g.get("username") if has_app_context() else None
+            ctx = UserContext(user_id, username or _username_of(user_id))
             with _user_contexts_lock:
                 _user_contexts[user_id] = ctx
         return ctx
